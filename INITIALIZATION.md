@@ -94,9 +94,9 @@ Do not create parallel architecture truths. Learning notes explain concepts and 
 | Docker daemon | Verified | Local server 29.6.1 responded; image/build behavior is tested during scaffold and distribution stages. |
 | Superpowers | Installed and enabled | `superpowers@openai-curated`, manifest 5.1.3, cache revision `11c74d6b`; required workflow skill directories are present. Start design in a session where the plugin skills are loaded. |
 | Local Git baseline | Completed by this initialization | Branch `main`; governance and documentation only. |
-| Public personal GitHub remote | Pending external input | A repository URL or GitHub username/name is required before configuring `origin` and protection. |
-| Course submission remote | Pending external input | The required NJU/GitLab URL and access rules are unknown. |
-| License | Pending user choice | Do not imply open-source permission until a license is selected. |
+| Public personal GitHub remote | Configured | `origin` is `https://github.com/Ztscream/ApexCrew.git`; it was verified empty before the first non-force publication. |
+| Course submission remote | Explicitly deferred | NJU/GitLab is not considered during current GitHub development but remains a final course-delivery dependency. |
+| License | Accepted | Original ApexCrew work uses Apache-2.0; `NOTICE` excludes course-provided requirement documents from relicensing. |
 | LLM credential value | Not required | `SPEC.md` defines storage and threat handling; an actual secret is supplied only for the provider slice and is never committed. |
 
 Recommended implementation defaults, subject to formal brainstorming, are Python 3.11, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI/HTMX, OS keyring, and a non-root Linux Docker image. Windows is the development host; tests and distribution target Linux portability.
@@ -108,7 +108,7 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 | Stage | Output | Exit gate |
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
-| 1. Local repository/process setup (complete) | Git, Superpowers, ignore/security baseline, `AGENT_LOG.md` | Initial documentation commit exists; remote publication is tracked separately |
+| 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
 | 2. Brainstorming (next) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
 | 3. Planning and fixtures | Python/TypeScript fixtures; 2-5 minute tasks in `PLAN.md` | Every task has dependencies and red/green evidence |
 | 4. Independent cold start | Different Agent attempts 1-2 tasks from SPEC/PLAN only | Revisions remove all blocking ambiguity |
@@ -117,9 +117,9 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 | 7. Productization | WebUI, credentials, Docker, GitHub Actions, `.gitlab-ci.yml` `unit-test` | Fresh-machine run, public demo, and required CI pass |
 | 8. Evaluation | Comparisons, docs, demo script, security review | Spec and quality reviews pass; student writes reflection |
 
-## 9. Information Needed From the User
+## 9. Information Still Needed
 
-Before GitHub publication: provide a GitHub username or repository URL, desired repository name, license choice, and the NJU/GitLab remote arrangement.
+GitHub publication and licensing are resolved. The NJU/GitLab remote is explicitly deferred by the user; retain it as a final delivery dependency rather than a current blocker.
 
 Before Stage 2 can exit: provide the course deadline, weekly time budget, selected LLM provider/model and selection rationale, whether the required final WebUI may use MockLLM only, and whether Windows development plus Linux Docker distribution is acceptable. Approve or replace the proposed fixture problems during brainstorming; both Python and TypeScript are already accepted fixture ecosystems. The credential storage design and threat model also belong in `SPEC.md`.
 

@@ -54,3 +54,13 @@ This chronological log records material agent work and human decisions. Future i
 - **Human intervention**: none during verification. GitHub/NJU remotes and license remain external follow-ups.
 - **Commit**: `chore: initialize ApexCrew project governance`; the immutable hash is read from Git history because a commit cannot contain its own final hash.
 - **Lesson**: process documents need the same evidence loop as code: audit found an omission, the log was corrected, and checks are rerun before completion.
+
+## 2026-07-26 / GOAL-001 - GitHub publication and durable objective
+
+- **Skill**: `domain-modeling`, used to record the hard-to-reverse public-license choice in ADR-0002 without adding implementation details to `CONTEXT.md`.
+- **Key context**: publish through the user's personal repository, defer NJU/GitLab, choose a license autonomously, and establish a goal that persists through v0.1 delivery.
+- **Human decision**: `https://github.com/Ztscream/ApexCrew.git` is the public repository; NJU/GitLab is out of current scope; license selection is delegated to the agent.
+- **Agent output**: configured `origin`, verified the remote contained no refs, selected Apache-2.0 for its permissive terms and explicit patent grant, added `NOTICE` to exclude course-provided documents, and created the long-running v0.1 goal.
+- **Safety**: publication uses an ordinary non-force push only after the committed tree passes link, secret, license-integrity, and Git checks.
+- **Commit**: `chore: configure GitHub publication and licensing`.
+- **Lesson**: a repository-level license must distinguish original project work from bundled reference material the project owner cannot relicense.

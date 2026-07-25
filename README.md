@@ -27,9 +27,12 @@ The target user is a developer who needs long-running agent collaboration to rem
 - `docs/experiments/`: falsifiable experiments and fixture matrix.
 - `docs/learning/`: interview-oriented notes created only after executable evidence exists.
 - `SPEC_PROCESS.md` and `AGENT_LOG.md`: required development-process evidence.
+- `LICENSE` and `NOTICE`: Apache-2.0 terms and the explicit scope exception for course-provided documents.
 
 There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` are interface commitments for later planning, not current capabilities.
 
-## External Prerequisites
+## Repository and License
 
-Publishing remains pending: provide the personal GitHub repository URL (or username and repository name), the NJU/GitLab remote details, and a license choice. No LLM API key is needed until the offline MockLLM core is specified and green.
+The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git`. Original ApexCrew material is available under [Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for the course-document exception. The NJU/GitLab remote is explicitly deferred and does not block current GitHub development.
+
+Before Stage 2 exits, select the low-level LLM provider/model, course schedule, final WebUI mode, and fixture problems. No API credential value is needed until the offline `ScriptedMockLLM` core is specified and green.
