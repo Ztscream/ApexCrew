@@ -1,0 +1,56 @@
+# ApexCrew Agent Log
+
+This chronological log records material agent work and human decisions. Future implementation entries must include the `PLAN.md` task, Superpowers skill, red/green evidence, commit or PR, and any manual correction. Never record credentials, private prompt text, or secret-bearing command output.
+
+## 2026-07-25 / DISCOVERY-001
+
+- **Skills**: `research`, `domain-modeling`.
+- **Human context**: the user selected A-class Coding Agent Harness, named it ApexCrew, proposed repository-bounded action, HITL for dangerous operations, test-feedback correction, multi-agent cooperation, long context, and continuous cowork. Provider choice is deferred.
+- **Agent work**: read both course requirement files; inspected the docs-only workspace and local toolchain; delegated primary-source GitHub landscape research and an independent scope review.
+- **Finding**: generic multi-agent/worktree/persistence/evidence orchestration overlaps OpenHands, Vibe Kanban, Gas Town, h5i, Bernstein, Codex, and Ruflo. This invalidated novelty claims for individual durability features, not the user's authority to select the product direction.
+- **Decision proposed, not accepted**: research suggested adversarial acceptance as an alternative mainline. It remained advisory.
+- **Human intervention**: none during the research pass. User sign-off remained required before formal `SPEC.md` brainstorming.
+- **Artifacts**: `docs/research/github-agent-landscape.md`, `INITIALIZATION.md`, `CONTEXT.md`, `docs/learning/README.md`, and revised `AGENTS.md`.
+- **Lesson**: feature combinations that sounded distinctive were already implemented by direct competitors. Research must precede scope freeze, and provenance must not be confused with semantic correctness.
+
+## 2026-07-26 / INIT-002 - Product direction accepted
+
+- **Skills**: no Superpowers workflow was invoked; this was a human product decision informed by the completed research agents.
+- **Key context**: choose one mainline, cap v1 at three Workers, use Python + TypeScript fixtures, and keep the assessed loop independent of host Coding Agent CLIs.
+- **Human decision**: accepted **Evidence-Driven Durable Crew** as the only mainline; limited v1 to one repository and at most three Workers; selected Python + TypeScript fixtures and a public personal GitHub repository; prioritized backend and Agent-engineering interview value.
+- **Core constraint**: real providers use low-level model APIs. Codex, Claude Code, Gemini CLI, and high-level agent frameworks cannot replace the self-built WorkerLoop.
+- **Correction**: adversarial acceptance and weak-oracle challenge became supporting experiments only. The research report was marked advisory and its conflicting Codex-backend recommendation was removed.
+- **Artifacts**: `docs/adr/0001-evidence-driven-durable-crew.md`, the decision callout in `docs/research/github-agent-landscape.md`, and reconciled initialization documents.
+- **Lesson**: research may challenge novelty and refine claims, but it does not silently supersede an explicit human product decision.
+
+## 2026-07-26 / INIT-003 - Superpowers setup
+
+- **Skills**: plugin installation and filesystem/configuration verification; no newly installed Superpowers workflow was claimed in the installation session.
+- **Key context**: the course requires the seven-step Superpowers workflow, so the complete official plugin must be present before formal brainstorming.
+- **Installation target**: `superpowers@openai-curated` through the Codex plugin registry.
+- **Verification**: enabled in Codex configuration; manifest version `5.1.3`; cache revision `11c74d6b`; required workflow skill directories are present.
+- **Agent output**: installed plugin cache and enabled configuration outside the repository; package/version evidence is recorded here and in `INITIALIZATION.md`.
+- **Human intervention**: the user authorized completing initialization; no credential or provider choice was required.
+- **Operational note**: Stage 2 starts in a task/session where the newly installed plugin skills are loaded. No workflow step is claimed before it is actually run.
+- **Lesson**: installation, activation, and actual workflow use are separate facts and must not be conflated.
+
+## 2026-07-26 / INIT-004 - Local governance baseline
+
+- **Skill**: `domain-modeling`, used to keep `CONTEXT.md` glossary-only and record the accepted direction in ADR-0001.
+- **Key context**: finish a documentation-only initialization; do not create `SPEC.md`, `PLAN.md`, fixtures, source, tests, or CI before their gates.
+- **Agent work**: reconciled product status, repository guidance, architecture boundaries, experiments, process records, and security-oriented ignore rules.
+- **Environment verification**: Git author identity is configured; Docker daemon 29.6.1 responds; GitHub CLI is absent but optional.
+- **Artifacts**: `README.md`, `SPEC_PROCESS.md`, `CONTEXT.md`, `INITIALIZATION.md`, repository policies, ADR-0001, system overview, experiment plan, research, and learning index.
+- **Human intervention still needed**: GitHub/NJU remote details, course schedule, final WebUI constraint, and license choice.
+- **Implementation state**: none. `SPEC.md`, `PLAN.md`, source, tests, and CI are deliberately absent.
+- **Lesson**: an initialization baseline should make unknowns and gates executable for the next task rather than filling them with guessed decisions.
+
+## 2026-07-26 / INIT-005 - Verification and baseline commit
+
+- **Skills**: `domain-modeling` consistency review plus verification-before-completion discipline; the Superpowers skill itself was installed but not falsely claimed as loaded in this session.
+- **Key context**: accept only a repository state that preserves the sole mainline, contains no implementation, leaks no likely credential, and has valid local document links.
+- **Agent output**: maintained Markdown files passed local-link checks; all Markdown fences close; `AGENTS.md` is within its required 200-400-word range; common secret patterns and machine-local paths were absent; forbidden implementation paths were absent; all seven required Superpowers skill directories were verified; `git diff --cached --check` passed.
+- **Independent review**: a fresh read-only subagent confirmed the mainline/scope/loop constraints and identified missing process-log fields, a cold-start gate deadlock, late provider selection, an incomplete Stage 2 checklist, and executable-looking archived research. All were corrected before commit.
+- **Human intervention**: none during verification. GitHub/NJU remotes and license remain external follow-ups.
+- **Commit**: `chore: initialize ApexCrew project governance`; the immutable hash is read from Git history because a commit cannot contain its own final hash.
+- **Lesson**: process documents need the same evidence loop as code: audit found an omission, the log was corrected, and checks are rerun before completion.

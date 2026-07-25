@@ -1,0 +1,42 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ApexCrew runtime state and worktrees
+.apexcrew/
+.worktrees/
+*.sqlite
+*.sqlite3
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Node and TypeScript fixtures
+node_modules/
+.npm/
+.pnpm-store/
+coverage/
+*.tsbuildinfo
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
