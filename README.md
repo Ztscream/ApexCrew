@@ -4,7 +4,7 @@ ApexCrew is a local-first Coding Agent Harness for an **Evidence-Driven Durable 
 
 ## Status
 
-This repository is intentionally documentation-only. Discovery and local repository initialization are complete; formal specification has not started. Do not add persistent implementation until three Superpowers brainstorming rounds produce an approved `SPEC.md`, `writing-plans` produces `PLAN.md`, and a different agent completes the required cold-start review. That review may generate code only in a disposable isolated worktree; its code is never merged or retained.
+This repository is intentionally documentation-only. Discovery and repository initialization are complete; Superpowers specification brainstorming is in progress with Round 1 of 3 approved. Do not add persistent implementation until all three rounds produce an approved `SPEC.md`, `writing-plans` produces `PLAN.md`, and a different agent completes the required cold-start review. That review may generate code only in a disposable isolated worktree; its code is never merged or retained.
 
 ## Accepted v1 Boundary
 

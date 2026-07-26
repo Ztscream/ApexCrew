@@ -109,7 +109,7 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
-| 2. Brainstorming (next) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
+| 2. Brainstorming (in progress: 1/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
 | 3. Planning and fixtures | Python/TypeScript fixtures; 2-5 minute tasks in `PLAN.md` | Every task has dependencies and red/green evidence |
 | 4. Independent cold start | Different Agent attempts 1-2 tasks from SPEC/PLAN only | Revisions remove all blocking ambiguity |
 | 5. Scaffold | Package, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |

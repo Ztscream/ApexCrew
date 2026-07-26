@@ -64,3 +64,13 @@ This chronological log records material agent work and human decisions. Future i
 - **Safety**: publication uses an ordinary non-force push only after the committed tree passes link, secret, license-integrity, and Git checks.
 - **Commit**: `chore: configure GitHub publication and licensing`.
 - **Lesson**: a repository-level license must distinguish original project work from bundled reference material the project owner cannot relicense.
+
+## 2026-07-26 / SPEC-R1 - Problem and scenario approval
+
+- **Skill**: Superpowers `brainstorming`, loaded from the installed official plugin; its visual companion was accepted and initialized for later diagram/layout questions.
+- **Key context**: define one primary user journey, failure, completion boundary, decomposition owner, and falsifiable comparison before discussing mechanisms.
+- **Human decisions**: selected option A for all five questions and explicitly approved Round 1: one developer delegates one hours-long cross-module task; stale integration is the main failure; success ends at a human-approved Integration Candidate; the Coordinator proposes a bounded DAG; freshness-disabled ablation is the primary baseline.
+- **Agent output**: recorded the full question/decision/consequence table and approved conclusion in `SPEC_PROCESS.md`; added `.superpowers/` to `.gitignore` so visual session state remains local.
+- **Implementation state**: none. The Superpowers design hard gate remains active.
+- **Commit**: `docs: approve brainstorming round 1`.
+- **Lesson**: the main contribution is strongest when evaluated by a controlled ablation, not by broad claims that multi-agent execution is generally better.

@@ -8,6 +8,7 @@ credentials.json
 
 # ApexCrew runtime state and worktrees
 .apexcrew/
+.superpowers/
 .worktrees/
 *.sqlite
 *.sqlite3
