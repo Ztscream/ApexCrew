@@ -1,6 +1,6 @@
 # ApexCrew Initialization Baseline
 
-> Status: accepted discovery baseline, updated 2026-07-26. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds are approved; architecture comparison, final written-spec sign-off, planning, and cold-start review still gate implementation.
+> Status: accepted discovery baseline, updated 2026-07-26. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds and A-Hybrid are approved, and independent specification review passed; final written-spec sign-off, planning, and implementation cold-start review still gate implementation.
 
 ## 1. Product Thesis
 
@@ -20,23 +20,25 @@ The A-class submission must implement its own:
 - **worker loop**: assemble context, make one model call, parse one structured action, execute a tool, return feedback, and stop;
 - deterministic tool, feedback, governance, memory, stop, and configuration mechanisms.
 
-`ScriptedMockLLM` is the first provider. A production adapter may later expose a low-level single-completion interface through `ModelPort`. Codex, Claude Code, Gemini CLI, AutoGen, CrewAI, LangGraph, or another hosted agent runner may be an experiment only after the core is complete; none may implement or substantiate the assessed loops.
+`ScriptedMockLLM` is the first provider. The sole real v0.1 adapter exposes OpenAI Responses as a low-level single-completion interface through `ModelPort`. Codex, Claude Code, Gemini CLI, AutoGen, CrewAI, LangGraph, or another hosted agent runner may be an experiment only after the core is complete; none may implement or substantiate the assessed loops.
 
 ## 3. MVP Scope
 
-The first usable slice supports one local user, one repository, one process, at most three Workers, an explicit bounded task DAG, file/path-glob write sets, per-attempt Git worktrees, SQLite persistence, and serial integration. Python and TypeScript micro-repositories are the accepted fixture matrix.
+The first usable slice supports one local user and host installation with exactly one configured repository, one target and runtime owner per Run plus short-lived locked CLI commands, at most three Workers, an explicit bounded task DAG plus promotion-hazard graph, declared read/dependency/write/check-input scopes, isolated detached workspaces, SQLite persistence, and serial integration. Python and TypeScript micro-repositories are the accepted fixture matrix. v0.1 rejects repositories with pre-existing linked Git worktrees, config includes, sparse/split indexes, grafts, shallow/partial history, alternates, or externally routed Git storage rather than following repository-controlled admin paths. A Run pins a direct local target branch before bounded read-only planning; the first planning command creates the sole locked Git-native Target Reservation that later `DRAFT` attempts reuse, and exact journaled terminal cleanup removes it before purge. The Run never rebases automatically.
+
+Accepted runtime-driving commands issue one internal one-use Runtime Permit bound to the exact command, Audit position, phase, and runtime generation. `CrewRuntime.run_until_blocked` must consume it before mutation; an old begin/start/resume/Grant/integration replay cannot mint another permit, while a fresh exact `continue` closes only a genuine orphaned-runtime crash window.
 
 Workers receive typed Context Capsules rather than full chat history. Checks use repository-declared structured `argv`; an immutable Evidence Receipt records the check and result against a prepared Verification Snapshot. A separate Freshness Assessment rejects capsules, receipts, and candidates whose dependency, contract, policy, or revision no longer applies; immutable historical records are not rewritten.
 
-Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape and secret access are hard denials. An immutable Policy Revision is versioned separately from the Plan Revision. An Approval Grant freezes the action and binds run, action digest, workspace revision, policy revision, expiry, and one use; a separate Grant Validation determines whether it still authorizes the pending effect.
+Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape, symlink operations, and the fixed plus host-local Secret Path Set are hard denials. Plan and Policy freeze at `ACTIVE`; Budget and Model Configuration may change only through their explicit approved invalidation rules. An Approval Grant freezes one action/integration/purge manifest and binds its exact state, expiry, and one use; a separate Grant Validation determines whether it authorizes that pending effect.
 
-Non-goals for v0.1: symbol-level ownership, arbitrary shell, automatic push/merge/release, vector memory, dynamic agent societies, more than three Workers, remote/multi-user execution, a writable WebUI, A2A, Kubernetes, plugin marketplace, production public execution, provider breadth, macOS/ARM support, or a hosted backend. Weak-oracle challenge is an experiment, not a mandatory alternate workflow.
+Non-goals for v0.1: symbol-level ownership, arbitrary shell, automatic push/merge/release, vector memory, dynamic agent societies, more than three Workers, pre-existing linked-worktree compatibility, remote/multi-user execution, a writable WebUI, A2A, Kubernetes, plugin marketplace, production public execution, provider breadth, macOS/ARM support, or a hosted backend. Weak-oracle challenge is an experiment, not a mandatory alternate workflow.
 
 ## 4. Decisive Demonstrations
 
 1. **Feedback correction**: a scripted Worker applies a wrong patch; a real check fails; structured evidence returns to the Worker; its next action fixes the patch; only fresh green evidence permits handoff.
-2. **Coordination freshness**: two isolated worktrees execute dependent Task Contracts. Upstream integration invalidates the downstream capsule and evidence, forces refresh and revalidation, and prevents a stale candidate from entering the integration queue. Run the same scenario on Python and TypeScript fixtures.
-3. **Governance and recovery**: workspace escape is denied with zero side effects; risky-action approval cannot be modified, replayed, or reused; injected crashes resume without duplicate action or integration. Uncertain external side effects enter `INDETERMINATE` for human resolution.
+2. **Coordination freshness**: two isolated detached Attempt workspaces execute dependent Task Contracts. Upstream integration invalidates the downstream capsule and evidence, forces refresh and revalidation, and prevents a stale candidate from entering the integration queue. Run the same scenario on Python and TypeScript fixtures.
+3. **Governance and recovery**: workspace/read-scope escape is denied with zero side effects or content exposure; a risky-action Grant can settle only its exact persisted intent; pre-dispatch model reservations and injected crashes cannot duplicate an authoritative action or silently retry uncertainty. Closed `INDETERMINATE` choices never assert success.
 4. **Supporting evidence-quality challenge**: a known flawed patch that passes visible checks is not described as proven correct; a bounded challenger may add a reproducible counterexample and measure its cost. This experiment cannot redefine the product mainline.
 
 All mechanism demos run offline with `ScriptedMockLLM` and real temporary repositories/processes. Go/no-go conditions are objective: stale evidence is never accepted, unapproved dangerous actions have zero side effects, recorded actions are not replayed after restart, and no LLM-as-judge determines correctness.
@@ -45,25 +47,37 @@ All mechanism demos run offline with `ScriptedMockLLM` and real temporary reposi
 
 ```mermaid
 flowchart TB
-    CLI["Authoritative CLI"] --> COORD["Coordinator Loop"]
+    CLI["Authoritative CLI"] --> CONTROL["CrewControl.handle"]
+    CONTROL -->|"Issues one-use authority"| PERMIT["Runtime Permit"]
+    CLI -->|"Delivery call"| RUNTIME["CrewRuntime.run_until_blocked"]
+    PERMIT -->|"Consumed before mutation"| RUNTIME
+    RUNTIME --> COORD
     COORD --> BOARD["Task Contracts, DAG, leases"]
-    COORD --> WORKER["ApexCrew WorkerLoop, max 3"]
-    WORKER --> CAPSULE["Context Capsule builder"]
-    WORKER --> POLICY["Governance and approval"]
-    WORKER --> RUNTIME["Typed host Git / restricted Docker tools"]
-    RUNTIME --> GATE["Prepared verifier and evidence gate"]
-    BOARD --> INVALIDATE["Freshness / invalidation graph"]
-    GATE --> INVALIDATE
-    COORD --> STORE["SQLite run and event store"]
-    CAPSULE --> STORE
-    POLICY --> STORE
-    WORKER --> MODEL["ModelPort: Scripted / OpenAI Responses"]
-    STORE --> READ["Sanitized RunReadModel"]
-    READ --> LOCAL["Read-only loopback WebUI"]
-    READ --> PAGES["Fixture-only GitHub Pages"]
+    COORD -->|"Planning only"| MODELREQ["Durable Model Request"]
+    COORD --> WORKER["WorkerLoops, max 3"]
+    WORKER --> AUTH["Authority"]
+    COORD -->|"Planning read/search"| TOOLS["Typed ToolRuntime"]
+    WORKER --> TOOLS["Typed ToolRuntime"]
+    TOOLS --> HOSTGIT["Sanitized Host Git Adapter"]
+    TOOLS --> EXEC["Restricted Executor"]
+    HOSTGIT --> ADMIT["Admission: freshness + evidence"]
+    EXEC --> ADMIT
+    AUTH --> ADMIT
+    ADMIT -->|"Admission-issued typed CAS"| HOSTGIT
+    HOSTGIT --> REFS["Private / Target Refs"]
+    CONTROL --> JOURNAL["EffectJournal + recovery"]
+    RUNTIME --> JOURNAL
+    JOURNAL --> STORE["SQLite state + Audit Ledger"]
+    WORKER --> MODELREQ
+    MODELREQ --> MODEL["ModelPort: Scripted / OpenAI Responses"]
+    MODELREQ --> AUTH
+    MODELREQ --> JOURNAL
+    STORE --> QUERY["RunQueries.get"]
+    QUERY --> LOCAL["Read-only loopback WebUI"]
+    QUERY --> PAGES["Fixture-only GitHub Pages"]
 ```
 
-The implementation architecture remains a pending post-Round-3 comparison. Every acceptable shape must keep both loops, contracts, transitions, freshness, evidence, policy, and budgets inside deep domain modules; Git/worktrees, restricted commands, SQLite, credentials, and model providers remain adapters. CLI is the sole command interface and WebUI is a read-only projection. Provider SDKs and FastAPI never enter the domain core. See [the system overview](docs/architecture/system-overview.md).
+The approved **A-Hybrid** shape exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get` for Run behavior. Coordinator plans and schedules; Admission exclusively validates/prepares candidates and issues typed private/target CAS requests; the sanitized host Git adapter only executes them. Control-issued Runtime Permits bind CLI delivery to exact runtime phases without becoming public continuation tokens. EffectJournal covers model requests as well as tool/ref/Target Reservation effects. Git, restricted commands, SQLite, credentials, and model providers remain adapters; provider SDKs and FastAPI never enter the domain core. Returned-model identity is validated before loop release, hostile Git config/includes/hooks/filters and sparse/split/graft/shallow metadata cannot execute, route external reads, or hide history, and terminal purge retains an administrative tombstone while invoking no Git operation. CLI may use all three Run interfaces, while WebUI/static delivery receives only `RunQueries`; auxiliary doctor/configuration/credential/UI-server flows have no Run or repository mutation authority. See [the system overview](docs/architecture/system-overview.md) and [ADR-0006](docs/adr/0006-use-a-hybrid-control-runtime-query-interfaces.md).
 
 ## 6. Documentation System
 
@@ -113,9 +127,9 @@ No `src/`, tests, fixtures, or CI may be retained until the remaining specificat
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
-| 2. Brainstorming (in progress: 3/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Architecture comparison, independent review, and final written-spec sign-off complete the Stage 2 gate |
+| 2. Specification (in progress: independent review passed) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat/module model | Final written-spec sign-off completes the Stage 2 gate |
 | 3. Planning | `PLAN.md` with 2-5 minute implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
-| 4. Independent cold start | Different Agent attempts 1-2 tasks from SPEC/PLAN only | Revisions remove all blocking ambiguity |
+| 4. Independent cold start | Different agent type, fresh session, only SPEC/PLAN, no prior memory; attempt 1-2 tasks for about 1-2 hours and pause on ambiguity | Revisions remove all blocking ambiguity; disposable code is not retained |
 | 5. Scaffold | Package, Python/TypeScript fixture repositories, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
 | 6. Core vertical slices | Worker feedback, contracts/leases, freshness gate, approval, recovery | Decisive demos pass offline on both fixtures |
 | 7. Productization | WebUI, credentials, Docker, GitHub Actions, `.gitlab-ci.yml` `unit-test` | Fresh-machine run, public demo, and required CI pass |
@@ -125,6 +139,6 @@ No `src/`, tests, fixtures, or CI may be retained until the remaining specificat
 
 GitHub publication, licensing, provider/model, credentials design, WebUI form, platform matrix, and schedule are resolved. The actual OpenAI secret/quota is neither needed nor accepted until the opt-in provider slice. The repository owner must later enable GitHub Pages/GHCR and any package trusted publisher.
 
-Stage 2 still requires comparison of implementation architectures, independent review, and final human sign-off on the complete `SPEC.md`. Stage 3 then creates `PLAN.md`; the independent cold-start review follows planning and must remove all blocking ambiguity before implementation is retained.
+The A-Hybrid implementation architecture is approved, and three independent whole-document cold reads found zero blockers. Stage 2 now requires final human sign-off on the complete `SPEC.md`. Stage 3 then creates `PLAN.md`; the independent implementation cold-start review follows planning and must remove all blocking ambiguity before implementation is retained.
 
 The NJU/GitLab remote is explicitly deferred but remains a final course-delivery dependency. The supplied course deadline omitted a time, so the plan assumes 23:59 Asia/Shanghai unless the user corrects it. Python 3.12 installation is the only missing local scaffold prerequisite currently observed.

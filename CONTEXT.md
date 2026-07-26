@@ -17,27 +17,43 @@ A logical coding participant whose decision loop is owned by ApexCrew and whose 
 _Avoid_: External CLI agent, role-play agent
 
 **Task Contract**:
-The immutable agreement for one unit of work: its dependencies, allowed write set, supplied context, and required checks.
+The immutable agreement for one unit of work: its execution dependencies, read/dependency/write/check-input scopes, supplied constraints, and required checks.
 _Avoid_: Prompt, ticket, task description
 
 **Plan Revision**:
-An immutable, human-approved version of a bounded Task Contract DAG for one Crew Run.
+An immutable, human-approved version of a bounded Task execution DAG, promotion-hazard graph, and Run Check Set for one Crew Run.
 _Avoid_: Mutable plan, Coordinator scratch plan
 
+**Promotion Hazard**:
+An ordering relation that prevents a Task Candidate from promoting before another Task that may still write one of its declared inputs; it constrains promotion without necessarily blocking speculative execution.
+_Avoid_: Task dependency, merge conflict
+
 **Policy Revision**:
-An immutable, human-approved version of the rules that allow, deny, or require approval for actions and integration.
+An immutable, human-approved version of planning-read authority, Secret Path Set identity, and the rules that allow, deny, or require approval for actions and integration.
 _Avoid_: Plan Revision, mutable policy
+
+**Secret Path Set**:
+The effective union of non-removable default secret-path denials and operator-added private path rules whose identity is bound to a Policy Revision without disclosing those rules.
+_Avoid_: Known-secret list, repository ignore file
+
+**Planning Read Authorization**:
+The Policy-bound path scope and disclosure caps under which the Coordinator may inspect a pinned tracked snapshot before a Plan exists.
+_Avoid_: Repository access, default full-repository context
 
 **Budget Revision**:
 An immutable, human-approved version of the hard resource ceilings and objective allocation rules for one Crew Run.
 _Avoid_: Usage counter, model estimate
 
 **Model Configuration Revision**:
-An immutable provenance record of the provider, model settings, and typed-action contract used by a Worker Attempt; it never contains credentials.
+An immutable, human-approved record of the provider, requested and acceptable returned-model identities, model settings, and typed-action contract used for planning or a Worker Attempt; it never contains credentials.
 _Avoid_: API key, provider session
 
+**Model Request Intent**:
+A durable pre-dispatch record that binds one provider attempt to its request identity and reserved budget before any external request occurs.
+_Avoid_: Prompt log, provider session
+
 **Workspace Lease**:
-A time-bounded claim that authorizes one Worker attempt to modify a declared write set.
+A time-bounded claim that authorizes one Worker Attempt to modify a declared write set while intervening Run Head changes remain outside its sensitivity scope.
 _Avoid_: File ownership, permanent lock
 
 **Context Capsule**:
@@ -45,7 +61,7 @@ A bounded, provenance-bearing handoff containing only the goal, constraints, dec
 _Avoid_: Chat history, memory dump, summary
 
 **Run Head**:
-The current immutable revision of a Crew Run's private branch, used as the expected parent for the next Task Candidate.
+The immutable commit currently named by a Crew Run's private `refs/apexcrew/runs/<run-id>` ref, used as the expected parent for the next Task Candidate.
 _Avoid_: Main, integration branch
 
 **Worker Attempt**:
@@ -81,7 +97,7 @@ An artifact's negative Freshness Assessment or a Worker Attempt's terminal outco
 _Avoid_: Failed, old
 
 **Task Candidate**:
-A Worker Attempt's change prepared and verified against the current Run Head, eligible for promotion only to the Crew Run's private branch.
+A Worker Attempt's change prepared and verified against the current Run Head, eligible for promotion only by CAS to the Crew Run's private `refs/apexcrew/runs/<run-id>` ref.
 _Avoid_: Integration Candidate, completed task
 
 **Run Candidate**:
@@ -89,11 +105,11 @@ The complete frozen Crew Run revision whose run-wide Evidence Bundle is fresh an
 _Avoid_: Integration Candidate, pull request
 
 **Approval Grant**:
-A single-use human authorization bound to one frozen risky action or final integration and to the exact applicable run, target, evidence, and policy revisions.
+A single-use human authorization bound to one frozen risky action, final integration, or Purge Manifest and its exact applicable state; after consumption it can settle only its already-journaled intent.
 _Avoid_: Confirmation, blanket permission
 
 **Grant Validation**:
-A gate-time judgment that an immutable Approval Grant exactly matches the pending action or integration and remains unexpired and unused.
+A gate-time judgment that an Approval Grant is unexpired/unused for the exact new intent, or is already consumed by the exact journaled intent being settled; no other reuse qualifies.
 _Avoid_: Freshness Assessment, stale approval
 
 **Audit Ledger**:
@@ -103,3 +119,19 @@ _Avoid_: Debug log, transcript
 **Restricted Transcript**:
 Redacted local diagnostic material that may explain model or tool behavior but can never authorize admission or enter a public export.
 _Avoid_: Evidence Receipt, Audit Ledger
+
+**Target Reservation**:
+A Run-owned branch-occupancy claim that keeps the pinned target out of user worktrees until terminal administrative cleanup.
+_Avoid_: Execution worktree, target lock
+
+**Runtime Permit**:
+A one-use internal authority that lets one exact accepted command start its matching runtime phase; command replay cannot recreate it after consumption.
+_Avoid_: Continuation token, idempotency key, session
+
+**Purge Manifest**:
+A frozen inventory of one terminal Crew Run's removable ApexCrew state, bound to its exact terminal Audit position before destructive retention cleanup is approved.
+_Avoid_: Delete request, retention policy
+
+**Purge Tombstone**:
+The minimal durable proof that an exact Purge Manifest is pending or complete, retained after the Crew Run's removable state is gone so recovery and idempotency remain authoritative.
+_Avoid_: Audit Ledger, deleted Run

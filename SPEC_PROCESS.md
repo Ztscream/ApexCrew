@@ -55,7 +55,7 @@ The user explicitly approved this round. Its problem and scenario section is acc
 | 4 | How should recovery handle an action that may already have caused a side effect? | **B**: reconcile by action class and pause on uncertainty. | File, Git, and check actions use idempotency keys plus expected pre/post state. Unconfirmable external effects enter `INDETERMINATE`; ApexCrew makes no universal exactly-once claim. |
 | 5 | How should dependent tasks advance before final human integration? | **B**: serial promotion to a private local Run Branch, followed by one final approval. | Verified Task Candidates advance only `refs/apexcrew/runs/<run-id>` under a lock and CAS. A frozen Run Candidate receives run-wide checks before a revision-bound Grant may update the user target; ApexCrew never pushes. |
 | 6 | What happens when a running Worker Attempt becomes stale? | **B**: let the current atomic action settle, then stop and refresh from the latest Run Head. | The old Attempt becomes `STALE`, loses its lease, and cannot hand off. Known changes restart only the affected closure; unknown, plan, or policy changes trigger global invalidation and a human pause. |
-| 7 | Which failures may be corrected without a new human approval? | **B**: retry within an immutable Plan Revision and Task Contract; reapprove structural changes. | Objective failures feed the Worker within a fixed budget. DAG, dependency/write scope, or required-check changes create a new Plan Revision; policy changes create a separate Policy Revision. Either requires applicable human approval; exact budgets belong to Round 3. |
+| 7 | Which failures may be corrected without a new human approval? | **B**: retry within an immutable Plan Revision and Task Contract; reapprove structural changes. | Objective failures feed the Worker within a fixed budget. DAG, scope, check, or Policy change requires reapproval before execution and, after `ACTIVE`, cancellation/new Run; exact budgets belong to Round 3. |
 
 #### Approved Round 2 conclusion
 
@@ -107,7 +107,7 @@ Rounds 1 and 2 created the draft [SPEC.md](SPEC.md) sections for product definit
 
 - The trusted host owns authority and durable state; untrusted repository commands execute only in a restricted Docker adapter. Typed capabilities and current revisions, not prompts or human vigilance, enforce the safety claim.
 - OpenAI Responses API supplies the one real low-level adapter, while every core gate and demo remains deterministic and offline through `ScriptedMockLLM`.
-- An adaptive Budget Revision combines hard Run ceilings, per-Task call/attempt/refresh maxima, evidence-based tranche renewal, deterministic no-progress stops, and approval for any increase.
+- An adaptive Budget Revision combines non-raiseable v0.1 Run/per-Task maxima, evidence-based tranche renewal, deterministic no-progress stops, and approval for any increase from a lower revision only up to those maxima.
 - CLI is the sole command surface. The token-protected loopback WebUI and GitHub Pages fixture replay are read-only projections from the allowlisted Audit Ledger.
 - The public demo, Open Design workflow, Windows/Linux support matrix, wheel plus executor distribution, CI jobs, Run Check Set, performance, accessibility, and onboarding thresholds are explicit acceptance work, not aspirational follow-ups.
 - The full action taxonomy, threat assumptions, environment fingerprint, redaction/quarantine, retention/export, and residual risks are normative in [SPEC.md sections 10-11](SPEC.md#10-operations-security-and-delivery).
@@ -130,17 +130,51 @@ The user explicitly approved the consolidated Round 3 design after reviewing all
 - The repository owner supplies the actual OpenAI credential/quota and confirms then-current model availability/pricing only during the opt-in provider slice.
 - GitHub Pages, GHCR, and package trusted-publishing settings require repository-owner enablement. The NJU/GitLab remote remains deferred but is a final course-submission dependency.
 - The supplied deadline omitted a time; the specification transparently assumes 23:59 Asia/Shanghai unless corrected.
-- Implementation module shape is deliberately deferred to the post-Round-3 architecture comparison. The complete written specification still requires independent review and a separate final human sign-off.
+- At Round 3 close, implementation module shape was deferred to the post-Round-3 architecture comparison, and the complete written specification still required independent review plus separate final human sign-off. Architecture and independent review are resolved below; final sign-off remains open.
 
 #### Resulting `SPEC.md` diff
 
-Round 3 replaced the open-requirements section with normative provider/provenance and credential behavior, adaptive ceilings and stop rules, a host/container threat model and action taxonomy, dual-tier observability with retention/export, CLI/read-only UI authority, Open Design and GitHub Pages workflows, distribution/platform/CI contracts, exact performance/accessibility thresholds, an objective acceptance matrix, a 53-hour delivery timebox, and explicit residual risks. It also updated module contracts, data entities, architecture flow, scope, and acceptance invariants. The artifact remains not implementation-ready until architecture comparison, independent review, final written-spec sign-off, planning, and cold-start gates complete.
+Round 3 replaced the open-requirements section with normative provider/provenance and credential behavior, adaptive ceilings and stop rules, a host/container threat model and action taxonomy, dual-tier observability with retention/export, CLI/read-only UI authority, Open Design and GitHub Pages workflows, distribution/platform/CI contracts, exact performance/accessibility thresholds, an objective acceptance matrix, a 53-hour delivery timebox, and explicit residual risks. It also updated module contracts, data entities, architecture flow, scope, and acceptance invariants. At Round 3 close the artifact remained gated by architecture comparison, independent review, final written-spec sign-off, planning, and cold-start review; the architecture comparison is resolved below.
 
 ## Brainstorming Workflow Reflection
 
 The workflow was strongest when it forced one bounded decision at a time. It converted a broad "multi-agent, long-context, continuous cowork" idea into a falsifiable stale-evidence failure, exposed crowded prior art, and made the user choose explicit safety, budget, delivery, and non-goal trade-offs. The consolidated visual review also made thirteen interacting Round 3 choices easier to inspect than another long prose draft.
 
 It was weakest at preserving reasoning and enforcing its own exit gates. Letter-only approvals captured the selected option but little of the user's rationale, and Round 2 was initially marked approved before its normative `SPEC.md` diff, lifecycles, and data model existed. The growing vocabulary also created cross-document drift that only independent review caught. Future design rounds must present the exact normative diff and a process/terminology consistency checklist before requesting approval, and must record a short rationale in addition to the option letter.
+
+## Post-Round-3 Architecture Comparison (approved 2026-07-26)
+
+The `codebase-design` Design It Twice workflow ran three read-only design passes against the same SPEC, glossary, dependency categories, and containment constraints. Two agents ran the minimal-kernel and flexible-module briefs in parallel; the third journey-facade brief ran as a follow-up after the agent-thread limit prevented a third concurrent spawn. This is a recorded workflow deviation, not three-agent parallel evidence:
+
+| Design | Strength | Rejected risk |
+|---|---|---|
+| Minimal kernel: `execute/read` | Maximum external depth and simple end-to-end tests | A giant implementation and ambiguous long-blocking `execute`/interrupt behavior |
+| Flexible dual reactor | Strong locality for Coordinator, WorkerLoop, Admission, governance, and adapters | Too many public interfaces could let callers reproduce ordering and scatter rules |
+| Journey facade: `propose/continue/inspect` | Trivial primary CLI journey | An overloaded continuation token/generic command bus could carry mutation authority into read projections |
+
+The recommended **A-Hybrid** combines a three-interface Run surface with internal dual-reactor locality. The user explicitly approved it. `CrewControl.handle` accepts exact idempotent human commands; `CrewRuntime.run_until_blocked` owns Coordinator planning and Coordinator/WorkerLoop execution until an external wait or terminal state; `RunQueries.get` is the sole sanitized read interface. CLI may compose control plus runtime, while local/static WebUI receives queries only. Internal deep modules own Coordinator, WorkerLoop, Admission, Authority, EffectJournal/recovery, tools, and projection; adapters never own domain ordering.
+
+The decision is recorded in [ADR-0006](docs/adr/0006-use-a-hybrid-control-runtime-query-interfaces.md). The resulting `SPEC.md` diff replaces the provisional module grouping with exact interfaces, package ownership, stop/error behavior, adapter categories, and interface-level testing rules. No implementation or `PLAN.md` was created.
+
+## Post-Approval Whole-Spec Cold Reviews (completed 2026-07-26)
+
+A whole-document cold read deliberately ignored the approved architecture diff and tried to implement the current SPEC from scratch. It found nine blockers: no executable bootstrap-planning protocol; a pre-approval provider/budget cycle; non-durable model calls; a future-writer Candidate promotion hazard; contradictory consumed-Grant recovery; undefined lease validity after unrelated promotion; Worker reads escaping declared dependencies; target movement before the Run gate; and unconstrained `INDETERMINATE` resolution.
+
+The correction keeps A-Hybrid unchanged while making its ordering executable. It adds `PLANNING` and `READY_TO_START`; exact Policy/Budget/Model Configuration bootstrap approvals and start guards; an eight-request read-only Coordinator planning schema; pre-dispatch Model Request Intents/reservations; separate execution and promotion-hazard graphs; `R`/`D`/`W`/`Q` scope enforcement; lease admissibility through classified heads; pinned-target behavior; consumed-Grant settlement authority for one intent; and closed, objectively guarded uncertainty resolution. It also assigns candidate CAS only to Admission and classifies doctor/configuration/credential/UI-server commands as non-Run auxiliary flows with no model/repository authority.
+
+A second lifecycle, course-consistency, and security read found further implementation forks: CAS ownership drifted back to Coordinator/CLI in companion prose; Candidate promotion required a lease that had already been released; invalid Grants terminally rejected a fresh Candidate; approval waits had pause/cancel and crash-window races; Policy mutability conflicted with a frozen Plan; returned provider model IDs were recorded but not authorized; symlink and secret-path behavior was incomplete; purge could delete its own recovery authority; a checked-out target branch and hostile Git configuration/hooks could escape the safety model; and the acceptance matrix referenced an undefined secret scan.
+
+The correction makes Coordinator schedule, Admission exclusively validate/prepare/issue CAS, and the sanitized host Git adapter execute only typed Admission requests. It freezes Plan and Policy at `ACTIVE`; defines returned-model allowlisting, non-removable plus host-local secret paths, v0.1 symlink denial, terminal tombstone-backed purge, checked-out-target rejection, non-extensible Git storage/invocation, Candidate lease provenance, approval-race precedence, and tracked-tree/full-history secret scanning. These rules narrow and close the approved design; they do not add a new public interface or product mainline.
+
+A third implementer/security/course pass found remaining execution forks around one-command runtime authority, planning and multi-intent state tables, known CAS failure, post-purge reads/idempotency, and Git-native target occupancy. In particular, a locked `--no-checkout` worktree could not be removed by the old allowlist; local Git config could follow external includes before overrides; record-supplied linked-worktree paths could route reads; and cleanup crashes left mixed admin/path states with no bounded repair.
+
+The correction introduces a persisted one-use Runtime Permit between control and runtime; closes planning, `PROMOTING`/`APPLYING`, and unresolved-set transitions; and defines tombstone-only post-purge behavior. One preallocated Target Reservation is reused across `DRAFT` retries. v0.1 rejects pre-existing linked worktrees, parses local config/admin state before Git without dereferencing record paths, and performs terminal cleanup through journaled unlock, exact revalidation, one intent-bound forced remove, and component-specific crash repair. The ownership row exists transactionally before any Git effect. These are failure-closed implementation prerequisites, not broader product scope.
+
+### Final Independent Review (passed 2026-07-26)
+
+Three fresh, read-only reviewers independently evaluated the complete specification frozen at SHA-256 `9751BEA572112994034AEA2AB265CFE6AD54195CFB513C18C587AB35AA2F3EB4`. The implementer/state-machine review, course/companion-document review, and security/Git-containment review each reported `ZERO BLOCKERS`. No reviewer relied on implementation code, and no source, fixture, test, CI, or `PLAN.md` artifact was created. The later status and terminology closeout does not change an accepted product choice; final written-spec approval remains a separate human gate.
+
+These edits are specification corrections, not new product scope. No `PLAN.md`, implementation, fixture, test, or CI artifact was created. Independent specification review is complete; final human sign-off remains open.
 
 ## Stage 2 Exit Checklist
 
@@ -154,8 +188,10 @@ It was weakest at preserving reasoning and enforcing its own exit gates. Letter-
 - [x] Define the credential threat model and lifecycle, distribution target, supported platforms, and required WebUI.
 - [x] Attach objective acceptance criteria, risks, open questions, and the Python/TypeScript fixture contract.
 - [x] Record three user-approved iterations, adopted/rejected AI suggestions, and a candid reflection on the brainstorming workflow.
-- [ ] Compare implementation architectures, complete independent review, and obtain final human sign-off on the written `SPEC.md`.
+- [x] Compare implementation architectures and obtain explicit approval for A-Hybrid.
+- [x] Complete final independent review with zero blockers on the frozen written specification.
+- [ ] Obtain final human sign-off on the written `SPEC.md`.
 
 ## Planning and Cold-Start Review - Pending
 
-After `SPEC.md` is signed off, use Superpowers `writing-plans` to create 2-5 minute TDD tasks with explicit paths, dependencies, failing tests, commands, and expected evidence. Then give only `SPEC.md` and `PLAN.md` to a different agent type in a fresh session. That reviewer may attempt 1-2 tasks only in a disposable isolated worktree. Record every pause, incorrect interpretation, output gap, and resulting revision; then remove the review worktree without merging or retaining its code. This is the sole exception to the pre-implementation gate.
+After `SPEC.md` is signed off, use Superpowers `writing-plans` to create 2-5 minute TDD tasks with explicit paths, dependencies, failing tests, commands, and expected evidence. A different agent type in a fresh session MUST then receive only `SPEC.md` and `PLAN.md`: no prior memory, chat history, or verbal additions. It MUST attempt 1-2 tasks for approximately 1-2 hours only in a disposable isolated worktree and MUST pause rather than guess at any ambiguity. Record every pause, incorrect interpretation, output gap, and resulting revision; then remove the review worktree without merging or retaining its code. This is the sole exception to the pre-implementation gate.
