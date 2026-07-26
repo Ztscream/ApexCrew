@@ -69,8 +69,20 @@ This chronological log records material agent work and human decisions. Future i
 
 - **Skill**: Superpowers `brainstorming`, loaded from the installed official plugin; its visual companion was accepted and initialized for later diagram/layout questions.
 - **Key context**: define one primary user journey, failure, completion boundary, decomposition owner, and falsifiable comparison before discussing mechanisms.
-- **Human decisions**: selected option A for all five questions and explicitly approved Round 1: one developer delegates one hours-long cross-module task; stale integration is the main failure; success ends at a human-approved Integration Candidate; the Coordinator proposes a bounded DAG; freshness-disabled ablation is the primary baseline.
+- **Human decisions**: selected option A for all five questions and explicitly approved Round 1: one developer delegates one hours-long cross-module task; stale integration is the main failure; success ends at a human-approved Integration Candidate (the provisional term later split into Task Candidate and Run Candidate); the Coordinator proposes a bounded DAG; freshness-disabled ablation is the primary baseline.
 - **Agent output**: recorded the full question/decision/consequence table and approved conclusion in `SPEC_PROCESS.md`; added `.superpowers/` to `.gitignore` so visual session state remains local.
 - **Implementation state**: none. The Superpowers design hard gate remains active.
 - **Commit**: `docs: approve brainstorming round 1`.
 - **Lesson**: the main contribution is strongest when evaluated by a controlled ablation, not by broad claims that multi-agent execution is generally better.
+
+## 2026-07-26 / SPEC-R2 - Mechanism and state approval
+
+- **Skills**: Superpowers `brainstorming` with its accepted visual companion; `domain-modeling` for the approved vocabulary correction.
+- **Key context**: turn the Round 1 freshness claim into a self-owned WorkerLoop, invalidation algorithm, evidence boundary, recoverable state model, and cross-language falsification fixtures without creating implementation.
+- **Human decisions**: selected declared dependencies with conservative fallback; prepared-snapshot verification; one typed action per model turn; reconciliation-based recovery; private Run Branch promotion; action-boundary stale termination; and immutable Plan Revisions with bounded automatic correction. The user then explicitly approved the consolidated Round 2 design.
+- **Independent review**: three parallel reviewers challenged integration identity, crash windows, state terminology, and fixture falsifiability. Their accepted corrections split Task Candidate from Run Candidate, separated immutable Evidence Receipts from Freshness Assessments, required a final run-wide gate, and bound integration to prepared commit and expected target OIDs.
+- **Fixtures approved**: Python changes money units from cents to decimal dollars; TypeScript changes timestamps from milliseconds to seconds. Both preserve text-level mergeability while making old green evidence semantically invalid.
+- **Rejected**: worker-tip receipts, merge-then-test, dynamic-only dependency inference, multi-action/free-form Worker execution, unconditional replay, hard process interruption, per-check human approval, and silent DAG/contract mutation.
+- **Implementation state**: none. Round 3, consolidated `SPEC.md`, `writing-plans`, and independent cold-start review remain mandatory gates.
+- **Commit**: `docs: approve brainstorming round 2`.
+- **Lesson**: evidence is immutable history; current authority is a separate judgment over the exact prospective revision, dependency graph, contract, policy, and checks.

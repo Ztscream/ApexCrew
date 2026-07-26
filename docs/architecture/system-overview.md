@@ -16,10 +16,16 @@ flowchart LR
     WORKER --> POLICY["Risk Policy and Approval"]
     WORKER --> TOOLS["Repository and Process Tools"]
     WORKER --> MODEL["Low-level ModelPort"]
-    TOOLS --> EVIDENCE["Verifier and Evidence Gate"]
+    TOOLS --> TASKGATE["Prepared Task Candidate Gate"]
+    TOOLS --> RUNGATE["Frozen Run Candidate Gate"]
+    TASKGATE --> RUNREF["Private Run Branch"]
+    RUNREF --> RUNGATE
+    RUNGATE --> APPROVE["Human Approval and Target CAS"]
     CONTEXT --> FRESH["Freshness / Invalidation"]
-    EVIDENCE --> FRESH
+    FRESH --> TASKGATE
+    FRESH --> RUNGATE
     COORD --> STORE["Durable Run Store"]
+    COORD --> RUNREF
     WORKER --> STORE
     FRESH --> STORE
 ```
@@ -36,11 +42,13 @@ flowchart LR
 
 ## Non-Negotiable Invariants
 
-1. An Integration Candidate is admitted only with a complete, fresh Evidence Bundle for its exact repository and policy revisions.
-2. A Worker writes only through an active Workspace Lease inside the configured repository.
-3. A risky action executes only under an unmodified, unexpired, one-use Approval Grant; hard denials never reach the executor.
-4. Restart does not duplicate a recorded action or integration. An uncertain external side effect becomes `INDETERMINATE` and requires human resolution.
-5. The complete core remains deterministic under `ScriptedMockLLM` and requires no network.
+1. A Task Candidate may advance the private Run Branch only when checks pass on its prepared commit and its Evidence Bundle is fresh for the current Run Head, Plan Revision, dependencies, checks, and policy.
+2. A Run Candidate may update the user target only after run-wide checks pass on its frozen prepared commit and a single-use Approval Grant binds that commit and the expected target OID; target movement makes both stale.
+3. A Worker writes only through an active Workspace Lease inside the configured repository.
+4. A risky action executes only under an unmodified, unexpired, one-use Approval Grant; hard denials never reach the executor.
+5. Restart reconciles a recorded action intent with observable state before retrying. An uncertain external side effect becomes `INDETERMINATE` and requires human resolution.
+6. Evidence Receipts and Context Capsules remain immutable; a separate Freshness Assessment decides whether they may be used at a gate or injected into model context.
+7. The complete core remains deterministic under `ScriptedMockLLM` and requires no network.
 
 ## Proposed Module Shape
 

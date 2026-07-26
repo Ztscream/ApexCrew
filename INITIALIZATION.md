@@ -26,7 +26,7 @@ The A-class submission must implement its own:
 
 The first usable slice supports one local user, one repository, one process, at most three Workers, an explicit bounded task DAG, file/path-glob write sets, per-attempt Git worktrees, SQLite persistence, and serial integration. Python and TypeScript micro-repositories are the accepted fixture matrix.
 
-Workers receive typed Context Capsules rather than full chat history. Checks use repository-declared structured `argv`; an Evidence Receipt records the command, output digest, exit status, and exact Git revision. A dependency, contract, policy, or revision change marks affected capsules and receipts stale before they can be reused or injected into another Worker.
+Workers receive typed Context Capsules rather than full chat history. Checks use repository-declared structured `argv`; an immutable Evidence Receipt records the check and result against a prepared Verification Snapshot. A separate Freshness Assessment rejects capsules, receipts, and candidates whose dependency, contract, policy, or revision no longer applies; immutable historical records are not rewritten.
 
 Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape and secret access are hard denials. An Approval Grant freezes the action and binds run, action digest, workspace revision, policy revision, expiry, and one use.
 
@@ -109,7 +109,7 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
-| 2. Brainstorming (in progress: 1/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
+| 2. Brainstorming (in progress: 2/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
 | 3. Planning and fixtures | Python/TypeScript fixtures; 2-5 minute tasks in `PLAN.md` | Every task has dependencies and red/green evidence |
 | 4. Independent cold start | Different Agent attempts 1-2 tasks from SPEC/PLAN only | Revisions remove all blocking ambiguity |
 | 5. Scaffold | Package, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
@@ -121,6 +121,6 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 
 GitHub publication and licensing are resolved. The NJU/GitLab remote is explicitly deferred by the user; retain it as a final delivery dependency rather than a current blocker.
 
-Before Stage 2 can exit: provide the course deadline, weekly time budget, selected LLM provider/model and selection rationale, whether the required final WebUI may use MockLLM only, and whether Windows development plus Linux Docker distribution is acceptable. Approve or replace the proposed fixture problems during brainstorming; both Python and TypeScript are already accepted fixture ecosystems. The credential storage design and threat model also belong in `SPEC.md`.
+Before Stage 2 can exit: provide the course deadline, weekly time budget, selected LLM provider/model and selection rationale, whether the required final WebUI may use MockLLM only, and whether Windows development plus Linux Docker distribution is acceptable. Round 2 approved the Python money-unit and TypeScript timestamp-unit drift fixtures. The credential storage design and threat model also belong in `SPEC.md`.
 
 Deferrable until the provider implementation slice: the actual API credential and production rate/cost values. The offline core must still become green with `ScriptedMockLLM` before tests depend on a real provider.
