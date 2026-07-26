@@ -14,7 +14,7 @@ This file records how ApexCrew moves from an idea to an approved `SPEC.md` and `
 
 The accepted decision is recorded in [ADR-0001](docs/adr/0001-evidence-driven-durable-crew.md). The landscape report remains evidence, not authority.
 
-## Formal Brainstorming - Pending
+## Formal Brainstorming - In Progress
 
 Run the installed Superpowers `brainstorming` workflow in three explicit, user-approved rounds. Preserve concise excerpts and record both accepted and rejected suggestions.
 
@@ -49,13 +49,13 @@ The user explicitly approved this round. Its problem and scenario section is acc
 
 | # | Question | User decision | Design consequence |
 |---|---|---|---|
-| 1 | How should repository changes invalidate context and evidence? | **B**: a declared dependency graph with conservative global fallback. | Versioned Task edges, read/write path globs, and required checks drive affected-closure invalidation. Unknown paths, renames, or graph/policy mismatches invalidate all non-terminal work. |
+| 1 | How should repository changes invalidate context and evidence? | **B**: a declared dependency graph with conservative global fallback. | Versioned Task edges, read/write path globs, and required checks drive affected-closure invalidation. Unknown paths, renames, or graph/Plan/Policy mismatches invalidate all non-terminal work. |
 | 2 | Which revision must final evidence verify? | **B**: an isolated integration snapshot prepared from the current integration head. | A receipt for a Worker tip cannot authorize promotion. Checks bind to the prospective prepared commit and expected parent; head movement forces preparation and verification again. |
 | 3 | How many actions may one WorkerLoop model call drive? | **A**: exactly one typed action. | ApexCrew persists one action intent and result per turn, then returns structured tool feedback to the next low-level completion. Free-form CLI sessions cannot implement the assessed loop. |
 | 4 | How should recovery handle an action that may already have caused a side effect? | **B**: reconcile by action class and pause on uncertainty. | File, Git, and check actions use idempotency keys plus expected pre/post state. Unconfirmable external effects enter `INDETERMINATE`; ApexCrew makes no universal exactly-once claim. |
 | 5 | How should dependent tasks advance before final human integration? | **B**: serial promotion to a private local Run Branch, followed by one final approval. | Verified Task Candidates advance only `refs/apexcrew/runs/<run-id>` under a lock and CAS. A frozen Run Candidate receives run-wide checks before a revision-bound Grant may update the user target; ApexCrew never pushes. |
 | 6 | What happens when a running Worker Attempt becomes stale? | **B**: let the current atomic action settle, then stop and refresh from the latest Run Head. | The old Attempt becomes `STALE`, loses its lease, and cannot hand off. Known changes restart only the affected closure; unknown, plan, or policy changes trigger global invalidation and a human pause. |
-| 7 | Which failures may be corrected without a new human approval? | **B**: retry within an immutable Plan Revision and Task Contract; reapprove structural changes. | Objective failures feed the Worker within a fixed budget. Changing the DAG, dependency/write scope, required checks, or policy creates a reviewable new Plan Revision; exact budgets belong to Round 3. |
+| 7 | Which failures may be corrected without a new human approval? | **B**: retry within an immutable Plan Revision and Task Contract; reapprove structural changes. | Objective failures feed the Worker within a fixed budget. DAG, dependency/write scope, or required-check changes create a new Plan Revision; policy changes create a separate Policy Revision. Either requires applicable human approval; exact budgets belong to Round 3. |
 
 #### Approved Round 2 conclusion
 
@@ -63,8 +63,8 @@ The user explicitly approved this round. Its problem and scenario section is acc
 - A versioned declared dependency graph enables targeted invalidation, but unknown changes fall back to global invalidation. Dependency pruning is an optimization, not a claim to discover every semantic dependency; final run-wide checks are mandatory.
 - `ModelPort` exposes low-level structured completion only. Each turn yields one typed `ActionEnvelope`; ApexCrew owns action validation, policy, execution, persistence, feedback, budgets, and stopping.
 - SQLite will keep transactional state and an append-only audit trail, while Git object IDs identify repository snapshots. Action recovery reconciles recorded intent against observable state and never guesses about uncertain external effects.
-- Run, Task, Worker Attempt, Task Candidate, and Run Candidate have separate lifecycles. An immutable Evidence Receipt is never edited to become stale; a separate Freshness Assessment determines current admissibility.
-- Task promotion is private and automatic only after its current prepared commit passes the Task Contract gate. Final target integration is never automatic: its Approval Grant binds the prepared commit, expected target OID, Evidence Bundle, contract, and policy, and is single-use.
+- Run, Task, Worker Attempt, Task Candidate, and Run Candidate have separate lifecycles, defined in [SPEC.md section 6](SPEC.md#6-state-model). An immutable Evidence Receipt is never edited to become stale; a separate Freshness Assessment determines current admissibility. Attempt `STALE` is a terminal lifecycle state, while an immutable Approval Grant is accepted or rejected by Grant Validation.
+- Task promotion may automatically advance only ApexCrew's disposable private Run Branch after its current prepared commit passes the Task Contract gate. This is not an automatic merge to the user target. Final target integration always requires a single-use Approval Grant bound to the prepared commit, expected target OID, Evidence Bundle, contract, and policy; ApexCrew never pushes.
 - The Python fixture changes a fee API from integer cents to decimal dollars; the TypeScript fixture changes session timestamps from milliseconds to seconds. In both, branches are individually green and merge without text conflict, but old evidence must be rejected and refreshed checks expose a deterministic semantic failure.
 
 #### Rejected suggestions and limits
@@ -81,7 +81,9 @@ The user explicitly approved this round. Its problem and scenario section is acc
 - Credential lifecycle, WebUI approval interaction, observability/redaction, supported distribution platforms, and the full threat model.
 - Exact run-wide command set, usability targets, performance thresholds, and final objective acceptance matrix.
 
-There is intentionally no partial `SPEC.md` diff yet. The accepted Round 1 and Round 2 sections will be consolidated only after Round 3 closes the operational and acceptance requirements.
+#### Resulting `SPEC.md` diff
+
+Rounds 1 and 2 created the draft [SPEC.md](SPEC.md) sections for product definition, scope, seven user stories, module contracts and component flow, the six required harness dimensions with feedback/admission as the primary contribution, core protocols, legal state transitions, logical entity relationships, both fixture contracts, and currently approved acceptance invariants. Section 10 explicitly reserves provider, credentials, budgets, containment, WebUI, observability, distribution, and final thresholds for Round 3. The draft is marked not implementation-ready and requires a separate final written-spec approval.
 
 ## Stage 2 Exit Checklist
 

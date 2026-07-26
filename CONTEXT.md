@@ -24,6 +24,10 @@ _Avoid_: Prompt, ticket, task description
 An immutable, human-approved version of a bounded Task Contract DAG for one Crew Run.
 _Avoid_: Mutable plan, Coordinator scratch plan
 
+**Policy Revision**:
+An immutable, human-approved version of the rules that allow, deny, or require approval for actions and integration.
+_Avoid_: Plan Revision, mutable policy
+
 **Workspace Lease**:
 A time-bounded claim that authorizes one Worker attempt to modify a declared write set.
 _Avoid_: File ownership, permanent lock
@@ -53,11 +57,11 @@ The complete set of fresh Evidence Receipts required by the current Task or Run 
 _Avoid_: Agent report, review comment
 
 **Freshness Assessment**:
-A gate-time judgment of whether an immutable Context Capsule, Evidence Receipt, or candidate still applies to the current Run Head, Plan Revision, dependency graph, checks, and policy.
+A gate-time judgment of whether an immutable Context Capsule, Evidence Receipt, Task Candidate, or Run Candidate still applies to the current head, revisions, dependency graph, and checks.
 _Avoid_: Receipt mutation, cache timestamp
 
 **Stale**:
-The negative outcome of a Freshness Assessment; the assessed artifact remains immutable history but cannot authorize further work or integration.
+An artifact's negative Freshness Assessment or a Worker Attempt's terminal outcome after its inputs become invalid; neither may authorize further work or integration.
 _Avoid_: Failed, old
 
 **Task Candidate**:
@@ -71,3 +75,7 @@ _Avoid_: Integration Candidate, pull request
 **Approval Grant**:
 A single-use human authorization bound to one frozen risky action or final integration and to the exact applicable run, target, evidence, and policy revisions.
 _Avoid_: Confirmation, blanket permission
+
+**Grant Validation**:
+A gate-time judgment that an immutable Approval Grant exactly matches the pending action or integration and remains unexpired and unused.
+_Avoid_: Freshness Assessment, stale approval

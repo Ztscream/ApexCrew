@@ -28,7 +28,7 @@ The first usable slice supports one local user, one repository, one process, at 
 
 Workers receive typed Context Capsules rather than full chat history. Checks use repository-declared structured `argv`; an immutable Evidence Receipt records the check and result against a prepared Verification Snapshot. A separate Freshness Assessment rejects capsules, receipts, and candidates whose dependency, contract, policy, or revision no longer applies; immutable historical records are not rewritten.
 
-Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape and secret access are hard denials. An Approval Grant freezes the action and binds run, action digest, workspace revision, policy revision, expiry, and one use.
+Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape and secret access are hard denials. An immutable Policy Revision is versioned separately from the Plan Revision. An Approval Grant freezes the action and binds run, action digest, workspace revision, policy revision, expiry, and one use; a separate Grant Validation determines whether it still authorizes the pending effect.
 
 Non-goals for v0.1: symbol-level ownership, arbitrary shell, automatic push/merge/release, vector memory, dynamic agent societies, more than three Workers, remote/multi-user operation, A2A, Kubernetes, plugin marketplace, production public execution, or provider breadth. Weak-oracle challenge is an experiment, not a mandatory alternate workflow.
 

@@ -1,6 +1,6 @@
 # System Overview
 
-> Initialization architecture, 2026-07-26. This map explains the accepted boundary; the future approved `SPEC.md` will own behavioral requirements and data details.
+> Architecture companion, updated 2026-07-26. This map explains the accepted boundary; the current draft `SPEC.md` owns normative behavior and data details and is not implementation-ready until its remaining gates close.
 
 ## Scope
 
@@ -43,11 +43,11 @@ flowchart LR
 ## Non-Negotiable Invariants
 
 1. A Task Candidate may advance the private Run Branch only when checks pass on its prepared commit and its Evidence Bundle is fresh for the current Run Head, Plan Revision, dependencies, checks, and policy.
-2. A Run Candidate may update the user target only after run-wide checks pass on its frozen prepared commit and a single-use Approval Grant binds that commit and the expected target OID; target movement makes both stale.
+2. A Run Candidate may update the user target only after run-wide checks pass on its frozen prepared commit and a single-use Approval Grant binds that commit and the expected target OID; target movement makes the candidate stale and causes Grant Validation to fail.
 3. A Worker writes only through an active Workspace Lease inside the configured repository.
 4. A risky action executes only under an unmodified, unexpired, one-use Approval Grant; hard denials never reach the executor.
 5. Restart reconciles a recorded action intent with observable state before retrying. An uncertain external side effect becomes `INDETERMINATE` and requires human resolution.
-6. Evidence Receipts and Context Capsules remain immutable; a separate Freshness Assessment decides whether they may be used at a gate or injected into model context.
+6. Evidence Receipts and Context Capsules remain immutable; a separate Freshness Assessment decides whether they and Task/Run Candidates may be used at a gate or injected into model context.
 7. The complete core remains deterministic under `ScriptedMockLLM` and requires no network.
 
 ## Proposed Module Shape

@@ -19,10 +19,11 @@ The target user is a developer who needs long-running agent collaboration to rem
 
 ## Repository Map
 
+- `SPEC.md`: current normative design; Rounds 1 and 2 are drafted, while Round 3 remains incomplete.
 - `INITIALIZATION.md`: accepted scope, prerequisites, stages, and remaining inputs.
 - `CONTEXT.md`: canonical domain vocabulary.
 - `docs/adr/`: accepted, hard-to-reverse decisions.
-- `docs/architecture/`: explanatory system maps, subordinate to the future spec.
+- `docs/architecture/`: explanatory system maps, subordinate to `SPEC.md`.
 - `docs/research/`: primary-source landscape and value-hypothesis evidence.
 - `docs/experiments/`: falsifiable experiments and fixture matrix.
 - `docs/learning/`: interview-oriented notes created only after executable evidence exists.
@@ -35,4 +36,4 @@ There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` 
 
 The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git`. Original ApexCrew material is available under [Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for the course-document exception. The NJU/GitLab remote is explicitly deferred and does not block current GitHub development.
 
-Before Stage 2 exits, select the low-level LLM provider/model, course schedule, final WebUI mode, and fixture problems. No API credential value is needed until the offline `ScriptedMockLLM` core is specified and green.
+Before Stage 2 exits, select the low-level LLM provider/model, course schedule, and final WebUI mode, then approve Round 3 and the complete written specification. The Python money-unit and TypeScript timestamp-unit fixture problems are already approved. No API credential value is needed until the offline `ScriptedMockLLM` core is specified and green.

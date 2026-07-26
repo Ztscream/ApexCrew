@@ -86,3 +86,11 @@ This chronological log records material agent work and human decisions. Future i
 - **Implementation state**: none. Round 3, consolidated `SPEC.md`, `writing-plans`, and independent cold-start review remain mandatory gates.
 - **Commit**: `docs: approve brainstorming round 2`.
 - **Lesson**: evidence is immutable history; current authority is a separate judgment over the exact prospective revision, dependency graph, contract, policy, and checks.
+
+## 2026-07-26 / SPEC-R2A - Post-commit specification correction
+
+- **Trigger**: an independent review of `e70b3e3..bdfc56c` found that Round 2 was recorded without the required `SPEC.md` diff or legal lifecycle/data-model definitions. It also found mixed freshness/grant terminology, Plan/Policy version coupling, ambiguous private promotion wording, and a stale README fixture TODO.
+- **Correction**: created a not-implementation-ready `SPEC.md` containing only approved Round 1/2 behavior plus explicit Round 3 gaps; defined legal Run, Task, Attempt, Candidate, and lease transitions and logical entity relationships; separated Policy Revision and Grant Validation; clarified that automatic promotion touches only the private Run Branch.
+- **Implementation state**: none. This correction closes documentation-process gaps and does not authorize source, tests, fixtures, or planning.
+- **Commit**: `docs: add approved round 2 spec sections`.
+- **Lesson**: approval of choices is not approval of an underspecified artifact. Each round must leave an inspectable normative diff, and independent review must check the process contract as well as prose consistency.
