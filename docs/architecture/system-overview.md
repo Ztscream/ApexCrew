@@ -1,33 +1,39 @@
 # System Overview
 
-> Architecture companion, updated 2026-07-26. This map explains the accepted boundary; the current draft `SPEC.md` owns normative behavior and data details and is not implementation-ready until its remaining gates close.
+> Architecture companion, updated 2026-07-26 after Round 3 approval. This map explains accepted seams; the draft `SPEC.md` owns normative behavior and remains gated by architecture comparison, independent review, final sign-off, planning, and cold-start review.
 
 ## Scope
 
-ApexCrew coordinates one developer goal in one local Git repository with at most three logical Workers. The product owns both decision loops. A model provider returns one low-level completion at a time and never controls tools, approval, scheduling, or stop conditions.
+ApexCrew coordinates one developer goal in one local Git repository with at most three logical Workers. The product owns both decision loops. OpenAI Responses or `ScriptedMockLLM` returns one low-level completion at a time and never controls tools, approval, scheduling, budgets, or stop conditions. The host control plane is trusted; repository commands are not.
 
 ```mermaid
 flowchart LR
-    USER["Developer / CLI / WebUI"] --> API["Harness API"]
-    API --> COORD["Coordinator Loop"]
-    COORD --> BOARD["Task Contracts and Leases"]
+    USER["Developer"] --> CLI["Authoritative CLI"]
+    CLI --> COORD["Coordinator Loop"]
+    COORD --> BOARD["Task Contracts, Leases, Budget"]
     COORD --> WORKER["WorkerLoop, max 3"]
-    WORKER --> CONTEXT["Context Capsule Builder"]
-    WORKER --> POLICY["Risk Policy and Approval"]
-    WORKER --> TOOLS["Repository and Process Tools"]
-    WORKER --> MODEL["Low-level ModelPort"]
-    TOOLS --> TASKGATE["Prepared Task Candidate Gate"]
-    TOOLS --> RUNGATE["Frozen Run Candidate Gate"]
+    WORKER --> CONTEXT["Context / Freshness"]
+    WORKER --> POLICY["Policy / Approval"]
+    WORKER --> TOOLS["Typed Tool Interface"]
+    WORKER --> MODEL["ModelPort"]
+    MODEL --> SCRIPTED["ScriptedMockLLM"]
+    MODEL --> OPENAI["OpenAI Responses"]
+    TOOLS --> HOSTGIT["Trusted Host Git Adapter"]
+    TOOLS --> DOCKER["Restricted Docker Adapter"]
+    HOSTGIT --> TASKGATE["Prepared Task Gate"]
+    DOCKER --> TASKGATE
     TASKGATE --> RUNREF["Private Run Branch"]
-    RUNREF --> RUNGATE
-    RUNGATE --> APPROVE["Human Approval and Target CAS"]
-    CONTEXT --> FRESH["Freshness / Invalidation"]
+    RUNREF --> RUNGATE["Frozen Run Check Set Gate"]
+    DOCKER --> RUNGATE
+    RUNGATE --> APPROVE["CLI Grant and Target CAS"]
+    CONTEXT --> FRESH["Invalidation Assessment"]
     FRESH --> TASKGATE
     FRESH --> RUNGATE
-    COORD --> STORE["Durable Run Store"]
-    COORD --> RUNREF
+    COORD --> STORE["State + Audit Ledger"]
     WORKER --> STORE
-    FRESH --> STORE
+    STORE --> READ["Sanitized RunReadModel"]
+    READ --> LOCAL["Read-only Loopback WebUI"]
+    READ --> PAGES["Fixture-only GitHub Pages"]
 ```
 
 ## Responsibilities
@@ -36,9 +42,10 @@ flowchart LR
 |---|---|---|
 | Coordinator | DAG progress, leases, handoff, invalidation, serial integration, pause/resume | Model-provider behavior or arbitrary shell policy |
 | WorkerLoop | Context assembly, one model call, structured action parsing, tool feedback, stop decisions | Scheduling other Workers or declaring its own integration success |
-| Domain core | Contracts, revisions, evidence, approvals, state transitions, invariants | Git, SQLite, provider SDK, FastAPI, or OS calls |
-| Adapters | Git/worktrees, subprocesses, persistence, credentials, model completion | Product policy and acceptance decisions |
-| Delivery | CLI/WebUI commands and read models | Alternate business rules |
+| Budget/progress | Hard ceilings, tranche allocation, objective progress, deterministic stop decisions | Model self-assessment or silent limit increases |
+| Domain modules | Contracts, revisions, evidence, approvals, state transitions, invariants | Git, SQLite, provider SDK, FastAPI, Docker, or OS calls |
+| Adapters | Git/worktrees, restricted commands, persistence, credentials, model completion | Product policy and admission decisions |
+| Delivery | CLI commands and sanitized read-model rendering | WebUI mutation/credential paths or alternate domain rules |
 
 ## Non-Negotiable Invariants
 
@@ -49,7 +56,16 @@ flowchart LR
 5. Restart reconciles a recorded action intent with observable state before retrying. An uncertain external side effect becomes `INDETERMINATE` and requires human resolution.
 6. Evidence Receipts and Context Capsules remain immutable; a separate Freshness Assessment decides whether they and Task/Run Candidates may be used at a gate or injected into model context.
 7. The complete core remains deterministic under `ScriptedMockLLM` and requires no network.
+8. Repository commands run only in the digest-pinned restricted executor from a bounded disposable copy of a sanitized, read-only action/Verification Snapshot; host Git effects are typed Coordinator operations and never model-controlled shell.
+9. Hard resource ceilings and objective no-progress rules stop new actions without relying on model judgment.
+10. Audit authority is allowlisted Tier 1 data. Restricted transcripts never satisfy a gate or enter WebUI/public exports.
+11. The local WebUI is token-protected and loopback-only; the public site contains sanitized deterministic fixture records only.
 
-## Proposed Module Shape
+## Accepted Seams
 
-The implementation plan should evaluate, not blindly adopt, `src/apexcrew/core/`, `adapters/`, `bootstrap/`, and `delivery/`. Acceptance fixtures should live outside production modules, with separate Python and TypeScript repositories. No directories are created until specification, planning, and cold-start gates pass.
+- `ModelPort` is a true external seam with deterministic scripted and OpenAI adapters.
+- Repository command execution is a containment seam with restricted Docker and test-fake adapters; Git object/ref work stays in a separate trusted host adapter.
+- Durable state is exercised through one domain-facing transaction/event interface with SQLite and in-memory test adapters.
+- Commands and queries are different interfaces: CLI invokes commands; local/static WebUI renders sanitized query projections only.
+
+The post-Round-3 architecture comparison will decide how these responsibilities are grouped into deep Python modules. It must not add ports for dependencies that do not actually vary or expose internal test seams as public interfaces. Acceptance fixtures remain separate Python and TypeScript repositories. No source directories are created until specification, planning, and cold-start gates pass.

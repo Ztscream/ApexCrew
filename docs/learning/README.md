@@ -13,7 +13,9 @@ This directory is an interview-oriented engineering notebook, not a second speci
 - `07-feedback-and-tdd.md`: structured failures, self-correction, deterministic MockLLM tests, and Python/TypeScript fixture differences.
 - `08-persistence-recovery.md`: state machines, idempotency, indeterminate side effects, crash injection, and replay.
 - `09-evidence-quality.md`: weak oracles, hidden checks, counterexamples, property/mutation testing, and why adversarial acceptance is only a supporting experiment.
-- `10-delivery-observability.md`: Web timeline, structured events, Docker, CI/CD, and public MockLLM delivery.
+- `10-budget-progress.md`: hard ceilings, tranche allocation, objective progress, cost reservation, and deterministic stopping.
+- `11-security-containment.md`: untrusted-repository threat model, typed capabilities, Docker containment, redaction, and residual risk.
+- `12-delivery-observability.md`: Audit Ledger versus Restricted Transcript, read-only WebUI, static fixture replay, distribution, and CI/CD.
 
 ## Required Shape for Each Note
 

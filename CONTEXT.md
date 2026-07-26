@@ -28,6 +28,14 @@ _Avoid_: Mutable plan, Coordinator scratch plan
 An immutable, human-approved version of the rules that allow, deny, or require approval for actions and integration.
 _Avoid_: Plan Revision, mutable policy
 
+**Budget Revision**:
+An immutable, human-approved version of the hard resource ceilings and objective allocation rules for one Crew Run.
+_Avoid_: Usage counter, model estimate
+
+**Model Configuration Revision**:
+An immutable provenance record of the provider, model settings, and typed-action contract used by a Worker Attempt; it never contains credentials.
+_Avoid_: API key, provider session
+
 **Workspace Lease**:
 A time-bounded claim that authorizes one Worker attempt to modify a declared write set.
 _Avoid_: File ownership, permanent lock
@@ -56,6 +64,14 @@ _Avoid_: Test log, confidence score
 The complete set of fresh Evidence Receipts required by the current Task or Run gate.
 _Avoid_: Agent report, review comment
 
+**Run Check Set**:
+The exact human-approved set of objective checks that the frozen Run Candidate must pass, independent of any Task's focused checks.
+_Avoid_: Task-check union, discovered CI jobs
+
+**Execution Fingerprint**:
+The immutable identity of the check definition and execution environment to which an Evidence Receipt applies.
+_Avoid_: Machine name, mutable environment snapshot
+
 **Freshness Assessment**:
 A gate-time judgment of whether an immutable Context Capsule, Evidence Receipt, Task Candidate, or Run Candidate still applies to the current head, revisions, dependency graph, and checks.
 _Avoid_: Receipt mutation, cache timestamp
@@ -79,3 +95,11 @@ _Avoid_: Confirmation, blanket permission
 **Grant Validation**:
 A gate-time judgment that an immutable Approval Grant exactly matches the pending action or integration and remains unexpired and unused.
 _Avoid_: Freshness Assessment, stale approval
+
+**Audit Ledger**:
+The authoritative, allowlisted chronological record from which a Crew Run's inspectable state and sanitized exports are projected.
+_Avoid_: Debug log, transcript
+
+**Restricted Transcript**:
+Redacted local diagnostic material that may explain model or tool behavior but can never authorize admission or enter a public export.
+_Avoid_: Evidence Receipt, Audit Ledger

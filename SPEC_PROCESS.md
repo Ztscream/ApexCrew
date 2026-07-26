@@ -14,9 +14,9 @@ This file records how ApexCrew moves from an idea to an approved `SPEC.md` and `
 
 The accepted decision is recorded in [ADR-0001](docs/adr/0001-evidence-driven-durable-crew.md). The landscape report remains evidence, not authority.
 
-## Formal Brainstorming - In Progress
+## Formal Brainstorming - Three Rounds Approved
 
-Run the installed Superpowers `brainstorming` workflow in three explicit, user-approved rounds. Preserve concise excerpts and record both accepted and rejected suggestions.
+The installed Superpowers `brainstorming` workflow ran in three explicit, user-approved rounds. This record preserves decisions, consequences, rejected suggestions, remaining ambiguity, and the resulting normative changes.
 
 1. **Round 1 - Problem and scenarios**: target user, painful long-running collaboration failures, user stories, non-goals, and measurable value hypothesis.
 2. **Round 2 - Mechanisms and state**: WorkerLoop protocol, task/lease lifecycle, context freshness, evidence gate, approvals, crash boundaries, data model, and Python/TypeScript fixture behavior.
@@ -85,18 +85,76 @@ The user explicitly approved this round. Its problem and scenario section is acc
 
 Rounds 1 and 2 created the draft [SPEC.md](SPEC.md) sections for product definition, scope, seven user stories, module contracts and component flow, the six required harness dimensions with feedback/admission as the primary contribution, core protocols, legal state transitions, logical entity relationships, both fixture contracts, and currently approved acceptance invariants. Section 10 explicitly reserves provider, credentials, budgets, containment, WebUI, observability, distribution, and final thresholds for Round 3. The draft is marked not implementation-ready and requires a separate final written-spec approval.
 
+### Round 3 - Operations and acceptance (approved 2026-07-26)
+
+| # | Question | User decision | Design consequence |
+|---|---|---|---|
+| 1 | Where may repository-owned commands execute? | **B**: trusted host control plane plus restricted Docker executor. | Git, SQLite, credentials, and policy remain on the host; repo commands run non-root in a digest-pinned, networkless container with no host secrets/socket and only a sanitized current snapshot mounted read-only. |
+| 2 | Which real low-level model integration is v0.1? | **A**: OpenAI Responses API with `gpt-5.6-terra`. | One OpenAI adapter and `ScriptedMockLLM` satisfy the same one-completion `ModelPort`; no Coding Agent CLI or high-level framework enters the assessed loop. |
+| 3 | How are credentials supplied? | **B**: OS keyring interactively, environment override for headless/CI. | Hidden CLI set/status/update/clear never reveals the value; repository `.env` is not loaded; no secret reaches executor, model context, logs, UI, or export. |
+| 4 | How is long-running work bounded? | **C1**: adaptive eight-call tranches inside hard ceilings. | 8 active hours, 12 Tasks, 240 calls, 2M/200k tokens, USD 10 reserve, and three Workers are immutable ceilings. A 16-call bootstrap precedes progress-gated renewal; repeated/no-progress states pause. |
+| 5 | Which WebUI authority model applies? | **A**: CLI-first with read-only WebUI. | Every mutation, approval, credential, recovery, and final integration command is CLI-only; WebUI consumes a sanitized read model. |
+| 6 | How is Open Design used? | **A**: design contract plus one-time/major-change prototypes. | Use a custom ApexCrew Operational system with `design-md`, a disposable `dashboard` prototype, and `design-review`; keep briefs/screenshots/critique, but never make Open Design a runtime/CI/source dependency. |
+| 7 | How are traceability and redaction balanced? | **B**: allowlisted Audit Ledger plus restricted local transcripts. | CLI/UI/export use Tier 1 only; Tier 2 is redacted, bounded, local, retained for 30 days/1 GiB, and quarantined on suspicion. |
+| 8 | What is the v0.1 threat boundary? | **B**: repo content and Worker output are untrusted; operator/host/control plane/Docker/keyring/TLS are trusted. | Prompt/script/path/log injection, exfiltration, approval replay, cross-Worker interference, and resource exhaustion receive controls/tests; compromised trusted roots are explicit non-goals. |
+| 9 | How is the mandatory public WebUI delivered? | **A**: GitHub Pages static interactive Run replay. | CI renders sanitized `ScriptedMockLLM` fixture records through the same read model/templates; no public backend, credentials, commands, or real repository data. |
+| 10 | Which platforms and distribution are supported? | **B**: Windows 11 and Ubuntu 24.04 x86_64; Python 3.12 wheel/uv plus GHCR executor. | Ubuntu runs full Docker integration/performance CI; Windows runs offline core/Git/path CI; macOS/ARM are out of scope; GitLab retains the exact `unit-test` job. |
+| 11 | Which checks authorize the final Candidate? | **B**: human-approved Run Check Set in the Plan Revision. | Coordinator discovery is only a proposal; the frozen Run Candidate reruns exact structured checks under a bound Execution Fingerprint. Failure rejects; timeout/infrastructure uncertainty cannot pass. |
+| 12 | What non-functional threshold is credible? | **B**: balanced quantitative v0.1 gates. | 10k-event latency/recovery, 90-second offline suite, ten-minute full CI/onboarding bounds, 2 MiB static assets, WCAG 2.2 AA, Lighthouse 95, keyboard, and responsive tests are normative. |
+| 13 | What delivery constraint controls scope? | Deadline **2026-08-10**, **25 hours/week**. | Treat deadline as 23:59 Asia/Shanghai and approximately 53 total hours; cut optional experiments/platforms before core evidence, safety, CI, public demo, or course artifacts. |
+
+#### Approved Round 3 conclusion
+
+- The trusted host owns authority and durable state; untrusted repository commands execute only in a restricted Docker adapter. Typed capabilities and current revisions, not prompts or human vigilance, enforce the safety claim.
+- OpenAI Responses API supplies the one real low-level adapter, while every core gate and demo remains deterministic and offline through `ScriptedMockLLM`.
+- An adaptive Budget Revision combines hard Run ceilings, per-Task call/attempt/refresh maxima, evidence-based tranche renewal, deterministic no-progress stops, and approval for any increase.
+- CLI is the sole command surface. The token-protected loopback WebUI and GitHub Pages fixture replay are read-only projections from the allowlisted Audit Ledger.
+- The public demo, Open Design workflow, Windows/Linux support matrix, wheel plus executor distribution, CI jobs, Run Check Set, performance, accessibility, and onboarding thresholds are explicit acceptance work, not aspirational follow-ups.
+- The full action taxonomy, threat assumptions, environment fingerprint, redaction/quarantine, retention/export, and residual risks are normative in [SPEC.md sections 10-11](SPEC.md#10-operations-security-and-delivery).
+
+The user explicitly approved the consolidated Round 3 design after reviewing all selected decisions and the conservative defaults for authentication, retention, action classification, and provenance.
+
+#### Rejected suggestions and limits
+
+- Host-only command execution cannot substantiate repository confinement; containerizing the whole control plane would require unsafe Docker-socket/nested orchestration and complicate local Git/keyring recovery.
+- Fixed equal Task budgets waste calls on stopped Tasks; unrestricted adaptive allocation turns model self-confidence into authority. The accepted allocator uses hard ceilings and objective receipts/lifecycle progress only.
+- Writable/HTMX parity and a React SPA both duplicate command authority and expand the attack/test surface. Public FastAPI hosting and temporary tunnels add ongoing operations or unstable URLs without improving the evidence mechanism.
+- A single sanitized event log loses diagnostic context; raw full transcripts persist secrets. Two-tier storage keeps authority allowlisted and diagnostics local/quarantinable.
+- Treating the repository as trusted makes the containment claim hollow; zero-trust host/provider security would require VM/confidential-computing scope that cannot be honestly delivered in v0.1.
+- Replaying only Task checks can miss cross-module coupling; automatically replaying arbitrary CI actions adds network/third-party semantics. An approved structured Run Check Set is the bounded middle.
+- Linux-only delivery ignores the development host; Windows/Linux/macOS binaries and multi-architecture images exceed the 53-hour budget. Windows plus Ubuntu x86_64 is the tested compromise.
+- Production-scale latency and 100,000-event targets were rejected because they would displace mechanism correctness; omitting all quantitative targets would make non-functional claims unverifiable.
+
+#### Remaining ambiguity and external dependencies
+
+- The repository owner supplies the actual OpenAI credential/quota and confirms then-current model availability/pricing only during the opt-in provider slice.
+- GitHub Pages, GHCR, and package trusted-publishing settings require repository-owner enablement. The NJU/GitLab remote remains deferred but is a final course-submission dependency.
+- The supplied deadline omitted a time; the specification transparently assumes 23:59 Asia/Shanghai unless corrected.
+- Implementation module shape is deliberately deferred to the post-Round-3 architecture comparison. The complete written specification still requires independent review and a separate final human sign-off.
+
+#### Resulting `SPEC.md` diff
+
+Round 3 replaced the open-requirements section with normative provider/provenance and credential behavior, adaptive ceilings and stop rules, a host/container threat model and action taxonomy, dual-tier observability with retention/export, CLI/read-only UI authority, Open Design and GitHub Pages workflows, distribution/platform/CI contracts, exact performance/accessibility thresholds, an objective acceptance matrix, a 53-hour delivery timebox, and explicit residual risks. It also updated module contracts, data entities, architecture flow, scope, and acceptance invariants. The artifact remains not implementation-ready until architecture comparison, independent review, final written-spec sign-off, planning, and cold-start gates complete.
+
+## Brainstorming Workflow Reflection
+
+The workflow was strongest when it forced one bounded decision at a time. It converted a broad "multi-agent, long-context, continuous cowork" idea into a falsifiable stale-evidence failure, exposed crowded prior art, and made the user choose explicit safety, budget, delivery, and non-goal trade-offs. The consolidated visual review also made thirteen interacting Round 3 choices easier to inspect than another long prose draft.
+
+It was weakest at preserving reasoning and enforcing its own exit gates. Letter-only approvals captured the selected option but little of the user's rationale, and Round 2 was initially marked approved before its normative `SPEC.md` diff, lifecycles, and data model existed. The growing vocabulary also created cross-document drift that only independent review caught. Future design rounds must present the exact normative diff and a process/terminology consistency checklist before requesting approval, and must record a short rationale in addition to the option letter.
+
 ## Stage 2 Exit Checklist
 
-- [ ] State the problem, target user, value hypothesis, and at least five INVEST user stories.
-- [ ] Specify each functional module's input, behavior, output, boundary conditions, and errors.
-- [ ] Cover performance, security, usability, and observability requirements.
-- [ ] Define architecture, data model, external dependencies, and the selected LLM provider/model with rationale; a MockLLM-only choice requires an explicit course-compliance rationale.
-- [ ] Design the four domain mechanisms: tools/actions, objective feedback, risky actions/HITL, and cross-session memory/context.
-- [ ] Give decision, tools, memory, governance, feedback, and configuration a testable minimum implementation; select one mechanism-dense dimension as the main contribution.
-- [ ] Show how every core mechanism remains deterministically testable with `ScriptedMockLLM` and no network.
-- [ ] Define the credential threat model and lifecycle, distribution target, supported platforms, and required WebUI.
-- [ ] Attach objective acceptance criteria, risks, open questions, and the Python/TypeScript fixture contract.
-- [ ] Record three user-approved iterations, adopted/rejected AI suggestions, and a candid reflection on the brainstorming workflow.
+- [x] State the problem, target user, value hypothesis, and at least five INVEST user stories.
+- [x] Specify each functional module's input, behavior, output, boundary conditions, and errors.
+- [x] Cover performance, security, usability, and observability requirements.
+- [x] Define architecture, data model, external dependencies, and the selected LLM provider/model with rationale.
+- [x] Design the four domain mechanisms: tools/actions, objective feedback, risky actions/HITL, and cross-session memory/context.
+- [x] Give decision, tools, memory, governance, feedback, and configuration a testable minimum implementation; select one mechanism-dense dimension as the main contribution.
+- [x] Show how every core mechanism remains deterministically testable with `ScriptedMockLLM` and no network.
+- [x] Define the credential threat model and lifecycle, distribution target, supported platforms, and required WebUI.
+- [x] Attach objective acceptance criteria, risks, open questions, and the Python/TypeScript fixture contract.
+- [x] Record three user-approved iterations, adopted/rejected AI suggestions, and a candid reflection on the brainstorming workflow.
+- [ ] Compare implementation architectures, complete independent review, and obtain final human sign-off on the written `SPEC.md`.
 
 ## Planning and Cold-Start Review - Pending
 

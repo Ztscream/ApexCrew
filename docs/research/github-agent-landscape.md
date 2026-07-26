@@ -128,7 +128,7 @@ Bernstein/h5i 的补充材料说明，worktree、replay、lineage、context caps
 - 不做无限层级 swarm；固定 2–3 个 worker 和有界 DAG。
 - 不做向量数据库或“记住一切”；只保存带 dependency fingerprint 的可复现实验证据。
 - （已被后续决策替代）不在 MVP 支持任意语言；当前已接受 Python + TypeScript fixture 矩阵。
-- 不自动 push、merge 或发布；集成分支仍需人工确认。
+- 不自动 push 或发布；私有 Run Branch 可按已批准规则自动推进，但用户 target ref 的最终 CAS 仍需一次性人工 Grant。
 - 不把任意 shell 直接开放给模型；checks 使用仓库声明的 argv，危险命令走不可变审批。
 - 不用 LLM-as-judge 代替目标仓库测试；LLM 评分只能是附加指标。
 
@@ -137,9 +137,9 @@ Bernstein/h5i 的补充材料说明，worktree、replay、lineage、context caps
 进入 `SPEC.md` brainstorming 前，只需用户确认五项，不需要 API key：
 
 1. ~~是否接受唯一主线 Adversarial Acceptance Crew~~：已由用户否决；Evidence-Driven Durable Crew 是唯一主线，弱 oracle 挑战仅作辅助实验。
-2. 后续低层真实模型供应商及模型；初始化与全部核心机制先使用 fake，不需要 API key。
-3. 课程截止日期和每周可投入时间，以决定 Web timeline 的交互深度；公网部署仍不进入 MVP。
-4. 允许使用的 Python oracle 工具，以及首版 mutation score/挑战轮数/模型调用预算的阈值。
-5. 2–3 个可公开提交的 Python fixture：每个都要有“原测试通过的 flawed patch”和不向 worker 暴露的 hidden oracle。
+2. ~~后续低层真实模型供应商及模型~~：Round 3 已选 OpenAI Responses API 与 `gpt-5.6-terra`；离线核心仍使用 `ScriptedMockLLM`。
+3. ~~课程截止日期和每周可投入时间~~：已确定 2026-08-10、25 小时/周；公网仅部署 sanitized fixture 的只读 GitHub Pages。
+4. ~~Python oracle 与 mutation 阈值~~：弱 oracle/challenger 已降为可选实验，不得占用主机制与课程交付时限。
+5. ~~fixture 选择~~：已批准 Python money-unit drift 与 TypeScript timestamp-unit drift 两个跨生态 fixture。
 
 根目录贡献指南已改为 ApexCrew 的探索期边界；方向确认后仍须在正式 brainstorming 中与新 `SPEC.md` 一起复核。本报告只是方向证据，不替代三轮需求确认。

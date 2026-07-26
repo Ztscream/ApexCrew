@@ -1,6 +1,6 @@
 # ApexCrew Initialization Baseline
 
-> Status: accepted discovery baseline, 2026-07-26. **Evidence-Driven Durable Crew is the only product mainline.** This is an initialization record, not `SPEC.md`; three formal brainstorming rounds and a cold-start review are still required before implementation may be merged or retained.
+> Status: accepted discovery baseline, updated 2026-07-26. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds are approved; architecture comparison, final written-spec sign-off, planning, and cold-start review still gate implementation.
 
 ## 1. Product Thesis
 
@@ -30,7 +30,7 @@ Workers receive typed Context Capsules rather than full chat history. Checks use
 
 Risk policy returns `ALLOW`, `DENY`, or `REQUIRE_APPROVAL`. Workspace escape and secret access are hard denials. An immutable Policy Revision is versioned separately from the Plan Revision. An Approval Grant freezes the action and binds run, action digest, workspace revision, policy revision, expiry, and one use; a separate Grant Validation determines whether it still authorizes the pending effect.
 
-Non-goals for v0.1: symbol-level ownership, arbitrary shell, automatic push/merge/release, vector memory, dynamic agent societies, more than three Workers, remote/multi-user operation, A2A, Kubernetes, plugin marketplace, production public execution, or provider breadth. Weak-oracle challenge is an experiment, not a mandatory alternate workflow.
+Non-goals for v0.1: symbol-level ownership, arbitrary shell, automatic push/merge/release, vector memory, dynamic agent societies, more than three Workers, remote/multi-user execution, a writable WebUI, A2A, Kubernetes, plugin marketplace, production public execution, provider breadth, macOS/ARM support, or a hosted backend. Weak-oracle challenge is an experiment, not a mandatory alternate workflow.
 
 ## 4. Decisive Demonstrations
 
@@ -45,23 +45,25 @@ All mechanism demos run offline with `ScriptedMockLLM` and real temporary reposi
 
 ```mermaid
 flowchart TB
-    UI["CLI / FastAPI + HTMX"] --> API["ApexCrew start / advance / inspect"]
-    API --> COORD["Coordinator Loop"]
+    CLI["Authoritative CLI"] --> COORD["Coordinator Loop"]
     COORD --> BOARD["Task Contracts, DAG, leases"]
     COORD --> WORKER["ApexCrew WorkerLoop, max 3"]
     WORKER --> CAPSULE["Context Capsule builder"]
     WORKER --> POLICY["Governance and approval"]
-    WORKER --> RUNTIME["Repository / worktree / process tools"]
-    RUNTIME --> GATE["Verifier and evidence gate"]
+    WORKER --> RUNTIME["Typed host Git / restricted Docker tools"]
+    RUNTIME --> GATE["Prepared verifier and evidence gate"]
     BOARD --> INVALIDATE["Freshness / invalidation graph"]
     GATE --> INVALIDATE
     COORD --> STORE["SQLite run and event store"]
     CAPSULE --> STORE
     POLICY --> STORE
-    WORKER --> MODEL["Low-level ModelPort: scripted first"]
+    WORKER --> MODEL["ModelPort: Scripted / OpenAI Responses"]
+    STORE --> READ["Sanitized RunReadModel"]
+    READ --> LOCAL["Read-only loopback WebUI"]
+    READ --> PAGES["Fixture-only GitHub Pages"]
 ```
 
-`core/` owns both loops, contracts, state transitions, freshness, evidence rules, and stop budgets. `adapters/` owns Git/worktrees, subprocesses, SQLite, credentials, and model integrations. `bootstrap/` composes validated configuration. `delivery/` exposes the same public harness interface through CLI and the required WebUI. Provider SDKs and FastAPI never enter `core/`. See [the system overview](docs/architecture/system-overview.md).
+The implementation architecture remains a pending post-Round-3 comparison. Every acceptable shape must keep both loops, contracts, transitions, freshness, evidence, policy, and budgets inside deep domain modules; Git/worktrees, restricted commands, SQLite, credentials, and model providers remain adapters. CLI is the sole command interface and WebUI is a read-only projection. Provider SDKs and FastAPI never enter the domain core. See [the system overview](docs/architecture/system-overview.md).
 
 ## 6. Documentation System
 
@@ -89,19 +91,21 @@ Do not create parallel architecture truths. Learning notes explain concepts and 
 | A-class project and direction | Accepted | Evidence-Driven Durable Crew is the only mainline. |
 | Scope | Accepted | One repository, at most three Workers, Python + TypeScript fixtures. |
 | Core ownership | Accepted | ApexCrew owns both loops; only low-level model completion APIs sit behind `ModelPort`. |
-| LLM provider decision | Required by Stage 2 exit | `SPEC.md` must name the provider/model and rationale, or explicitly justify a MockLLM-only submission; the API key value is not needed for design. |
-| Local toolchain | Available | Git 2.47.1, Python 3.11.5, uv 0.9.29, Node 22.14, Make 4.4.1, Docker CLI 29.6.1, and WSL2 Ubuntu were observed. |
+| LLM provider decision | Accepted | OpenAI Responses API with `gpt-5.6-terra`; every core gate remains offline under `ScriptedMockLLM`. The credential value is deferred to the provider slice. |
+| Local toolchain | Partially ready | Git 2.47.1, Python 3.11.5 and uv-managed 3.14.2, uv 0.9.29, Node 22.14, Make 4.4.1, Docker 29.6.1, and WSL2 Ubuntu were observed. The selected Python 3.12 is not installed and MUST be added with `uv python install 3.12` before scaffold work. Host Node is not required; Node 24 lives in the executor image. |
 | Docker daemon | Verified | Local server 29.6.1 responded; image/build behavior is tested during scaffold and distribution stages. |
 | Superpowers | Installed and enabled | `superpowers@openai-curated`, manifest 5.1.3, cache revision `11c74d6b`; required workflow skill directories are present. Start design in a session where the plugin skills are loaded. |
 | Local Git baseline | Completed by this initialization | Branch `main`; governance and documentation only. |
 | Public personal GitHub remote | Configured | `origin` is `https://github.com/Ztscream/ApexCrew.git`; it was verified empty before the first non-force publication. |
 | Course submission remote | Explicitly deferred | NJU/GitLab is not considered during current GitHub development but remains a final course-delivery dependency. |
 | License | Accepted | Original ApexCrew work uses Apache-2.0; `NOTICE` excludes course-provided requirement documents from relicensing. |
-| LLM credential value | Not required | `SPEC.md` defines storage and threat handling; an actual secret is supplied only for the provider slice and is never committed. |
+| LLM credential value | Not required yet | Interactive use requires OS keyring; CI may inject `APEXCREW_OPENAI_API_KEY`. An actual value is supplied only for the opt-in provider slice and is never committed. |
+| Delivery schedule | Accepted | Deadline is assumed 2026-08-10 23:59 Asia/Shanghai; 25 hours/week yields approximately 53 hours. Optional scope is cut before required mechanisms or course artifacts. |
+| Public WebUI | Accepted | GitHub Pages hosts only a sanitized deterministic fixture replay; real commands and credentials remain local and CLI-only. |
 
-Recommended implementation defaults, subject to formal brainstorming, are Python 3.11, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI/HTMX, OS keyring, and a non-root Linux Docker image. Windows is the development host; tests and distribution target Linux portability.
+Approved operational defaults are Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI plus Jinja2 for a read-only UI, OS keyring, OpenAI's low-level SDK adapter, and a digest-pinned non-root Linux executor image with Python 3.12 and Node 24. Windows 11 and Ubuntu 24.04 x86_64 are supported; Ubuntu is the full-integration and performance reference.
 
-No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
+No `src/`, tests, fixtures, or CI may be retained until the remaining specification, planning, and cold-start gates pass. `PLAN.md` is created by `writing-plans` only after final `SPEC.md` sign-off, then becomes required input to the independent cold-start review and may be revised from its findings.
 
 ## 8. Stages and Gates
 
@@ -109,18 +113,18 @@ No `src/`, tests, `SPEC.md`, or `PLAN.md` belongs in the initialization commit.
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
-| 2. Brainstorming (in progress: 2/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Three user-approved iterations and every `SPEC_PROCESS.md` Stage 2 checklist item satisfied |
-| 3. Planning and fixtures | Python/TypeScript fixtures; 2-5 minute tasks in `PLAN.md` | Every task has dependencies and red/green evidence |
+| 2. Brainstorming (in progress: 3/3 approved) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat model | Architecture comparison, independent review, and final written-spec sign-off complete the Stage 2 gate |
+| 3. Planning | `PLAN.md` with 2-5 minute implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
 | 4. Independent cold start | Different Agent attempts 1-2 tasks from SPEC/PLAN only | Revisions remove all blocking ambiguity |
-| 5. Scaffold | Package, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
+| 5. Scaffold | Package, Python/TypeScript fixture repositories, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
 | 6. Core vertical slices | Worker feedback, contracts/leases, freshness gate, approval, recovery | Decisive demos pass offline on both fixtures |
 | 7. Productization | WebUI, credentials, Docker, GitHub Actions, `.gitlab-ci.yml` `unit-test` | Fresh-machine run, public demo, and required CI pass |
 | 8. Evaluation | Comparisons, docs, demo script, security review | Spec and quality reviews pass; student writes reflection |
 
-## 9. Information Still Needed
+## 9. Remaining External Inputs And Gates
 
-GitHub publication and licensing are resolved. The NJU/GitLab remote is explicitly deferred by the user; retain it as a final delivery dependency rather than a current blocker.
+GitHub publication, licensing, provider/model, credentials design, WebUI form, platform matrix, and schedule are resolved. The actual OpenAI secret/quota is neither needed nor accepted until the opt-in provider slice. The repository owner must later enable GitHub Pages/GHCR and any package trusted publisher.
 
-Before Stage 2 can exit: provide the course deadline, weekly time budget, selected LLM provider/model and selection rationale, whether the required final WebUI may use MockLLM only, and whether Windows development plus Linux Docker distribution is acceptable. Round 2 approved the Python money-unit and TypeScript timestamp-unit drift fixtures. The credential storage design and threat model also belong in `SPEC.md`.
+Stage 2 still requires comparison of implementation architectures, independent review, and final human sign-off on the complete `SPEC.md`. Stage 3 then creates `PLAN.md`; the independent cold-start review follows planning and must remove all blocking ambiguity before implementation is retained.
 
-Deferrable until the provider implementation slice: the actual API credential and production rate/cost values. The offline core must still become green with `ScriptedMockLLM` before tests depend on a real provider.
+The NJU/GitLab remote is explicitly deferred but remains a final course-delivery dependency. The supplied course deadline omitted a time, so the plan assumes 23:59 Asia/Shanghai unless the user corrects it. Python 3.12 installation is the only missing local scaffold prerequisite currently observed.

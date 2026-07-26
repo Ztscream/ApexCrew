@@ -4,7 +4,7 @@ Experiments falsify the product hypothesis; they do not serve as demonstrations 
 
 ## Fixture Matrix
 
-Maintain two intentionally small target repositories: one Python project and one TypeScript project. Each must have a fast deterministic check command, at least one dependent two-task change, a known flawed patch, and a hidden acceptance oracle not supplied to the Worker. Fixture content and licenses will be selected during specification.
+Maintain two intentionally small Apache-compatible target repositories with fast deterministic checks and dependent two-Task changes. The Python fixture changes a fee interface from integer cents to decimal dollars while a dependent formatter still divides by 100. The TypeScript fixture changes session timestamps from milliseconds to seconds while a dependent countdown still applies millisecond conversion. In both cases the branches merge without text conflict and old focused checks are green, but refreshing against the promoted dependency exposes a deterministic failure. A hidden oracle may support the optional weak-evidence experiment; it is not part of the Worker context or the primary admission gate.
 
 ## E1 - Context Freshness Across Ecosystems
 
