@@ -1,6 +1,6 @@
 # ApexCrew Initialization Baseline
 
-> Status: accepted discovery baseline, updated 2026-07-26. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds and A-Hybrid are approved, and independent specification review passed; final written-spec sign-off, planning, and implementation cold-start review still gate implementation.
+> Status: accepted initialization baseline, updated 2026-07-27. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds, A-Hybrid, independent specification review, and final written-spec sign-off are complete; planning and implementation cold-start review still gate implementation.
 
 ## 1. Product Thesis
 
@@ -119,7 +119,7 @@ Do not create parallel architecture truths. Learning notes explain concepts and 
 
 Approved operational defaults are Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI plus Jinja2 for a read-only UI, OS keyring, OpenAI's low-level SDK adapter, and a digest-pinned non-root Linux executor image with Python 3.12 and Node 24. Windows 11 and Ubuntu 24.04 x86_64 are supported; Ubuntu is the full-integration and performance reference.
 
-No `src/`, tests, fixtures, or CI may be retained until the remaining specification, planning, and cold-start gates pass. `PLAN.md` is created by `writing-plans` only after final `SPEC.md` sign-off, then becomes required input to the independent cold-start review and may be revised from its findings.
+No `src/`, tests, fixtures, or CI may be retained until the remaining planning and cold-start gates pass. `PLAN.md` is created by `writing-plans`, then becomes required input to the independent cold-start review and may be revised from its findings.
 
 ## 8. Stages and Gates
 
@@ -127,8 +127,8 @@ No `src/`, tests, fixtures, or CI may be retained until the remaining specificat
 |---|---|---|
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
-| 2. Specification (in progress: independent review passed) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat/module model | Final written-spec sign-off completes the Stage 2 gate |
-| 3. Planning | `PLAN.md` with 2-5 minute implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
+| 2. Specification (complete) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat/module model | Exact SHA-256 approved after zero-blocker independent review |
+| 3. Planning (next) | `PLAN.md` with 2-5 minute implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
 | 4. Independent cold start | Different agent type, fresh session, only SPEC/PLAN, no prior memory; attempt 1-2 tasks for about 1-2 hours and pause on ambiguity | Revisions remove all blocking ambiguity; disposable code is not retained |
 | 5. Scaffold | Package, Python/TypeScript fixture repositories, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
 | 6. Core vertical slices | Worker feedback, contracts/leases, freshness gate, approval, recovery | Decisive demos pass offline on both fixtures |
@@ -139,6 +139,6 @@ No `src/`, tests, fixtures, or CI may be retained until the remaining specificat
 
 GitHub publication, licensing, provider/model, credentials design, WebUI form, platform matrix, and schedule are resolved. The actual OpenAI secret/quota is neither needed nor accepted until the opt-in provider slice. The repository owner must later enable GitHub Pages/GHCR and any package trusted publisher.
 
-The A-Hybrid implementation architecture is approved, and three independent whole-document cold reads found zero blockers. Stage 2 now requires final human sign-off on the complete `SPEC.md`. Stage 3 then creates `PLAN.md`; the independent implementation cold-start review follows planning and must remove all blocking ambiguity before implementation is retained.
+The A-Hybrid architecture, independent review, and exact final `SPEC.md` digest are approved, completing Stage 2. Stage 3 must now create `PLAN.md` with `writing-plans`; the independent implementation cold-start review follows and must remove all blocking ambiguity before implementation is retained.
 
 The NJU/GitLab remote is explicitly deferred but remains a final course-delivery dependency. The supplied course deadline omitted a time, so the plan assumes 23:59 Asia/Shanghai unless the user corrects it. Python 3.12 installation is the only missing local scaffold prerequisite currently observed.

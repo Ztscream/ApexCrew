@@ -1,6 +1,6 @@
 # System Overview
 
-> Architecture companion, updated 2026-07-26 after A-Hybrid approval and zero-blocker independent review. This map explains accepted interfaces and seams; the draft `SPEC.md` owns normative behavior and remains gated by final sign-off, planning, and implementation cold-start review.
+> Architecture companion, updated 2026-07-27 after final written-spec sign-off. This map explains accepted interfaces and seams; the signed `SPEC.md` owns normative behavior, while planning and implementation cold-start review still gate implementation.
 
 ## Scope
 

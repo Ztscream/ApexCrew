@@ -167,3 +167,13 @@ This chronological log records material agent work and human decisions. Future i
 - **Implementation state**: none. No `PLAN.md`, source, fixture, test, build, or CI artifact exists; final written-spec approval, planning, and the separate implementation cold-start review still gate persistent implementation.
 - **Authority state**: this review result is not final written-spec approval, implementation authorization, commit publication, or push authorization.
 - **Lesson**: a frozen review result must identify both the artifact digest and reviewer perspective, while process-status edits must remain visibly separate from product approval.
+
+## 2026-07-27 / SPEC-SIGNOFF - Final written specification approval
+
+- **Human decision**: in Codex task `019f99cb-b307-75a3-8059-6e12908ff4b8`, the repository owner stated `批准最终 SPEC.md，哈希 2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`.
+- **Approved artifact**: root `SPEC.md`, SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`, 128,418 bytes, source commit `aabdd4fb664eb82dcc34c41391dbdb48872254c8`, Git blob `9d32355e610e08a75bf89a3a0fc23785441cda24`.
+- **Review basis**: implementer/state-machine, course/companion-document, and security/Git-containment reviewers each reconfirmed `ZERO BLOCKERS` on the final digest and closeout delta.
+- **Integrity rule**: `SPEC.md` was rehashed unchanged while the worktree was clean. Its embedded pre-approval status is superseded by the external sign-off record; any byte change requires a new digest and explicit approval.
+- **Scope**: Stage 2 is complete. The approval authorizes `writing-plans` to create `PLAN.md`; it does not authorize persistent implementation, credentials, publication, push, release, or a Runtime Grant.
+- **Planning state**: `writing-plans` 5.1.3 is installed at cache revision `11c74d6b` but is absent from this session's available-skills catalog, so no `PLAN.md` was created. Planning must resume in a session where the plugin skill is loaded.
+- **Recorder**: Codex at 2026-07-27T09:26:27+08:00. SHA-256 identifies content but does not itself prove approver identity.

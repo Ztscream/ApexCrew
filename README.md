@@ -4,7 +4,7 @@ ApexCrew is a local-first Coding Agent Harness for an **Evidence-Driven Durable 
 
 ## Status
 
-This repository is intentionally documentation-only. Discovery, all three specification-brainstorming rounds, the A-Hybrid implementation architecture, and independent specification review are complete. Do not add persistent implementation until the user gives final written-spec approval, `writing-plans` produces `PLAN.md`, and a different agent completes the required implementation cold-start review. That review may generate code only in a disposable isolated worktree; its code is never merged or retained.
+This repository is intentionally documentation-only. Discovery, all three specification-brainstorming rounds, the A-Hybrid implementation architecture, independent review, and final written-spec sign-off are complete. Do not add persistent implementation until `writing-plans` produces `PLAN.md` and a different agent completes the required implementation cold-start review. That review may generate code only in a disposable isolated worktree; its code is never merged or retained.
 
 ## Accepted v0.1 Boundary
 
@@ -29,7 +29,7 @@ The target user is a developer who needs long-running agent collaboration to rem
 
 ## Repository Map
 
-- `SPEC.md`: current normative design; all three rounds are represented, but final artifact sign-off is pending.
+- `SPEC.md`: frozen normative design signed at SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`; approval is recorded externally so its bytes remain unchanged.
 - `INITIALIZATION.md`: accepted scope, prerequisites, stages, and remaining inputs.
 - `CONTEXT.md`: canonical domain vocabulary.
 - `docs/adr/`: accepted, hard-to-reverse decisions.
@@ -46,4 +46,4 @@ There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` 
 
 The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git`. Original ApexCrew material is available under [Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for the course-document exception. The NJU/GitLab remote is explicitly deferred and does not block current GitHub development.
 
-The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai with 25 hours/week available. Independent specification review passed with zero blockers; final written-spec approval is the immediate gate. The Python money-unit and TypeScript timestamp-unit fixture problems are approved. No API credential value is needed until the offline `ScriptedMockLLM` core is green and the opt-in provider slice begins.
+The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai with 25 hours/week available. Stage 2 is complete; creating `PLAN.md` with `writing-plans` is the immediate next gate. The Python money-unit and TypeScript timestamp-unit fixture problems are approved. No API credential value is needed until the offline `ScriptedMockLLM` core is green and the opt-in provider slice begins.

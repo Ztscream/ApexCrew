@@ -130,7 +130,7 @@ The user explicitly approved the consolidated Round 3 design after reviewing all
 - The repository owner supplies the actual OpenAI credential/quota and confirms then-current model availability/pricing only during the opt-in provider slice.
 - GitHub Pages, GHCR, and package trusted-publishing settings require repository-owner enablement. The NJU/GitLab remote remains deferred but is a final course-submission dependency.
 - The supplied deadline omitted a time; the specification transparently assumes 23:59 Asia/Shanghai unless corrected.
-- At Round 3 close, implementation module shape was deferred to the post-Round-3 architecture comparison, and the complete written specification still required independent review plus separate final human sign-off. Architecture and independent review are resolved below; final sign-off remains open.
+- At Round 3 close, implementation module shape was deferred to the post-Round-3 architecture comparison, and the complete written specification still required independent review plus separate final human sign-off. Architecture, independent review, and final sign-off are resolved below.
 
 #### Resulting `SPEC.md` diff
 
@@ -172,9 +172,24 @@ The correction introduces a persisted one-use Runtime Permit between control and
 
 ### Final Independent Review (passed 2026-07-26)
 
-Three fresh, read-only reviewers independently evaluated the complete specification frozen at SHA-256 `9751BEA572112994034AEA2AB265CFE6AD54195CFB513C18C587AB35AA2F3EB4`. The implementer/state-machine review, course/companion-document review, and security/Git-containment review each reported `ZERO BLOCKERS`. No reviewer relied on implementation code, and no source, fixture, test, CI, or `PLAN.md` artifact was created. The later status and terminology closeout does not change an accepted product choice; final written-spec approval remains a separate human gate.
+Three fresh, read-only reviewers independently evaluated the complete specification frozen at SHA-256 `9751BEA572112994034AEA2AB265CFE6AD54195CFB513C18C587AB35AA2F3EB4`. The implementer/state-machine review, course/companion-document review, and security/Git-containment review each reported `ZERO BLOCKERS`. No reviewer relied on implementation code, and no source, fixture, test, CI, or `PLAN.md` artifact was created. A final delta review found zero blockers on the later status and terminology closeout at the digest signed below.
 
-These edits are specification corrections, not new product scope. No `PLAN.md`, implementation, fixture, test, or CI artifact was created. Independent specification review is complete; final human sign-off remains open.
+These edits are specification corrections, not new product scope. No `PLAN.md`, implementation, fixture, test, or CI artifact was created. At review close, final human sign-off remained a separate gate; it is resolved by the following record.
+
+### Final Written-Spec Sign-Off (approved 2026-07-27)
+
+In Codex task `019f99cb-b307-75a3-8059-6e12908ff4b8`, the repository owner explicitly stated: `批准最终 SPEC.md，哈希 2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`. The task channel is the approval authority for this workflow; the digest proves content identity, not cryptographic identity of the approver.
+
+| Field | Approved value |
+|---|---|
+| Repository | `https://github.com/Ztscream/ApexCrew.git` |
+| Artifact | Root `SPEC.md`, 128,418 bytes |
+| SHA-256 | `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC` |
+| Source commit | `aabdd4fb664eb82dcc34c41391dbdb48872254c8` |
+| Git blob locator | `9d32355e610e08a75bf89a3a0fc23785441cda24` |
+| Recorder | Codex, 2026-07-27T09:26:27+08:00 |
+
+This sign-off completes Stage 2 and authorizes only Superpowers `writing-plans` to create `PLAN.md`. It does not authorize persistent implementation, credentials, publication, push, release, or any ApexCrew Runtime Grant. `SPEC.md` remains byte-for-byte unchanged: its embedded pre-approval status statements are superseded by this external record. Any byte change, including line-ending normalization, invalidates this approval and requires a new digest and explicit sign-off; future approval records append or supersede rather than rewrite this one.
 
 ## Stage 2 Exit Checklist
 
@@ -190,8 +205,8 @@ These edits are specification corrections, not new product scope. No `PLAN.md`, 
 - [x] Record three user-approved iterations, adopted/rejected AI suggestions, and a candid reflection on the brainstorming workflow.
 - [x] Compare implementation architectures and obtain explicit approval for A-Hybrid.
 - [x] Complete final independent review with zero blockers on the frozen written specification.
-- [ ] Obtain final human sign-off on the written `SPEC.md`.
+- [x] Obtain final human sign-off on the exact written `SPEC.md` digest.
 
-## Planning and Cold-Start Review - Pending
+## Stage 3 Planning - Next
 
-After `SPEC.md` is signed off, use Superpowers `writing-plans` to create 2-5 minute TDD tasks with explicit paths, dependencies, failing tests, commands, and expected evidence. A different agent type in a fresh session MUST then receive only `SPEC.md` and `PLAN.md`: no prior memory, chat history, or verbal additions. It MUST attempt 1-2 tasks for approximately 1-2 hours only in a disposable isolated worktree and MUST pause rather than guess at any ambiguity. Record every pause, incorrect interpretation, output gap, and resulting revision; then remove the review worktree without merging or retaining its code. This is the sole exception to the pre-implementation gate.
+In a session that exposes Superpowers `writing-plans`, create 2-5 minute TDD tasks with explicit paths, dependencies, failing tests, commands, and expected evidence. A different agent type in a fresh session MUST then receive only `SPEC.md` and `PLAN.md`: no prior memory, chat history, or verbal additions. It MUST attempt 1-2 tasks for approximately 1-2 hours only in a disposable isolated worktree and MUST pause rather than guess at any ambiguity. Record every pause, incorrect interpretation, output gap, and resulting revision; then remove the review worktree without merging or retaining its code. This is the sole exception to the pre-implementation gate.
