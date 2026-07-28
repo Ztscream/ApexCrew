@@ -239,3 +239,18 @@ Two further independent document audits ran before a renewed cold-start dispatch
 Before a new independent reviewer begins, the recorder must verify the current committed `PLAN.md` hash, the unchanged frozen `SPEC.md` hash, `uv python find 3.12`, and the absence of any retained implementation changes. The reviewer receives only those two normative documents in a fresh disposable worktree, runs no execution sub-skill, does not alter process records, stage, or commit, and stops on any ambiguity. A successful disposable probe alone does not authorize retained Task 1: the R2 plan must receive a second independent document review, its disposable worktree/code must be removed without merge, and the owner must accept the post-M0 capacity report before M1 retained execution.
 
 The R2 re-review closed all M0 document blockers: the M0 procedure has standalone red/green/type/diff checks, the old oversized task groups are explicitly roadmap rather than current authority, Task 35B consumes committed CI definitions rather than impossible completed remote jobs, and the required CPython 3.12 probe resolves successfully. The next authorized action is therefore a new, user-owned Stage 4 M0 evaluator task at the exact documentation commit. It may attempt only Task 1 and `2A` in a disposable worktree and cannot retain, stage, commit, push, or activate any later milestone.
+
+### Stage 4 Attempt 2 - paused and rejected (2026-07-28)
+
+| Field | Evidence |
+|---|---|
+| Review snapshot | Detached disposable worktree `C:\Users\29119\.codex\worktrees\bbcb\AI4SE` at R2 documentation commit `6d219a91413e6de52e8f5b86ee87d15c149544a8` |
+| Reviewer context | Fresh user-owned evaluator, instructed to use only frozen `SPEC.md` and R2 `PLAN.md`, execute Task 1 plus exact `2A`, and stop before evidence/staging/commit |
+| Prerequisite | `uv python find 3.12` passed and selected CPython 3.12.12 |
+| Red evidence | Both initial package selectors failed with the expected `ModuleNotFoundError: No module named 'apexcrew'`; the only `.gitignore` diff was `+.tmp/` |
+| Pause point | Task 1 Step 8: `uv lock --python 3.12` exited 0 and wrote `uv.lock`, but emitted undeclared warnings about ignored legacy Jinja2/keyring/tqdm artifacts and corrected third-party version specifiers |
+| Reviewer action | Correctly stopped before sync, green tests, `2A`, process records, staging, commit, push, credentials, or later work |
+| Disposable files | Task 1 configuration/package/test files, `uv.lock`, and ignored pytest cache only; no retained repository change |
+| Cleanup | Git deregistered the worktree but Windows retained the exact directory under an external file handle; evaluator task archived and both exact Git removal and recoverable move were denied |
+
+The warnings are normal resolver metadata diagnostics when the lock command exits 0; the plan had failed to distinguish them from a resolver failure. R3 explicitly permits those warnings while preserving mandatory stops for a nonzero exit, missing lockfile, unsupported Python, or absent direct dependency. Attempt 2 is not a successful cold-start review. Its Git worktree registration is gone, but its generated directory remains locked by an external process and cannot yet be deleted or moved. Release that file handle and remove the exact directory before a new fresh evaluator reruns Task 1 plus `2A` against the amended plan; do not carry over generated code or the old evaluator context.

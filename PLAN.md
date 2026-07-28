@@ -28,6 +28,8 @@ This plan is complete M0 review input but is conditionally implementation-ready:
 
 Record each prerequisite result, pause, incorrect interpretation, missing output, and resulting plan correction in `SPEC_PROCESS.md` and `AGENT_LOG.md`; amend `PLAN.md` before another attempt. The cold-start worker executes every test, implementation, and verification step in Task 1 and `2A` but stops before each slice's evidence/commit step: it reports the red/green output and intended boundary to the Stage 4 recorder, does not edit the root process documents, and does not run `git add` or `git commit`. Those final steps remain mandatory only when implementation is retained after Stage 4. After every attempt, remove the disposable worktree and all generated code without merging it. No dependency install beyond commands explicitly named in Task 1 and `2A`, credential access, publication, push, commit, or Runtime Grant is authorized by this gate.
 
+For Task 1 Step 8 only, `uv lock` warnings about ignored legacy package artifacts or corrected third-party metadata specifiers are permitted resolver diagnostics, not an ambiguity, when the command exits 0 and writes a syntactically complete `uv.lock`. The evaluator records the warnings but continues to Steps 9-10. A resolver error, a nonzero exit, an absent lockfile, an unsupported Python constraint, or a direct dependency omitted from the lock remains a mandatory stop.
+
 ## Milestones, Scope Tiers, and Stop Rules (R2)
 
 This amendment records the independent planning audit of 2026-07-28. It does not alter the frozen `SPEC.md`, waive any signed requirement, or authorize retained implementation. A deferred item is not optional: it is simply not started until its predecessor milestone closes. Only the optional work already named in the signed specification may be cut without a new approved specification revision. This root document is an executable plan only for M0; the remaining legacy detail is a signed-scope roadmap. Before M1, create a new exact root `PLAN.md` revision for that milestone, obtain an independent document review, and preserve the superseded M0 version in `docs/architecture/` or another documented course-artifact location.
@@ -411,6 +413,8 @@ Expected: PASS with exactly one added content line, `+.tmp/`, and no removed lin
 Run: `uv lock --python 3.12`
 
 Expected: PASS and create `uv.lock` resolving `requires-python = ">=3.12,<3.13"` without changing `.python-version` or `.gitignore`.
+
+Nonfatal `uv` warnings about ignored legacy artifacts or corrected invalid third-party version specifiers are allowed here if the command exits 0 and produces the lockfile. Record them as resolver diagnostics and continue; they do not authorize a lockfile edit beyond this command.
 
 - [ ] **Step 9: Synchronize only from the frozen lock**
 
