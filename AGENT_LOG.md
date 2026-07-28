@@ -177,3 +177,31 @@ This chronological log records material agent work and human decisions. Future i
 - **Scope**: Stage 2 is complete. The approval authorizes `writing-plans` to create `PLAN.md`; it does not authorize persistent implementation, credentials, publication, push, release, or a Runtime Grant.
 - **Planning state**: `writing-plans` 5.1.3 is installed at cache revision `11c74d6b` but is absent from this session's available-skills catalog, so no `PLAN.md` was created. Planning must resume in a session where the plugin skill is loaded.
 - **Recorder**: Codex at 2026-07-27T09:26:27+08:00. SHA-256 identifies content but does not itself prove approver identity.
+
+## 2026-07-27 / PLAN-R1 - Stage 3 implementation plan and document review
+
+- **Skill and authority**: pinned personal `writing-plans` at upstream commit `f2cbfbefebbfef77321e4c9abc9e949826bea9d7`, normalized equal to repository-recorded Superpowers 5.1.3 cache revision `11c74d6b`; frozen approved `SPEC.md` SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`.
+- **Output**: created only root `PLAN.md` plus planning/process records. The plan covers the approved A-Hybrid interfaces, ApexCrew-owned Coordinator/WorkerLoop, low-level ModelPort and offline `ScriptedMockLLM`, SQLite recovery, typed admission/authority/tools, hostile Git/Docker containment, both fixtures, CLI/read-only WebUI, CI/public replay, evaluation, and delivery gates.
+- **Schedule/cut line**: retained 2026-08-10 23:59 Asia/Shanghai, 25 hours/week, and approximately 53 hours; required core, safety, deterministic fixtures, delivery, public replay, and course evidence precede optional experiments/providers/platforms/UI scope.
+- **Independent plan review**: found five blockers: missing wheel backend/source-package configuration; unreachable Policy/Budget/Model Configuration flows; fixture commands without deterministic provisioned imports/tools; no `dist/pages` producer; and task commits omitting `AGENT_LOG.md`. The plan was corrected before cold-start dispatch.
+- **Implementation state**: none retained; no commit or push authorized or performed.
+
+## 2026-07-27 / COLDSTART-1 - Stage 4 disposable attempt paused
+
+- **Review isolation**: detached worktree `C:\Users\29119\.codex\worktrees\stage4-apexcrew-87fd-review` at `07f20aa92de97088d56d07c1a8528f93a220cf91`; fresh different-model reviewer received only `SPEC.md` and copied untracked `PLAN.md` as normative inputs.
+- **Task 1 red evidence**: `uv run pytest tests/unit/test_package.py::test_package_exposes_initial_version -q` failed with the expected `ModuleNotFoundError: No module named 'apexcrew'`, but selected Python 3.11 rather than required Python 3.12.
+- **Blocking probe**: `uv python find 3.12` failed because no CPython 3.12 interpreter was discoverable. The reviewer correctly paused instead of inferring authority for `uv python install 3.12`.
+- **Task 2 result**: not attempted because Task 1 could not complete. Read-only inspection additionally found undefined canonical revision-document fields and lifecycle-dependent enforcement assigned to immutable type files.
+- **Disposable changes**: only `tests/unit/test_package.py`, ignored pytest/bytecode caches, and the copied `PLAN.md`; no package source, configuration, lockfile, credentials, commit, push, or user-target effect.
+- **Plan correction**: authorized an explicit conditional Python 3.12 host prerequisite; made the initial red command select Python 3.12; defined exact closed Policy/Budget/Model Configuration documents, digests, payloads, revision bindings, and confirmation codes; moved state-dependent revision rules to `CrewControlService` and the runtime action barrier.
+- **Status**: Attempt 1 rejected as incomplete. Remove its disposable artifacts/worktree, then rerun Tasks 1-2 in a new detached worktree and fresh context. Stage 4 remains open.
+
+## 2026-07-28 / PLAN-R2 - execution-readiness audit and correction
+
+- **Authority and scope**: documentation-only correction under the frozen approved `SPEC.md` digest `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`; no source, fixture, test, CI, lockfile, credential, commit, or push was created by this audit.
+- **Independent findings**: dependency review reported no forward references or missing legacy task commit commands. Schedule review found the claimed 53-hour all-scope completion infeasible from 757 two-to-five-minute actions before TDD/review/commit overhead; it also found non-atomic Tasks 2, 7, 11, 12, and 27, Task 28's unsequenced provider work, a premature eight-job Task 35 release assertion, and a partial `TASK-*` ledger presentation.
+- **Plan correction**: `PLAN.md` now records M0-M4 milestones, requires owner capacity review at every boundary, keeps M4 requirements deferred rather than waived, splits the five legacy groups into independent execution slices, designates Task 28 as the offline-contract-tested M4 provider profile, makes Task 35A report `PENDING_FINAL_CI_TOPOLOGY`, and adds Task 35B after Task 36C for the eight-job release verifier.
+- **Cold-start scope**: the next disposable review is limited to the Python 3.12 probe, Task 1, and Task 2A. It stops before ledger/commit steps and cannot close retained implementation until an independent re-review accepts the R2 plan and its generated worktree is removed.
+- **Observed host prerequisite**: `uv python find 3.12` passed and selected `C:\Users\29119\AppData\Roaming\uv\python\cpython-3.12.12-windows-x86_64-none\python.exe`.
+- **Implementation state**: none retained. The old Attempt 2 worktree remains quarantined because it contains a stale untracked plan; it is not an authorized review input.
+- **R2 independent re-review**: schedule, structural, and dependency auditors reported zero blockers for an M0 Stage 4 evaluator. They verified that only Task 1 and the exact `2A` procedure are executable, that `2A` has independent red/green/mypy/diff commands, that M1-M4 require future reviewed plan revisions, that 35B consumes committed CI definitions rather than completed remote jobs, and that the Python 3.12 host probe passes. The remaining 66-task roadmap is not current execution authority.

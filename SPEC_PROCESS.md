@@ -207,6 +207,35 @@ This sign-off completes Stage 2 and authorizes only Superpowers `writing-plans` 
 - [x] Complete final independent review with zero blockers on the frozen written specification.
 - [x] Obtain final human sign-off on the exact written `SPEC.md` digest.
 
-## Stage 3 Planning - Next
+## Stage 3 Planning and Stage 4 Cold-Start Review
 
-In a session that exposes Superpowers `writing-plans`, create 2-5 minute TDD tasks with explicit paths, dependencies, failing tests, commands, and expected evidence. A different agent type in a fresh session MUST then receive only `SPEC.md` and `PLAN.md`: no prior memory, chat history, or verbal additions. It MUST attempt 1-2 tasks for approximately 1-2 hours only in a disposable isolated worktree and MUST pause rather than guess at any ambiguity. Record every pause, incorrect interpretation, output gap, and resulting revision; then remove the review worktree without merging or retaining its code. This is the sole exception to the pre-implementation gate.
+The pinned Superpowers `writing-plans` workflow produced root `PLAN.md` from the approved frozen specification. The plan keeps the 2026-08-10 23:59 Asia/Shanghai deadline and 25 hours/week constraint explicit, orders required core before optional scope, and defines red/green commands plus Conventional Commit boundaries without creating retained implementation. Its independent plan-document review initially found five blockers: missing wheel backend/source-package configuration, unreachable Policy/Budget/Model Configuration command flows, non-runnable fixture toolchains, no producer for `dist/pages`, and omission of `AGENT_LOG.md` from task commit commands. All five were corrected before cold-start dispatch.
+
+### Stage 4 Attempt 1 - paused and rejected (2026-07-27)
+
+| Field | Evidence |
+|---|---|
+| Review snapshot | Detached disposable worktree at commit `07f20aa92de97088d56d07c1a8528f93a220cf91`; untracked root `PLAN.md` copied in as the second normative input |
+| Reviewer context | Fresh `gpt-5.6-terra` agent with no inherited task context; instructed to use only `SPEC.md` and `PLAN.md` and attempt Tasks 1-2 |
+| Frozen specification | SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC` |
+| Task 1 red command | `uv run pytest tests/unit/test_package.py::test_package_exposes_initial_version -q` |
+| Observed red | Expected `ModuleNotFoundError: No module named 'apexcrew'`, but `uv` selected system Python 3.11 rather than required Python 3.12 |
+| Prerequisite probe | `uv python find 3.12` failed because no managed, PATH, virtualenv, registry, or other discoverable CPython 3.12 interpreter was installed |
+| Reviewer action | Paused instead of inferring authorization for the user-level mutation `uv python install 3.12`; Task 2 was not attempted |
+| Disposable files | Only `tests/unit/test_package.py`, `.pytest_cache`, bytecode cache, and the copied untracked `PLAN.md`; no package/configuration/lockfile, credential access, commit, push, or repository effect |
+
+Attempt 1 is not a successful review. It exposed an environment gap and an independent plan ambiguity: Task 2 named canonical Policy/Budget/Model Configuration documents without defining their fields, put lifecycle-dependent replacement rules in immutable type files, and omitted the envelope's applicable revision bindings and approval confirmation code required by the specification.
+
+The resulting correction explicitly authorizes the review-host prerequisite sequence `uv python find 3.12`, conditional `uv python install 3.12`, and a repeated successful find; makes the disposable exception distinct from retained implementation; and makes Task 1's initial red command select CPython 3.12. Task 2 now defines closed Planning Read Authorization, Secret Path Binding, Executor Profile, Policy, Budget/pricing, inference/returned-model alias, and Model Configuration documents, canonical digests, exact proposal/approval fields, applicable revision bindings, and confirmation codes. State-dependent bootstrap approval, Plan/Policy freeze, and bounded Budget/Model Configuration replacement moved to Task 10 `CrewControlService`, with barrier application in Task 11.
+
+The review remains open until a clean disposable Attempt 2 implements Tasks 1-2 without guessing, all blocking findings are corrected, independent plan review passes again, and every generated implementation artifact/worktree is removed without merge.
+
+### Stage 3 R2 plan correction and renewed Stage 4 precondition (2026-07-28)
+
+Two further independent document audits ran before a renewed cold-start dispatch. The dependency audit found no missing task-level commit action, no unresolved `Consumes` forward dependency, and a valid Task 1 to Task 2 foundation order. The schedule audit found a blocking execution-readiness problem: 757 stated 2-5 minute actions already imply 25.2-63.1 raw hours, which cannot support an honest 53-hour all-scope commitment once red/green cycles, regressions, evidence, review, and 66 legacy commit boundaries are included. It also found non-atomic legacy groups (2, 7, 11, 12, and 27), unsequenced provider work, a Task 35 release verifier that asserted future jobs before Tasks 36A/36C defined them, and a partial `TASK-*` ledger convention.
+
+`PLAN.md` R2 preserves the frozen specification but adds M0-M4 milestones, explicit owner capacity checks, execution slices, Task 28 M4 provider sequencing, and the Task 35A/35B CI topology split. M4 remains required for a complete signed v0.1 claim; it is deferred, not silently cut. The cold-start probe is correspondingly narrowed to Task 1 plus the `2A` immutable revision foundation, which is sufficient to test zero-context setup and the first vertical domain slice inside the stated 1-2 hour disposable window.
+
+Before a new independent reviewer begins, the recorder must verify the current committed `PLAN.md` hash, the unchanged frozen `SPEC.md` hash, `uv python find 3.12`, and the absence of any retained implementation changes. The reviewer receives only those two normative documents in a fresh disposable worktree, runs no execution sub-skill, does not alter process records, stage, or commit, and stops on any ambiguity. A successful disposable probe alone does not authorize retained Task 1: the R2 plan must receive a second independent document review, its disposable worktree/code must be removed without merge, and the owner must accept the post-M0 capacity report before M1 retained execution.
+
+The R2 re-review closed all M0 document blockers: the M0 procedure has standalone red/green/type/diff checks, the old oversized task groups are explicitly roadmap rather than current authority, Task 35B consumes committed CI definitions rather than impossible completed remote jobs, and the required CPython 3.12 probe resolves successfully. The next authorized action is therefore a new, user-owned Stage 4 M0 evaluator task at the exact documentation commit. It may attempt only Task 1 and `2A` in a disposable worktree and cannot retain, stage, commit, push, or activate any later milestone.
