@@ -4,7 +4,7 @@ ApexCrew is a local-first Coding Agent Harness for an **Evidence-Driven Durable 
 
 ## Status
 
-This repository is intentionally documentation-only. Discovery, all three specification-brainstorming rounds, the A-Hybrid implementation architecture, independent review, and final written-spec sign-off are complete. Do not add persistent implementation until `writing-plans` produces `PLAN.md` and a different agent completes the required implementation cold-start review. That review may generate code only in a disposable isolated worktree; its code is never merged or retained.
+This repository is intentionally documentation-only. Discovery, all three specification-brainstorming rounds, the A-Hybrid implementation architecture, independent review, final written-spec sign-off, the R3 `PLAN.md`, and the Stage 4 implementation cold-start review are complete; that review returned zero blockers on 2026-07-31 and its disposable code was destroyed without merge. Do not add persistent implementation until a new M1 `PLAN.md` revision passes its own independent document review.
 
 ## Accepted v0.1 Boundary
 
@@ -40,10 +40,12 @@ The target user is a developer who needs long-running agent collaboration to rem
 - `SPEC_PROCESS.md` and `AGENT_LOG.md`: required development-process evidence.
 - `LICENSE` and `NOTICE`: Apache-2.0 terms and the explicit scope exception for course-provided documents.
 
-There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` are interface commitments for later planning, not current capabilities. The selected target is a Python 3.12 wheel/`uv` CLI plus a digest-pinned GHCR executor for Windows 11 and Ubuntu 24.04 x86_64; Python 3.12 is not yet installed on this development host.
+There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` are interface commitments, not current capabilities. The selected target is a Python 3.12 wheel/`uv` CLI plus a digest-pinned GHCR executor for Windows 11 and Ubuntu 24.04 x86_64. Every `SPEC.md` section 10.5 host prerequisite was re-verified on 2026-07-31: Git 2.47.1, CPython 3.12.12, uv 0.9.29, a responding Docker daemon, and OS keyring support.
 
 ## Repository and License
 
-The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git`. Original ApexCrew material is available under [Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for the course-document exception. The NJU/GitLab remote is explicitly deferred and does not block current GitHub development.
+The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git` and is the sole remote. Original ApexCrew material is available under [Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for the course-document exception.
 
-The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai with 25 hours/week available. Stage 2 is complete; creating `PLAN.md` with `writing-plans` is the immediate next gate. The Python money-unit and TypeScript timestamp-unit fixture problems are approved. No API credential value is needed until the offline `ScriptedMockLLM` core is green and the opt-in provider slice begins.
+The repository owner decided on 2026-07-31 that no NJU/GitLab remote will be configured and that delivery runs through GitHub. The course brief is internally inconsistent here: section 4.7 is titled "GitHub 仓库要求" and mandates a public GitHub repository with GitHub Actions CI, while section 5 describes submission through an NJU Git link. The owner resolved that inconsistency in favour of GitHub. A `.gitlab-ci.yml` carrying a job named exactly `unit-test` is still produced, because deliverable 6 names that file directly and because frozen `SPEC.md` section 10.5 requires the file's existence and job name, not a GitLab remote.
+
+The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The owner raised available capacity to 30-40 hours/week on 2026-07-31. Stages 2 and 3 are complete and the Stage 4 cold-start review returned zero blockers; the immediate next gate is a new M1 `PLAN.md` revision with its own independent document review. The Python money-unit and TypeScript timestamp-unit fixture problems are approved. No API credential value is needed until the offline `ScriptedMockLLM` core is green and the opt-in provider slice begins.

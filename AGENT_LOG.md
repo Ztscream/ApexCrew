@@ -285,3 +285,12 @@ A re-read of the course brief against the repository found requirements that `SP
 - **`SECURITY.md`** is named in the `INITIALIZATION.md` documentation table but does not exist; either create it or correct the table.
 
 These findings are inputs to the M1 `PLAN.md` revision, not authorization to change `SPEC.md`. Where a requirement conflicts with the signed specification, the resolution is an explicit owner decision, recorded, and if necessary a proposed specification amendment with a new digest.
+
+## 2026-07-31 / DELIVERY-1 - Delivery channel resolved to GitHub only
+
+- **Owner decision**: no NJU/GitLab remote will be configured; GitHub is the sole remote and delivery channel.
+- **Documented basis and its limits**: the course brief is internally inconsistent. Section 4.7 is titled "GitHub 仓库要求", mandates a public GitHub repository, and section 4.8's CI clause requires GitHub Actions on every push; section 5 instead describes submission "通过同一个 NJU Git 仓库链接" and names `.gitlab-ci.yml` as deliverable 6. The recorder searched both course documents exhaustively and found no clause resolving the conflict. The owner resolved it in favour of GitHub using course context not present in these files. This entry records the decision and its basis; it does not claim the brief itself authorizes dropping the NJU link.
+- **Retained despite the decision**: `.gitlab-ci.yml` carrying a job named exactly `unit-test` is still produced. Deliverable 6 names the file directly, and frozen `SPEC.md` section 10.5 requires the file's existence and job name rather than a GitLab remote, so keeping it satisfies both without a specification amendment.
+- **Residual risk, not closed**: if the grader requires the NJU link as the submission channel, GitHub-only delivery does not satisfy deliverable 5. Configuring a second remote later is a single command, so the cost of reversing this decision stays low; the cost of discovering it late does not.
+- **Documents corrected**: `README.md`, `INITIALIZATION.md`, and `AGENTS.md` now state GitHub-only delivery, the passed Stage 4 review, the M1 plan revision as the next gate, and the 2026-07-31 host re-verification. `AGENTS.md` additionally carries the course workflow rules that bind from M1: worktree-per-module with one PR each, subagent/human attribution in commit or PR text, the two-phase per-task review, and continuous `PLAN.md` commit-hash updates.
+- **`SPEC.md`**: unchanged and unaffected. Its `.gitlab-ci.yml` requirement remains satisfiable.

@@ -1,6 +1,6 @@
 # ApexCrew Initialization Baseline
 
-> Status: accepted initialization baseline, updated 2026-07-27. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds, A-Hybrid, independent specification review, and final written-spec sign-off are complete; planning and implementation cold-start review still gate implementation.
+> Status: accepted initialization baseline, updated 2026-07-31. **Evidence-Driven Durable Crew is the only product mainline.** All three brainstorming rounds, A-Hybrid, independent specification review, final written-spec sign-off, the R3 `PLAN.md`, and the Stage 4 cold-start review are complete. A new M1 `PLAN.md` revision and its independent document review still gate retained implementation.
 
 ## 1. Product Thesis
 
@@ -106,12 +106,12 @@ Do not create parallel architecture truths. Learning notes explain concepts and 
 | Scope | Accepted | One repository, at most three Workers, Python + TypeScript fixtures. |
 | Core ownership | Accepted | ApexCrew owns both loops; only low-level model completion APIs sit behind `ModelPort`. |
 | LLM provider decision | Accepted | OpenAI Responses API with `gpt-5.6-terra`; every core gate remains offline under `ScriptedMockLLM`. The credential value is deferred to the provider slice. |
-| Local toolchain | Partially ready | Git 2.47.1, Python 3.11.5 and uv-managed 3.14.2, uv 0.9.29, Node 22.14, Make 4.4.1, Docker 29.6.1, and WSL2 Ubuntu were observed. The selected Python 3.12 is not installed and MUST be added with `uv python install 3.12` before scaffold work. Host Node is not required; Node 24 lives in the executor image. |
+| Local toolchain | Ready, re-verified 2026-07-31 | Git 2.47.1, CPython 3.12.12 via uv, uv 0.9.29, Node 22.14, Make 4.4.1, Docker server 29.6.1 responding, and OS keyring resolving to `keyring.backends.Windows.WinVaultKeyring`. Keyring is required by `SPEC.md` section 5.3 for the Secret Path Set installation key and had not been verified before. Host Node is not required; Node 24 lives in the executor image. |
 | Docker daemon | Verified | Local server 29.6.1 responded; image/build behavior is tested during scaffold and distribution stages. |
 | Superpowers | Installed and enabled | `superpowers@openai-curated`, manifest 5.1.3, cache revision `11c74d6b`; required workflow skill directories are present. Start design in a session where the plugin skills are loaded. |
 | Local Git baseline | Completed by this initialization | Branch `main`; governance and documentation only. |
 | Public personal GitHub remote | Configured | `origin` is `https://github.com/Ztscream/ApexCrew.git`; it was verified empty before the first non-force publication. |
-| Course submission remote | Explicitly deferred | NJU/GitLab is not considered during current GitHub development but remains a final course-delivery dependency. |
+| Course submission remote | Resolved 2026-07-31 | No NJU/GitLab remote will be configured; GitHub is the sole remote and delivery channel. The course brief is inconsistent - section 4.7 mandates a public GitHub repository with GitHub Actions, section 5 describes an NJU Git link - and the owner resolved it in favour of GitHub. `.gitlab-ci.yml` with its exact `unit-test` job is still produced to satisfy deliverable 6 and frozen `SPEC.md` section 10.5, neither of which requires a GitLab remote. |
 | License | Accepted | Original ApexCrew work uses Apache-2.0; `NOTICE` excludes course-provided requirement documents from relicensing. |
 | LLM credential value | Not required yet | Interactive use requires OS keyring; CI may inject `APEXCREW_OPENAI_API_KEY`. An actual value is supplied only for the opt-in provider slice and is never committed. |
 | Delivery schedule | Accepted | Deadline is assumed 2026-08-10 23:59 Asia/Shanghai; 25 hours/week yields approximately 53 hours. Optional scope is cut before required mechanisms or course artifacts. |
@@ -128,8 +128,9 @@ No `src/`, tests, fixtures, or CI may be retained until the remaining planning a
 | 0. Discovery (complete) | Landscape, value hypothesis, alternatives, vocabulary | User accepted one direction and non-goals |
 | 1. Repository/process setup (complete) | Git/GitHub, Superpowers, license, ignore/security baseline, `AGENT_LOG.md` | GitHub `main` contains the verified governance baseline |
 | 2. Specification (complete) | `SPEC.md`, `SPEC_PROCESS.md`, scenarios, state/data/threat/module model | Exact SHA-256 approved after zero-blocker independent review |
-| 3. Planning (next) | `PLAN.md` with 2-5 minute implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
-| 4. Independent cold start | Different agent type, fresh session, only SPEC/PLAN, no prior memory; attempt 1-2 tasks for about 1-2 hours and pause on ambiguity | Revisions remove all blocking ambiguity; disposable code is not retained |
+| 3. Planning (complete) | `PLAN.md` R3 with milestone-scoped implementation and Python/TypeScript fixture-construction tasks | Every task has dependencies, paths, a failing test, and red/green evidence |
+| 4. Independent cold start (passed 2026-07-31) | Different agent type, fresh session, only SPEC/PLAN, no prior memory; attempt 1-2 tasks for about 1-2 hours and pause on ambiguity | Attempt 3 returned zero blockers; disposable code was destroyed without merge |
+| 4b. M1 plan revision (next) | New exact M1 `PLAN.md` revision plus independent document review; superseded M0 plan archived | Review closes the Budget field-scope question and defines worktree/PR boundaries |
 | 5. Scaffold | Package, Python/TypeScript fixture repositories, offline test harness, lint/type CI, `ScriptedMockLLM` | One red-green vertical smoke slice |
 | 6. Core vertical slices | Worker feedback, contracts/leases, freshness gate, approval, recovery | Decisive demos pass offline on both fixtures |
 | 7. Productization | WebUI, credentials, Docker, GitHub Actions, `.gitlab-ci.yml` `unit-test` | Fresh-machine run, public demo, and required CI pass |
@@ -141,4 +142,6 @@ GitHub publication, licensing, provider/model, credentials design, WebUI form, p
 
 The A-Hybrid architecture, independent review, and exact final `SPEC.md` digest are approved, completing Stage 2. Stage 3 must now create `PLAN.md` with `writing-plans`; the independent implementation cold-start review follows and must remove all blocking ambiguity before implementation is retained.
 
-The NJU/GitLab remote is explicitly deferred but remains a final course-delivery dependency. The supplied course deadline omitted a time, so the plan assumes 23:59 Asia/Shanghai unless the user corrects it. Python 3.12 installation is the only missing local scaffold prerequisite currently observed.
+The NJU/GitLab question is closed: on 2026-07-31 the owner decided GitHub is the sole remote and delivery channel, while `.gitlab-ci.yml` with its exact `unit-test` job is still produced. The supplied course deadline omitted a time, so the plan assumes 23:59 Asia/Shanghai unless the user corrects it. No local scaffold prerequisite is missing; every `SPEC.md` section 10.5 host requirement was re-verified on 2026-07-31.
+
+GitHub Pages and workflow write permissions are being enabled by the owner. Both are required before the M3 static replay and any container publication can run.

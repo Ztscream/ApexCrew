@@ -1,6 +1,8 @@
 # Repository Guidelines
 
-ApexCrew is specification-only. Do not add source, fixtures, tests, or CI until `SPEC.md` is signed off, `writing-plans` produces `PLAN.md`, and cold-start review closes blocking ambiguity. `PLAN.md` is required review input; reviewer code is disposable. ApexCrew must own Coordinator and WorkerLoop; external agent CLIs and high-level frameworks cannot replace them.
+ApexCrew is specification-only. `SPEC.md` is signed off, `PLAN.md` R3 exists, and the Stage 4 cold-start review passed with zero blockers on 2026-07-31. Do not add source, fixtures, tests, or CI until a new M1 `PLAN.md` revision passes its own independent document review. Reviewer code is disposable. ApexCrew must own Coordinator and WorkerLoop; external agent CLIs and high-level frameworks cannot replace them.
+
+From M1 onward the course brief's workflow rules bind: each independent feature or large module gets its own Git worktree and one corresponding pull request, a single commit containing everything is rejected, commit or PR text states which subagent did the work and which parts a human changed, each task is followed by a spec-compliance check then a code-quality check with critical issues fixed before the next task, and `PLAN.md` is updated with each task's commit hash as it lands.
 
 ## Project Structure & Module Organization
 
