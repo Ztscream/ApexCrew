@@ -254,3 +254,9 @@ The R2 re-review closed all M0 document blockers: the M0 procedure has standalon
 | Cleanup | Git deregistered the worktree but Windows retained the exact directory under an external file handle; evaluator task archived and both exact Git removal and recoverable move were denied |
 
 The warnings are normal resolver metadata diagnostics when the lock command exits 0; the plan had failed to distinguish them from a resolver failure. R3 explicitly permits those warnings while preserving mandatory stops for a nonzero exit, missing lockfile, unsupported Python, or absent direct dependency. Attempt 2 is not a successful cold-start review. Its Git worktree registration is gone, but its generated directory remains locked by an external process and cannot yet be deleted or moved. Release that file handle and remove the exact directory before a new fresh evaluator reruns Task 1 plus `2A` against the amended plan; do not carry over generated code or the old evaluator context.
+
+#### Attempt 2 cleanup closed (2026-07-31)
+
+The external file handle was released at some point after 2026-07-28. On 2026-07-31 the exact path `C:\Users\29119\.codex\worktrees\bbcb\AI4SE` was observed to contain zero entries, was removed, and its then-empty parent `bbcb` was removed with it. Git had already deregistered the worktree, so no Git operation was required or performed. The recorded precondition blocking a new cold-start attempt is therefore satisfied: no orphaned Attempt 2 artifact remains, and no cleanup exception needs to be accepted.
+
+Two unrelated Codex worktrees remain registered and are **not** cold-start inputs: `C:\Users\29119\.codex\worktrees\87fd\AI4SE` on branch `codex/stage4-m0-plan`, and `C:\Users\29119\.codex\worktrees\stage4-apexcrew-87fd-attempt2` detached at `07f20aa`. The latter holds a stale pre-R2 plan and must not be handed to an evaluator.
