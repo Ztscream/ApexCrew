@@ -29,7 +29,8 @@ The target user is a developer who needs long-running agent collaboration to rem
 
 ## Repository Map
 
-- `SPEC.md`: frozen normative design signed at SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`; approval is recorded externally so its bytes remain unchanged.
+- `SPEC.md`: frozen normative design, revision 2, signed at SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`. Revision 1 (`2F1434AB…663BC`) was signed 2026-07-27 and superseded 2026-07-31 by approved proposal 0001. Approval is recorded externally so the bytes remain unchanged between revisions.
+- `docs/proposals/`: specification amendment proposals and their disposition.
 - `INITIALIZATION.md`: accepted scope, prerequisites, stages, and remaining inputs.
 - `CONTEXT.md`: canonical domain vocabulary.
 - `docs/adr/`: accepted, hard-to-reverse decisions.

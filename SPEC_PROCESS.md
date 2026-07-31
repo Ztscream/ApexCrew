@@ -312,3 +312,25 @@ Undefined helper functions making two claimed red states unreachable; a recovery
 ### Required sequence before `M1 GO`
 
 A separately hashed `SPEC.md` clarification proposal covering the three specification gaps, owner approval producing a new digest, an M1-R2 plan correcting the seven plan defects and aligning to the amended specification, and a further independent review returning zero blockers. Only then may the owner give `M1 GO` and authorize the first worktree.
+
+## Specification Revision 2 - approved and applied (2026-07-31)
+
+The first amendment to the frozen specification. Revision 1, SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC`, signed 2026-07-27, is superseded but remains the authoritative identity for every decision recorded before this point.
+
+**Revision 2**: SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes, 636 lines.
+
+**Basis**: proposal `docs/proposals/0001-spec-clarification-budget-and-run-time.md`, raised because the M1 plan review found three gaps that no plan could close. The owner approved all three as written.
+
+**Applied changes**, 12 insertions and 2 deletions, confined to sections 7 and 10.2:
+
+1. **Budget Revision field scope.** Section 10.2 now states that a `BudgetRevisionDocument` contains exactly the eight scalar ceilings represented by the seven table rows plus `pricing_observed_on` and the allowed-returned-ID price mapping, and nothing else; that "allocation rules" in section 7 denotes fixed schema-versioned mechanism behavior rather than mutable fields; and that per-Task tranche/call/Attempt/stale-refresh/manual-resume/no-progress/repeated-action limits, action and check timeouts, the provider retry limit, and the warning threshold sit outside Budget Revision and are rejected before state mutation. Section 7's Budget Revision row was amended to match. This selects the **narrow** reading, chosen because keeping caller-controlled input away from mechanism limits removes a real attack surface: a model able to propose its own timeout or retry ceiling could extend its own budget.
+2. **Table ceiling floor.** Every scalar table ceiling other than the cost reserve is a positive integer and zero is rejected before state mutation; the cost reserve may be zero, which reserves nothing and pauses the Run before the next real provider call.
+3. **Active Run time accounting.** Time accumulates only across intervals holding runtime ownership, opening in the transaction that consumes a Runtime Permit and closing in the transaction recording the resulting `RunStop`. Duration uses a monotonic clock, never wall-clock differences. A crash with no recorded `RunStop` is closed conservatively at the last Audit Event committed under that ownership generation, and the unobservable remainder is never charged or guessed.
+
+**What this revision does not do**: it authorizes no implementation, gives no `M1 GO`, and does not address review blockers 4-10, which are plan defects belonging to the M1-R2 revision.
+
+**Consequence for the rejected M1-R1 candidate**: its `Frozen input` gate requires revision 1's digest, so that plan now fails its own precondition and cannot be executed. This is the intended outcome; M1-R2 must cite revision 2.
+
+### Standing qualification on the revision-1 sign-off
+
+Revision 1 was approved after three independent reviews each reporting zero blockers, yet a fourth reader working from an implementation plan found three genuine gaps. Specification review that reads only the specification cannot substitute for review that attempts to build from it. Future specification gates should treat implementation-facing review as capable of reopening specification text, and should not read an earlier zero-blocker verdict as proof of implementability.

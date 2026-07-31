@@ -394,7 +394,7 @@ An unrelated classified promotion leaves the lease `ACTIVE` only after its admis
 | Command Receipt | Repository/request ID, canonical full-envelope digest, committed outcome/resulting sequence, optional permit generation | Run-owned idempotency authority before purge; only the exact purge-confirmation receipt survives inside the tombstone |
 | Plan Revision | Immutable digest, approved DAG, Task Contract digests, Run Check Set digest | Exactly one approved Plan freezes at `ACTIVE`; v0.1 mismatch requires cancellation/new Run |
 | Policy Revision | Immutable digest, Secret Path Set digest/count, planning authority, action rules, and approval metadata | Freezes with the approved Plan at `ACTIVE`; fixed hard denials remain external and non-relaxable |
-| Budget Revision | Immutable limits, allocation rules, pricing snapshot, and approval metadata | Independently versioned; governs Run and Task allocation without changing Plan structure |
+| Budget Revision | Immutable table ceilings, pricing snapshot, and approval metadata | Independently versioned; governs Run and Task allocation through fixed mechanism rules without changing Plan structure |
 | Model Configuration Revision | Immutable approved provider/request settings, requested canonical model, exact returned-ID/alias set, and tool-schema digest; excludes credentials | Planning/Attempt provenance; changing it stales a proposal or active Attempts but does not rewrite objective receipts |
 | Task Contract | Task ID/revision, dependencies, `R`/`D`/`W`/`Q` globs, structured check definitions, constraints | Belongs to a Plan Revision; has many Attempts and validated hazard edges |
 | Worker Attempt | Attempt ID, Task digest, base Run Head, state, budget counters | Has one Capsule/lease generation and many actions; may emit one candidate |
@@ -482,7 +482,7 @@ The initial approved Budget Revision uses these values, which are also non-raise
 
 | Resource | Ceiling |
 |---|---:|
-| Cumulative active Run time (human-wait and paused states excluded) | 8 hours |
+| Cumulative active Run time, accumulated only while runtime ownership is held | 8 hours |
 | Tasks in the approved DAG | 12 |
 | Planning model requests, including retries | 8 |
 | Model calls | 240 |
@@ -491,6 +491,16 @@ The initial approved Budget Revision uses these values, which are also non-raise
 | Concurrent Workers | 3 |
 
 The pricing snapshot maps every approved returned model ID to the 2026-07-26 standard `gpt-5.6-terra` rates observed during design: USD 2.50 per million input tokens and USD 15 per million output tokens. The initial exact-ID set has one member. The token ceilings therefore reserve USD 8 without assuming cached-input discounts and leave USD 2 headroom. Before every real call, ApexCrew reserves projected worst-case cost; missing usage/pricing data, exhausted reserve, or increased provider pricing pauses the Run before another call. A human-approved Budget Revision may lower any table value or restore a previously lowered value up to the table maximum and may replace an allowed-ID price mapping, but it cannot exceed 8 hours, 12 Tasks, 8 planning requests, 240 calls, 2,000,000/200,000 tokens, USD 10, or three Workers in the same v0.1 Run.
+
+A `BudgetRevisionDocument` contains exactly the eight scalar ceilings represented by the seven table rows above — input and output tokens are separate fields — plus `pricing_observed_on` and the complete allowed-returned-ID price mapping. It contains nothing else. "Allocation rules" in section 7 denotes fixed schema-versioned mechanism behavior, not mutable Budget fields. The per-Task tranche sizes, call, Attempt, stale-refresh, manual-resume, no-progress and repeated-action limits, the ordinary-action and declared-check timeouts, the provider retry limit, and the warning threshold are outside Budget Revision. They cannot be proposed, lowered, restored, or replaced by one, and an otherwise valid proposal carrying any of them is rejected before state mutation.
+
+Every scalar table ceiling other than the cost reserve is a positive integer; a proposal setting one to zero is invalid and is rejected before state mutation. The cost reserve may be zero, which reserves nothing and therefore pauses the Run before the next real provider call.
+
+Active Run time accumulates only across intervals during which one process holds runtime ownership for that Run. An interval opens in the same transaction that consumes a Runtime Permit, installs the owner ID, and increments runtime progress; it closes in the transaction that records the resulting `RunStop`. States with no runtime owner therefore contribute nothing, which is why human-wait and paused states are excluded, and `DRAFT`, `READY_TO_START`, every approval wait, `PAUSED`, `INDETERMINATE` awaiting a human strategy, and terminal states accumulate no time even though some remain lifecycle-`ACTIVE`.
+
+Duration is measured with a monotonic clock supplied by the clock adapter, never with wall-clock differences, so host clock adjustment can neither inflate nor reverse an interval. Each closed interval's duration is added to a durable cumulative total in the same transaction that records its `RunStop`.
+
+If the process dies without recording a `RunStop`, that interval has no observed end. Recovery closes it at the timestamp of the last Audit Event committed under that ownership generation and adds only that bounded portion; the unobservable remainder is never charged and never guessed. A subsequent permitted invocation opens a new interval. The ceiling is evaluated at each action boundary against the durable cumulative total plus the open interval's elapsed monotonic duration; reaching it lets the current atomic action settle and then pauses under the existing section 10.2 stop rule.
 
 Each Task receives a 16-call bootstrap as two eight-call tranches. After bootstrap, another eight calls are allocated only when the immediately preceding tranche shows objective progress. Progress means a strictly larger fresh-pass set, a strictly smaller failure set with no regression, or deterministic lifecycle advance to `VERIFYING`/`CANDIDATE_READY`; model self-report is never progress. A Task is limited to 48 calls, five Attempts, and three stale refreshes. During bootstrap, two consecutive no-progress tranches pause the Task; after bootstrap, one no-progress tranche denies renewal and pauses it. Two identical `tree_oid + check-set digest` checkpoints or three repeated identical invalid actions likewise pause the Task. An invalid action still fails its current Attempt, but automatic rescheduling cannot bypass the Task pause.
 

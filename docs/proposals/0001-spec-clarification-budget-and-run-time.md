@@ -1,9 +1,13 @@
 ---
-status: PENDING OWNER APPROVAL
+status: APPROVED AND APPLIED
 date: 2026-07-31
+approved: 2026-07-31, owner approved all three gaps as written
+applied: SPEC.md revision 1 `2F1434AB…663BC` -> revision 2 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`
 supersedes: nothing
 affects: SPEC.md sections 7, 10.2
 ---
+
+> **Disposition**: the owner approved all three gaps as written on 2026-07-31. The text below was applied verbatim, producing `SPEC.md` revision 2 at SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes, 636 lines. The applied diff was 12 insertions and 2 deletions and touched nothing outside the wording proposed here. The pre-amendment bytes remain identifiable by revision 1's digest.
 
 # Proposal 0001: Clarify Budget Revision field scope, table ceiling floors, and active Run time
 
