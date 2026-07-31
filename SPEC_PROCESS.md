@@ -290,3 +290,25 @@ Attempt 3 is the first Stage 4 attempt to complete both authorized M0 slices wit
 The four non-blocking findings are: an unclear boundary in `SPEC.md` §10.2 between the seven headline Budget values and the per-Task administrative caps, which `PLAN.md` models as one document of independently proposable fields and which Task 10 will have to resolve; `SPEC.md` §4.1's `domain/` list being a subset of `PLAN.md`'s File Structure rather than an exhaustive manifest; the specified red state being a pytest collection error with exit code 4 rather than a test failure with exit code 1, which converges on the same observable message text; and the plan's per-action sizing excluding a cold reader's comprehension cost across a 626-line specification and a 26,981-line plan.
 
 Every generated artifact was destroyed without merge. Git had already deregistered the worktree when `git worktree remove` reported a Windows permission error, reproducing the COLDSTART-2 failure mode; the empty directory was removed on a later retry, the disposable branch was deleted, and `main` was confirmed to contain no `src/`, `tests/`, `pyproject.toml`, `uv.lock`, or `.python-version`.
+
+## Stage 5 M1 Planning - candidate rejected, 10 blockers (2026-07-31)
+
+The M1-R1 candidate `PLAN.md` at SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD` received an owner-dispatched independent document review. Verdict: **10 blockers, M1 stops before Task 1**. No implementation was authorized and none was created.
+
+What passed: module coverage is exact. Tasks 1-17 map to 27 slices across 8 serial module worktrees and pull requests with no omission, duplication, or unassigned slice. The per-task protocol, commit trailer grammar, attribution rules, and task commit ledger satisfy the course workflow requirements, and the capacity statement is honest with its dependencies named and no unconditional fit claim.
+
+### Three blockers reopen the frozen specification
+
+The signed `SPEC.md` was approved after three independent reviews each reporting zero blockers. A fourth reader, working from an implementation plan rather than from the specification alone, found three genuine gaps. This is recorded plainly because it qualifies the earlier sign-off: the specification was complete enough to approve and not complete enough to implement from.
+
+1. **Budget Revision field boundary.** Line 481 states the section 10.2 table values "are also non-raiseable v0.1 administrative maxima", proving a value can be a Budget Revision field and non-raiseable simultaneously. Line 499 calls the per-Task limits "likewise" non-raiseable, which points at that same dual status. The narrow reading adopted by M1-R1 assumed non-raiseable implies not-a-Budget-field, and line 481 defeats that inference. Line 493's enumeration of what a Budget Revision "may lower" nonetheless supports the narrow reading, while line 397's "allocation rules" and "governs Run and Task allocation" support the broad one. Both are defensible; only an approved clarification closes it.
+2. **Zero floor for table ceilings.** Line 493 permits lowering any table value but never says whether zero is reachable. A zero calls/tokens/workers proposal can be implemented as a valid stop-budget or as an invalid Revision.
+3. **Active Run time semantics.** Line 485 excludes human-wait and paused states, but lines 310 and 312 describe approval waits and orphaned phases whose lifecycle state remains `ACTIVE`. Billing by lifecycle wall clock and billing only intervals holding a Runtime Permit produce different stop moments.
+
+### Seven blockers are plan defects
+
+Undefined helper functions making two claimed red states unreachable; a recovery ordering that contradicts line 499's approved-higher-Budget resume path; a cross-module forward reference to a test file created three modules later under strictly serial execution; a type consumed two modules before it is defined; three stale post-split selector paths; a slice whose mandatory test edit is missing from its exact stage set; and GitHub Actions deferred to M3 although `SPEC.md` line 561 and course section 4.8 require CI on every push while M1 performs eight module pushes first.
+
+### Required sequence before `M1 GO`
+
+A separately hashed `SPEC.md` clarification proposal covering the three specification gaps, owner approval producing a new digest, an M1-R2 plan correcting the seven plan defects and aligning to the amended specification, and a further independent review returning zero blockers. Only then may the owner give `M1 GO` and authorize the first worktree.
