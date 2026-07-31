@@ -228,3 +228,12 @@ This chronological log records material agent work and human decisions. Future i
 - **Implementation state**: none retained. No `src/`, `tests/`, `fixtures/`, or CI artifact exists on `main`.
 - **Next authorized action**: a new user-owned Stage 4 M0 evaluator, different agent type, fresh session, disposable worktree at the current documentation commit, receiving only frozen `SPEC.md` and R3 `PLAN.md`, attempting Task 1 plus exact `2A` and stopping before ledger, staging, or commit.
 - **Lesson**: a clean working tree on the default branch is not evidence that no work exists. Enumerate refs before judging project state, and treat an unexpectedly quiet history as a prompt to look wider rather than as a finding.
+
+## 2026-07-31 / CLEANUP-2 - Stale Attempt 1 worktree removed
+
+- **Target inspected before deletion**: `C:\Users\29119\.codex\worktrees\stage4-apexcrew-87fd-attempt2`, detached at `07f20aa`. `git status` showed exactly one untracked file, the superseded R1 `PLAN.md`; every other entry was tracked content already present at that commit.
+- **Superseded artifact identified, not silently destroyed**: the R1 plan measured 7,385 lines at SHA-256 `835231CA29C880F875F3FE42C142B2B711CEEF46995448F5B780D0EB3165A676`. That digest is recorded in `SPEC_PROCESS.md` so the artifact Attempt 1 reviewed stays identifiable, while the repository keeps only one plan of record. Its substantive findings were already captured in PLAN-R1 and COLDSTART-1.
+- **Removal**: `git worktree remove --force` deregistered and deleted it without the Windows file-handle failure seen in COLDSTART-2. `git worktree list` now shows only the main worktree and `C:\Users\29119\.codex\worktrees\87fd\AI4SE` on `codex/stage4-m0-plan`, whose commits are merged into `main`.
+- **Rationale**: `SPEC_PROCESS.md` had recorded that this worktree held a pre-R2 plan that must not reach an evaluator. Removing it converts a documented prohibition into a structural impossibility before Attempt 3 is dispatched.
+- **Implementation state**: none retained. `main` remains documentation-only at a clean tree.
+- **Publication state**: unchanged. `origin/main` is still at `e70b3e3`; no push was authorized or performed.
