@@ -270,3 +270,18 @@ The remaining schedule does not close for the full signed scope. Per the Milesto
 - **Promised-but-absent artifacts**: `SECURITY.md` (named in the INITIALIZATION documentation table), `DESIGN.md` (named in SPEC 10.5), `REFLECTION.md` (final phase), `.gitlab-ci.yml` with its exact `unit-test` job, `Makefile`, `pyproject.toml`, `fixtures/`, and all CI workflows. All are expected to be absent at this stage except `SECURITY.md`, which the documentation table implies should already exist.
 - **Carried design question**: the Budget Revision field-scope ambiguity raised as non-blocking finding 1 in COLDSTART-3 must be resolved before Task 10 implements `propose_budget`/`approve_budget`.
 - **Implementation state**: none retained. `main` is documentation-only and clean.
+
+## 2026-07-31 / COURSE-GAP-1 - Graded course requirements not carried by the current plan
+
+A re-read of the course brief against the repository found requirements that `SPEC.md` and the R3 `PLAN.md` do not fully carry. These are graded deliverables, not preferences.
+
+- **PR workflow is mandatory and is currently unmet.** Brief 4.6 requires one worktree per independent feature/large module, each corresponding to one PR; 4.7 rejects a single commit containing everything and requires a complete commit and PR history. All 12 commits to date went directly to `main` with zero PRs, and `.github/PULL_REQUEST_TEMPLATE.md` has never been used. Documentation-only commits are defensible, but M1 implementation must move to worktree-plus-PR boundaries.
+- **Attribution format**: 4.7 requires commit or PR text to state which subagent performed the work and which parts a human changed. Existing commits carry `Co-Authored-By` but not that split.
+- **Two-phase per-task review**: 4.6.4 requires a spec-compliance check followed by a code-quality check after every task, with critical issues fixed before the next task. The current sizing does not visibly include this cost.
+- **Continuous `PLAN.md` updates**: 4.7 requires marking each task complete with its commit hash as it lands.
+- **Submission channel**: deliverable list 5 submits through one NJU GitLab repository link; GitHub is development only. No NJU remote is configured - `origin` is the sole remote. Deliverable 6 requires `.gitlab-ci.yml` with a job named exactly `unit-test`, and deliverable 7 requires the **last CI run to be green**, which is execution work rather than a file drop.
+- **Deliverable 9 tension with the signed scope**: the course requires a publicly reachable URL exposing an accessible WebUI. `SPEC.md` v0.1 excludes hosted backend, production public execution, and a writable WebUI, and its only public surface is a sanitized static fixture replay on GitHub Pages. Whether that satisfies deliverable 9 is a grader judgment. It must be decided explicitly and described accurately in `README.md` rather than left implicit.
+- **`REFLECTION.md` authorship**: brief section 6 requires the student to write it and forbids AI ghost-writing, permitting disclosed AI polish. No agent may draft its content. Planning its schedule and required questions is permitted.
+- **`SECURITY.md`** is named in the `INITIALIZATION.md` documentation table but does not exist; either create it or correct the table.
+
+These findings are inputs to the M1 `PLAN.md` revision, not authorization to change `SPEC.md`. Where a requirement conflicts with the signed specification, the resolution is an explicit owner decision, recorded, and if necessary a proposed specification amendment with a new digest.
