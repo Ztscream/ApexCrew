@@ -237,3 +237,25 @@ This chronological log records material agent work and human decisions. Future i
 - **Rationale**: `SPEC_PROCESS.md` had recorded that this worktree held a pre-R2 plan that must not reach an evaluator. Removing it converts a documented prohibition into a structural impossibility before Attempt 3 is dispatched.
 - **Implementation state**: none retained. `main` remains documentation-only at a clean tree.
 - **Publication state**: unchanged. `origin/main` is still at `e70b3e3`; no push was authorized or performed.
+
+## 2026-07-31 / COLDSTART-3 - Stage 4 M0 review passed with zero blockers
+
+- **Dispatch**: fresh Claude Sonnet 5 evaluator, no inherited context, isolated disposable worktree at `d0ebc62`, inputs restricted to frozen `SPEC.md` (`2F1434AB...663BC`) and R3 `PLAN.md` (`93ADDFE7...90CE`). The Execution Gate's prohibition on loading `superpowers:executing-plans` was passed through explicitly and observed.
+- **Result**: both authorized M0 slices completed with no pause. Task 1 red reproduced the specified `ModuleNotFoundError`; `uv lock --python 3.12` exited 0 resolving 51 packages; Task 1 and `2A` focused selectors turned green; `mypy` succeeded on `types.py` and `revisions.py`; `git diff --check` was clean; `commands.py` was confirmed absent. Verdict `ZERO BLOCKERS` with four non-blocking findings.
+- **Independent verification**: the recorder re-ran the Task 1 and `2A` green selectors and `mypy` inside the evaluator's worktree and observed the same passing output before destroying it. The report was not accepted on its own assertion.
+- **Process-strength qualification**: Attempts 1 and 2 were owner-dispatched Codex evaluators. Attempt 3 was dispatched by the assisting agent inside the same session. Cold context, a different model from both dispatcher and prior evaluators, worktree isolation, and the two-file input restriction all held, and the evaluator disclosed that an early directory listing incidentally exposed forbidden filenames without opening their content. It is still weaker evidence than an owner-opened session because the dispatcher was not independent of the plan. An owner-dispatched Codex confirmation run is recommended before this is cited as sole Stage 4 closure.
+- **Unexercised amendment**: `uv lock` emitted zero warnings, so the R3 correction permitting resolver metadata diagnostics was never triggered. It is written but unvalidated by observation.
+- **Cleanup**: `git worktree remove` reported the same Windows permission error seen in COLDSTART-2 after Git had already deregistered the worktree. The empty directory was removed on retry, `.claude/worktrees/` was removed, and the disposable branch `worktree-agent-adb25cb7a7b91acb4` was deleted. `main` contains no `src/`, `tests/`, `pyproject.toml`, `uv.lock`, or `.python-version`; `git status` is clean.
+- **Implementation state**: none retained. Stage 4 success now authorizes retained re-execution of Task 1 and `2A` under M1, which itself still requires a new exact M1 `PLAN.md` revision, an independent document review, and the owner capacity decision below.
+
+### M0 milestone capacity review (required by `PLAN.md` Milestones section)
+
+| Field | Value |
+|---|---|
+| Elapsed against the planned budget | ~17.9 h of the ~53 h notionally available from 2026-07-26, at the stated 25 h/week |
+| Hours available before the deadline | ~35.7 h (2026-07-31 to 2026-08-10 23:59 Asia/Shanghai at 25 h/week) |
+| Completed retained evidence | None. M0 is disposable by definition; its artifacts were destroyed |
+| Conservative remaining estimate for M1-M4 | Exceeds the hours available. `PLAN.md` already records that the 757 listed 2-5 minute actions alone total 25.2-63.1 raw hours **before** red/green reruns, full regressions, review, evidence recording, and 66 commit boundaries |
+| Owner decision | **PENDING.** Not decided by an agent |
+
+The remaining schedule does not close for the full signed scope. Per the Milestones section the only valid outcomes are a new approved scope revision or additional capacity/time; silently omitting a required signed item is prohibited. The owner must record an explicit `GO` or `HOLD` for M1, and if `GO`, state which signed deliverables move behind the deterministic offline core.

@@ -262,3 +262,31 @@ The external file handle was released at some point after 2026-07-28. On 2026-07
 The stale worktree `C:\Users\29119\.codex\worktrees\stage4-apexcrew-87fd-attempt2`, detached at `07f20aa`, was also removed on 2026-07-31. Its only content outside that commit was an untracked superseded R1 `PLAN.md` of 7,385 lines at SHA-256 `835231CA29C880F875F3FE42C142B2B711CEEF46995448F5B780D0EB3165A676`; that digest is recorded here so the superseded artifact stays identifiable without keeping a second plan inside the repository. Removing it eliminates the risk of handing a pre-R2 plan to an evaluator.
 
 One Codex worktree remains registered and is **not** a cold-start input: `C:\Users\29119\.codex\worktrees\87fd\AI4SE` on branch `codex/stage4-m0-plan`, whose commits are now merged into `main`.
+
+### Stage 4 Attempt 3 - zero blockers (2026-07-31)
+
+| Field | Evidence |
+|---|---|
+| Review snapshot | Disposable isolated worktree at documentation commit `d0ebc62`, branch `worktree-agent-adb25cb7a7b91acb4` |
+| Reviewer context | Fresh Claude Sonnet 5 evaluator with no inherited task context; received only the dispatch text, and used only frozen `SPEC.md` and R3 `PLAN.md` |
+| Frozen specification | SHA-256 `2F1434AB29C3B7205B13CA96FE35D18C7666729F633EDF984F1DFCA54F0663BC` |
+| Plan under review | `PLAN.md` SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE` |
+| Prerequisite | `uv python find 3.12` PASS, selecting CPython 3.12.12 |
+| Task 1 red | `ModuleNotFoundError: No module named 'apexcrew'` as specified, persisting after `pyproject.toml` |
+| Task 1 Step 8 | `uv lock --python 3.12` exit 0, `Resolved 51 packages`, `uv.lock` written at 73,519 bytes, **zero warnings emitted** |
+| Task 1 green | `pytest tests/unit/test_package.py::test_package_exposes_initial_version` passed |
+| `2A` red | `ModuleNotFoundError: No module named 'apexcrew.domain'` as specified |
+| `2A` green | Focused revision selector passed; the revision-document import check exited 0; `mypy` reported success on both files; `git diff --check` clean |
+| Produced boundary | `src/apexcrew/domain/commands.py` confirmed absent after `2A` |
+| Stop discipline | Stopped before each slice's evidence/commit step; nothing staged, committed, or pushed; root process documents untouched |
+| Verdict | **ZERO BLOCKERS**, with four non-blocking findings |
+
+Attempt 3 is the first Stage 4 attempt to complete both authorized M0 slices without a pause. The recorder independently re-ran the `2A` and Task 1 green selectors and `mypy` in the evaluator's worktree before destroying it, and observed the same passing output rather than accepting the report unverified.
+
+**Process-strength qualification, recorded rather than glossed.** Attempts 1 and 2 used user-owned Codex evaluators dispatched by the repository owner. Attempt 3 used a subagent dispatched by the assisting agent inside the same working session. Cold context, a different model from both the dispatcher and the prior evaluators, an isolated disposable worktree, and the `SPEC.md`/`PLAN.md`-only input restriction were all satisfied, and the evaluator disclosed that an early directory listing incidentally exposed forbidden **filenames** while no forbidden file content was opened. It nevertheless remains weaker process evidence than an owner-opened fresh session, because the dispatcher was not independent of the plan under review. A confirming owner-dispatched Codex run is recommended before this result is cited as the sole Stage 4 closure.
+
+**The R3 resolver-diagnostic amendment remains unexercised.** `uv lock` emitted no warnings at all in this run, so the exact condition that stopped Attempt 2 did not recur and the amendment permitting those warnings was never tested by observation. It is written correctly but unvalidated.
+
+The four non-blocking findings are: an unclear boundary in `SPEC.md` §10.2 between the seven headline Budget values and the per-Task administrative caps, which `PLAN.md` models as one document of independently proposable fields and which Task 10 will have to resolve; `SPEC.md` §4.1's `domain/` list being a subset of `PLAN.md`'s File Structure rather than an exhaustive manifest; the specified red state being a pytest collection error with exit code 4 rather than a test failure with exit code 1, which converges on the same observable message text; and the plan's per-action sizing excluding a cold reader's comprehension cost across a 626-line specification and a 26,981-line plan.
+
+Every generated artifact was destroyed without merge. Git had already deregistered the worktree when `git worktree remove` reported a Windows permission error, reproducing the COLDSTART-2 failure mode; the empty directory was removed on a later retry, the disposable branch was deleted, and `main` was confirmed to contain no `src/`, `tests/`, `pyproject.toml`, `uv.lock`, or `.python-version`.
