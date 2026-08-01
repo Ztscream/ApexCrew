@@ -12,6 +12,12 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
 )
+from apexcrew.domain.model import (
+    ModelCompletion,
+    ModelDispatchResult,
+    ModelRequest,
+    ModelRequestIntent,
+)
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
@@ -118,6 +124,26 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def unsettled_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        raise NotImplementedError
+
+    def reserve_model_request(
+        self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> ModelRequestIntent:
+        raise NotImplementedError
+
+    def settle_model_request(
+        self,
+        intent: ModelRequestIntent,
+        completion: ModelCompletion,
+        allowed_model_ids: frozenset[str],
+        expected_sequence: AuditSequence,
+    ) -> ModelDispatchResult:
+        raise NotImplementedError
+
+    def model_request(self, run_id: RunId, intent_id: IntentId) -> ModelRequestIntent:
+        raise NotImplementedError
+
+    def reserved_call_count(self, run_id: RunId) -> int:
         raise NotImplementedError
 
 

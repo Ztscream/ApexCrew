@@ -2,6 +2,7 @@ import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from apexcrew.domain.effects import (
     StateCommitFault,
     StateConflict,
 )
+from apexcrew.domain.model import ModelRequest
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -36,6 +38,25 @@ from apexcrew.domain.types import (
 )
 
 
+def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
+    return ModelRequest(
+        run_id="run-1",
+        plan_digest=None,
+        policy_digest="sha256:" + "3" * 64,
+        budget_digest="sha256:" + "4" * 64,
+        model_configuration_digest="sha256:" + "5" * 64,
+        requested_model_id="gpt-5.6-terra",
+        allowed_model_ids=frozenset(allowed_model_ids),
+        prompt=({"role": "user", "content": "finish"},),
+        tool_schema_digest="sha256:" + "1" * 64,
+        request_digest="sha256:" + "2" * 64,
+        idempotency_key="request-1",
+        max_input_tokens=1_000,
+        max_output_tokens=200,
+        reserved_cost_usd=Decimal("0.01"),
+    )
+
+
 def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
     del tmp_path
     return InMemoryStateStore()
@@ -43,6 +64,43 @@ def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
 
 def sqlite_store_factory(tmp_path: Path) -> SqliteStateStore:
     return SqliteStateStore(tmp_path / "state.db")
+
+
+def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:
+    database = tmp_path / "state.db"
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    first = SqliteStateStore(database)
+    before = first.audit_sequence(request.run_id)
+    intent = first.reserve_model_request(request, expected_sequence=before)
+    assert first.audit_sequence(request.run_id) == before + 1
+    first.close()
+    reopened = SqliteStateStore(database)
+    restored = reopened.model_request(request.run_id, intent.intent_id)
+    assert restored.intent_id == intent.intent_id
+    assert restored.logical_turn_id == intent.logical_turn_id
+    assert restored.request.request_digest == request.request_digest
+    assert restored.request.allowed_model_ids == frozenset({"gpt-5.6-terra"})
+    assert reopened.reserved_call_count(request.run_id) == 1
+
+
+def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
+    request = replace(
+        make_model_request(allowed_model_ids={"gpt-5.6-terra"}),
+        owner_kind="WORKER",
+        task_id=TaskId("task-1"),
+        attempt_id=AttemptId("attempt-1"),
+        tranche_id="tranche-1",
+    )
+    database = tmp_path / "state.db"
+    first = SqliteStateStore(database)
+    intent = first.reserve_model_request(
+        request, expected_sequence=first.audit_sequence(request.run_id)
+    )
+    first.close()
+    reopened = SqliteStateStore(database)
+    restored = reopened.model_request(request.run_id, intent.intent_id)
+    assert restored.request == request
+    assert restored.request.owner_kind == "WORKER"
 
 
 def make_test_effect_intent(
