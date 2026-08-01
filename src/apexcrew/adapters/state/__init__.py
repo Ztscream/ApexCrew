@@ -1,0 +1,1 @@
+"""Durable state adapter implementations."""
