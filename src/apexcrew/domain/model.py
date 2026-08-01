@@ -63,6 +63,43 @@ class ModelRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelRecoveryBinding:
+    request_digest: str
+    tool_schema_digest: str
+    plan_digest: RevisionDigest | None
+    policy_digest: RevisionDigest
+    budget_digest: RevisionDigest
+    model_configuration_digest: RevisionDigest
+
+    @classmethod
+    def from_request(cls, request: ModelRequest) -> ModelRecoveryBinding:
+        return cls(
+            request.request_digest,
+            request.tool_schema_digest,
+            request.plan_digest,
+            request.policy_digest,
+            request.budget_digest,
+            request.model_configuration_digest,
+        )
+
+
+RecoveryBlock = Literal[
+    "MODEL_COMPLETION_NOT_COMMITTED",
+    "RECOVERY_BINDING_MISMATCH",
+    "DOWNSTREAM_INTENT_REQUIRES_RECONCILIATION",
+]
+ModelDispatchOutcome = Literal[
+    "COMPLETED",
+    "RETURNED_MODEL_MISMATCH",
+    "KNOWN_CLOSED_REJECTION",
+    "INDETERMINATE",
+    "MODEL_COMPLETION_NOT_COMMITTED",
+    "RECOVERY_BINDING_MISMATCH",
+    "DOWNSTREAM_INTENT_REQUIRES_RECONCILIATION",
+]
+
+
+@dataclass(frozen=True, slots=True)
 class ModelCompletion:
     response_id: str
     requested_model_id: str
@@ -130,6 +167,10 @@ class ModelBudgetAmounts:
     input_tokens: int
     output_tokens: int
     cost_usd: Decimal
+
+    @classmethod
+    def zero(cls) -> ModelBudgetAmounts:
+        return cls(calls=0, input_tokens=0, output_tokens=0, cost_usd=Decimal(0))
 
     def to_json(self) -> str:
         return json.dumps(
@@ -230,16 +271,48 @@ class ModelRequestIntent:
 class ModelDispatchResult:
     run_id: RunId
     logical_turn_id: LogicalTurnId
-    outcome: Literal[
-        "COMPLETED",
-        "KNOWN_CLOSED_REJECTION",
-        "RETURNED_MODEL_MISMATCH",
-        "INDETERMINATE",
-    ]
+    outcome: ModelDispatchOutcome
     returned_model_id: str | None
     normalized_action: Mapping[str, object] | None
     normalized_payload_digest: str | None
     charged_amounts: ModelBudgetAmounts
+
+    @classmethod
+    def blocked(
+        cls,
+        *,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        outcome: RecoveryBlock,
+    ) -> ModelDispatchResult:
+        return cls(
+            run_id=run_id,
+            logical_turn_id=logical_turn_id,
+            outcome=outcome,
+            returned_model_id=None,
+            normalized_action=None,
+            normalized_payload_digest=None,
+            charged_amounts=ModelBudgetAmounts.zero(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedModelTurn:
+    run_id: RunId
+    logical_turn_id: LogicalTurnId
+    owner_kind: Literal["PLANNING", "WORKER"]
+    task_id: TaskId | None
+    attempt_id: AttemptId | None
+    tranche_id: str | None
+    recovery_binding: ModelRecoveryBinding
+    returned_model_id: str
+    normalized_output_digest: str
+    normalized_payload: Mapping[str, object]
+    dispatch_result: ModelDispatchResult
+    committed_sequence: AuditSequence
+    state: Literal["COMPLETION_COMMITTED", "DOWNSTREAM_INTENT_RECORDED"]
+    downstream_intent_id: IntentId | None
+    downstream_sequence: AuditSequence | None
 
 
 def _normalized_payload_digest(payload: Mapping[str, object]) -> str:
@@ -451,8 +524,71 @@ def model_request_from_json(value: str) -> ModelRequest:
     )
 
 
+def model_recovery_binding_to_json(binding: ModelRecoveryBinding) -> str:
+    return json.dumps(
+        {
+            "budget_digest": binding.budget_digest,
+            "model_configuration_digest": binding.model_configuration_digest,
+            "plan_digest": binding.plan_digest,
+            "policy_digest": binding.policy_digest,
+            "request_digest": binding.request_digest,
+            "tool_schema_digest": binding.tool_schema_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def model_recovery_binding_from_json(value: str) -> ModelRecoveryBinding:
+    data = json.loads(value)
+    return ModelRecoveryBinding(
+        request_digest=data["request_digest"],
+        tool_schema_digest=data["tool_schema_digest"],
+        plan_digest=(None if data["plan_digest"] is None else RevisionDigest(data["plan_digest"])),
+        policy_digest=RevisionDigest(data["policy_digest"]),
+        budget_digest=RevisionDigest(data["budget_digest"]),
+        model_configuration_digest=RevisionDigest(data["model_configuration_digest"]),
+    )
+
+
+def model_dispatch_result_to_json(result: ModelDispatchResult) -> str:
+    return json.dumps(
+        {
+            "charged_amounts": json.loads(result.charged_amounts.to_json()),
+            "logical_turn_id": result.logical_turn_id,
+            "normalized_action": result.normalized_action,
+            "normalized_payload_digest": result.normalized_payload_digest,
+            "outcome": result.outcome,
+            "returned_model_id": result.returned_model_id,
+            "run_id": result.run_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def model_dispatch_result_from_json(value: str) -> ModelDispatchResult:
+    data = json.loads(value)
+    return ModelDispatchResult(
+        run_id=RunId(data["run_id"]),
+        logical_turn_id=data["logical_turn_id"],
+        outcome=data["outcome"],
+        returned_model_id=data["returned_model_id"],
+        normalized_action=data["normalized_action"],
+        normalized_payload_digest=data["normalized_payload_digest"],
+        charged_amounts=ModelBudgetAmounts.from_json(
+            json.dumps(data["charged_amounts"], sort_keys=True, separators=(",", ":"))
+        ),
+    )
+
+
 class ModelJournal(Protocol):
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        raise NotImplementedError
+
+    def committed_model_turn(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> CommittedModelTurn | None:
         raise NotImplementedError
 
     def begin_model_turn_and_reserve(
@@ -503,6 +639,33 @@ class DurableModelClient:
         self._journal = journal
         self._backoff = ImmediateBackoff() if backoff is None else backoff
         self.journal = journal
+
+    def recover_committed(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        expected: ModelRecoveryBinding,
+    ) -> ModelDispatchResult:
+        committed = self._journal.committed_model_turn(run_id, logical_turn_id)
+        if committed is None:
+            return ModelDispatchResult.blocked(
+                run_id=run_id,
+                logical_turn_id=logical_turn_id,
+                outcome="MODEL_COMPLETION_NOT_COMMITTED",
+            )
+        if committed.recovery_binding != expected:
+            return ModelDispatchResult.blocked(
+                run_id=run_id,
+                logical_turn_id=logical_turn_id,
+                outcome="RECOVERY_BINDING_MISMATCH",
+            )
+        if committed.downstream_intent_id is not None:
+            return ModelDispatchResult.blocked(
+                run_id=run_id,
+                logical_turn_id=logical_turn_id,
+                outcome="DOWNSTREAM_INTENT_REQUIRES_RECONCILIATION",
+            )
+        return committed.dispatch_result
 
     def complete(self, request: ModelRequest) -> ModelDispatchResult:
         for retry_index in range(V01_MECHANISM_LIMITS.provider_retry_ceiling + 1):

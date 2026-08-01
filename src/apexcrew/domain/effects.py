@@ -13,7 +13,9 @@ from apexcrew.domain.commands import (
     CommandOutcome,
 )
 from apexcrew.domain.model import (
+    CommittedModelTurn,
     LogicalModelTurn,
+    LogicalTurnId,
     ModelCompletion,
     ModelDispatchResult,
     ModelRequest,
@@ -127,6 +129,20 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def unsettled_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        raise NotImplementedError
+
+    def committed_model_turn(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> CommittedModelTurn | None:
+        raise NotImplementedError
+
+    def record_downstream_action_intent(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        intent: EffectIntent,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
         raise NotImplementedError
 
     def begin_model_turn_and_reserve(

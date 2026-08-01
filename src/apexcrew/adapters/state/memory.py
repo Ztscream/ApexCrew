@@ -21,13 +21,16 @@ from apexcrew.domain.effects import (
     sha256_digest,
 )
 from apexcrew.domain.model import (
+    CommittedModelTurn,
     LogicalModelTurn,
     LogicalTurnId,
     ModelCompletion,
     ModelCounters,
     ModelDispatchResult,
+    ModelRecoveryBinding,
     ModelRequest,
     ModelRequestIntent,
+    ProviderAttemptKind,
     ProviderAttemptResult,
     SettledModelAttempt,
 )
@@ -72,7 +75,7 @@ class InMemoryStateStore:
         self._sequences: dict[RunId, AuditSequence] = {}
         self._effect_intents: dict[IntentId, EffectIntent] = {}
         self._effect_results: dict[IntentId, EffectResult] = {}
-        self._model_turns: dict[LogicalTurnId, LogicalModelTurn] = {}
+        self._model_turns: dict[LogicalTurnId, LogicalModelTurn | CommittedModelTurn] = {}
         self._model_attempt_numbers: dict[tuple[RunId, LogicalTurnId, int], IntentId] = {}
         self._model_attempts: dict[IntentId, ModelRequestIntent | SettledModelAttempt] = {}
         self._model_counters: dict[RunId, ModelCounters] = {}
@@ -383,6 +386,12 @@ class InMemoryStateStore:
             )
         )
 
+    def committed_model_turn(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> CommittedModelTurn | None:
+        turn = self._model_turns.get(logical_turn_id)
+        return turn if isinstance(turn, CommittedModelTurn) and turn.run_id == run_id else None
+
     def settle_model_attempt(
         self,
         intent: ModelRequestIntent,
@@ -403,6 +412,35 @@ class InMemoryStateStore:
             copied._model_counters[intent.run_id] = copied.model_counters(intent.run_id).settle(
                 settled.reserved_amounts, settled.charged_amounts
             )
+            if settled.kind is ProviderAttemptKind.COMPLETED:
+                dispatch = settled.dispatch_result
+                if dispatch.outcome == "COMPLETED":
+                    if (
+                        dispatch.returned_model_id is None
+                        or dispatch.normalized_payload_digest is None
+                        or dispatch.normalized_action is None
+                    ):
+                        raise StateConflict("MODEL_COMPLETION_NOT_RELEASABLE")
+                    turn = copied._model_turns[intent.logical_turn_id]
+                    if not isinstance(turn, LogicalModelTurn) or turn.run_id != intent.run_id:
+                        raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
+                    copied._model_turns[intent.logical_turn_id] = CommittedModelTurn(
+                        run_id=intent.run_id,
+                        logical_turn_id=intent.logical_turn_id,
+                        owner_kind=intent.request.owner_kind,
+                        task_id=intent.request.task_id,
+                        attempt_id=intent.request.attempt_id,
+                        tranche_id=intent.request.tranche_id,
+                        recovery_binding=ModelRecoveryBinding.from_request(intent.request),
+                        returned_model_id=dispatch.returned_model_id,
+                        normalized_output_digest=dispatch.normalized_payload_digest,
+                        normalized_payload=dispatch.normalized_action,
+                        dispatch_result=dispatch,
+                        committed_sequence=AuditSequence(expected_sequence + 1),
+                        state="COMPLETION_COMMITTED",
+                        downstream_intent_id=None,
+                        downstream_sequence=None,
+                    )
 
         self._commit_state_and_event(
             run_id=intent.run_id,
@@ -411,6 +449,42 @@ class InMemoryStateStore:
             mutate=mutate,
         )
         return settled
+
+    def record_downstream_action_intent(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        intent: EffectIntent,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if intent.run_id != run_id:
+            raise StateConflict("DOWNSTREAM_INTENT_RUN_MISMATCH")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            turn = copied._model_turns[logical_turn_id]
+            if (
+                not isinstance(turn, CommittedModelTurn)
+                or turn.run_id != run_id
+                or turn.state != "COMPLETION_COMMITTED"
+                or turn.downstream_intent_id is not None
+            ):
+                raise StateConflict("DOWNSTREAM_INTENT_ALREADY_RECORDED")
+            if intent.intent_id in copied._effect_intents:
+                raise StateConflict("EFFECT_INTENT_REUSED")
+            copied._effect_intents[intent.intent_id] = intent
+            copied._model_turns[logical_turn_id] = replace(
+                turn,
+                state="DOWNSTREAM_INTENT_RECORDED",
+                downstream_intent_id=intent.intent_id,
+                downstream_sequence=AuditSequence(expected_sequence + 1),
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_DOWNSTREAM_INTENT_RECORDED"),
+            mutate=mutate,
+        )
 
     def record_model_backoff(
         self,

@@ -24,17 +24,23 @@ from apexcrew.domain.effects import (
     sha256_digest,
 )
 from apexcrew.domain.model import (
+    CommittedModelTurn,
     LogicalModelTurn,
     LogicalTurnId,
     ModelBudgetAmounts,
     ModelCompletion,
     ModelCounters,
     ModelDispatchResult,
+    ModelRecoveryBinding,
     ModelRequest,
     ModelRequestIntent,
     ProviderAttemptKind,
     ProviderAttemptResult,
     SettledModelAttempt,
+    model_dispatch_result_from_json,
+    model_dispatch_result_to_json,
+    model_recovery_binding_from_json,
+    model_recovery_binding_to_json,
     model_request_from_json,
     model_request_to_json,
 )
@@ -146,6 +152,23 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 output_tokens INTEGER NOT NULL,
                 cost_usd TEXT NOT NULL
             )""",
+        ),
+    ),
+    (
+        4,
+        (
+            "ALTER TABLE model_turns ADD COLUMN recovery_binding_json TEXT",
+            "ALTER TABLE model_turns ADD COLUMN owner_kind TEXT",
+            "ALTER TABLE model_turns ADD COLUMN task_id TEXT",
+            "ALTER TABLE model_turns ADD COLUMN attempt_id TEXT",
+            "ALTER TABLE model_turns ADD COLUMN tranche_id TEXT",
+            "ALTER TABLE model_turns ADD COLUMN returned_model_id TEXT",
+            "ALTER TABLE model_turns ADD COLUMN normalized_output_digest TEXT",
+            "ALTER TABLE model_turns ADD COLUMN normalized_payload_json TEXT",
+            "ALTER TABLE model_turns ADD COLUMN dispatch_result_json TEXT",
+            "ALTER TABLE model_turns ADD COLUMN committed_sequence INTEGER",
+            "ALTER TABLE model_turns ADD COLUMN downstream_intent_id TEXT",
+            "ALTER TABLE model_turns ADD COLUMN downstream_sequence INTEGER",
         ),
     ),
 )
@@ -796,6 +819,45 @@ class SqliteStateStore:
                 intent.reserved_amounts,
                 settled.charged_amounts,
             )
+            if settled.kind is ProviderAttemptKind.COMPLETED:
+                dispatch = settled.dispatch_result
+                if dispatch.outcome == "COMPLETED":
+                    if (
+                        dispatch.returned_model_id is None
+                        or dispatch.normalized_payload_digest is None
+                        or dispatch.normalized_action is None
+                    ):
+                        raise StateConflict("MODEL_COMPLETION_NOT_RELEASABLE")
+                    committed = connection.execute(
+                        "UPDATE model_turns SET owner_kind = ?, task_id = ?, attempt_id = ?, "
+                        "tranche_id = ?, recovery_binding_json = ?, returned_model_id = ?, "
+                        "normalized_output_digest = ?, normalized_payload_json = ?, "
+                        "dispatch_result_json = ?, committed_sequence = ?, "
+                        "state = 'COMPLETION_COMMITTED' WHERE run_id = ? "
+                        "AND logical_turn_id = ? AND state = 'OPEN'",
+                        (
+                            intent.request.owner_kind,
+                            intent.request.task_id,
+                            intent.request.attempt_id,
+                            intent.request.tranche_id,
+                            model_recovery_binding_to_json(
+                                ModelRecoveryBinding.from_request(intent.request)
+                            ),
+                            dispatch.returned_model_id,
+                            dispatch.normalized_payload_digest,
+                            json.dumps(
+                                dispatch.normalized_action,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            model_dispatch_result_to_json(dispatch),
+                            expected_sequence + 1,
+                            intent.run_id,
+                            intent.logical_turn_id,
+                        ),
+                    ).rowcount
+                    if committed != 1:
+                        raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
 
         self._commit_state_and_event(
             run_id=intent.run_id,
@@ -804,6 +866,40 @@ class SqliteStateStore:
             mutate=mutate,
         )
         return settled
+
+    def record_downstream_action_intent(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        intent: EffectIntent,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if intent.run_id != run_id:
+            raise StateConflict("DOWNSTREAM_INTENT_RUN_MISMATCH")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._insert_effect_intent(connection, intent)
+            changed = connection.execute(
+                "UPDATE model_turns SET downstream_intent_id = ?, "
+                "downstream_sequence = ?, state = 'DOWNSTREAM_INTENT_RECORDED' "
+                "WHERE run_id = ? AND logical_turn_id = ? "
+                "AND state = 'COMPLETION_COMMITTED' AND downstream_intent_id IS NULL",
+                (
+                    intent.intent_id,
+                    expected_sequence + 1,
+                    run_id,
+                    logical_turn_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflict("DOWNSTREAM_INTENT_ALREADY_RECORDED")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_DOWNSTREAM_INTENT_RECORDED"),
+            mutate=mutate,
+        )
 
     def record_model_backoff(
         self,
@@ -871,6 +967,56 @@ class SqliteStateStore:
                 )
             )
         return tuple(attempts)
+
+    def committed_model_turn(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> CommittedModelTurn | None:
+        row = self._connection.execute(
+            "SELECT logical_turn_id, owner_kind, task_id, attempt_id, tranche_id, "
+            "recovery_binding_json, returned_model_id, normalized_output_digest, "
+            "normalized_payload_json, dispatch_result_json, committed_sequence, state, "
+            "downstream_intent_id, downstream_sequence FROM model_turns "
+            "WHERE run_id = ? AND logical_turn_id = ?",
+            (run_id, logical_turn_id),
+        ).fetchone()
+        if row is None or row[11] not in {
+            "COMPLETION_COMMITTED",
+            "DOWNSTREAM_INTENT_RECORDED",
+        }:
+            return None
+        if any(row[index] is None for index in (1, 5, 6, 7, 8, 9, 10)):
+            raise StateConflict("COMMITTED_MODEL_TURN_INCOMPLETE")
+        if row[1] == "PLANNING" and any(row[index] is not None for index in (2, 3, 4)):
+            raise StateConflict("COMMITTED_MODEL_OWNER_BINDING_MISMATCH")
+        if row[1] == "WORKER" and any(row[index] is None for index in (2, 3, 4)):
+            raise StateConflict("COMMITTED_MODEL_OWNER_BINDING_MISMATCH")
+        dispatch = model_dispatch_result_from_json(row[9])
+        payload = json.loads(row[8])
+        if (
+            dispatch.run_id != run_id
+            or dispatch.logical_turn_id != row[0]
+            or dispatch.returned_model_id != row[6]
+            or dispatch.normalized_payload_digest != row[7]
+            or dispatch.normalized_action != payload
+        ):
+            raise StateConflict("COMMITTED_MODEL_TURN_BINDING_MISMATCH")
+        return CommittedModelTurn(
+            run_id=run_id,
+            logical_turn_id=row[0],
+            owner_kind=row[1],
+            task_id=None if row[2] is None else TaskId(row[2]),
+            attempt_id=None if row[3] is None else AttemptId(row[3]),
+            tranche_id=row[4],
+            recovery_binding=model_recovery_binding_from_json(row[5]),
+            returned_model_id=row[6],
+            normalized_output_digest=row[7],
+            normalized_payload=payload,
+            dispatch_result=dispatch,
+            committed_sequence=AuditSequence(row[10]),
+            state=row[11],
+            downstream_intent_id=(None if row[12] is None else IntentId(row[12])),
+            downstream_sequence=(None if row[13] is None else AuditSequence(row[13])),
+        )
 
     def reserved_call_count(self, run_id: RunId) -> int:
         with self._read_transaction() as connection:
