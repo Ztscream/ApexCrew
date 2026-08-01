@@ -26,7 +26,12 @@ from apexcrew.domain.effects import (
     StateCommitFault,
     StateConflict,
 )
-from apexcrew.domain.model import ModelRequest
+from apexcrew.domain.model import (
+    LogicalModelTurn,
+    ModelRequest,
+    ModelRequestIntent,
+    ProviderAttemptResult,
+)
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -101,6 +106,88 @@ def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
     restored = reopened.model_request(request.run_id, intent.intent_id)
     assert restored.request == request
     assert restored.request.owner_kind == "WORKER"
+
+
+def test_sqlite_model_backoff_survives_restart(tmp_path: Path) -> None:
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    turn, intent = store.begin_model_turn_and_reserve(
+        request, expected_sequence=store.audit_sequence(request.run_id)
+    )
+    store.settle_model_attempt(
+        intent,
+        ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION"),
+        expected_sequence=store.audit_sequence(request.run_id),
+    )
+    store.record_model_backoff(
+        request.run_id,
+        intent.intent_id,
+        seconds=1,
+        expected_sequence=store.audit_sequence(request.run_id),
+    )
+    store.close()
+    attempts = SqliteStateStore(database).model_attempts(request.run_id, turn.logical_turn_id)
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "KNOWN_CLOSED_REJECTION"
+    assert attempts[0].backoff_seconds == 1
+    assert attempts[0].charged_amounts == attempts[0].reserved_amounts
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_model_attempt_cannot_be_settled_twice(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    _, intent = store.begin_model_turn_and_reserve(
+        request, expected_sequence=store.audit_sequence(request.run_id)
+    )
+    result = ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION")
+    store.settle_model_attempt(
+        intent, result, expected_sequence=store.audit_sequence(request.run_id)
+    )
+    before = store.audit_sequence(request.run_id)
+    counters = store.model_counters(request.run_id)
+    with pytest.raises(StateConflict, match="MODEL_ATTEMPT_ALREADY_SETTLED"):
+        store.settle_model_attempt(intent, result, expected_sequence=before)
+    assert store.audit_sequence(request.run_id) == before
+    assert store.model_counters(request.run_id) == counters
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_unjournaled_model_attempt_cannot_be_settled(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    turn = LogicalModelTurn.new(request)
+    intent = ModelRequestIntent.reserve(turn, request)
+    with pytest.raises(StateConflict, match="MODEL_ATTEMPT_BINDING_MISMATCH"):
+        store.settle_model_attempt(
+            intent,
+            ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION"),
+            expected_sequence=store.audit_sequence(request.run_id),
+        )
+    assert store.audit_sequence(request.run_id) == 0
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_model_reservation_and_counters_roll_back_together(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    before = store.audit_sequence(request.run_id)
+    store.fail_next_commit_after_state_write_for_test()
+    with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):
+        store.begin_model_turn_and_reserve(request, expected_sequence=before)
+    assert store.audit_sequence(request.run_id) == before
+    assert store.reserved_call_count(request.run_id) == 0
+    assert store.model_counters(request.run_id).calls == 0
 
 
 def make_test_effect_intent(

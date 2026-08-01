@@ -24,14 +24,19 @@ from apexcrew.domain.effects import (
     sha256_digest,
 )
 from apexcrew.domain.model import (
+    LogicalModelTurn,
+    LogicalTurnId,
     ModelBudgetAmounts,
     ModelCompletion,
+    ModelCounters,
     ModelDispatchResult,
     ModelRequest,
     ModelRequestIntent,
+    ProviderAttemptKind,
+    ProviderAttemptResult,
+    SettledModelAttempt,
     model_request_from_json,
     model_request_to_json,
-    settle_model_completion,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import (
@@ -115,6 +120,31 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 result_json TEXT,
                 FOREIGN KEY(run_id, logical_turn_id)
                     REFERENCES model_turns(run_id, logical_turn_id)
+            )""",
+        ),
+    ),
+    (
+        3,
+        (
+            "ALTER TABLE model_attempts ADD COLUMN provider_attempt_number INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE model_attempts ADD COLUMN outcome TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN provider_response_id TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN reason_code TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN reported_usage_json TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN backoff_seconds INTEGER",
+            "ALTER TABLE model_attempts ADD COLUMN result_digest TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN charged_json TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN reserved_sequence INTEGER",
+            "ALTER TABLE model_attempts ADD COLUMN settled_sequence INTEGER",
+            "ALTER TABLE model_attempts ADD COLUMN backoff_sequence INTEGER",
+            """CREATE UNIQUE INDEX model_attempt_number_once
+                ON model_attempts(run_id, logical_turn_id, provider_attempt_number)""",
+            """CREATE TABLE model_counters (
+                run_id TEXT PRIMARY KEY,
+                calls INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd TEXT NOT NULL
             )""",
         ),
     ),
@@ -475,54 +505,139 @@ class SqliteStateStore:
             mutate=lambda connection: None,
         )
 
-    def reserve_model_request(
-        self, request: ModelRequest, expected_sequence: AuditSequence
-    ) -> ModelRequestIntent:
-        intent = ModelRequestIntent.reserve(request)
-        reserved_json = json.dumps(
-            {
-                "calls": intent.reserved_amounts.calls,
-                "cost_usd": str(intent.reserved_amounts.cost_usd),
-                "input_tokens": intent.reserved_amounts.input_tokens,
-                "output_tokens": intent.reserved_amounts.output_tokens,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+    def _write_model_counters(
+        self, connection: sqlite3.Connection, run_id: RunId, counters: ModelCounters
+    ) -> None:
+        connection.execute(
+            "INSERT INTO model_counters(run_id, calls, input_tokens, output_tokens, "
+            "cost_usd) VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+            "calls = excluded.calls, input_tokens = excluded.input_tokens, "
+            "output_tokens = excluded.output_tokens, cost_usd = excluded.cost_usd",
+            (
+                run_id,
+                counters.calls,
+                counters.input_tokens,
+                counters.output_tokens,
+                str(counters.cost_usd),
+            ),
         )
 
+    def _model_counters(self, connection: sqlite3.Connection, run_id: RunId) -> ModelCounters:
+        row = connection.execute(
+            "SELECT calls, input_tokens, output_tokens, cost_usd "
+            "FROM model_counters WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return ModelCounters()
+        return ModelCounters(row[0], row[1], row[2], Decimal(row[3]))
+
+    def _reserve_model_counters(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        reserved: ModelBudgetAmounts,
+    ) -> None:
+        self._write_model_counters(
+            connection, run_id, self._model_counters(connection, run_id).reserve(reserved)
+        )
+
+    def model_counters(self, run_id: RunId) -> ModelCounters:
+        return self._model_counters(self._connection, run_id)
+
+    def begin_model_turn_and_reserve(
+        self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> tuple[LogicalModelTurn, ModelRequestIntent]:
+        turn = LogicalModelTurn.new(request)
+        intent = ModelRequestIntent.reserve(turn, request, provider_attempt_number=1)
+
         def mutate(connection: sqlite3.Connection) -> None:
+            self._reserve_model_counters(connection, request.run_id, intent.reserved_amounts)
             connection.execute(
                 "INSERT INTO model_turns(logical_turn_id, run_id, request_digest, "
                 "created_sequence, state) VALUES (?, ?, ?, ?, 'OPEN')",
                 (
-                    intent.logical_turn_id,
+                    turn.logical_turn_id,
                     request.run_id,
                     request.request_digest,
                     expected_sequence + 1,
                 ),
             )
             connection.execute(
-                "INSERT INTO model_attempts(intent_id, run_id, logical_turn_id, request_json, "
-                "request_digest, idempotency_key, reserved_json, allowed_model_ids_json, state) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED')",
+                "INSERT INTO model_attempts(intent_id, run_id, logical_turn_id, "
+                "provider_attempt_number, request_json, request_digest, idempotency_key, "
+                "reserved_json, allowed_model_ids_json, reserved_sequence, state) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'RESERVED')",
                 (
                     intent.intent_id,
                     request.run_id,
-                    intent.logical_turn_id,
+                    turn.logical_turn_id,
                     model_request_to_json(request),
                     request.request_digest,
                     request.idempotency_key,
-                    reserved_json,
+                    intent.reserved_amounts.to_json(),
                     json.dumps(sorted(request.allowed_model_ids), separators=(",", ":")),
+                    expected_sequence + 1,
                 ),
             )
 
         self._commit_state_and_event(
             run_id=request.run_id,
             expected_sequence=expected_sequence,
-            event=AuditEvent.kind("MODEL_REQUEST_RESERVED"),
+            event=AuditEvent.kind("MODEL_TURN_AND_ATTEMPT_RESERVED"),
             mutate=mutate,
         )
+        return turn, intent
+
+    def reserve_model_attempt(
+        self,
+        turn: LogicalModelTurn,
+        request: ModelRequest,
+        provider_attempt_number: int,
+        expected_sequence: AuditSequence,
+    ) -> ModelRequestIntent:
+        intent = ModelRequestIntent.reserve(turn, request, provider_attempt_number)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            bound = connection.execute(
+                "SELECT 1 FROM model_turns WHERE run_id = ? AND logical_turn_id = ? "
+                "AND request_digest = ? AND state = 'OPEN'",
+                (request.run_id, turn.logical_turn_id, request.request_digest),
+            ).fetchone()
+            if bound is None:
+                raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
+            self._reserve_model_counters(connection, request.run_id, intent.reserved_amounts)
+            connection.execute(
+                "INSERT INTO model_attempts(intent_id, run_id, logical_turn_id, "
+                "provider_attempt_number, request_json, request_digest, idempotency_key, "
+                "reserved_json, allowed_model_ids_json, reserved_sequence, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED')",
+                (
+                    intent.intent_id,
+                    request.run_id,
+                    turn.logical_turn_id,
+                    provider_attempt_number,
+                    model_request_to_json(request),
+                    request.request_digest,
+                    request.idempotency_key,
+                    intent.reserved_amounts.to_json(),
+                    json.dumps(sorted(request.allowed_model_ids), separators=(",", ":")),
+                    expected_sequence + 1,
+                ),
+            )
+
+        self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_RETRY_ATTEMPT_RESERVED"),
+            mutate=mutate,
+        )
+        return intent
+
+    def reserve_model_request(
+        self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> ModelRequestIntent:
+        _, intent = self.begin_model_turn_and_reserve(request, expected_sequence)
         return intent
 
     def _model_request_from_row(
@@ -559,6 +674,7 @@ class SqliteStateStore:
                     output_tokens=int(reserved["output_tokens"]),
                     cost_usd=Decimal(str(reserved["cost_usd"])),
                 ),
+                provider_attempt_number=int(row["provider_attempt_number"]),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise StateConflict("MODEL_REQUEST_STORAGE_BINDING_MISMATCH") from error
@@ -583,20 +699,58 @@ class SqliteStateStore:
         allowed_model_ids: frozenset[str],
         expected_sequence: AuditSequence,
     ) -> ModelDispatchResult:
-        result = settle_model_completion(intent, completion, allowed_model_ids)
-        encoded = json.dumps(
+        if allowed_model_ids != intent.request.allowed_model_ids:
+            raise StateConflict("MODEL_INTENT_BINDING_MISMATCH")
+        return self.settle_model_attempt(
+            intent,
+            ProviderAttemptResult.completed(completion),
+            expected_sequence,
+        ).dispatch_result
+
+    def _settle_model_counters(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        reserved: ModelBudgetAmounts,
+        charged: ModelBudgetAmounts,
+    ) -> None:
+        self._write_model_counters(
+            connection,
+            run_id,
+            self._model_counters(connection, run_id).settle(reserved, charged),
+        )
+
+    def settle_model_attempt(
+        self,
+        intent: ModelRequestIntent,
+        result: ProviderAttemptResult,
+        expected_sequence: AuditSequence,
+    ) -> SettledModelAttempt:
+        settled = SettledModelAttempt.from_result(intent, result)
+        dispatch_json = json.dumps(
             {
-                "run_id": result.run_id,
-                "charged_cost_usd": str(result.charged_amounts.cost_usd),
-                "charged_input_tokens": result.charged_amounts.input_tokens,
-                "charged_output_tokens": result.charged_amounts.output_tokens,
-                "normalized_action": result.normalized_action,
-                "normalized_payload_digest": result.normalized_payload_digest,
-                "outcome": result.outcome,
-                "returned_model_id": result.returned_model_id,
+                "run_id": settled.run_id,
+                "charged_amounts": json.loads(settled.charged_amounts.to_json()),
+                "normalized_action": settled.dispatch_result.normalized_action,
+                "normalized_payload_digest": (settled.dispatch_result.normalized_payload_digest),
+                "outcome": settled.dispatch_result.outcome,
+                "returned_model_id": settled.dispatch_result.returned_model_id,
             },
             sort_keys=True,
             separators=(",", ":"),
+        )
+        reported_usage_json = (
+            None
+            if result.usage is None
+            else json.dumps(
+                {
+                    "cost_usd": str(result.usage.cost_usd),
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
 
         def mutate(connection: sqlite3.Connection) -> None:
@@ -608,27 +762,115 @@ class SqliteStateStore:
                 (intent.run_id, intent.intent_id),
             ).fetchone()
             if row is None:
-                raise StateConflict("MODEL_INTENT_BINDING_MISMATCH")
+                raise StateConflict("MODEL_ATTEMPT_BINDING_MISMATCH")
             if row["state"] != "RESERVED":
-                raise StateConflict("MODEL_INTENT_ALREADY_SETTLED")
+                raise StateConflict("MODEL_ATTEMPT_ALREADY_SETTLED")
             stored = self._model_request_from_row(intent.run_id, intent.intent_id, row)
-            if stored != intent or allowed_model_ids != stored.request.allowed_model_ids:
-                raise StateConflict("MODEL_INTENT_BINDING_MISMATCH")
+            if stored != intent:
+                raise StateConflict("MODEL_ATTEMPT_BINDING_MISMATCH")
             changed = connection.execute(
-                "UPDATE model_attempts SET state = 'CLOSED', returned_model_id = ?, "
-                "result_json = ? WHERE run_id = ? AND intent_id = ? AND state = 'RESERVED'",
-                (result.returned_model_id, encoded, intent.run_id, intent.intent_id),
+                "UPDATE model_attempts SET state = 'CLOSED', outcome = ?, "
+                "provider_response_id = ?, reason_code = ?, reported_usage_json = ?, "
+                "returned_model_id = ?, result_digest = ?, charged_json = ?, "
+                "result_json = ?, settled_sequence = ? WHERE run_id = ? AND intent_id = ? "
+                "AND state = 'RESERVED'",
+                (
+                    settled.kind,
+                    settled.provider_response_id,
+                    settled.reason_code,
+                    reported_usage_json,
+                    settled.dispatch_result.returned_model_id,
+                    settled.result_digest,
+                    settled.charged_amounts.to_json(),
+                    dispatch_json,
+                    expected_sequence + 1,
+                    intent.run_id,
+                    intent.intent_id,
+                ),
             ).rowcount
             if changed != 1:
-                raise StateConflict("MODEL_INTENT_ALREADY_SETTLED")
+                raise StateConflict("MODEL_ATTEMPT_ALREADY_SETTLED")
+            self._settle_model_counters(
+                connection,
+                intent.run_id,
+                intent.reserved_amounts,
+                settled.charged_amounts,
+            )
 
         self._commit_state_and_event(
             run_id=intent.run_id,
             expected_sequence=expected_sequence,
-            event=AuditEvent.kind("MODEL_REQUEST_SETTLED"),
+            event=AuditEvent.kind("MODEL_ATTEMPT_SETTLED"),
             mutate=mutate,
         )
-        return result
+        return settled
+
+    def record_model_backoff(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+        seconds: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            changed = connection.execute(
+                "UPDATE model_attempts SET backoff_seconds = ?, backoff_sequence = ? "
+                "WHERE run_id = ? AND intent_id = ? AND state = 'CLOSED' "
+                "AND outcome = 'KNOWN_CLOSED_REJECTION' AND backoff_seconds IS NULL",
+                (seconds, expected_sequence + 1, run_id, intent_id),
+            ).rowcount
+            if changed != 1:
+                raise StateConflict("BACKOFF_REQUIRES_CLOSED_REJECTION")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_RETRY_BACKOFF_RECORDED"),
+            mutate=mutate,
+        )
+
+    def model_attempts(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> tuple[SettledModelAttempt, ...]:
+        rows = self._connection.execute(
+            "SELECT run_id, intent_id, provider_attempt_number, request_json, "
+            "reserved_json, outcome, provider_response_id, reason_code, result_digest, "
+            "charged_json, result_json, backoff_seconds FROM model_attempts "
+            "WHERE run_id = ? AND logical_turn_id = ? AND state = 'CLOSED' "
+            "ORDER BY provider_attempt_number",
+            (run_id, logical_turn_id),
+        ).fetchall()
+        attempts: list[SettledModelAttempt] = []
+        for row in rows:
+            dispatch_data = json.loads(row[10])
+            charged = ModelBudgetAmounts.from_json(row[9])
+            dispatch = ModelDispatchResult(
+                run_id=RunId(dispatch_data["run_id"]),
+                logical_turn_id=logical_turn_id,
+                outcome=dispatch_data["outcome"],
+                returned_model_id=dispatch_data["returned_model_id"],
+                normalized_action=dispatch_data["normalized_action"],
+                normalized_payload_digest=dispatch_data["normalized_payload_digest"],
+                charged_amounts=charged,
+            )
+            attempts.append(
+                SettledModelAttempt(
+                    run_id=RunId(row[0]),
+                    intent_id=IntentId(row[1]),
+                    logical_turn_id=logical_turn_id,
+                    provider_attempt_number=row[2],
+                    request=model_request_from_json(row[3]),
+                    reserved_amounts=ModelBudgetAmounts.from_json(row[4]),
+                    kind=ProviderAttemptKind(row[5]),
+                    provider_response_id=row[6],
+                    reason_code=row[7],
+                    charged_amounts=charged,
+                    result_digest=row[8],
+                    dispatch_result=dispatch,
+                    backoff_seconds=row[11],
+                )
+            )
+        return tuple(attempts)
 
     def reserved_call_count(self, run_id: RunId) -> int:
         with self._read_transaction() as connection:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from threading import RLock
 
 from apexcrew.domain.commands import (
@@ -23,10 +24,12 @@ from apexcrew.domain.model import (
     LogicalModelTurn,
     LogicalTurnId,
     ModelCompletion,
+    ModelCounters,
     ModelDispatchResult,
     ModelRequest,
     ModelRequestIntent,
-    settle_model_completion,
+    ProviderAttemptResult,
+    SettledModelAttempt,
 )
 from apexcrew.domain.types import AuditSequence, CommandStatus, IntentId, RunId
 
@@ -69,9 +72,10 @@ class InMemoryStateStore:
         self._sequences: dict[RunId, AuditSequence] = {}
         self._effect_intents: dict[IntentId, EffectIntent] = {}
         self._effect_results: dict[IntentId, EffectResult] = {}
-        self._model_requests: dict[IntentId, ModelRequestIntent] = {}
-        self._model_results: dict[IntentId, ModelDispatchResult] = {}
         self._model_turns: dict[LogicalTurnId, LogicalModelTurn] = {}
+        self._model_attempt_numbers: dict[tuple[RunId, LogicalTurnId, int], IntentId] = {}
+        self._model_attempts: dict[IntentId, ModelRequestIntent | SettledModelAttempt] = {}
+        self._model_counters: dict[RunId, ModelCounters] = {}
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
 
@@ -82,9 +86,10 @@ class InMemoryStateStore:
         copied._sequences = self._sequences.copy()
         copied._effect_intents = self._effect_intents.copy()
         copied._effect_results = self._effect_results.copy()
-        copied._model_requests = self._model_requests.copy()
-        copied._model_results = self._model_results.copy()
         copied._model_turns = self._model_turns.copy()
+        copied._model_attempt_numbers = self._model_attempt_numbers.copy()
+        copied._model_attempts = self._model_attempts.copy()
+        copied._model_counters = self._model_counters.copy()
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
         return copied
@@ -95,9 +100,10 @@ class InMemoryStateStore:
         self._sequences = copied._sequences
         self._effect_intents = copied._effect_intents
         self._effect_results = copied._effect_results
-        self._model_requests = copied._model_requests
-        self._model_results = copied._model_results
         self._model_turns = copied._model_turns
+        self._model_attempt_numbers = copied._model_attempt_numbers
+        self._model_attempts = copied._model_attempts
+        self._model_counters = copied._model_counters
 
     def _commit_state_and_event(
         self,
@@ -303,25 +309,133 @@ class InMemoryStateStore:
     def reserve_model_request(
         self, request: ModelRequest, expected_sequence: AuditSequence
     ) -> ModelRequestIntent:
-        intent = ModelRequestIntent.reserve(request)
+        _, intent = self.begin_model_turn_and_reserve(request, expected_sequence)
+        return intent
+
+    def begin_model_turn_and_reserve(
+        self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> tuple[LogicalModelTurn, ModelRequestIntent]:
+        turn = LogicalModelTurn.new(request)
+        intent = ModelRequestIntent.reserve(turn, request, provider_attempt_number=1)
 
         def mutate(copied: InMemoryStateStore) -> None:
-            if intent.intent_id in copied._model_requests:
-                raise StateConflict("MODEL_INTENT_REUSED")
-            copied._model_requests[intent.intent_id] = intent
-            copied._model_turns[intent.logical_turn_id] = LogicalModelTurn(
-                request.run_id,
-                intent.logical_turn_id,
-                request.request_digest,
-            )
+            key = (request.run_id, turn.logical_turn_id, 1)
+            if key in copied._model_attempt_numbers:
+                raise StateConflict("MODEL_ATTEMPT_NUMBER_REUSED")
+            copied._model_turns[turn.logical_turn_id] = turn
+            copied._model_attempt_numbers[key] = intent.intent_id
+            copied._model_attempts[intent.intent_id] = intent
+            counters = copied._model_counters.get(request.run_id, ModelCounters())
+            copied._model_counters[request.run_id] = counters.reserve(intent.reserved_amounts)
 
         self._commit_state_and_event(
             run_id=request.run_id,
             expected_sequence=expected_sequence,
-            event=AuditEvent.kind("MODEL_REQUEST_RESERVED"),
+            event=AuditEvent.kind("MODEL_TURN_AND_ATTEMPT_RESERVED"),
+            mutate=mutate,
+        )
+        return turn, intent
+
+    def reserve_model_attempt(
+        self,
+        turn: LogicalModelTurn,
+        request: ModelRequest,
+        provider_attempt_number: int,
+        expected_sequence: AuditSequence,
+    ) -> ModelRequestIntent:
+        intent = ModelRequestIntent.reserve(turn, request, provider_attempt_number)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied._model_turns.get(turn.logical_turn_id) != turn:
+                raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
+            key = (request.run_id, turn.logical_turn_id, provider_attempt_number)
+            if key in copied._model_attempt_numbers:
+                raise StateConflict("MODEL_ATTEMPT_NUMBER_REUSED")
+            copied._model_attempt_numbers[key] = intent.intent_id
+            copied._model_attempts[intent.intent_id] = intent
+            counters = copied._model_counters.get(request.run_id, ModelCounters())
+            copied._model_counters[request.run_id] = counters.reserve(intent.reserved_amounts)
+
+        self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_RETRY_ATTEMPT_RESERVED"),
             mutate=mutate,
         )
         return intent
+
+    def model_counters(self, run_id: RunId) -> ModelCounters:
+        return self._model_counters.get(run_id, ModelCounters())
+
+    def model_attempts(
+        self, run_id: RunId, logical_turn_id: LogicalTurnId
+    ) -> tuple[SettledModelAttempt, ...]:
+        return tuple(
+            sorted(
+                (
+                    attempt
+                    for attempt in self._model_attempts.values()
+                    if isinstance(attempt, SettledModelAttempt)
+                    and attempt.run_id == run_id
+                    and attempt.logical_turn_id == logical_turn_id
+                ),
+                key=lambda attempt: attempt.provider_attempt_number,
+            )
+        )
+
+    def settle_model_attempt(
+        self,
+        intent: ModelRequestIntent,
+        result: ProviderAttemptResult,
+        expected_sequence: AuditSequence,
+    ) -> SettledModelAttempt:
+        settled = SettledModelAttempt.from_result(intent, result)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            current = copied._model_attempts.get(intent.intent_id)
+            if current is None or current.run_id != intent.run_id:
+                raise StateConflict("MODEL_ATTEMPT_BINDING_MISMATCH")
+            if current.state != "RESERVED":
+                raise StateConflict("MODEL_ATTEMPT_ALREADY_SETTLED")
+            if current != intent:
+                raise StateConflict("MODEL_ATTEMPT_BINDING_MISMATCH")
+            copied._model_attempts[intent.intent_id] = settled
+            copied._model_counters[intent.run_id] = copied.model_counters(intent.run_id).settle(
+                settled.reserved_amounts, settled.charged_amounts
+            )
+
+        self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_ATTEMPT_SETTLED"),
+            mutate=mutate,
+        )
+        return settled
+
+    def record_model_backoff(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+        seconds: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            attempt = copied._model_attempts.get(intent_id)
+            if (
+                not isinstance(attempt, SettledModelAttempt)
+                or attempt.run_id != run_id
+                or attempt.kind != "KNOWN_CLOSED_REJECTION"
+                or attempt.backoff_seconds is not None
+            ):
+                raise StateConflict("BACKOFF_REQUIRES_CLOSED_REJECTION")
+            copied._model_attempts[intent_id] = replace(attempt, backoff_seconds=seconds)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("MODEL_RETRY_BACKOFF_RECORDED"),
+            mutate=mutate,
+        )
 
     def settle_model_request(
         self,
@@ -330,34 +444,26 @@ class InMemoryStateStore:
         allowed_model_ids: frozenset[str],
         expected_sequence: AuditSequence,
     ) -> ModelDispatchResult:
-        result = settle_model_completion(intent, completion, allowed_model_ids)
-
-        def mutate(copied: InMemoryStateStore) -> None:
-            if intent.intent_id in copied._model_results:
-                raise StateConflict("MODEL_INTENT_ALREADY_SETTLED")
-            stored = copied._model_requests.get(intent.intent_id)
-            if stored != intent or allowed_model_ids != intent.request.allowed_model_ids:
-                raise StateConflict("MODEL_INTENT_BINDING_MISMATCH")
-            copied._model_results[intent.intent_id] = result
-
-        self._commit_state_and_event(
-            run_id=intent.run_id,
-            expected_sequence=expected_sequence,
-            event=AuditEvent.kind("MODEL_REQUEST_SETTLED"),
-            mutate=mutate,
-        )
-        return result
+        if allowed_model_ids != intent.request.allowed_model_ids:
+            raise StateConflict("MODEL_INTENT_BINDING_MISMATCH")
+        return self.settle_model_attempt(
+            intent,
+            ProviderAttemptResult.completed(completion),
+            expected_sequence,
+        ).dispatch_result
 
     def model_request(self, run_id: RunId, intent_id: IntentId) -> ModelRequestIntent:
         with self._lock:
-            intent = self._model_requests[intent_id]
+            intent = self._model_attempts[intent_id]
+            if not isinstance(intent, ModelRequestIntent):
+                raise KeyError(intent_id)
             if intent.run_id != run_id:
                 raise KeyError(intent_id)
             return intent
 
     def reserved_call_count(self, run_id: RunId) -> int:
         with self._lock:
-            return sum(intent.run_id == run_id for intent in self._model_requests.values())
+            return sum(intent.run_id == run_id for intent in self._model_attempts.values())
 
     def fail_next_commit_after_state_write_for_test(self) -> None:
         with self._lock:

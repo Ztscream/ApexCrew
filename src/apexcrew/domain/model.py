@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 from typing import Literal, Protocol
 from uuid import uuid4
 
+from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -69,12 +71,113 @@ class ModelCompletion:
     normalized_action: Mapping[str, object]
 
 
+class ProviderAttemptKind(StrEnum):
+    COMPLETED = "COMPLETED"
+    KNOWN_CLOSED_REJECTION = "KNOWN_CLOSED_REJECTION"
+    UNKNOWN_OUTCOME = "UNKNOWN_OUTCOME"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAttemptResult:
+    kind: ProviderAttemptKind
+    provider_response_id: str | None
+    reason_code: str | None
+    completion: ModelCompletion | None
+    usage: ModelUsage | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", ProviderAttemptKind(self.kind))
+
+    @classmethod
+    def completed(cls, completion: ModelCompletion) -> ProviderAttemptResult:
+        return cls(
+            ProviderAttemptKind.COMPLETED,
+            completion.response_id,
+            None,
+            completion,
+            completion.usage,
+        )
+
+    @classmethod
+    def known_closed(
+        cls,
+        provider_response_id: str,
+        reason_code: str,
+        usage: ModelUsage | None = None,
+    ) -> ProviderAttemptResult:
+        return cls(
+            ProviderAttemptKind.KNOWN_CLOSED_REJECTION,
+            provider_response_id,
+            reason_code,
+            None,
+            usage,
+        )
+
+    @classmethod
+    def unknown(cls, reason_code: str) -> ProviderAttemptResult:
+        return cls(
+            ProviderAttemptKind.UNKNOWN_OUTCOME,
+            None,
+            reason_code,
+            None,
+            None,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ModelBudgetAmounts:
     calls: int
     input_tokens: int
     output_tokens: int
     cost_usd: Decimal
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "calls": self.calls,
+                "cost_usd": str(self.cost_usd),
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> ModelBudgetAmounts:
+        data = json.loads(value)
+        return cls(
+            calls=data["calls"],
+            input_tokens=data["input_tokens"],
+            output_tokens=data["output_tokens"],
+            cost_usd=Decimal(data["cost_usd"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCounters:
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: Decimal = Decimal(0)
+
+    def reserve(self, amounts: ModelBudgetAmounts) -> ModelCounters:
+        return replace(
+            self,
+            calls=self.calls + amounts.calls,
+            input_tokens=self.input_tokens + amounts.input_tokens,
+            output_tokens=self.output_tokens + amounts.output_tokens,
+            cost_usd=self.cost_usd + amounts.cost_usd,
+        )
+
+    def settle(self, reserved: ModelBudgetAmounts, charged: ModelBudgetAmounts) -> ModelCounters:
+        return replace(
+            self,
+            calls=self.calls - reserved.calls + charged.calls,
+            input_tokens=self.input_tokens - reserved.input_tokens + charged.input_tokens,
+            output_tokens=self.output_tokens - reserved.output_tokens + charged.output_tokens,
+            cost_usd=self.cost_usd - reserved.cost_usd + charged.cost_usd,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,33 +199,30 @@ class ModelRequestIntent:
     logical_turn_id: LogicalTurnId
     request: ModelRequest
     reserved_amounts: ModelBudgetAmounts
+    provider_attempt_number: int = 1
     state: Literal["RESERVED"] = "RESERVED"
 
     @classmethod
     def reserve(
         cls,
-        turn: LogicalModelTurn | ModelRequest,
-        request: ModelRequest | None = None,
+        turn: LogicalModelTurn,
+        request: ModelRequest,
         provider_attempt_number: int = 1,
     ) -> ModelRequestIntent:
-        del provider_attempt_number
-        actual_request = turn if isinstance(turn, ModelRequest) else request
-        if actual_request is None:
-            raise ValueError("MODEL_REQUEST_REQUIRED")
-        logical_turn_id = (
-            f"model-turn-{uuid4().hex}" if isinstance(turn, ModelRequest) else turn.logical_turn_id
-        )
+        if turn.run_id != request.run_id or turn.request_digest != request.request_digest:
+            raise ValueError("MODEL_TURN_REQUEST_BINDING_MISMATCH")
         return cls(
-            run_id=actual_request.run_id,
+            run_id=request.run_id,
             intent_id=IntentId(f"model-intent-{uuid4().hex}"),
-            logical_turn_id=logical_turn_id,
-            request=actual_request,
+            logical_turn_id=turn.logical_turn_id,
+            request=request,
             reserved_amounts=ModelBudgetAmounts(
                 calls=1,
-                input_tokens=actual_request.max_input_tokens,
-                output_tokens=actual_request.max_output_tokens,
-                cost_usd=actual_request.reserved_cost_usd,
+                input_tokens=request.max_input_tokens,
+                output_tokens=request.max_output_tokens,
+                cost_usd=request.reserved_cost_usd,
             ),
+            provider_attempt_number=provider_attempt_number,
         )
 
 
@@ -135,9 +235,6 @@ class ModelDispatchResult:
         "KNOWN_CLOSED_REJECTION",
         "RETURNED_MODEL_MISMATCH",
         "INDETERMINATE",
-        "MODEL_COMPLETION_NOT_COMMITTED",
-        "RECOVERY_BINDING_MISMATCH",
-        "DOWNSTREAM_INTENT_REQUIRES_RECONCILIATION",
     ]
     returned_model_id: str | None
     normalized_action: Mapping[str, object] | None
@@ -198,8 +295,105 @@ def settle_model_completion(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SettledModelAttempt:
+    run_id: RunId
+    intent_id: IntentId
+    logical_turn_id: LogicalTurnId
+    provider_attempt_number: int
+    request: ModelRequest
+    reserved_amounts: ModelBudgetAmounts
+    kind: ProviderAttemptKind
+    provider_response_id: str | None
+    reason_code: str | None
+    charged_amounts: ModelBudgetAmounts
+    result_digest: str
+    dispatch_result: ModelDispatchResult
+    backoff_seconds: int | None = None
+    state: Literal["CLOSED"] = "CLOSED"
+
+    @property
+    def outcome(self) -> ProviderAttemptKind:
+        return self.kind
+
+    @classmethod
+    def from_result(
+        cls, intent: ModelRequestIntent, result: ProviderAttemptResult
+    ) -> SettledModelAttempt:
+        if result.kind is ProviderAttemptKind.COMPLETED:
+            if result.completion is None:
+                raise ValueError("COMPLETED_ATTEMPT_REQUIRES_COMPLETION")
+            dispatch = settle_model_completion(
+                intent, result.completion, intent.request.allowed_model_ids
+            )
+        else:
+            if result.completion is not None:
+                raise ValueError("CLOSED_ATTEMPT_FORBIDS_COMPLETION")
+            charged = (
+                intent.reserved_amounts
+                if result.usage is None
+                else ModelBudgetAmounts(
+                    calls=1,
+                    input_tokens=result.usage.input_tokens,
+                    output_tokens=result.usage.output_tokens,
+                    cost_usd=result.usage.cost_usd,
+                )
+            )
+            dispatch = ModelDispatchResult(
+                run_id=intent.run_id,
+                logical_turn_id=intent.logical_turn_id,
+                outcome=(
+                    "KNOWN_CLOSED_REJECTION"
+                    if result.kind is ProviderAttemptKind.KNOWN_CLOSED_REJECTION
+                    else "INDETERMINATE"
+                ),
+                returned_model_id=None,
+                normalized_action=None,
+                normalized_payload_digest=None,
+                charged_amounts=charged,
+            )
+        digest_payload = json.dumps(
+            {
+                "charged": {
+                    "calls": dispatch.charged_amounts.calls,
+                    "cost_usd": str(dispatch.charged_amounts.cost_usd),
+                    "input_tokens": dispatch.charged_amounts.input_tokens,
+                    "output_tokens": dispatch.charged_amounts.output_tokens,
+                },
+                "kind": result.kind,
+                "normalized_payload_digest": dispatch.normalized_payload_digest,
+                "provider_response_id": result.provider_response_id,
+                "reason_code": result.reason_code,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return cls(
+            intent.run_id,
+            intent.intent_id,
+            intent.logical_turn_id,
+            intent.provider_attempt_number,
+            intent.request,
+            intent.reserved_amounts,
+            result.kind,
+            result.provider_response_id,
+            result.reason_code,
+            dispatch.charged_amounts,
+            "sha256:" + sha256(digest_payload).hexdigest(),
+            dispatch,
+        )
+
+
+class BackoffPort(Protocol):
+    def wait(self, seconds: int) -> None:
+        raise NotImplementedError
+
+
+PROVIDER_RETRY_BACKOFF_SECONDS: tuple[int, int] = (1, 2)
+
+
 class ModelPort(Protocol):
-    def complete(self, request: ModelRequest) -> ModelCompletion:
+    def complete(self, request: ModelRequest) -> ProviderAttemptResult:
         raise NotImplementedError
 
 
@@ -261,36 +455,85 @@ class ModelJournal(Protocol):
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         raise NotImplementedError
 
-    def reserve_model_request(
+    def begin_model_turn_and_reserve(
         self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> tuple[LogicalModelTurn, ModelRequestIntent]:
+        raise NotImplementedError
+
+    def reserve_model_attempt(
+        self,
+        turn: LogicalModelTurn,
+        request: ModelRequest,
+        provider_attempt_number: int,
+        expected_sequence: AuditSequence,
     ) -> ModelRequestIntent:
         raise NotImplementedError
 
-    def settle_model_request(
+    def settle_model_attempt(
         self,
         intent: ModelRequestIntent,
-        completion: ModelCompletion,
-        allowed_model_ids: frozenset[str],
+        result: ProviderAttemptResult,
         expected_sequence: AuditSequence,
-    ) -> ModelDispatchResult:
+    ) -> SettledModelAttempt:
+        raise NotImplementedError
+
+    def record_model_backoff(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+        seconds: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
         raise NotImplementedError
 
 
+class ImmediateBackoff:
+    def wait(self, seconds: int) -> None:
+        del seconds
+
+
 class DurableModelClient:
-    def __init__(self, model: ModelPort, journal: ModelJournal) -> None:
+    def __init__(
+        self,
+        model: ModelPort,
+        journal: ModelJournal,
+        backoff: BackoffPort | None = None,
+    ) -> None:
         self._model = model
         self._journal = journal
+        self._backoff = ImmediateBackoff() if backoff is None else backoff
         self.journal = journal
 
     def complete(self, request: ModelRequest) -> ModelDispatchResult:
-        intent = self._journal.reserve_model_request(
-            request,
-            self._journal.audit_sequence(request.run_id),
-        )
-        completion = self._model.complete(request)
-        return self._journal.settle_model_request(
-            intent,
-            completion,
-            request.allowed_model_ids,
-            self._journal.audit_sequence(request.run_id),
-        )
+        for retry_index in range(V01_MECHANISM_LIMITS.provider_retry_ceiling + 1):
+            sequence = self._journal.audit_sequence(request.run_id)
+            if retry_index == 0:
+                turn, intent = self._journal.begin_model_turn_and_reserve(request, sequence)
+            else:
+                intent = self._journal.reserve_model_attempt(
+                    turn, request, retry_index + 1, sequence
+                )
+            attempt_result = self._model.complete(request)
+            if isinstance(attempt_result, ModelCompletion):
+                attempt_result = ProviderAttemptResult.completed(attempt_result)
+            settled = self._journal.settle_model_attempt(
+                intent,
+                attempt_result,
+                self._journal.audit_sequence(request.run_id),
+            )
+            if settled.kind == ProviderAttemptKind.COMPLETED:
+                return settled.dispatch_result
+            if (
+                settled.kind != ProviderAttemptKind.KNOWN_CLOSED_REJECTION
+                or retry_index == V01_MECHANISM_LIMITS.provider_retry_ceiling
+            ):
+                return settled.dispatch_result
+            seconds = PROVIDER_RETRY_BACKOFF_SECONDS[retry_index]
+            self._journal.record_model_backoff(
+                request.run_id,
+                intent.intent_id,
+                seconds,
+                self._journal.audit_sequence(request.run_id),
+            )
+            self._backoff.wait(seconds)
+        raise AssertionError("closed retry loop exhausted without a dispatch result")

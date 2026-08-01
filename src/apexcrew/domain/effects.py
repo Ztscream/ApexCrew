@@ -13,10 +13,13 @@ from apexcrew.domain.commands import (
     CommandOutcome,
 )
 from apexcrew.domain.model import (
+    LogicalModelTurn,
     ModelCompletion,
     ModelDispatchResult,
     ModelRequest,
     ModelRequestIntent,
+    ProviderAttemptResult,
+    SettledModelAttempt,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import (
@@ -124,6 +127,37 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def unsettled_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        raise NotImplementedError
+
+    def begin_model_turn_and_reserve(
+        self, request: ModelRequest, expected_sequence: AuditSequence
+    ) -> tuple[LogicalModelTurn, ModelRequestIntent]:
+        raise NotImplementedError
+
+    def reserve_model_attempt(
+        self,
+        turn: LogicalModelTurn,
+        request: ModelRequest,
+        provider_attempt_number: int,
+        expected_sequence: AuditSequence,
+    ) -> ModelRequestIntent:
+        raise NotImplementedError
+
+    def settle_model_attempt(
+        self,
+        intent: ModelRequestIntent,
+        result: ProviderAttemptResult,
+        expected_sequence: AuditSequence,
+    ) -> SettledModelAttempt:
+        raise NotImplementedError
+
+    def record_model_backoff(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+        seconds: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
         raise NotImplementedError
 
     def reserve_model_request(
