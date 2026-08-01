@@ -1,0 +1,1 @@
+"""Bound repository adapters."""
