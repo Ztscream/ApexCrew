@@ -5537,6 +5537,12 @@ class SqliteStateStore:
             raise StateConflict("EFFECT_RESULT_RUN_OR_INTENT_MISMATCH")
         if intent.applicable_revision_digests != applicable_revision_digests:
             raise StateConflict("EFFECT_RESULT_REVISION_BINDING_MISMATCH")
+        from apexcrew.domain.tools import ToolEffectResultError, validate_tool_effect_result
+
+        try:
+            validate_tool_effect_result(intent, result)
+        except ToolEffectResultError as error:
+            raise StateConflict(error.code) from error
         result_json = effect_result_to_storage_json(result)
         try:
             connection.execute(

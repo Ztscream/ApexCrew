@@ -17,7 +17,7 @@ from helpers.application import (
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
-from apexcrew.domain.actions import ReadAction, SearchAction
+from apexcrew.domain.actions import CheckAction, PatchAction, ReadAction, SearchAction
 from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
@@ -65,7 +65,7 @@ from apexcrew.domain.revisions import (
     ModelPricingEntryDocument,
     revision_digest,
 )
-from apexcrew.domain.tools import ToolIntent
+from apexcrew.domain.tools import ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -1342,7 +1342,9 @@ def test_unsettled_intents_have_identical_deterministic_order(
     assert store.unsettled_intents(run_id) == (first, second)
 
 
-def make_contract_tool_intent(*, intent_id: str, action: ReadAction | SearchAction) -> ToolIntent:
+def make_contract_tool_intent(
+    *, intent_id: str, action: ReadAction | SearchAction | PatchAction | CheckAction
+) -> ToolIntent:
     digest = "sha256:" + "1" * 64
     return ToolIntent.for_authorized_worker_action(
         intent_id=IntentId(intent_id),
@@ -1391,3 +1393,73 @@ def test_read_and_search_tool_intents_use_the_same_effect_journal_contract(
         )
         == documents
     )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_patch_and_check_tool_documents_use_the_same_effect_journal_contract(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    patch = make_contract_tool_intent(
+        intent_id="intent-patch",
+        action=PatchAction(path="src/a.py", unified_diff="@@ -1 +1 @@\n-old\n+new\n"),
+    )
+    check = make_contract_tool_intent(
+        intent_id="intent-check",
+        action=CheckAction(check_id="task-check-1"),
+    )
+    patch_effect = patch.to_effect_intent(AuditSequence(1))
+    check_effect = check.to_effect_intent(AuditSequence(2))
+    store.record_intent(patch_effect, AuditSequence(0))
+    store.record_intent(check_effect, AuditSequence(1))
+    result = ToolResult(
+        code="CHECK_PASSED",
+        run_id=check.run_id,
+        intent_id=check.intent_id,
+        passed=True,
+        bounded_payload={"snapshot_digest": check.snapshot_digest, "timing_ms": 10},
+    )
+    store.settle_intent(
+        check.run_id,
+        check.intent_id,
+        result.to_effect_result(AuditSequence(3)),
+        check.applicable_revision_digests,
+        AuditSequence(2),
+    )
+
+    assert ToolIntent.from_effect_intent(store.effect_intent(patch.intent_id)) == patch
+    assert store.effect_result(check.intent_id).result_class == "CHECK_PASSED"
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_timed_out_check_cannot_be_settled_as_passing(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    check = make_contract_tool_intent(
+        intent_id="intent-timeout-forged-pass",
+        action=CheckAction(check_id="task-check-1"),
+    )
+    effect = check.to_effect_intent(AuditSequence(1))
+    store.record_intent(effect, AuditSequence(0))
+    forged = ToolResult.model_construct(
+        code="CHECK_PASSED",
+        run_id=check.run_id,
+        intent_id=check.intent_id,
+        passed=True,
+        timed_out=True,
+        matches=(),
+        bounded_payload={"snapshot_digest": check.snapshot_digest},
+        content_digest=None,
+    ).to_effect_result(AuditSequence(2))
+
+    with pytest.raises(StateConflict, match="CHECK_RESULT_BINDING_INVALID"):
+        store.settle_intent(
+            check.run_id,
+            check.intent_id,
+            forged,
+            check.applicable_revision_digests,
+            AuditSequence(1),
+        )

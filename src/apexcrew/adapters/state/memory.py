@@ -3173,6 +3173,12 @@ class InMemoryStateStore:
                 raise StateConflict("UNSETTLED_EFFECT_INTENT_REQUIRED")
             if intent.applicable_revision_digests != applicable_revision_digests:
                 raise StateConflict("EFFECT_RESULT_REVISION_BINDING_MISMATCH")
+            from apexcrew.domain.tools import ToolEffectResultError, validate_tool_effect_result
+
+            try:
+                validate_tool_effect_result(intent, result)
+            except ToolEffectResultError as error:
+                raise StateConflict(error.code) from error
             copied._effect_results[intent_id] = result
 
         return self._commit_state_and_event(
