@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import struct
+import subprocess
 import sys
+from collections.abc import Mapping
 from ctypes import POINTER, c_long, cast, memmove, string_at, wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +12,12 @@ from typing import Any, Literal
 
 import pytest
 
+from apexcrew.adapters.repository.git import (
+    GitCommandRunner,
+    GitLayout,
+    GitStatusPorcelain,
+    RepositoryInstance,
+)
 from apexcrew.adapters.repository.no_follow import (
     HandleIdentity,
     NodeKind,
@@ -52,6 +60,9 @@ class _RecordingBackend:
         self.absolute_root = Path("C:/repo") if platform == "windows" else Path("/repo")
         self.opens: list[_RecordedOpen] = []
         self.followed_link_count = 0
+        self.git_executable = Path("C:/git.exe")
+        self.empty_dir = Path("C:/empty")
+        self._replacement_ids: dict[tuple[str, ...], int] = {}
 
     @property
     def opened_components(self) -> list[tuple[int, str]]:
@@ -72,11 +83,17 @@ class _RecordingBackend:
             ".git": self.git_handle,
             "config": self.config_handle,
         }.get(name, 50 + len(self.opens))
+        binding = {
+            (self.volume_handle, "repo"): ("repo",),
+            (self.repo_handle, ".git"): ("repo", ".git"),
+            (self.git_handle, "config"): ("repo", ".git", "config"),
+        }.get((parent, name), (name,))
+        file_id = self._replacement_ids.get(binding, handle)
         components = () if name == "repo" else (name,)
         return OpenedNode(
             components,
             handle,
-            HandleIdentity(self.platform, 1, handle, kind),
+            HandleIdentity(self.platform, 1, file_id, kind),
         )
 
     def open_root_chain(self, root: Path) -> tuple[OpenedNode, ...]:
@@ -123,6 +140,9 @@ class _RecordingBackend:
             for item in self.opens
         )
 
+    def replace_name_binding(self, replaced: tuple[str, ...], new_file_id: int) -> None:
+        self._replacement_ids[replaced] = new_file_id
+
 
 def recording_backend(
     platform: Literal["posix", "windows"], tree: tuple[str, ...]
@@ -137,6 +157,34 @@ def recording_windows_backend() -> _RecordingBackend:
 
 def recording_posix_backend() -> _RecordingBackend:
     return recording_backend("posix", ("repo", ".git", "config"))
+
+
+def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:
+    handles = StableHandleTree(backend.absolute_root, backend)
+    git_dir = handles.open(".git", "directory")
+    config = handles.open(".git/config", "file")
+    return RepositoryInstance.from_layout(
+        GitLayout(handles, handles.root_node, git_dir, config, None, ())
+    )
+
+
+class RecordingGitSpawner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        cwd: Path,
+        environment: Mapping[str, str],
+        *,
+        text: bool,
+    ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+        del cwd, environment
+        self.calls.append(argv)
+        if text:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
 
 
 @pytest.mark.parametrize("platform", ["posix", "windows"])
@@ -166,6 +214,25 @@ def test_posix_open_flags_use_dir_fd_and_no_follow() -> None:
     StableHandleTree(backend.absolute_root, backend).open(".git/config", "file")
     assert backend.every_open_has(POSIX_O_NOFOLLOW | POSIX_O_CLOEXEC)
     assert backend.every_child_open_has_dir_fd()
+
+
+@pytest.mark.parametrize("platform", ["posix", "windows"])
+@pytest.mark.parametrize("replaced", [("repo", ".git"), ("repo", ".git", "config")])
+def test_replaced_bound_component_stops_before_git_spawn(
+    platform: Literal["posix", "windows"], replaced: tuple[str, ...]
+) -> None:
+    backend = recording_backend(platform, tree=("repo", ".git", "config"))
+    repository = bound_repository_from_backend(backend)
+    spawner = RecordingGitSpawner()
+    backend.replace_name_binding(replaced, new_file_id=999)
+    with pytest.raises(
+        RepositoryUnsafeError,
+        match="REPOSITORY_ANCESTOR_IDENTITY_CHANGED|GIT_STORAGE_IDENTITY_CHANGED",
+    ):
+        GitCommandRunner(backend.git_executable, backend.empty_dir, spawner).run(
+            repository, GitStatusPorcelain()
+        )
+    assert spawner.calls == []
 
 
 @pytest.mark.parametrize("relative", ["..", ""])
