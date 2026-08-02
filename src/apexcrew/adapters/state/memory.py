@@ -5,7 +5,7 @@ from base64 import b32encode
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import compare_digest
@@ -21,6 +21,7 @@ from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
     TargetAuthorityDigestService,
 )
+from apexcrew.domain.actions import FailAction, FinishAction
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
@@ -38,6 +39,7 @@ from apexcrew.domain.authority import (
     AtomicAction,
     AttemptLifecycleState,
     AuthorityDenied,
+    AuthorizationDecision,
     AuthorizationReason,
     AuthorizationRequest,
     BudgetSettlement,
@@ -104,7 +106,9 @@ from apexcrew.domain.coordination import (
     PlanningReadResult,
     PlanningReadSettlement,
     PlanProposal,
+    TaskDispatchSelection,
     plan_proposal_from_document,
+    task_contract_digest,
     validate_plan_proposal,
 )
 from apexcrew.domain.effects import (
@@ -139,13 +143,15 @@ from apexcrew.domain.model import (
     RecoveredModelAction,
     SettledModelAttempt,
 )
-from apexcrew.domain.plan import CheckDefinition, TaskContract, may_overlap
+from apexcrew.domain.plan import CheckDefinition, GlobPattern, TaskContract, may_overlap
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
+    ModelConfigurationRevisionDocument,
     Sha256DigestText,
     revision_digest,
 )
+from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -158,6 +164,18 @@ from apexcrew.domain.types import (
     RunState,
     RuntimeOwnerId,
     TaskId,
+)
+from apexcrew.domain.worker import (
+    PendingActionFreeze,
+    WorkerActionRecord,
+    WorkerAttemptRecord,
+    WorkerAttemptSnapshot,
+    WorkerTaskRecord,
+    WorkerTurnBinding,
+    bounded_worker_feedback,
+    pending_worker_action_id,
+    terminal_worker_effects,
+    validate_authorized_worker_action,
 )
 
 _EXECUTION_REVISION_STATES = frozenset(
@@ -444,6 +462,10 @@ class InMemoryStateStore:
         ] = {}
         self._trusted_task_repairs: dict[tuple[RunId, TaskId, int, str], str] = {}
         self._task_resume_allocations: dict[str, TaskResumeAllocation] = {}
+        self._worker_attempts: dict[AttemptId, WorkerAttemptRecord] = {}
+        self._worker_bindings: dict[AttemptId, WorkerTurnBinding] = {}
+        self._worker_actions: dict[str, WorkerActionRecord] = {}
+        self._worker_turn_actions: dict[tuple[AttemptId, LogicalTurnId], str] = {}
         self._monotonic_clock = monotonic_clock
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
@@ -505,6 +527,10 @@ class InMemoryStateStore:
         copied._task_resume_metadata = self._task_resume_metadata.copy()
         copied._trusted_task_repairs = self._trusted_task_repairs.copy()
         copied._task_resume_allocations = self._task_resume_allocations.copy()
+        copied._worker_attempts = self._worker_attempts.copy()
+        copied._worker_bindings = self._worker_bindings.copy()
+        copied._worker_actions = self._worker_actions.copy()
+        copied._worker_turn_actions = self._worker_turn_actions.copy()
         copied._monotonic_clock = self._monotonic_clock
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
@@ -566,6 +592,10 @@ class InMemoryStateStore:
         self._task_resume_metadata = copied._task_resume_metadata
         self._trusted_task_repairs = copied._trusted_task_repairs
         self._task_resume_allocations = copied._task_resume_allocations
+        self._worker_attempts = copied._worker_attempts
+        self._worker_bindings = copied._worker_bindings
+        self._worker_actions = copied._worker_actions
+        self._worker_turn_actions = copied._worker_turn_actions
 
     def _commit_state_and_event(
         self,
@@ -888,6 +918,494 @@ class InMemoryStateStore:
             self._tasks[task_key] = ("ACTIVE", None, None)
             if current_attempt is None:
                 self._attempts[attempt_key] = (task.task_id, "RUNNING")
+
+    def install_worker_attempt_for_test(self, binding: WorkerTurnBinding) -> None:
+        with self._lock:
+            current_budget = self._approved_budgets.get(binding.run_id)
+            if current_budget is None or current_budget[0] != binding.budget_digest:
+                raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+            if binding.attempt_id in self._worker_attempts:
+                raise StateConflict("WORKER_ATTEMPT_DUPLICATE")
+            now = datetime.now(UTC)
+            self._tasks[(binding.run_id, binding.task_id)] = ("ACTIVE", None, None)
+            self._attempts[(binding.run_id, binding.attempt_id)] = (
+                binding.task_id,
+                "RUNNING",
+            )
+            self._worker_attempts[binding.attempt_id] = WorkerAttemptRecord(
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                plan_digest=binding.plan_digest,
+                policy_digest=binding.policy_digest,
+                budget_digest=binding.budget_digest,
+                model_configuration_digest=binding.model_configuration_digest,
+                tool_schema_digest=binding.tool_schema_digest,
+                target_safety_digest=binding.target_safety_digest,
+                credential_profile=binding.credential_profile,
+                task_contract_digest=binding.task_contract_digest,
+                base_run_head_oid=binding.admissible_head,
+                worker_slot=f"worker-{binding.lease_generation}",
+                state="RUNNING",
+                created_sequence=self._sequences.get(binding.run_id, AuditSequence(0)),
+            )
+            self._worker_bindings[binding.attempt_id] = binding
+            self._workspace_leases[(binding.run_id, binding.lease_id)] = WorkspaceLease(
+                lease_id=binding.lease_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                generation=binding.lease_generation,
+                base_head=binding.admissible_head,
+                admissible_head=binding.admissible_head,
+                task_contract_digest=binding.task_contract_digest,
+                write_globs=(GlobPattern.parse("**"),),
+                sensitivity_globs=(GlobPattern.parse("**"),),
+                issued_at=now,
+                expires_at=now + timedelta(minutes=30),
+                state="ACTIVE",
+            )
+
+    def current_worker_turn_binding(self, attempt_id: AttemptId) -> WorkerTurnBinding:
+        with self._lock:
+            binding = self._worker_bindings.get(attempt_id)
+            attempt = self._worker_attempts.get(attempt_id)
+            lease = (
+                None
+                if binding is None
+                else self._workspace_leases.get((binding.run_id, binding.lease_id))
+            )
+        if binding is None or attempt is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        if attempt.state != "RUNNING" or lease is None or lease.state != "ACTIVE":
+            raise StateConflict("WORKER_ATTEMPT_NOT_RUNNABLE")
+        return binding
+
+    def attempt(self, attempt_id: AttemptId) -> WorkerAttemptRecord:
+        with self._lock:
+            attempt = self._worker_attempts.get(attempt_id)
+        if attempt is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        return attempt
+
+    def attempts_for_task(self, task_id: TaskId) -> tuple[WorkerAttemptRecord, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        attempt
+                        for attempt in self._worker_attempts.values()
+                        if attempt.task_id == task_id
+                    ),
+                    key=lambda attempt: (attempt.created_sequence, attempt.attempt_id),
+                )
+            )
+
+    def active_lease_for_task(self, task_id: TaskId) -> WorkspaceLease | None:
+        with self._lock:
+            active = tuple(
+                lease
+                for lease in self._workspace_leases.values()
+                if lease.task_id == task_id and lease.state == "ACTIVE"
+            )
+        if len(active) > 1:
+            raise StateConflict("MULTIPLE_ACTIVE_TASK_LEASES")
+        return None if not active else active[0]
+
+    def invalid_action_count(self, task_id: TaskId) -> int:
+        with self._lock:
+            return sum(
+                len(history)
+                for (
+                    candidate_run_id,
+                    candidate_task_id,
+                ), history in self._task_invalid_actions.items()
+                if candidate_task_id == task_id and candidate_run_id in self._runs
+            )
+
+    def task_record(self, task_id: TaskId) -> WorkerTaskRecord:
+        with self._lock:
+            matches = tuple(
+                (run_id, value)
+                for (run_id, candidate_task_id), value in self._tasks.items()
+                if candidate_task_id == task_id
+            )
+        if len(matches) != 1:
+            raise StateConflict("WORKER_TASK_NOT_FOUND_OR_AMBIGUOUS")
+        run_id, value = matches[0]
+        terminal_results = tuple(
+            result
+            for action in self._worker_actions.values()
+            if action.run_id == run_id
+            and action.task_id == task_id
+            and action.result_intent_id is not None
+            and (result := self._effect_results.get(action.result_intent_id)) is not None
+            and result.result_class in {"WORKER_FINISHED", "WORKER_FAILED"}
+        )
+        if terminal_results:
+            latest = max(terminal_results, key=lambda result: result.settled_sequence)
+            state = "SUCCEEDED" if latest.result_class == "WORKER_FINISHED" else "FAILED"
+            return WorkerTaskRecord(run_id, task_id, state, None)
+        return WorkerTaskRecord(run_id, task_id, value[0], value[1])
+
+    def next_dispatchable(self, run_id: RunId) -> TaskDispatchSelection | RuntimeDecision:
+        with self._lock:
+            run = self._runs.get(run_id)
+            sequence = self._sequences.get(run_id, AuditSequence(0))
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run.state != RunState.ACTIVE or not self._new_dispatch_open.get(run_id, True):
+                return RuntimeDecision.pause("RUN_DISPATCH_CLOSED", sequence)
+            revisions = ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            )
+            if (
+                revisions.plan_digest is None
+                or revisions.policy_digest is None
+                or revisions.budget_digest is None
+                or revisions.model_configuration_digest is None
+            ):
+                return RuntimeDecision.pause("REVISION_BINDING_MISMATCH", sequence)
+            runnable = tuple(
+                sorted(
+                    (
+                        attempt
+                        for attempt in self._worker_attempts.values()
+                        if attempt.run_id == run_id and attempt.state == "RUNNING"
+                    ),
+                    key=lambda item: (item.created_sequence, item.attempt_id),
+                )
+            )
+            for attempt in runnable:
+                binding = self._worker_bindings[attempt.attempt_id]
+                lease = self._workspace_leases.get((run_id, binding.lease_id))
+                if lease is not None and lease.state == "ACTIVE":
+                    return TaskDispatchSelection(
+                        dispatch_id=f"existing:{attempt.attempt_id}",
+                        run_id=run_id,
+                        task_id=attempt.task_id,
+                        task_contract_digest=attempt.task_contract_digest,
+                        base_run_head_oid=attempt.base_run_head_oid,
+                        applicable_revision_digests=binding.applicable_revision_digests,
+                        target_safety_digest=binding.target_safety_digest,
+                        credential_profile=binding.credential_profile,
+                        resume_allocation_id=None,
+                        reserved_attempt_id=None,
+                        expected_sequence=sequence,
+                        existing_attempt_id=attempt.attempt_id,
+                    )
+            budget = self._require_current_budget(run_id, revisions.budget_digest)
+            active_count = sum(
+                lease.run_id == run_id and lease.state == "ACTIVE"
+                for lease in self._workspace_leases.values()
+            )
+            if active_count >= budget.concurrent_worker_ceiling:
+                return RuntimeDecision.pause("CONCURRENT_WORKER_CEILING", sequence)
+            contracts = self._plan_task_contracts.get(revisions.plan_digest, ())
+            active_task_ids = {
+                attempt.task_id
+                for attempt in self._worker_attempts.values()
+                if attempt.run_id == run_id
+                and attempt.state in {"RUNNING", "WAITING_APPROVAL", "VERIFYING"}
+            }
+            succeeded = {
+                attempt.task_id
+                for attempt in self._worker_attempts.values()
+                if attempt.run_id == run_id and attempt.state == "SUCCEEDED"
+            }
+            hazards = self._plan_hazard_edges.get(revisions.plan_digest, ())
+            for contract in sorted(contracts, key=lambda item: item.task_id):
+                task_state = self._tasks.get((run_id, contract.task_id), ("READY", None, None))[0]
+                if (
+                    task_state != "READY"
+                    or not set(contract.dependency_task_ids).issubset(succeeded)
+                    or any(
+                        contract.task_id in edge and any(item in active_task_ids for item in edge)
+                        for edge in hazards
+                    )
+                ):
+                    continue
+                counters = self._task_budget_counters.get(
+                    (run_id, contract.task_id),
+                    TaskBudgetState(run_id=run_id, task_id=contract.task_id),
+                )
+                attempts = max(
+                    counters.attempts,
+                    sum(
+                        item.run_id == run_id and item.task_id == contract.task_id
+                        for item in self._worker_attempts.values()
+                    ),
+                )
+                if attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling:
+                    return RuntimeDecision.pause("TASK_ATTEMPT_CEILING", sequence)
+                resume = next(
+                    (
+                        allocation
+                        for allocation in self._task_resume_allocations.values()
+                        if allocation.run_id == run_id
+                        and allocation.task_id == contract.task_id
+                        and allocation.state == "RESERVED"
+                    ),
+                    None,
+                )
+                tranche_id = counters.active_tranche_id
+                tranche = (
+                    None
+                    if tranche_id is None
+                    else self._task_tranches.get((run_id, contract.task_id, tranche_id))
+                )
+                if resume is None and (
+                    tranche is None or counters.active_tranche_remaining_calls <= 0
+                ):
+                    continue
+                identity = canonical_json(
+                    {
+                        "run_id": run_id,
+                        "sequence": int(sequence),
+                        "task_id": contract.task_id,
+                    }
+                )
+                return TaskDispatchSelection(
+                    dispatch_id="worker-dispatch-" + sha256(identity.encode()).hexdigest(),
+                    run_id=run_id,
+                    task_id=contract.task_id,
+                    task_contract_digest=task_contract_digest(contract),
+                    base_run_head_oid=str(run.pinned_target_oid),
+                    applicable_revision_digests=revisions,
+                    target_safety_digest=self.target_authority_digest(run_id),
+                    credential_profile=None,
+                    resume_allocation_id=None if resume is None else resume.allocation_id,
+                    reserved_attempt_id=(None if resume is None else resume.reserved_attempt_id),
+                    expected_sequence=sequence,
+                )
+            return RuntimeDecision.pause("NO_DISPATCHABLE_TASK", sequence)
+
+    def create_attempt_with_lease(
+        self,
+        selection: TaskDispatchSelection,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> WorkerAttemptSnapshot:
+        if selection.expected_sequence != expected_sequence:
+            raise StateConflict("WORKER_DISPATCH_SEQUENCE_MISMATCH")
+        if selection.existing_attempt_id is not None:
+            binding = self.current_worker_turn_binding(selection.existing_attempt_id)
+            if binding.run_id != selection.run_id or binding.task_id != selection.task_id:
+                raise StateConflict("WORKER_EXISTING_ATTEMPT_BINDING_MISMATCH")
+            return WorkerAttemptSnapshot(
+                binding.run_id,
+                binding.task_id,
+                binding.attempt_id,
+                binding.applicable_revision_digests,
+            )
+        created: list[WorkerAttemptSnapshot] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(selection.run_id)
+            if run is None or run.state != RunState.ACTIVE:
+                raise StateConflict("RUN_NOT_DISPATCHABLE")
+            if copied.current_revision_digests(selection.run_id) != (
+                selection.applicable_revision_digests
+            ):
+                raise StateConflict("REVISION_BINDING_MISMATCH")
+            plan_digest = selection.applicable_revision_digests.plan_digest
+            policy_digest = selection.applicable_revision_digests.policy_digest
+            budget_digest = selection.applicable_revision_digests.budget_digest
+            model_digest = selection.applicable_revision_digests.model_configuration_digest
+            if (
+                plan_digest is None
+                or policy_digest is None
+                or budget_digest is None
+                or model_digest is None
+            ):
+                raise StateConflict("REVISION_BINDING_MISMATCH")
+            budget = copied._require_current_budget(selection.run_id, budget_digest)
+            active = sum(
+                lease.run_id == selection.run_id and lease.state == "ACTIVE"
+                for lease in copied._workspace_leases.values()
+            )
+            if active >= budget.concurrent_worker_ceiling:
+                raise StateConflict("CONCURRENT_WORKER_CEILING")
+            contracts = copied._plan_task_contracts[plan_digest]
+            contract = next((item for item in contracts if item.task_id == selection.task_id), None)
+            if contract is None or task_contract_digest(contract) != selection.task_contract_digest:
+                raise StateConflict("TASK_CONTRACT_BINDING_MISMATCH")
+            counters = copied._task_budget_counters.get(
+                (selection.run_id, selection.task_id),
+                TaskBudgetState(selection.run_id, selection.task_id),
+            )
+            if counters.attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling:
+                raise StateConflict("TASK_ATTEMPT_CEILING")
+            tranche_id = counters.active_tranche_id
+            tranche = (
+                None
+                if tranche_id is None
+                else copied._task_tranches.get((selection.run_id, selection.task_id, tranche_id))
+            )
+            resume = (
+                None
+                if selection.resume_allocation_id is None
+                else copied._task_resume_allocations.get(selection.resume_allocation_id)
+            )
+            if resume is None and (tranche is None or counters.active_tranche_remaining_calls <= 0):
+                raise StateConflict("TASK_ALLOCATION_REQUIRED")
+            allocated_attempt_id = (
+                resume.reserved_attempt_id if resume is not None else tranche[0]  # type: ignore[index]
+            )
+            if (
+                selection.reserved_attempt_id is not None
+                and selection.reserved_attempt_id != allocated_attempt_id
+            ):
+                raise StateConflict("RESERVED_ATTEMPT_BINDING_MISMATCH")
+            attempt_id = AttemptId(allocated_attempt_id)
+            if attempt_id in copied._worker_attempts:
+                raise StateConflict("WORKER_ATTEMPT_DUPLICATE")
+            generation = 1 + max(
+                (
+                    lease.generation
+                    for lease in copied._workspace_leases.values()
+                    if lease.run_id == selection.run_id and lease.task_id == selection.task_id
+                ),
+                default=0,
+            )
+            lease_id = (
+                "worker-lease-"
+                + sha256(f"{selection.run_id}:{attempt_id}:{generation}".encode()).hexdigest()
+            )
+            scope_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "read": [item.value for item in contract.read_globs],
+                        "write": [item.value for item in contract.write_globs],
+                    }
+                )
+            )
+            snapshot_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "head": selection.base_run_head_oid,
+                        "repository_id": run.repository_id,
+                        "scope_digest": scope_digest,
+                    }
+                )
+            )
+            dependency_basis = sha256_digest(
+                canonical_json({"dependencies": list(contract.dependency_task_ids)})
+            )
+            model_record = copied._revision_documents.get(
+                (
+                    selection.run_id,
+                    "MODEL_CONFIGURATION",
+                    model_digest,
+                )
+            )
+            if model_record is None or not isinstance(
+                model_record[0], ModelConfigurationRevisionDocument
+            ):
+                raise StateConflict("MODEL_CONFIGURATION_NOT_FOUND")
+            binding = WorkerTurnBinding(
+                run_id=selection.run_id,
+                task_id=selection.task_id,
+                attempt_id=attempt_id,
+                tranche_id=str(tranche_id or resume.allocation_id),  # type: ignore[union-attr]
+                lease_id=lease_id,
+                lease_generation=generation,
+                admissible_head=selection.base_run_head_oid,
+                task_contract_digest=selection.task_contract_digest,
+                plan_digest=plan_digest,
+                policy_digest=policy_digest,
+                budget_digest=budget_digest,
+                model_configuration_digest=model_digest,
+                tool_schema_digest=model_record[0].tool_schema_digest,
+                target_safety_digest=selection.target_safety_digest,
+                credential_profile=selection.credential_profile,
+                repository_id=str(run.repository_id),
+                snapshot_digest=snapshot_digest,
+                scope_digest=scope_digest,
+                dependency_fingerprint_basis=dependency_basis,
+            )
+            copied._tasks[(selection.run_id, selection.task_id)] = ("ACTIVE", None, None)
+            copied._attempts[(selection.run_id, attempt_id)] = (
+                selection.task_id,
+                "RUNNING",
+            )
+            copied._worker_attempts[attempt_id] = WorkerAttemptRecord(
+                selection.run_id,
+                selection.task_id,
+                attempt_id,
+                binding.plan_digest,
+                binding.policy_digest,
+                binding.budget_digest,
+                binding.model_configuration_digest,
+                binding.tool_schema_digest,
+                binding.target_safety_digest,
+                binding.credential_profile,
+                binding.task_contract_digest,
+                binding.admissible_head,
+                f"worker-{active + 1}",
+                "RUNNING",
+                AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_bindings[attempt_id] = binding
+            now = datetime.now(UTC)
+            sensitivity = (
+                contract.read_globs
+                + contract.dependency_globs
+                + tuple(item for check in contract.checks for item in check.input_globs)
+            )
+            copied._workspace_leases[(selection.run_id, lease_id)] = WorkspaceLease(
+                lease_id,
+                selection.run_id,
+                selection.task_id,
+                attempt_id,
+                generation,
+                selection.base_run_head_oid,
+                selection.base_run_head_oid,
+                selection.task_contract_digest,
+                contract.write_globs,
+                sensitivity,
+                now,
+                now + timedelta(minutes=15),
+                "ACTIVE",
+            )
+            copied._task_budget_counters[(selection.run_id, selection.task_id)] = replace(
+                counters, attempts=counters.attempts + 1
+            )
+            if resume is not None:
+                copied._task_resume_allocations[resume.allocation_id] = replace(
+                    resume, state="CONSUMED"
+                )
+            copied._settle_global_usage_for_producer(
+                selection.run_id,
+                binding.budget_digest,
+                GlobalBudgetMetric.CONCURRENT_WORKERS,
+                active + 1,
+            )
+            created.append(
+                WorkerAttemptSnapshot(
+                    selection.run_id,
+                    selection.task_id,
+                    attempt_id,
+                    binding.applicable_revision_digests,
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=selection.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_CREATED",
+                task_id=selection.task_id,
+                attempt_id=selection.reserved_attempt_id,
+                applicable_revision_digests=selection.applicable_revision_digests,
+                subject_digests=(selection.task_contract_digest,),
+            ),
+            mutate=mutate,
+        )
+        return created[0]
 
     def task_lifecycle_state(self, run_id: RunId, task_id: TaskId) -> TaskLifecycleState:
         with self._lock:
@@ -1317,6 +1835,14 @@ class InMemoryStateStore:
         action_digest: str,
         budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
+        *,
+        worker_recovery: tuple[
+            WorkerTurnBinding,
+            LogicalTurnId,
+            EffectIntent | None,
+            RuntimePermit | None,
+        ]
+        | None = None,
     ) -> TaskStopDecision:
         if attempt_id != task.attempt_id:
             raise StateConflict("TASK_ATTEMPT_BINDING_MISMATCH")
@@ -1326,6 +1852,11 @@ class InMemoryStateStore:
             nonlocal count
             copied._require_current_task_budget(task, budget_digest)
             copied._finish_attempt(task.run_id, task.task_id, attempt_id, "FAILED")
+            worker_attempt = copied._worker_attempts.get(attempt_id)
+            if worker_attempt is not None:
+                if worker_attempt.run_id != task.run_id or worker_attempt.task_id != task.task_id:
+                    raise StateConflict("WORKER_ATTEMPT_BINDING_MISMATCH")
+                copied._worker_attempts[attempt_id] = replace(worker_attempt, state="FAILED")
             current = copied._tasks.get((task.run_id, task.task_id))
             if current is None or current[0] != "ACTIVE":
                 raise StateConflict("TASK_INVALID_ACTION_SOURCE_STATE_ILLEGAL")
@@ -1350,6 +1881,16 @@ class InMemoryStateStore:
                 )
             else:
                 copied._set_task_state(task.run_id, task.task_id, "READY")
+            if worker_recovery is not None:
+                binding, logical_turn_id, marker, permit = worker_recovery
+                copied._settle_recovered_worker_marker(
+                    binding,
+                    logical_turn_id,
+                    marker,
+                    permit,
+                    "WORKER_MALFORMED_ACTION_RECORDED",
+                    expected_sequence,
+                )
 
         sequence = self._commit_state_and_event(
             run_id=task.run_id,
@@ -1372,6 +1913,426 @@ class InMemoryStateStore:
             attempt_state="FAILED",
             resulting_sequence=sequence,
         )
+
+    def record_malformed_worker_action(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action_digest: str,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        if self.current_worker_turn_binding(binding.attempt_id) != binding:
+            raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+        return self.record_invalid_action(
+            TaskAuthority(binding.run_id, binding.task_id, binding.attempt_id),
+            binding.attempt_id,
+            action_digest,
+            binding.budget_digest,
+            expected_sequence,
+            worker_recovery=(binding, logical_turn_id, recovered_marker, permit),
+        )
+
+    def record_authorized_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> ToolIntent:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        binding = self.current_worker_turn_binding(request.attempt_id)
+        try:
+            validate_authorized_worker_action(binding, intent, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, request.logical_turn_id)
+            if (
+                request.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            if effect.intent_id in copied._effect_intents or any(
+                existing.idempotency_key == effect.idempotency_key
+                for existing in copied._effect_intents.values()
+            ):
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._worker_actions[request.action_id] = WorkerActionRecord(
+                action_id=request.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=request.logical_turn_id,
+                normalized_action_digest=request.action_digest,
+                expected_prestate_digest=request.expected_prestate_digest,
+                authorization_binding_digest=decision.binding_digest,
+                deadline_at_utc=decision.deadline_at_utc,
+                intent_id=intent.intent_id,
+                result_intent_id=None,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = request.action_id
+            copied._settle_recovered_worker_marker(
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_INTENT_RECORDED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        authorization: AuthorizationDecision,
+        result: ToolResult,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != intent.run_id or result.intent_id != intent.intent_id:
+            raise StateConflict("WORKER_TOOL_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            action = copied._worker_actions.get(intent.action_id)
+            stored_intent = copied._effect_intents.get(intent.intent_id)
+            if (
+                action is None
+                or action.intent_id != intent.intent_id
+                or action.result_intent_id is not None
+                or action.authorization_binding_digest != authorization.binding_digest
+                or stored_intent is None
+                or ToolIntent.from_effect_intent(stored_intent) != intent
+                or intent.intent_id in copied._effect_results
+            ):
+                raise StateConflict("WORKER_ACTION_SETTLEMENT_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = effect_result
+            copied._worker_actions[intent.action_id] = replace(
+                action, result_intent_id=intent.intent_id
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_SETTLED",
+                task_id=intent.task_id,
+                attempt_id=intent.attempt_id,
+                action_id=intent.action_id,
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def settle_recovered_action_denial(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        marker: EffectIntent,
+        permit: RuntimePermit,
+        decision: AuthorizationDecision,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (
+            decision.decision != "DENY"
+            or decision.persistence != "DENIAL_AUDIT"
+            or decision.run_id != binding.run_id
+            or decision.task_id != binding.task_id
+            or decision.attempt_id != binding.attempt_id
+            or decision.resulting_sequence != expected_sequence
+        ):
+            raise StateConflict("RECOVERED_WORKER_DENIAL_BINDING_MISMATCH")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._settle_recovered_worker_marker(
+                binding,
+                LogicalTurnId(marker.action_id or ""),
+                marker,
+                permit,
+                "WORKER_ACTION_DENIED",
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "RECOVERED_WORKER_ACTION_DENIAL_SETTLED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=decision.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=decision.reason,
+            ),
+            mutate=mutate,
+        )
+
+    def freeze_authorized_pending_action(
+        self,
+        *,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> PendingActionFreeze:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        binding = self.current_worker_turn_binding(request.attempt_id)
+        try:
+            pending_id = pending_worker_action_id(binding, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, request.logical_turn_id)
+            if (
+                request.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            copied._worker_actions[request.action_id] = WorkerActionRecord(
+                action_id=request.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=request.logical_turn_id,
+                normalized_action_digest=request.action_digest,
+                expected_prestate_digest=request.expected_prestate_digest,
+                authorization_binding_digest=decision.binding_digest,
+                deadline_at_utc=decision.deadline_at_utc,
+                intent_id=None,
+                result_intent_id=None,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = request.action_id
+            copied._worker_attempts[binding.attempt_id] = replace(
+                copied._worker_attempts[binding.attempt_id], state="WAITING_APPROVAL"
+            )
+            copied._settle_recovered_worker_marker(
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_PENDING_ACTION_FROZEN",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_PENDING_ACTION_FROZEN",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return PendingActionFreeze(pending_id, sequence)
+
+    def finish_attempt(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action: FinishAction | FailAction,
+        action_digest: str,
+        authorization: AuthorizationDecision,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        try:
+            effect, result = terminal_worker_effects(
+                binding,
+                logical_turn_id,
+                action,
+                action_digest,
+                authorization,
+                AuditSequence(expected_sequence + 1),
+            )
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, logical_turn_id)
+            if (
+                authorization.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+                or effect.intent_id in copied._effect_intents
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._effect_results[effect.intent_id] = result
+            copied._worker_actions[authorization.action_id] = WorkerActionRecord(
+                action_id=authorization.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=logical_turn_id,
+                normalized_action_digest=action_digest,
+                expected_prestate_digest=sha256_digest("{}"),
+                authorization_binding_digest=authorization.binding_digest,
+                deadline_at_utc=authorization.deadline_at_utc,
+                intent_id=effect.intent_id,
+                result_intent_id=effect.intent_id,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = authorization.action_id
+            attempt = copied._worker_attempts[binding.attempt_id]
+            terminal_state = "SUCCEEDED" if isinstance(action, FinishAction) else "FAILED"
+            copied._worker_attempts[binding.attempt_id] = replace(attempt, state=terminal_state)
+            if isinstance(action, FailAction):
+                copied._finish_attempt(
+                    binding.run_id, binding.task_id, binding.attempt_id, "FAILED"
+                )
+            copied._release_attempt_lease(binding.run_id, binding.attempt_id)
+            copied._settle_recovered_worker_marker(
+                binding,
+                logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_TERMINAL_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_FINISHED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=authorization.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=result.result_class,
+                subject_digests=(action_digest, result.result_digest),
+            ),
+            mutate=mutate,
+        )
+        return RuntimeDecision(
+            code="ACTION_RECORDED",
+            stop_reason=None,
+            resulting_sequence=sequence,
+        )
+
+    def _settle_recovered_worker_marker(
+        self,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        result_class: str,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if marker is None and permit is None:
+            return
+        owner_id = None if permit is None else permit.consumed_owner_id
+        try:
+            payload = {} if marker is None else json.loads(marker.normalized_payload_json)
+        except json.JSONDecodeError as error:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH") from error
+        if (
+            marker is None
+            or permit is None
+            or owner_id is None
+            or permit.run_id != binding.run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "ACTIVE"
+            or permit.applicable_revision_digests != binding.applicable_revision_digests
+            or permit.target_authority_digest != binding.target_safety_digest
+            or marker.run_id != binding.run_id
+            or marker.kind != "RECOVERED_MODEL_ACTION"
+            or marker.task_id != binding.task_id
+            or marker.attempt_id != binding.attempt_id
+            or marker.action_id != logical_turn_id
+            or marker.applicable_revision_digests != binding.applicable_revision_digests
+            or not isinstance(payload, dict)
+            or payload.get("owner_kind") != "WORKER"
+            or payload.get("task_id") != binding.task_id
+            or payload.get("attempt_id") != binding.attempt_id
+            or payload.get("logical_turn_id") != logical_turn_id
+            or payload.get("tranche_id") != binding.tranche_id
+            or self._require_unsettled_effect_intent(binding.run_id, marker.intent_id) != marker
+        ):
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        stored_permit, _ = self._require_consumed_runtime_owner_on_copy(
+            self, binding.run_id, owner_id, permit.generation
+        )
+        if stored_permit != permit:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        result_payload = canonical_json({"result_class": result_class})
+        self._effect_results[marker.intent_id] = EffectResult(
+            intent_id=marker.intent_id,
+            run_id=binding.run_id,
+            outcome="COMPLETED",
+            result_class=result_class,
+            result_digest=sha256_digest(result_payload),
+            bounded_result_json=result_payload,
+            settled_sequence=AuditSequence(expected_sequence + 1),
+        )
+
+    def latest_worker_feedback(self, attempt_id: AttemptId) -> str | None:
+        with self._lock:
+            actions = tuple(
+                action
+                for action in self._worker_actions.values()
+                if action.attempt_id == attempt_id and action.result_intent_id is not None
+            )
+            if not actions:
+                return None
+            latest = max(actions, key=lambda action: action.created_sequence)
+            result_intent_id = latest.result_intent_id
+            if result_intent_id is None:
+                raise StateConflict("WORKER_FEEDBACK_RESULT_MISSING")
+            result = self._effect_results.get(result_intent_id)
+        if result is None:
+            raise StateConflict("WORKER_FEEDBACK_RESULT_MISSING")
+        return bounded_worker_feedback(ToolResult.model_validate_json(result.bounded_result_json))
 
     def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
         with self._lock:

@@ -6,7 +6,7 @@ from base64 import b32encode
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import compare_digest
@@ -22,6 +22,7 @@ from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
     TargetAuthorityDigestService,
 )
+from apexcrew.domain.actions import FailAction, FinishAction
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
@@ -39,6 +40,7 @@ from apexcrew.domain.authority import (
     AtomicAction,
     AttemptLifecycleState,
     AuthorityDenied,
+    AuthorizationDecision,
     AuthorizationReason,
     AuthorizationRequest,
     BudgetCeilingExhaustion,
@@ -116,6 +118,7 @@ from apexcrew.domain.coordination import (
     PlanningReadResult,
     PlanningReadSettlement,
     PlanProposal,
+    TaskDispatchSelection,
     check_definition_from_json,
     check_definition_json,
     plan_proposal_from_document,
@@ -175,9 +178,11 @@ from apexcrew.domain.plan import (
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
+    ModelConfigurationRevisionDocument,
     Sha256DigestText,
     revision_digest,
 )
+from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -191,6 +196,17 @@ from apexcrew.domain.types import (
     RunState,
     RuntimeOwnerId,
     TaskId,
+)
+from apexcrew.domain.worker import (
+    PendingActionFreeze,
+    WorkerAttemptRecord,
+    WorkerAttemptSnapshot,
+    WorkerTaskRecord,
+    WorkerTurnBinding,
+    bounded_worker_feedback,
+    pending_worker_action_id,
+    terminal_worker_effects,
+    validate_authorized_worker_action,
 )
 
 _EXECUTION_REVISION_STATES = frozenset(
@@ -790,6 +806,60 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 last_intent_id TEXT REFERENCES effect_intents(intent_id),
                 guard_binding_json TEXT,
                 PRIMARY KEY(run_id, ref_kind)
+            )""",
+        ),
+    ),
+    (
+        16,
+        (
+            """CREATE TABLE worker_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                plan_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                model_configuration_digest TEXT NOT NULL,
+                tool_schema_digest TEXT NOT NULL,
+                target_safety_digest TEXT NOT NULL,
+                credential_profile TEXT,
+                task_id TEXT NOT NULL,
+                task_contract_digest TEXT NOT NULL,
+                base_run_head_oid TEXT NOT NULL,
+                worker_slot TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'CREATED','LEASED','RUNNING','WAITING_APPROVAL','VERIFYING',
+                    'SUCCEEDED','FAILED','STALE','CANCELLED','INDETERMINATE'
+                )),
+                tranche_id TEXT NOT NULL,
+                lease_id TEXT NOT NULL,
+                repository_id TEXT NOT NULL,
+                snapshot_digest TEXT NOT NULL,
+                scope_digest TEXT NOT NULL,
+                dependency_fingerprint_basis TEXT NOT NULL,
+                created_sequence INTEGER NOT NULL
+            )""",
+            """CREATE UNIQUE INDEX one_active_workspace_lease
+                ON workspace_leases(run_id, attempt_id) WHERE state = 'ACTIVE'""",
+            """CREATE TABLE worker_actions (
+                action_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL REFERENCES worker_attempts(attempt_id),
+                logical_turn_id TEXT NOT NULL,
+                normalized_action_digest TEXT NOT NULL,
+                expected_prestate_digest TEXT NOT NULL,
+                authorization_binding_digest TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                model_configuration_digest TEXT NOT NULL,
+                tool_schema_digest TEXT NOT NULL,
+                target_safety_digest TEXT NOT NULL,
+                deadline_at_utc TEXT NOT NULL,
+                intent_id TEXT REFERENCES effect_intents(intent_id),
+                result_intent_id TEXT REFERENCES effect_results(intent_id),
+                created_sequence INTEGER NOT NULL,
+                UNIQUE(attempt_id, logical_turn_id)
             )""",
         ),
     ),
@@ -1759,6 +1829,614 @@ class SqliteStateStore:
             elif attempt_row["task_id"] != task.task_id or attempt_row["state"] != "RUNNING":
                 raise StateConflict("ATTEMPT_NOT_STARTABLE")
 
+    def install_worker_attempt_for_test(self, binding: WorkerTurnBinding) -> None:
+        now = datetime.now(UTC)
+        with self._transaction("IMMEDIATE") as connection:
+            budget = connection.execute(
+                "SELECT budget_digest FROM approved_budgets_for_test WHERE run_id = ?",
+                (binding.run_id,),
+            ).fetchone()
+            if budget is None or budget["budget_digest"] != binding.budget_digest:
+                raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM worker_attempts WHERE attempt_id = ?",
+                    (binding.attempt_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise StateConflict("WORKER_ATTEMPT_DUPLICATE")
+            connection.execute(
+                "INSERT INTO tasks(run_id, task_id, state) VALUES (?, ?, 'ACTIVE') "
+                "ON CONFLICT(run_id, task_id) DO UPDATE SET state = 'ACTIVE', "
+                "pause_reason = NULL, pause_counter = NULL",
+                (binding.run_id, binding.task_id),
+            )
+            connection.execute(
+                "INSERT INTO attempts(run_id, task_id, attempt_id, state) "
+                "VALUES (?, ?, ?, 'RUNNING')",
+                (binding.run_id, binding.task_id, binding.attempt_id),
+            )
+            sequence_row = connection.execute(
+                "SELECT current_sequence FROM run_sequences WHERE run_id = ?",
+                (binding.run_id,),
+            ).fetchone()
+            created_sequence = AuditSequence(
+                0 if sequence_row is None else sequence_row["current_sequence"]
+            )
+            connection.execute(
+                "INSERT INTO worker_attempts(attempt_id, run_id, plan_digest, policy_digest, "
+                "budget_digest, model_configuration_digest, tool_schema_digest, "
+                "target_safety_digest, credential_profile, task_id, task_contract_digest, "
+                "base_run_head_oid, worker_slot, state, tranche_id, lease_id, repository_id, "
+                "snapshot_digest, scope_digest, dependency_fingerprint_basis, created_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    binding.attempt_id,
+                    binding.run_id,
+                    binding.plan_digest,
+                    binding.policy_digest,
+                    binding.budget_digest,
+                    binding.model_configuration_digest,
+                    binding.tool_schema_digest,
+                    binding.target_safety_digest,
+                    binding.credential_profile,
+                    binding.task_id,
+                    binding.task_contract_digest,
+                    binding.admissible_head,
+                    f"worker-{binding.lease_generation}",
+                    binding.tranche_id,
+                    binding.lease_id,
+                    binding.repository_id,
+                    binding.snapshot_digest,
+                    binding.scope_digest,
+                    binding.dependency_fingerprint_basis,
+                    created_sequence,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO workspace_leases(lease_id, run_id, task_id, attempt_id, "
+                "generation, base_head, admissible_head, task_contract_digest, "
+                "write_globs_json, sensitivity_globs_json, issued_at_utc, expires_at_utc, "
+                "state, issued_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                (
+                    binding.lease_id,
+                    binding.run_id,
+                    binding.task_id,
+                    binding.attempt_id,
+                    binding.lease_generation,
+                    binding.admissible_head,
+                    binding.admissible_head,
+                    binding.task_contract_digest,
+                    '["**"]',
+                    '["**"]',
+                    now.isoformat(),
+                    (now + timedelta(minutes=30)).isoformat(),
+                    created_sequence,
+                ),
+            )
+
+    @staticmethod
+    def _worker_attempt_from_row(row: sqlite3.Row) -> WorkerAttemptRecord:
+        return WorkerAttemptRecord(
+            run_id=RunId(row["run_id"]),
+            task_id=TaskId(row["task_id"]),
+            attempt_id=AttemptId(row["attempt_id"]),
+            plan_digest=RevisionDigest(row["plan_digest"]),
+            policy_digest=RevisionDigest(row["policy_digest"]),
+            budget_digest=RevisionDigest(row["budget_digest"]),
+            model_configuration_digest=RevisionDigest(row["model_configuration_digest"]),
+            tool_schema_digest=Sha256DigestText(row["tool_schema_digest"]),
+            target_safety_digest=Sha256DigestText(row["target_safety_digest"]),
+            credential_profile=row["credential_profile"],
+            task_contract_digest=Sha256DigestText(row["task_contract_digest"]),
+            base_run_head_oid=str(row["base_run_head_oid"]),
+            worker_slot=str(row["worker_slot"]),
+            state=str(row["state"]),
+            created_sequence=AuditSequence(row["created_sequence"]),
+        )
+
+    @staticmethod
+    def _worker_turn_binding_in_transaction(
+        connection: sqlite3.Connection, attempt_id: AttemptId
+    ) -> WorkerTurnBinding:
+        row = connection.execute(
+            "SELECT worker_attempts.*, workspace_leases.generation, "
+            "workspace_leases.admissible_head, workspace_leases.state AS lease_state "
+            "FROM worker_attempts JOIN workspace_leases "
+            "ON workspace_leases.lease_id = worker_attempts.lease_id "
+            "WHERE worker_attempts.attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        if row["state"] != "RUNNING" or row["lease_state"] != "ACTIVE":
+            raise StateConflict("WORKER_ATTEMPT_NOT_RUNNABLE")
+        return WorkerTurnBinding(
+            run_id=RunId(row["run_id"]),
+            task_id=TaskId(row["task_id"]),
+            attempt_id=AttemptId(row["attempt_id"]),
+            tranche_id=str(row["tranche_id"]),
+            lease_id=str(row["lease_id"]),
+            lease_generation=int(row["generation"]),
+            admissible_head=str(row["admissible_head"]),
+            task_contract_digest=Sha256DigestText(row["task_contract_digest"]),
+            plan_digest=RevisionDigest(row["plan_digest"]),
+            policy_digest=RevisionDigest(row["policy_digest"]),
+            budget_digest=RevisionDigest(row["budget_digest"]),
+            model_configuration_digest=RevisionDigest(row["model_configuration_digest"]),
+            tool_schema_digest=Sha256DigestText(row["tool_schema_digest"]),
+            target_safety_digest=Sha256DigestText(row["target_safety_digest"]),
+            credential_profile=row["credential_profile"],
+            repository_id=str(row["repository_id"]),
+            snapshot_digest=Sha256DigestText(row["snapshot_digest"]),
+            scope_digest=Sha256DigestText(row["scope_digest"]),
+            dependency_fingerprint_basis=Sha256DigestText(row["dependency_fingerprint_basis"]),
+        )
+
+    def current_worker_turn_binding(self, attempt_id: AttemptId) -> WorkerTurnBinding:
+        with self._read_transaction() as connection:
+            return self._worker_turn_binding_in_transaction(connection, attempt_id)
+
+    def attempt(self, attempt_id: AttemptId) -> WorkerAttemptRecord:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM worker_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+        if row is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        return self._worker_attempt_from_row(row)
+
+    def attempts_for_task(self, task_id: TaskId) -> tuple[WorkerAttemptRecord, ...]:
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT * FROM worker_attempts WHERE task_id = ? "
+                    "ORDER BY created_sequence, attempt_id",
+                    (task_id,),
+                )
+            )
+        return tuple(self._worker_attempt_from_row(row) for row in rows)
+
+    def active_lease_for_task(self, task_id: TaskId) -> WorkspaceLease | None:
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT * FROM workspace_leases WHERE task_id = ? AND state = 'ACTIVE'",
+                    (task_id,),
+                )
+            )
+        if len(rows) > 1:
+            raise StateConflict("MULTIPLE_ACTIVE_TASK_LEASES")
+        return None if not rows else _workspace_lease_from_row(rows[0])
+
+    def invalid_action_count(self, task_id: TaskId) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_invalid_actions WHERE task_id = ?", (task_id,)
+                ).fetchone()[0]
+            )
+
+    def task_record(self, task_id: TaskId) -> WorkerTaskRecord:
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT run_id, state, pause_reason FROM tasks WHERE task_id = ?", (task_id,)
+                )
+            )
+            terminal = connection.execute(
+                "SELECT effect_results.result_class FROM worker_actions "
+                "JOIN effect_results ON effect_results.intent_id = worker_actions.result_intent_id "
+                "WHERE worker_actions.task_id = ? AND effect_results.result_class "
+                "IN ('WORKER_FINISHED','WORKER_FAILED') "
+                "ORDER BY effect_results.settled_sequence DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if len(rows) != 1:
+            raise StateConflict("WORKER_TASK_NOT_FOUND_OR_AMBIGUOUS")
+        if terminal is not None:
+            state = "SUCCEEDED" if terminal[0] == "WORKER_FINISHED" else "FAILED"
+            return WorkerTaskRecord(RunId(rows[0]["run_id"]), task_id, state, None)
+        return WorkerTaskRecord(
+            RunId(rows[0]["run_id"]), task_id, str(rows[0]["state"]), rows[0]["pause_reason"]
+        )
+
+    def next_dispatchable(self, run_id: RunId) -> TaskDispatchSelection | RuntimeDecision:
+        with self._read_transaction() as connection:
+            run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            sequence = AuditSequence(
+                connection.execute(
+                    "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+            )
+            if run["state"] != RunState.ACTIVE or not bool(run["new_dispatch_open"]):
+                return RuntimeDecision.pause("RUN_DISPATCH_CLOSED", sequence)
+            revisions = self._current_revision_digests_in_transaction(connection, run_id)
+            if (
+                revisions.plan_digest is None
+                or revisions.policy_digest is None
+                or revisions.budget_digest is None
+                or revisions.model_configuration_digest is None
+            ):
+                return RuntimeDecision.pause("REVISION_BINDING_MISMATCH", sequence)
+            row = connection.execute(
+                "SELECT worker_attempts.attempt_id FROM worker_attempts "
+                "JOIN workspace_leases USING(run_id, attempt_id) "
+                "WHERE worker_attempts.run_id = ? AND worker_attempts.state = 'RUNNING' "
+                "AND workspace_leases.state = 'ACTIVE' "
+                "ORDER BY worker_attempts.created_sequence, worker_attempts.attempt_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row is not None:
+                binding = self._worker_turn_binding_in_transaction(
+                    connection, AttemptId(row["attempt_id"])
+                )
+                return TaskDispatchSelection(
+                    f"existing:{binding.attempt_id}",
+                    run_id,
+                    binding.task_id,
+                    binding.task_contract_digest,
+                    binding.admissible_head,
+                    binding.applicable_revision_digests,
+                    binding.target_safety_digest,
+                    binding.credential_profile,
+                    None,
+                    None,
+                    sequence,
+                    binding.attempt_id,
+                )
+            budget_row = connection.execute(
+                "SELECT budget_json FROM approved_budgets_for_test WHERE run_id = ? "
+                "AND budget_digest = ?",
+                (run_id, revisions.budget_digest),
+            ).fetchone()
+            if budget_row is None:
+                raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+            budget = BudgetRevisionDocument.model_validate_json(str(budget_row[0]))
+            active = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE'",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            if active >= budget.concurrent_worker_ceiling:
+                return RuntimeDecision.pause("CONCURRENT_WORKER_CEILING", sequence)
+            contracts = self._task_contracts_in_transaction(connection, revisions.plan_digest)
+            active_tasks = {
+                TaskId(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT task_id FROM worker_attempts WHERE run_id = ? "
+                    "AND state IN ('RUNNING','WAITING_APPROVAL','VERIFYING')",
+                    (run_id,),
+                )
+            }
+            succeeded = {
+                TaskId(row[0])
+                for row in connection.execute(
+                    "SELECT DISTINCT task_id FROM worker_attempts WHERE run_id = ? "
+                    "AND state = 'SUCCEEDED'",
+                    (run_id,),
+                )
+            }
+            hazards = self._task_edges_in_transaction(
+                connection, "hazard_edges", revisions.plan_digest
+            )
+            for contract in contracts:
+                task = connection.execute(
+                    "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                    (run_id, contract.task_id),
+                ).fetchone()
+                if (
+                    (task is not None and task[0] != "READY")
+                    or not set(contract.dependency_task_ids).issubset(succeeded)
+                    or any(
+                        contract.task_id in edge and any(item in active_tasks for item in edge)
+                        for edge in hazards
+                    )
+                ):
+                    continue
+                counters = self._task_budget_state(connection, run_id, contract.task_id)
+                attempt_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM worker_attempts WHERE run_id = ? AND task_id = ?",
+                        (run_id, contract.task_id),
+                    ).fetchone()[0]
+                )
+                if (
+                    max(counters.attempts, attempt_count)
+                    >= V01_MECHANISM_LIMITS.task_attempt_ceiling
+                ):
+                    return RuntimeDecision.pause("TASK_ATTEMPT_CEILING", sequence)
+                resume = connection.execute(
+                    "SELECT allocation_id, reserved_attempt_id FROM task_resume_allocations "
+                    "WHERE run_id = ? AND task_id = ? AND state = 'RESERVED' "
+                    "ORDER BY created_sequence LIMIT 1",
+                    (run_id, contract.task_id),
+                ).fetchone()
+                tranche = (
+                    None
+                    if counters.active_tranche_id is None
+                    else connection.execute(
+                        "SELECT attempt_id FROM task_tranches WHERE run_id = ? AND task_id = ? "
+                        "AND tranche_id = ?",
+                        (run_id, contract.task_id, counters.active_tranche_id),
+                    ).fetchone()
+                )
+                if resume is None and (
+                    tranche is None or counters.active_tranche_remaining_calls <= 0
+                ):
+                    continue
+                identity = canonical_json(
+                    {"run_id": run_id, "sequence": int(sequence), "task_id": contract.task_id}
+                )
+                return TaskDispatchSelection(
+                    "worker-dispatch-" + sha256(identity.encode()).hexdigest(),
+                    run_id,
+                    contract.task_id,
+                    task_contract_digest(contract),
+                    str(run["pinned_target_oid"]),
+                    revisions,
+                    self._target_authority_digest_in_transaction(connection, run_id),
+                    None,
+                    None if resume is None else str(resume["allocation_id"]),
+                    None if resume is None else AttemptId(resume["reserved_attempt_id"]),
+                    sequence,
+                )
+            return RuntimeDecision.pause("NO_DISPATCHABLE_TASK", sequence)
+
+    def create_attempt_with_lease(
+        self,
+        selection: TaskDispatchSelection,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> WorkerAttemptSnapshot:
+        if selection.expected_sequence != expected_sequence:
+            raise StateConflict("WORKER_DISPATCH_SEQUENCE_MISMATCH")
+        if selection.existing_attempt_id is not None:
+            binding = self.current_worker_turn_binding(selection.existing_attempt_id)
+            if binding.run_id != selection.run_id or binding.task_id != selection.task_id:
+                raise StateConflict("WORKER_EXISTING_ATTEMPT_BINDING_MISMATCH")
+            return WorkerAttemptSnapshot(
+                binding.run_id,
+                binding.task_id,
+                binding.attempt_id,
+                binding.applicable_revision_digests,
+            )
+        result: list[WorkerAttemptSnapshot] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            run = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (selection.run_id,)
+            ).fetchone()
+            revisions = self._current_revision_digests_in_transaction(connection, selection.run_id)
+            if (
+                run is None
+                or run["state"] != RunState.ACTIVE
+                or revisions != selection.applicable_revision_digests
+            ):
+                raise StateConflict("WORKER_DISPATCH_BINDING_MISMATCH")
+            plan_digest = revisions.plan_digest
+            policy_digest = revisions.policy_digest
+            budget_digest = revisions.budget_digest
+            model_digest = revisions.model_configuration_digest
+            if (
+                plan_digest is None
+                or policy_digest is None
+                or budget_digest is None
+                or model_digest is None
+            ):
+                raise StateConflict("REVISION_BINDING_MISMATCH")
+            budget_row = connection.execute(
+                "SELECT budget_json FROM approved_budgets_for_test WHERE run_id = ? "
+                "AND budget_digest = ?",
+                (selection.run_id, budget_digest),
+            ).fetchone()
+            if budget_row is None:
+                raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+            budget = BudgetRevisionDocument.model_validate_json(str(budget_row[0]))
+            active = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE'",
+                    (selection.run_id,),
+                ).fetchone()[0]
+            )
+            if active >= budget.concurrent_worker_ceiling:
+                raise StateConflict("CONCURRENT_WORKER_CEILING")
+            contract = next(
+                (
+                    item
+                    for item in self._task_contracts_in_transaction(connection, plan_digest)
+                    if item.task_id == selection.task_id
+                ),
+                None,
+            )
+            if contract is None or task_contract_digest(contract) != selection.task_contract_digest:
+                raise StateConflict("TASK_CONTRACT_BINDING_MISMATCH")
+            counters = self._task_budget_state(connection, selection.run_id, selection.task_id)
+            if counters.attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling:
+                raise StateConflict("TASK_ATTEMPT_CEILING")
+            resume = (
+                None
+                if selection.resume_allocation_id is None
+                else connection.execute(
+                    "SELECT * FROM task_resume_allocations WHERE allocation_id = ? "
+                    "AND run_id = ? AND task_id = ? AND state = 'RESERVED'",
+                    (
+                        selection.resume_allocation_id,
+                        selection.run_id,
+                        selection.task_id,
+                    ),
+                ).fetchone()
+            )
+            tranche = (
+                None
+                if counters.active_tranche_id is None
+                else connection.execute(
+                    "SELECT attempt_id FROM task_tranches WHERE run_id = ? AND task_id = ? "
+                    "AND tranche_id = ?",
+                    (selection.run_id, selection.task_id, counters.active_tranche_id),
+                ).fetchone()
+            )
+            if resume is None and (tranche is None or counters.active_tranche_remaining_calls <= 0):
+                raise StateConflict("TASK_ALLOCATION_REQUIRED")
+            if resume is not None:
+                attempt_id = AttemptId(resume["reserved_attempt_id"])
+            elif tranche is not None:
+                attempt_id = AttemptId(tranche["attempt_id"])
+            else:
+                raise StateConflict("TASK_ALLOCATION_REQUIRED")
+            if selection.reserved_attempt_id not in {None, attempt_id}:
+                raise StateConflict("RESERVED_ATTEMPT_BINDING_MISMATCH")
+            generation = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 FROM workspace_leases "
+                    "WHERE run_id = ? AND task_id = ?",
+                    (selection.run_id, selection.task_id),
+                ).fetchone()[0]
+            )
+            lease_id = (
+                "worker-lease-"
+                + sha256(f"{selection.run_id}:{attempt_id}:{generation}".encode()).hexdigest()
+            )
+            scope_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "read": [item.value for item in contract.read_globs],
+                        "write": [item.value for item in contract.write_globs],
+                    }
+                )
+            )
+            snapshot_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "head": selection.base_run_head_oid,
+                        "repository_id": run["repository_id"],
+                        "scope_digest": scope_digest,
+                    }
+                )
+            )
+            dependency_basis = sha256_digest(
+                canonical_json({"dependencies": list(contract.dependency_task_ids)})
+            )
+            model_row = connection.execute(
+                "SELECT document_json FROM revision_documents WHERE run_id = ? "
+                "AND revision_class = 'MODEL_CONFIGURATION' AND revision_digest = ?",
+                (selection.run_id, model_digest),
+            ).fetchone()
+            if model_row is None:
+                raise StateConflict("MODEL_CONFIGURATION_NOT_FOUND")
+            model = ModelConfigurationRevisionDocument.model_validate_json(str(model_row[0]))
+            tranche_id = (
+                counters.active_tranche_id if resume is None else str(resume["allocation_id"])
+            )
+            now = datetime.now(UTC)
+            sensitivity = (
+                contract.read_globs
+                + contract.dependency_globs
+                + tuple(item for check in contract.checks for item in check.input_globs)
+            )
+            connection.execute(
+                "INSERT INTO tasks(run_id, task_id, state) VALUES (?, ?, 'ACTIVE') "
+                "ON CONFLICT(run_id, task_id) DO UPDATE SET state = 'ACTIVE', "
+                "pause_reason = NULL, pause_counter = NULL",
+                (selection.run_id, selection.task_id),
+            )
+            connection.execute(
+                "INSERT INTO attempts(run_id, task_id, attempt_id, state) "
+                "VALUES (?, ?, ?, 'RUNNING')",
+                (selection.run_id, selection.task_id, attempt_id),
+            )
+            connection.execute(
+                "INSERT INTO worker_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'RUNNING', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    attempt_id,
+                    selection.run_id,
+                    plan_digest,
+                    policy_digest,
+                    budget_digest,
+                    model_digest,
+                    model.tool_schema_digest,
+                    selection.target_safety_digest,
+                    selection.credential_profile,
+                    selection.task_id,
+                    selection.task_contract_digest,
+                    selection.base_run_head_oid,
+                    f"worker-{active + 1}",
+                    tranche_id,
+                    lease_id,
+                    run["repository_id"],
+                    snapshot_digest,
+                    scope_digest,
+                    dependency_basis,
+                    expected_sequence + 1,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO workspace_leases(lease_id, run_id, task_id, attempt_id, "
+                "generation, base_head, admissible_head, task_contract_digest, "
+                "write_globs_json, sensitivity_globs_json, issued_at_utc, expires_at_utc, "
+                "state, issued_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?)",
+                (
+                    lease_id,
+                    selection.run_id,
+                    selection.task_id,
+                    attempt_id,
+                    generation,
+                    selection.base_run_head_oid,
+                    selection.base_run_head_oid,
+                    selection.task_contract_digest,
+                    json.dumps(
+                        [item.value for item in contract.write_globs], separators=(",", ":")
+                    ),
+                    json.dumps([item.value for item in sensitivity], separators=(",", ":")),
+                    now.isoformat(),
+                    (now + timedelta(minutes=15)).isoformat(),
+                    expected_sequence + 1,
+                ),
+            )
+            self._write_task_budget_state(
+                connection, replace(counters, attempts=counters.attempts + 1)
+            )
+            if resume is not None:
+                connection.execute(
+                    "UPDATE task_resume_allocations SET state = 'CONSUMED' "
+                    "WHERE allocation_id = ? AND state = 'RESERVED'",
+                    (resume["allocation_id"],),
+                )
+            self._settle_global_usage_in_transaction(
+                connection,
+                selection.run_id,
+                budget_digest,
+                GlobalBudgetMetric.CONCURRENT_WORKERS,
+                active + 1,
+            )
+            result.append(
+                WorkerAttemptSnapshot(
+                    selection.run_id,
+                    selection.task_id,
+                    attempt_id,
+                    revisions,
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=selection.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_CREATED",
+                task_id=selection.task_id,
+                attempt_id=selection.reserved_attempt_id,
+                applicable_revision_digests=selection.applicable_revision_digests,
+                subject_digests=(selection.task_contract_digest,),
+            ),
+            mutate=mutate,
+        )
+        return result[0]
+
     def task_lifecycle_state(self, run_id: RunId, task_id: TaskId) -> TaskLifecycleState:
         with self._read_transaction() as connection:
             row = connection.execute(
@@ -2474,6 +3152,14 @@ class SqliteStateStore:
         action_digest: str,
         budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
+        *,
+        worker_recovery: tuple[
+            WorkerTurnBinding,
+            LogicalTurnId,
+            EffectIntent | None,
+            RuntimePermit | None,
+        ]
+        | None = None,
     ) -> TaskStopDecision:
         if attempt_id != task.attempt_id:
             raise StateConflict("TASK_ATTEMPT_BINDING_MISMATCH")
@@ -2489,6 +3175,25 @@ class SqliteStateStore:
                 attempt_id,
                 "FAILED",
             )
+            worker_attempt = connection.execute(
+                "SELECT run_id, task_id FROM worker_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if worker_attempt is not None:
+                if (
+                    worker_attempt["run_id"] != task.run_id
+                    or worker_attempt["task_id"] != task.task_id
+                ):
+                    raise StateConflict("WORKER_ATTEMPT_BINDING_MISMATCH")
+                if (
+                    connection.execute(
+                        "UPDATE worker_attempts SET state = 'FAILED' "
+                        "WHERE attempt_id = ? AND state = 'RUNNING'",
+                        (attempt_id,),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("WORKER_ATTEMPT_NOT_RUNNING")
             task_row = connection.execute(
                 "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
                 (task.run_id, task.task_id),
@@ -2545,6 +3250,17 @@ class SqliteStateStore:
                     )
             else:
                 self._set_task_state(connection, task.run_id, task.task_id, "READY")
+            if worker_recovery is not None:
+                binding, logical_turn_id, marker, permit = worker_recovery
+                self._settle_recovered_worker_marker(
+                    connection,
+                    binding,
+                    logical_turn_id,
+                    marker,
+                    permit,
+                    "WORKER_MALFORMED_ACTION_RECORDED",
+                    expected_sequence,
+                )
 
         sequence = self._commit_state_and_event(
             run_id=task.run_id,
@@ -2566,6 +3282,513 @@ class SqliteStateStore:
             identical_invalid_action_count=count,
             attempt_state="FAILED",
             resulting_sequence=sequence,
+        )
+
+    def record_malformed_worker_action(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action_digest: str,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        if self.current_worker_turn_binding(binding.attempt_id) != binding:
+            raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+        return self.record_invalid_action(
+            TaskAuthority(binding.run_id, binding.task_id, binding.attempt_id),
+            binding.attempt_id,
+            action_digest,
+            binding.budget_digest,
+            expected_sequence,
+            worker_recovery=(binding, logical_turn_id, recovered_marker, permit),
+        )
+
+    def record_authorized_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> ToolIntent:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        with self._read_transaction() as connection:
+            binding = self._worker_turn_binding_in_transaction(connection, request.attempt_id)
+        try:
+            validate_authorized_worker_action(binding, intent, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            if self._worker_turn_binding_in_transaction(connection, binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            duplicate = connection.execute(
+                "SELECT 1 FROM worker_actions WHERE action_id = ? OR "
+                "(attempt_id = ? AND logical_turn_id = ?)",
+                (request.action_id, binding.attempt_id, request.logical_turn_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            self._insert_effect_intent(connection, effect)
+            try:
+                connection.execute(
+                    "INSERT INTO worker_actions(action_id, run_id, task_id, attempt_id, "
+                    "logical_turn_id, normalized_action_digest, expected_prestate_digest, "
+                    "authorization_binding_digest, plan_digest, policy_digest, budget_digest, "
+                    "model_configuration_digest, tool_schema_digest, target_safety_digest, "
+                    "deadline_at_utc, intent_id, created_sequence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        request.action_id,
+                        binding.run_id,
+                        binding.task_id,
+                        binding.attempt_id,
+                        request.logical_turn_id,
+                        request.action_digest,
+                        request.expected_prestate_digest,
+                        decision.binding_digest,
+                        binding.plan_digest,
+                        binding.policy_digest,
+                        binding.budget_digest,
+                        binding.model_configuration_digest,
+                        binding.tool_schema_digest,
+                        binding.target_safety_digest,
+                        decision.deadline_at_utc.isoformat(),
+                        intent.intent_id,
+                        expected_sequence + 1,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("WORKER_ACTION_DUPLICATE") from error
+            self._settle_recovered_worker_marker(
+                connection,
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_INTENT_RECORDED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        authorization: AuthorizationDecision,
+        result: ToolResult,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != intent.run_id or result.intent_id != intent.intent_id:
+            raise StateConflict("WORKER_TOOL_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            action = connection.execute(
+                "SELECT intent_id, result_intent_id, authorization_binding_digest "
+                "FROM worker_actions WHERE action_id = ?",
+                (intent.action_id,),
+            ).fetchone()
+            stored_intent = self._require_unsettled_effect_intent(
+                connection, intent.run_id, intent.intent_id
+            )
+            if (
+                action is None
+                or action["intent_id"] != intent.intent_id
+                or action["result_intent_id"] is not None
+                or action["authorization_binding_digest"] != authorization.binding_digest
+                or ToolIntent.from_effect_intent(stored_intent) != intent
+            ):
+                raise StateConflict("WORKER_ACTION_SETTLEMENT_BINDING_MISMATCH")
+            self._insert_effect_result(
+                connection,
+                intent.run_id,
+                intent.intent_id,
+                effect_result,
+                intent.applicable_revision_digests,
+            )
+            if (
+                connection.execute(
+                    "UPDATE worker_actions SET result_intent_id = ? "
+                    "WHERE action_id = ? AND result_intent_id IS NULL",
+                    (intent.intent_id, intent.action_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("WORKER_ACTION_ALREADY_SETTLED")
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_SETTLED",
+                task_id=intent.task_id,
+                attempt_id=intent.attempt_id,
+                action_id=intent.action_id,
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def settle_recovered_action_denial(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        marker: EffectIntent,
+        permit: RuntimePermit,
+        decision: AuthorizationDecision,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (
+            decision.decision != "DENY"
+            or decision.persistence != "DENIAL_AUDIT"
+            or decision.run_id != binding.run_id
+            or decision.task_id != binding.task_id
+            or decision.attempt_id != binding.attempt_id
+            or decision.resulting_sequence != expected_sequence
+        ):
+            raise StateConflict("RECOVERED_WORKER_DENIAL_BINDING_MISMATCH")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._settle_recovered_worker_marker(
+                connection,
+                binding,
+                LogicalTurnId(marker.action_id or ""),
+                marker,
+                permit,
+                "WORKER_ACTION_DENIED",
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "RECOVERED_WORKER_ACTION_DENIAL_SETTLED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=decision.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=decision.reason,
+            ),
+            mutate=mutate,
+        )
+
+    def freeze_authorized_pending_action(
+        self,
+        *,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> PendingActionFreeze:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        with self._read_transaction() as connection:
+            binding = self._worker_turn_binding_in_transaction(connection, request.attempt_id)
+        try:
+            pending_id = pending_worker_action_id(binding, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            if self._worker_turn_binding_in_transaction(connection, binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            duplicate = connection.execute(
+                "SELECT 1 FROM worker_actions WHERE action_id = ? OR "
+                "(attempt_id = ? AND logical_turn_id = ?)",
+                (request.action_id, binding.attempt_id, request.logical_turn_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            connection.execute(
+                "INSERT INTO worker_actions(action_id, run_id, task_id, attempt_id, "
+                "logical_turn_id, normalized_action_digest, expected_prestate_digest, "
+                "authorization_binding_digest, plan_digest, policy_digest, budget_digest, "
+                "model_configuration_digest, tool_schema_digest, target_safety_digest, "
+                "deadline_at_utc, created_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request.action_id,
+                    binding.run_id,
+                    binding.task_id,
+                    binding.attempt_id,
+                    request.logical_turn_id,
+                    request.action_digest,
+                    request.expected_prestate_digest,
+                    decision.binding_digest,
+                    binding.plan_digest,
+                    binding.policy_digest,
+                    binding.budget_digest,
+                    binding.model_configuration_digest,
+                    binding.tool_schema_digest,
+                    binding.target_safety_digest,
+                    decision.deadline_at_utc.isoformat(),
+                    expected_sequence + 1,
+                ),
+            )
+            if (
+                connection.execute(
+                    "UPDATE worker_attempts SET state = 'WAITING_APPROVAL' "
+                    "WHERE attempt_id = ? AND state = 'RUNNING'",
+                    (binding.attempt_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("WORKER_ATTEMPT_NOT_RUNNING")
+            self._settle_recovered_worker_marker(
+                connection,
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_PENDING_ACTION_FROZEN",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_PENDING_ACTION_FROZEN",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return PendingActionFreeze(pending_id, sequence)
+
+    def finish_attempt(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action: FinishAction | FailAction,
+        action_digest: str,
+        authorization: AuthorizationDecision,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        try:
+            effect, result = terminal_worker_effects(
+                binding,
+                logical_turn_id,
+                action,
+                action_digest,
+                authorization,
+                AuditSequence(expected_sequence + 1),
+            )
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            if self._worker_turn_binding_in_transaction(connection, binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            self._insert_effect_intent(connection, effect)
+            self._insert_effect_result(
+                connection,
+                binding.run_id,
+                effect.intent_id,
+                result,
+                binding.applicable_revision_digests,
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO worker_actions(action_id, run_id, task_id, attempt_id, "
+                    "logical_turn_id, normalized_action_digest, expected_prestate_digest, "
+                    "authorization_binding_digest, plan_digest, policy_digest, budget_digest, "
+                    "model_configuration_digest, tool_schema_digest, target_safety_digest, "
+                    "deadline_at_utc, intent_id, result_intent_id, created_sequence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        authorization.action_id,
+                        binding.run_id,
+                        binding.task_id,
+                        binding.attempt_id,
+                        logical_turn_id,
+                        action_digest,
+                        sha256_digest("{}"),
+                        authorization.binding_digest,
+                        binding.plan_digest,
+                        binding.policy_digest,
+                        binding.budget_digest,
+                        binding.model_configuration_digest,
+                        binding.tool_schema_digest,
+                        binding.target_safety_digest,
+                        authorization.deadline_at_utc.isoformat(),
+                        effect.intent_id,
+                        effect.intent_id,
+                        expected_sequence + 1,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("WORKER_ACTION_DUPLICATE") from error
+            terminal_state = "SUCCEEDED" if isinstance(action, FinishAction) else "FAILED"
+            if (
+                connection.execute(
+                    "UPDATE worker_attempts SET state = ? WHERE attempt_id = ? "
+                    "AND state = 'RUNNING'",
+                    (terminal_state, binding.attempt_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("WORKER_ATTEMPT_NOT_RUNNING")
+            if isinstance(action, FailAction):
+                self._finish_attempt(
+                    connection,
+                    binding.run_id,
+                    binding.task_id,
+                    binding.attempt_id,
+                    "FAILED",
+                )
+            self._release_attempt_lease(
+                connection,
+                binding.run_id,
+                binding.attempt_id,
+                AuditSequence(expected_sequence + 1),
+            )
+            self._settle_recovered_worker_marker(
+                connection,
+                binding,
+                logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_TERMINAL_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_FINISHED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=authorization.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=result.result_class,
+                subject_digests=(action_digest, result.result_digest),
+            ),
+            mutate=mutate,
+        )
+        return RuntimeDecision(
+            code="ACTION_RECORDED",
+            stop_reason=None,
+            resulting_sequence=sequence,
+        )
+
+    def _settle_recovered_worker_marker(
+        self,
+        connection: sqlite3.Connection,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        result_class: str,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if marker is None and permit is None:
+            return
+        owner_id = None if permit is None else permit.consumed_owner_id
+        try:
+            payload = {} if marker is None else json.loads(marker.normalized_payload_json)
+        except json.JSONDecodeError as error:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH") from error
+        if (
+            marker is None
+            or permit is None
+            or owner_id is None
+            or permit.run_id != binding.run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "ACTIVE"
+            or permit.applicable_revision_digests != binding.applicable_revision_digests
+            or permit.target_authority_digest != binding.target_safety_digest
+            or marker.run_id != binding.run_id
+            or marker.kind != "RECOVERED_MODEL_ACTION"
+            or marker.task_id != binding.task_id
+            or marker.attempt_id != binding.attempt_id
+            or marker.action_id != logical_turn_id
+            or marker.applicable_revision_digests != binding.applicable_revision_digests
+            or not isinstance(payload, dict)
+            or payload.get("owner_kind") != "WORKER"
+            or payload.get("task_id") != binding.task_id
+            or payload.get("attempt_id") != binding.attempt_id
+            or payload.get("logical_turn_id") != logical_turn_id
+            or payload.get("tranche_id") != binding.tranche_id
+        ):
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        stored = self._require_unsettled_effect_intent(connection, binding.run_id, marker.intent_id)
+        stored_permit, _ = self._require_consumed_runtime_owner(
+            connection, binding.run_id, owner_id, permit.generation
+        )
+        if stored != marker or stored_permit != permit:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        result_payload = canonical_json({"result_class": result_class})
+        self._insert_effect_result(
+            connection,
+            binding.run_id,
+            marker.intent_id,
+            EffectResult(
+                intent_id=marker.intent_id,
+                run_id=binding.run_id,
+                outcome="COMPLETED",
+                result_class=result_class,
+                result_digest=sha256_digest(result_payload),
+                bounded_result_json=result_payload,
+                settled_sequence=AuditSequence(expected_sequence + 1),
+            ),
+            binding.applicable_revision_digests,
+        )
+
+    def latest_worker_feedback(self, attempt_id: AttemptId) -> str | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT effect_results.result_json FROM worker_actions "
+                "JOIN effect_results ON effect_results.intent_id = worker_actions.result_intent_id "
+                "WHERE worker_actions.attempt_id = ? "
+                "ORDER BY worker_actions.created_sequence DESC LIMIT 1",
+                (attempt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        effect_result = effect_result_from_storage_json(str(row["result_json"]))
+        return bounded_worker_feedback(
+            ToolResult.model_validate_json(effect_result.bounded_result_json)
         )
 
     def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
