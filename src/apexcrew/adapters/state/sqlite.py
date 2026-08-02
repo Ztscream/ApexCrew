@@ -1114,6 +1114,7 @@ class SqliteStateStore:
         expected_sequence: AuditSequence,
         event_factory: Callable[[], tuple[AuditEvent, ...]],
         mutate: Callable[[sqlite3.Connection], None],
+        runtime_now_factory: Callable[[], MonotonicInstant | None] | None = None,
     ) -> AuditSequence:
         with self._lock:
             connection = self._connection
@@ -1133,6 +1134,7 @@ class SqliteStateStore:
                 events = event_factory()
                 if not events:
                     raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
+                runtime_now = None if runtime_now_factory is None else runtime_now_factory()
                 sequence = expected_sequence
                 for event in events:
                     sequence = self._append_audit_event(
@@ -1140,6 +1142,7 @@ class SqliteStateStore:
                         run_id,
                         event,
                         sequence,
+                        runtime_now=runtime_now,
                     )
             except BaseException:
                 connection.rollback()
@@ -5195,11 +5198,14 @@ class SqliteStateStore:
     ) -> RuntimePermit | None:
         consumed: list[RuntimePermit] = []
         event_kinds: list[str] = []
+        opened_at: list[MonotonicInstant] = []
 
         def mutate(connection: sqlite3.Connection) -> None:
             row = connection.execute(
                 "SELECT runtime_permits.*, runs.state AS run_state, "
-                "runs.runtime_progress_generation, runs.runtime_owner_id "
+                "runs.runtime_progress_generation, runs.runtime_owner_id, "
+                "runs.runtime_owner_generation, runs.runtime_interval_owner_generation, "
+                "runs.runtime_interval_opened_nanoseconds "
                 "FROM runtime_permits JOIN runs USING(run_id) WHERE run_id = ? "
                 "AND runtime_permits.state = 'UNCONSUMED'",
                 (run_id,),
@@ -5233,6 +5239,16 @@ class SqliteStateStore:
                 return
             if row["runtime_owner_id"] is not None:
                 raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            if (
+                row["runtime_interval_owner_generation"] is not None
+                or row["runtime_interval_opened_nanoseconds"] is not None
+            ):
+                raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            if self._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            now = self._monotonic_clock.now()
+            opened_at.append(now)
+            owner_generation = int(row["runtime_owner_generation"]) + 1
             consumed_sequence = AuditSequence(expected_sequence + 1)
             if (
                 connection.execute(
@@ -5246,11 +5262,21 @@ class SqliteStateStore:
                 raise StateConflict("RUNTIME_PERMIT_CONSUME_COMPARE_AND_SET_FAILED")
             if (
                 connection.execute(
-                    "UPDATE runs SET runtime_owner_id = ?, runtime_owner_generation = "
-                    "runtime_owner_generation + 1, runtime_progress_generation = "
-                    "runtime_progress_generation + 1 WHERE run_id = ? "
-                    "AND runtime_owner_id IS NULL AND runtime_progress_generation = ?",
-                    (owner_id, run_id, permit.expected_runtime_progress_generation),
+                    "UPDATE runs SET runtime_owner_id = ?, runtime_owner_generation = ?, "
+                    "runtime_progress_generation = runtime_progress_generation + 1, "
+                    "runtime_interval_owner_generation = ?, "
+                    "runtime_interval_opened_nanoseconds = ? WHERE run_id = ? "
+                    "AND runtime_owner_id IS NULL AND runtime_progress_generation = ? "
+                    "AND runtime_interval_owner_generation IS NULL "
+                    "AND runtime_interval_opened_nanoseconds IS NULL",
+                    (
+                        owner_id,
+                        owner_generation,
+                        owner_generation,
+                        now.nanoseconds,
+                        run_id,
+                        permit.expected_runtime_progress_generation,
+                    ),
                 ).rowcount
                 != 1
             ):
@@ -5272,6 +5298,7 @@ class SqliteStateStore:
                 expected_sequence=expected_sequence,
                 event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
                 mutate=mutate,
+                runtime_now_factory=lambda: opened_at[0] if opened_at else None,
             )
         except StateConflict as error:
             if str(error) == "RUNTIME_PERMIT_NOT_FOUND":

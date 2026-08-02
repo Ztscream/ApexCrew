@@ -527,6 +527,7 @@ class InMemoryStateStore:
         event_factory: Callable[[], tuple[AuditEvent, ...]],
         mutate: Callable[[InMemoryStateStore], None],
         runtime_now: MonotonicInstant | None = None,
+        runtime_now_factory: Callable[[], MonotonicInstant] | None = None,
     ) -> AuditSequence:
         with self._lock:
             current = self._sequences.get(run_id, AuditSequence(0))
@@ -554,7 +555,10 @@ class InMemoryStateStore:
             else:
                 if copied._monotonic_clock is None:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
-                now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
+                if runtime_now_factory is not None:
+                    now = runtime_now_factory()
+                else:
+                    now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
                 runtime_state.observed_nanoseconds(now)
                 committed_events = tuple(
                     replace(
@@ -3231,6 +3235,7 @@ class InMemoryStateStore:
                 return None
         consumed: list[RuntimePermit] = []
         event_kinds: list[str] = []
+        opened_at: list[MonotonicInstant] = []
 
         def mutate(copied: InMemoryStateStore) -> None:
             permit = copied._runtime_permits[(run_id, existing.generation)]
@@ -3258,6 +3263,15 @@ class InMemoryStateStore:
                 return
             if run_id in copied._runtime_owners:
                 raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            active = copied._active_run_times.get(
+                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            )
+            if active.open_owner_generation is not None:
+                raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            now = copied._monotonic_clock.now()
+            opened_at.append(now)
             consumed_sequence = AuditSequence(expected_sequence + 1)
             result = permit.model_copy(
                 update={
@@ -3272,6 +3286,13 @@ class InMemoryStateStore:
             copied._runtime_progress_generations[run_id] = (
                 copied._runtime_progress_generations.get(run_id, 0) + 1
             )
+            copied._active_run_times[run_id] = ActiveRunTimeState(
+                run_id=run_id,
+                cumulative_nanoseconds=active.cumulative_nanoseconds,
+                open_owner_generation=owner_generation,
+                opened_at=now,
+                latest_committed_at=now,
+            )
             consumed.append(result)
             event_kinds.append("RUNTIME_PERMIT_CONSUMED")
 
@@ -3280,6 +3301,7 @@ class InMemoryStateStore:
             expected_sequence=expected_sequence,
             event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
             mutate=mutate,
+            runtime_now_factory=lambda: opened_at[0],
         )
         return consumed[0] if consumed else None
 

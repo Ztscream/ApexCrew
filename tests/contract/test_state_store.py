@@ -181,8 +181,10 @@ def seeded_authority_store(database: Path, run_id: str) -> SqliteStateStore:
 @dataclass
 class FixedMonotonicClock:
     instant: MonotonicInstant
+    readings: int = 0
 
     def now(self) -> MonotonicInstant:
+        self.readings += 1
         return self.instant
 
 
@@ -227,6 +229,15 @@ def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
 
 def sqlite_store_factory(tmp_path: Path) -> SqliteStateStore:
     return SqliteStateStore(tmp_path / "state.db")
+
+
+def memory_runtime_store_factory(tmp_path: Path, clock: FixedMonotonicClock) -> InMemoryStateStore:
+    del tmp_path
+    return InMemoryStateStore(monotonic_clock=clock)
+
+
+def sqlite_runtime_store_factory(tmp_path: Path, clock: FixedMonotonicClock) -> SqliteStateStore:
+    return SqliteStateStore(tmp_path / "state.db", monotonic_clock=clock)
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
@@ -769,12 +780,15 @@ def test_stale_revision_document_cannot_be_reapproved(
     assert store.current_revision_digests(run_id).policy_digest == replacement_digest
 
 
-@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+@pytest.mark.parametrize(
+    "store_factory", [memory_runtime_store_factory, sqlite_runtime_store_factory]
+)
 def test_runtime_permit_consumption_is_atomic_and_one_use(
     tmp_path: Path,
-    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+    store_factory: Callable[[Path, FixedMonotonicClock], InMemoryStateStore | SqliteStateStore],
 ) -> None:
-    store = store_factory(tmp_path)
+    clock = FixedMonotonicClock(MonotonicInstant(50_000_000_000))
+    store = store_factory(tmp_path, clock)
     run_id, _ = seed_control_permit(store)
     permit = store.unconsumed_permit(run_id)
     store.fail_next_commit_after_state_write_for_test()
@@ -785,6 +799,9 @@ def test_runtime_permit_consumption_is_atomic_and_one_use(
             store.audit_sequence(run_id),
         )
     assert store.runtime_permit(run_id, permit.generation).state == "UNCONSUMED"
+    assert store.active_run_time_state(run_id).open_owner_generation is None
+    assert store.last_runtime_audit_event(run_id, owner_generation=1) is None
+    assert clock.readings == 1
     consumed = store.consume_current_runtime_permit(
         run_id,
         RuntimeOwnerId("owner-1"),
@@ -793,12 +810,21 @@ def test_runtime_permit_consumption_is_atomic_and_one_use(
     assert consumed is not None
     assert consumed.state == "CONSUMED"
     assert consumed.consumed_owner_id == "owner-1"
+    active = store.active_run_time_state(run_id)
+    assert active.open_owner_generation == 1
+    assert active.opened_at == MonotonicInstant(50_000_000_000)
+    assert active.latest_committed_at == MonotonicInstant(50_000_000_000)
+    stamp = store.last_runtime_audit_event(run_id, owner_generation=1)
+    assert stamp is not None
+    assert stamp.monotonic_instant == MonotonicInstant(50_000_000_000)
+    assert clock.readings == 2
     before_replay = store.audit_sequence(run_id)
     assert (
         store.consume_current_runtime_permit(run_id, RuntimeOwnerId("owner-2"), before_replay)
         is None
     )
     assert store.audit_sequence(run_id) == before_replay
+    assert clock.readings == 2
 
 
 def seed_mismatched_permit_phase(
