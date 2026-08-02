@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from base64 import b32encode
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -91,7 +91,15 @@ from apexcrew.domain.commands import (
     RuntimePermit,
     RuntimeState,
 )
-from apexcrew.domain.coordination import PlanProposal, validate_plan_proposal
+from apexcrew.domain.coordination import (
+    PlanningAuthorization,
+    PlanningReadIntent,
+    PlanningReadResult,
+    PlanningReadSettlement,
+    PlanProposal,
+    plan_proposal_from_document,
+    validate_plan_proposal,
+)
 from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
@@ -401,6 +409,7 @@ class InMemoryStateStore:
         self._authorization_denials: dict[tuple[RunId, str], tuple[str, AuthorizationReason]] = {}
         self._task_budget_counters: dict[tuple[RunId, TaskId], TaskBudgetState] = {}
         self._planning_request_counts: dict[RunId, int] = {}
+        self._planning_returned_bytes: dict[RunId, int] = {}
         self._dispatch_close_causes: dict[RunId, tuple[str, ...]] = {}
         self._new_dispatch_open: dict[RunId, bool] = {}
         self._active_run_times: dict[RunId, ActiveRunTimeState] = {}
@@ -469,6 +478,7 @@ class InMemoryStateStore:
         copied._authorization_denials = self._authorization_denials.copy()
         copied._task_budget_counters = self._task_budget_counters.copy()
         copied._planning_request_counts = self._planning_request_counts.copy()
+        copied._planning_returned_bytes = self._planning_returned_bytes.copy()
         copied._dispatch_close_causes = self._dispatch_close_causes.copy()
         copied._new_dispatch_open = self._new_dispatch_open.copy()
         copied._active_run_times = self._active_run_times.copy()
@@ -527,6 +537,7 @@ class InMemoryStateStore:
         self._authorization_denials = copied._authorization_denials
         self._task_budget_counters = copied._task_budget_counters
         self._planning_request_counts = copied._planning_request_counts
+        self._planning_returned_bytes = copied._planning_returned_bytes
         self._dispatch_close_causes = copied._dispatch_close_causes
         self._new_dispatch_open = copied._new_dispatch_open
         self._active_run_times = copied._active_run_times
@@ -1891,7 +1902,19 @@ class InMemoryStateStore:
         proposal: PlanProposal,
         *,
         expected_sequence: AuditSequence,
+        recovered_marker: EffectIntent | None = None,
+        permit: RuntimePermit | None = None,
+        recovered_logical_turn_id: LogicalTurnId | None = None,
     ) -> AuditSequence:
+        if not (
+            (recovered_marker is None and permit is None and recovered_logical_turn_id is None)
+            or (
+                recovered_marker is not None
+                and permit is not None
+                and recovered_logical_turn_id is not None
+            )
+        ):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
         try:
             validate_plan_proposal(proposal)
         except ValueError as error:
@@ -1950,6 +1973,14 @@ class InMemoryStateStore:
                 run,
                 state=(RunState.PAUSED if stopped else RunState.AWAITING_PLAN_APPROVAL),
             )
+            copied._settle_recovered_planning_marker(
+                proposal.run_id,
+                recovered_marker,
+                permit,
+                recovered_logical_turn_id,
+                proposal.applicable_revision_digests,
+                expected_sequence,
+            )
             if stopped:
                 events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
 
@@ -2002,6 +2033,241 @@ class InMemoryStateStore:
             if run_id not in self._runs:
                 raise StateConflict("RUN_NOT_FOUND")
             return self._planning_request_counts.get(run_id, 0)
+
+    def planning_returned_bytes(self, run_id: RunId) -> int:
+        with self._lock:
+            if run_id not in self._runs:
+                raise StateConflict("RUN_NOT_FOUND")
+            return self._planning_returned_bytes.get(run_id, 0)
+
+    def record_planning_read_intent(
+        self,
+        intent: PlanningReadIntent,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        effect_intent = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect_intent, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if effect_intent.intent_id in copied._effect_intents or any(
+                existing.idempotency_key == effect_intent.idempotency_key
+                for existing in copied._effect_intents.values()
+            ):
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect_intent.intent_id] = effect_intent
+            copied._settle_recovered_planning_marker(
+                intent.run_id,
+                recovered_marker,
+                permit,
+                intent.logical_turn_id,
+                intent.applicable_revision_digests,
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_READ_INTENT_RECORDED",
+                action_id=intent.logical_turn_id,
+                applicable_revision_digests=intent.applicable_revision_digests,
+                subject_digests=(effect_intent.payload_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def _settle_recovered_planning_marker(
+        self,
+        run_id: RunId,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        logical_turn_id: LogicalTurnId | None,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if recovered_marker is None and permit is None:
+            return
+        owner_id = None if permit is None else permit.consumed_owner_id
+        if (
+            recovered_marker is None
+            or permit is None
+            or permit.run_id != run_id
+            or permit.state != "CONSUMED"
+            or owner_id is None
+            or permit.allowed_phase != "PLANNING"
+            or permit.applicable_revision_digests != applicable_revision_digests
+            or recovered_marker.kind != "RECOVERED_MODEL_ACTION"
+            or recovered_marker.action_id != logical_turn_id
+            or recovered_marker.applicable_revision_digests != applicable_revision_digests
+            or self._require_unsettled_effect_intent(run_id, recovered_marker.intent_id)
+            != recovered_marker
+        ):
+            raise StateConflict("RECOVERED_PLANNING_MARKER_BINDING_MISMATCH")
+        stored_permit, _ = self._require_consumed_runtime_owner_on_copy(
+            self, run_id, owner_id, permit.generation
+        )
+        if stored_permit != permit:
+            raise StateConflict("RECOVERED_PLANNING_MARKER_BINDING_MISMATCH")
+        payload = canonical_json({"result_class": "PLANNING_ACTION_RELEASED"})
+        self._effect_results[recovered_marker.intent_id] = EffectResult(
+            intent_id=recovered_marker.intent_id,
+            run_id=run_id,
+            outcome="COMPLETED",
+            result_class="PLANNING_ACTION_RELEASED",
+            result_digest=sha256_digest(payload),
+            bounded_result_json=payload,
+            settled_sequence=AuditSequence(expected_sequence + 1),
+        )
+
+    def settle_planning_read(
+        self,
+        intent: PlanningReadIntent,
+        result: PlanningReadResult,
+        expected_sequence: AuditSequence,
+    ) -> PlanningReadSettlement:
+        if result.intent_id != intent.intent_id or result.run_id != intent.run_id:
+            raise StateConflict("PLANNING_READ_RESULT_BINDING_MISMATCH")
+        expected_bytes = (
+            0
+            if result.result_class == "DENIED"
+            else len(canonical_json(result.bounded_payload).encode("utf-8"))
+        )
+        if result.returned_bytes != expected_bytes:
+            raise StateConflict("PLANNING_READ_RETURNED_BYTES_INVALID")
+        overflow = self.planning_returned_bytes(intent.run_id) + result.returned_bytes > 2_097_152
+        stored_result = result
+        if overflow:
+            stored_result = PlanningReadResult(
+                intent_id=result.intent_id,
+                run_id=result.run_id,
+                result_class="DENIED",
+                bounded_payload={"reason": "PLANNING_READ_LIMIT"},
+                snapshot_digest=result.snapshot_digest,
+                returned_bytes=0,
+            )
+        effect_result = stored_result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            effect_intent = copied._require_unsettled_effect_intent(intent.run_id, intent.intent_id)
+            if effect_intent.applicable_revision_digests != intent.applicable_revision_digests:
+                raise StateConflict("EFFECT_RESULT_REVISION_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = effect_result
+            if not overflow:
+                copied._planning_returned_bytes[intent.run_id] = (
+                    copied._planning_returned_bytes.get(intent.run_id, 0) + result.returned_bytes
+                )
+            else:
+                copied._runs[intent.run_id] = replace(
+                    copied._runs[intent.run_id], state=RunState.PAUSED
+                )
+                copied._close_new_dispatch(intent.run_id, DispatchCloseCause.BUDGET_EXHAUSTED)
+
+        sequence = self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_READ_SETTLED",
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=effect_result.result_class,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+        return PlanningReadSettlement(
+            sequence,
+            "PLANNING_READ_LIMIT" if overflow else None,
+        )
+
+    def persist_submitted_plan(
+        self,
+        run_id: RunId,
+        plan_document: Mapping[str, object],
+        authorization: PlanningAuthorization,
+        logical_turn_id: LogicalTurnId,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        if authorization.run_id != run_id or authorization.decision != "ALLOW":
+            raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+        proposal = plan_proposal_from_document(
+            run_id=run_id,
+            plan_document=plan_document,
+            authorization=authorization,
+        )
+        return self.persist_plan_proposal(
+            proposal,
+            expected_sequence=expected_sequence,
+            recovered_marker=recovered_marker,
+            permit=permit,
+            recovered_logical_turn_id=logical_turn_id,
+        )
+
+    def record_planning_failure_or_invalid_action(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        reason: str,
+        authorization: PlanningAuthorization,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if authorization.run_id != run_id or authorization.decision != "ALLOW":
+                raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+            if copied._planning_request_counts.get(run_id, 0) >= (
+                authorization.planning_request_ceiling
+            ):
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.PAUSED)
+                copied._close_new_dispatch(run_id, DispatchCloseCause.BUDGET_EXHAUSTED)
+            copied._settle_recovered_planning_marker(
+                run_id,
+                recovered_marker,
+                permit,
+                logical_turn_id,
+                authorization.applicable_revision_digests,
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_ACTION_REJECTED",
+                action_id=logical_turn_id,
+                applicable_revision_digests=authorization.applicable_revision_digests,
+                result_class=reason,
+            ),
+            mutate=mutate,
+        )
+
+    def return_to_draft_for_planning_context_overflow(
+        self,
+        run_id: RunId,
+        authorization: PlanningAuthorization,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            if authorization.run_id != run_id or authorization.decision != "ALLOW":
+                raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.DRAFT)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("PLANNING_CONTEXT_OVERFLOW"),
+            mutate=mutate,
+        )
 
     def _evaluate_model_reservation(
         self, request: ModelReservationRequest
@@ -2074,6 +2340,7 @@ class InMemoryStateStore:
             if (
                 reason is None
                 and request.owner_kind == "PLANNING"
+                and request.provider_attempt_number == 1
                 and (planning_requests >= budget.planning_request_ceiling)
             ):
                 reason = "PLANNING_REQUEST_CEILING"
@@ -2233,11 +2500,14 @@ class InMemoryStateStore:
                 copied._model_attempts[intent.intent_id] = intent
                 run_after = evaluation.run_counters.reserve(evaluation.amounts)
                 copied._model_counters[request.run_id] = run_after
-                if request.owner_kind == "PLANNING":
+                new_planning_request = (
+                    request.owner_kind == "PLANNING" and request.provider_attempt_number == 1
+                )
+                if new_planning_request:
                     copied._planning_request_counts[request.run_id] = (
                         evaluation.planning_requests + 1
                     )
-                else:
+                elif request.owner_kind == "WORKER":
                     if evaluation.task_counters is None:
                         raise StateConflict("TASK_COUNTERS_REQUIRED")
                     if request.task_id is None:
@@ -2272,7 +2542,7 @@ class InMemoryStateStore:
                     for metric, amount in usage:
                         if (
                             metric == GlobalBudgetMetric.PLANNING_REQUESTS
-                            and request.owner_kind != "PLANNING"
+                            and not new_planning_request
                         ):
                             continue
                         _, stopped = copied._settle_global_usage_for_producer(

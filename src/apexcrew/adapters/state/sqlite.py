@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from base64 import b32encode
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -104,9 +104,14 @@ from apexcrew.domain.commands import (
     applicable_revision_digests_to_json,
 )
 from apexcrew.domain.coordination import (
+    PlanningAuthorization,
+    PlanningReadIntent,
+    PlanningReadResult,
+    PlanningReadSettlement,
     PlanProposal,
     check_definition_from_json,
     check_definition_json,
+    plan_proposal_from_document,
     plan_proposal_record_from_json,
     plan_proposal_record_json,
     run_check_set_digest,
@@ -749,6 +754,10 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 FOREIGN KEY(plan_digest) REFERENCES plans(plan_digest)
             )""",
         ),
+    ),
+    (
+        14,
+        ("ALTER TABLE runs ADD COLUMN planning_returned_bytes INTEGER NOT NULL DEFAULT 0",),
     ),
 )
 
@@ -2654,7 +2663,19 @@ class SqliteStateStore:
         proposal: PlanProposal,
         *,
         expected_sequence: AuditSequence,
+        recovered_marker: EffectIntent | None = None,
+        permit: RuntimePermit | None = None,
+        recovered_logical_turn_id: LogicalTurnId | None = None,
     ) -> AuditSequence:
+        if not (
+            (recovered_marker is None and permit is None and recovered_logical_turn_id is None)
+            or (
+                recovered_marker is not None
+                and permit is not None
+                and recovered_logical_turn_id is not None
+            )
+        ):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
         try:
             validate_plan_proposal(proposal)
         except ValueError as error:
@@ -2781,6 +2802,15 @@ class SqliteStateStore:
                 != 1
             ):
                 raise StateConflict("PLAN_PROPOSAL_STATE_COMPARE_AND_SET_FAILED")
+            self._settle_recovered_planning_marker(
+                connection,
+                proposal.run_id,
+                recovered_marker,
+                permit,
+                recovered_logical_turn_id,
+                proposal.applicable_revision_digests,
+                expected_sequence,
+            )
             if stopped:
                 events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
 
@@ -2886,6 +2916,267 @@ class SqliteStateStore:
                 (run_id,),
             ).fetchone()
             return 0 if row is None else int(row["planning_requests"])
+
+    def planning_returned_bytes(self, run_id: RunId) -> int:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT planning_returned_bytes FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            return int(row["planning_returned_bytes"])
+
+    def record_planning_read_intent(
+        self,
+        intent: PlanningReadIntent,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        effect_intent = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect_intent, expected_sequence)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._insert_effect_intent(connection, effect_intent)
+            self._settle_recovered_planning_marker(
+                connection,
+                intent.run_id,
+                recovered_marker,
+                permit,
+                intent.logical_turn_id,
+                intent.applicable_revision_digests,
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_READ_INTENT_RECORDED",
+                action_id=intent.logical_turn_id,
+                applicable_revision_digests=intent.applicable_revision_digests,
+                subject_digests=(effect_intent.payload_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def _settle_recovered_planning_marker(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        logical_turn_id: LogicalTurnId | None,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if recovered_marker is None and permit is None:
+            return
+        owner_id = None if permit is None else permit.consumed_owner_id
+        if (
+            recovered_marker is None
+            or permit is None
+            or permit.run_id != run_id
+            or permit.state != "CONSUMED"
+            or owner_id is None
+            or permit.allowed_phase != "PLANNING"
+            or permit.applicable_revision_digests != applicable_revision_digests
+            or recovered_marker.kind != "RECOVERED_MODEL_ACTION"
+            or recovered_marker.action_id != logical_turn_id
+            or recovered_marker.applicable_revision_digests != applicable_revision_digests
+        ):
+            raise StateConflict("RECOVERED_PLANNING_MARKER_BINDING_MISMATCH")
+        stored_permit, _ = self._require_consumed_runtime_owner(
+            connection, run_id, owner_id, permit.generation
+        )
+        if stored_permit != permit:
+            raise StateConflict("RECOVERED_PLANNING_MARKER_BINDING_MISMATCH")
+        stored = self._require_unsettled_effect_intent(
+            connection, run_id, recovered_marker.intent_id
+        )
+        if stored != recovered_marker:
+            raise StateConflict("RECOVERED_PLANNING_MARKER_BINDING_MISMATCH")
+        payload = canonical_json({"result_class": "PLANNING_ACTION_RELEASED"})
+        result = EffectResult(
+            intent_id=recovered_marker.intent_id,
+            run_id=run_id,
+            outcome="COMPLETED",
+            result_class="PLANNING_ACTION_RELEASED",
+            result_digest=sha256_digest(payload),
+            bounded_result_json=payload,
+            settled_sequence=AuditSequence(expected_sequence + 1),
+        )
+        self._insert_effect_result(
+            connection,
+            run_id,
+            recovered_marker.intent_id,
+            result,
+            recovered_marker.applicable_revision_digests,
+        )
+
+    def settle_planning_read(
+        self,
+        intent: PlanningReadIntent,
+        result: PlanningReadResult,
+        expected_sequence: AuditSequence,
+    ) -> PlanningReadSettlement:
+        if result.intent_id != intent.intent_id or result.run_id != intent.run_id:
+            raise StateConflict("PLANNING_READ_RESULT_BINDING_MISMATCH")
+        expected_bytes = (
+            0
+            if result.result_class == "DENIED"
+            else len(canonical_json(result.bounded_payload).encode("utf-8"))
+        )
+        if result.returned_bytes != expected_bytes:
+            raise StateConflict("PLANNING_READ_RETURNED_BYTES_INVALID")
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT planning_returned_bytes FROM runs WHERE run_id = ?", (intent.run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            overflow = int(row["planning_returned_bytes"]) + result.returned_bytes > 2_097_152
+        stored_result = result
+        if overflow:
+            stored_result = PlanningReadResult(
+                intent_id=result.intent_id,
+                run_id=result.run_id,
+                result_class="DENIED",
+                bounded_payload={"reason": "PLANNING_READ_LIMIT"},
+                snapshot_digest=result.snapshot_digest,
+                returned_bytes=0,
+            )
+        effect_result = stored_result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._insert_effect_result(
+                connection,
+                intent.run_id,
+                intent.intent_id,
+                effect_result,
+                intent.applicable_revision_digests,
+            )
+            if not overflow:
+                updated = connection.execute(
+                    "UPDATE runs SET planning_returned_bytes = planning_returned_bytes + ? "
+                    "WHERE run_id = ? AND planning_returned_bytes + ? <= 2097152",
+                    (result.returned_bytes, intent.run_id, result.returned_bytes),
+                )
+                if updated.rowcount != 1:
+                    raise StateConflict("PLANNING_READ_LIMIT_REVALIDATION_FAILED")
+            else:
+                connection.execute(
+                    "UPDATE runs SET state = 'PAUSED' WHERE run_id = ?", (intent.run_id,)
+                )
+                self._close_new_dispatch(
+                    connection, intent.run_id, DispatchCloseCause.BUDGET_EXHAUSTED
+                )
+
+        sequence = self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_READ_SETTLED",
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=effect_result.result_class,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+        return PlanningReadSettlement(sequence, "PLANNING_READ_LIMIT" if overflow else None)
+
+    def persist_submitted_plan(
+        self,
+        run_id: RunId,
+        plan_document: Mapping[str, object],
+        authorization: PlanningAuthorization,
+        logical_turn_id: LogicalTurnId,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        if authorization.run_id != run_id or authorization.decision != "ALLOW":
+            raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+        proposal = plan_proposal_from_document(
+            run_id=run_id,
+            plan_document=plan_document,
+            authorization=authorization,
+        )
+        return self.persist_plan_proposal(
+            proposal,
+            expected_sequence=expected_sequence,
+            recovered_marker=recovered_marker,
+            permit=permit,
+            recovered_logical_turn_id=logical_turn_id,
+        )
+
+    def record_planning_failure_or_invalid_action(
+        self,
+        run_id: RunId,
+        logical_turn_id: LogicalTurnId,
+        reason: str,
+        authorization: PlanningAuthorization,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            if authorization.run_id != run_id or authorization.decision != "ALLOW":
+                raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+            row = connection.execute(
+                "SELECT planning_requests FROM run_authority_counters WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            count = 0 if row is None else int(row["planning_requests"])
+            if count >= authorization.planning_request_ceiling:
+                connection.execute("UPDATE runs SET state = 'PAUSED' WHERE run_id = ?", (run_id,))
+                self._close_new_dispatch(connection, run_id, DispatchCloseCause.BUDGET_EXHAUSTED)
+            self._settle_recovered_planning_marker(
+                connection,
+                run_id,
+                recovered_marker,
+                permit,
+                logical_turn_id,
+                authorization.applicable_revision_digests,
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PLANNING_ACTION_REJECTED",
+                action_id=logical_turn_id,
+                applicable_revision_digests=authorization.applicable_revision_digests,
+                result_class=reason,
+            ),
+            mutate=mutate,
+        )
+
+    def return_to_draft_for_planning_context_overflow(
+        self,
+        run_id: RunId,
+        authorization: PlanningAuthorization,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            if authorization.run_id != run_id or authorization.decision != "ALLOW":
+                raise StateConflict("PLANNING_AUTHORIZATION_MISMATCH")
+            connection.execute("UPDATE runs SET state = 'DRAFT' WHERE run_id = ?", (run_id,))
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("PLANNING_CONTEXT_OVERFLOW"),
+            mutate=mutate,
+        )
 
     @staticmethod
     def _approved_budget_for_update(
@@ -3387,6 +3678,7 @@ class SqliteStateStore:
             if (
                 reason is None
                 and request.owner_kind == "PLANNING"
+                and request.provider_attempt_number == 1
                 and (planning_requests >= budget.planning_request_ceiling)
             ):
                 reason = "PLANNING_REQUEST_CEILING"
@@ -3592,14 +3884,17 @@ class SqliteStateStore:
             )
             run_after = evaluation.run_counters.reserve(evaluation.amounts)
             self._write_model_counters(connection, request.run_id, run_after)
-            if request.owner_kind == "PLANNING":
+            new_planning_request = (
+                request.owner_kind == "PLANNING" and request.provider_attempt_number == 1
+            )
+            if new_planning_request:
                 connection.execute(
                     "INSERT INTO run_authority_counters(run_id, planning_requests) "
                     "VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET "
                     "planning_requests = excluded.planning_requests",
                     (request.run_id, evaluation.planning_requests + 1),
                 )
-            else:
+            elif request.owner_kind == "WORKER":
                 if evaluation.task_counters is None:
                     raise StateConflict("TASK_COUNTERS_REQUIRED")
                 remaining = evaluation.task_counters.active_tranche_remaining_calls - 1
@@ -3635,10 +3930,7 @@ class SqliteStateStore:
                     (GlobalBudgetMetric.COST_RESERVE_USD, run_after.cost_usd),
                 )
                 for metric, amount in usage:
-                    if (
-                        metric == GlobalBudgetMetric.PLANNING_REQUESTS
-                        and request.owner_kind != "PLANNING"
-                    ):
+                    if metric == GlobalBudgetMetric.PLANNING_REQUESTS and not new_planning_request:
                         continue
                     _, stopped = self._settle_global_usage_in_transaction(
                         connection,

@@ -6,10 +6,15 @@ import json
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from hashlib import sha256
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from apexcrew.domain.coordination import PlanningTurnBinding
 
 from apexcrew.domain.actions import ActionEnvelope
 from apexcrew.domain.plan import CanonicalPath, GlobPattern, PathValidationError
+from apexcrew.domain.revisions import PlanningReadAuthorizationDocument
 
 DEFAULT_SECRET_GLOBS = (
     "**/.env",
@@ -98,6 +103,43 @@ class SecretPathPolicy:
             "SECRET_PATH_DENIED" if denied else "ALLOW",
             "effective secret path" if denied else "allowed path",
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PlanningPathPolicy:
+    authorization: PlanningReadAuthorizationDocument
+    secret_paths: SecretPathPolicy
+
+    @property
+    def scope_digest(self) -> str:
+        payload = json.dumps(
+            self.authorization.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "sha256:" + sha256(payload).hexdigest()
+
+    def require_allowed(
+        self, path: CanonicalPath, authorization: PlanningReadAuthorizationDocument
+    ) -> None:
+        if authorization != self.authorization:
+            raise ValueError("PLANNING_READ_AUTHORIZATION_MISMATCH")
+        if (
+            str(path) == ".git"
+            or str(path).startswith(".git/")
+            or str(path) == ".apexcrew"
+            or str(path).startswith(".apexcrew/")
+            or not any(
+                GlobPattern.parse(pattern).matches(path) for pattern in authorization.positive_globs
+            )
+            or self.secret_paths.inspect(path).code != "ALLOW"
+        ):
+            raise ValueError("PLANNING_READ_DENIED")
+
+    def require_manifest_allowed(self, path: CanonicalPath, binding: PlanningTurnBinding) -> None:
+        if binding.scope_digest != self.scope_digest:
+            raise ValueError("PLANNING_SCOPE_BINDING_MISMATCH")
+        self.require_allowed(path, self.authorization)
 
 
 ActionDecision = Literal["ALLOW", "REQUIRE_APPROVAL", "DENY"]

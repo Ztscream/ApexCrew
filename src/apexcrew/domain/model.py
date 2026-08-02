@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from apexcrew.domain.authority import TaskBudgetState
     from apexcrew.domain.effects import EffectIntent
 
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
@@ -702,6 +703,30 @@ class ModelJournal(Protocol):
         run_id: RunId,
         intent_id: IntentId,
         seconds: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+    def model_counters(self, run_id: RunId) -> ModelCounters:
+        raise NotImplementedError
+
+    def task_budget_state(self, run_id: RunId, task_id: TaskId) -> TaskBudgetState:
+        raise NotImplementedError
+
+    def new_dispatch_open(self, run_id: RunId) -> bool:
+        raise NotImplementedError
+
+    def begin_runtime_barrier(
+        self, run_id: RunId, action_id: str, expected_sequence: AuditSequence
+    ) -> str:
+        raise NotImplementedError
+
+    def settle_runtime_barrier(
+        self,
+        run_id: RunId,
+        action_id: str,
+        model_calls: int,
+        pending_stop_reason: str | None,
         expected_sequence: AuditSequence,
     ) -> AuditSequence:
         raise NotImplementedError

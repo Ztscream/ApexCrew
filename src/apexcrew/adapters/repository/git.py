@@ -5,10 +5,11 @@ import hmac
 import os
 import struct
 import subprocess
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import IO, Literal, Protocol, cast
 
 from apexcrew.adapters.repository.no_follow import (
     HandleIdentity,
@@ -45,6 +46,8 @@ MAX_WORKTREE_ADMIN_ENTRIES = 2
 MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES = 4_096
 MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 16
 MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
+MAX_GIT_STDOUT_BYTES = 2_000_000
+MAX_GIT_STDERR_BYTES = 65_536
 _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
 _TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES = frozenset(
     {"index", "locked", "logs", "ORIG_HEAD", "refs"}
@@ -738,18 +741,71 @@ class SubprocessGitSpawner:
         *,
         text: bool,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
-        return cast(
-            subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
-            subprocess.run(
-                argv,
-                cwd=cwd,
-                env=dict(environment),
-                check=False,
-                capture_output=True,
-                text=text,
-                timeout=30,
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=dict(environment),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        overflow = threading.Event()
+        stdout = bytearray()
+        stderr = bytearray()
+
+        def kill_if_running() -> None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        def drain(stream: IO[bytes], destination: bytearray, maximum: int) -> None:
+            while True:
+                chunk = stream.read(65_536)
+                if not chunk:
+                    return
+                remaining = maximum - len(destination)
+                destination.extend(chunk[: max(remaining, 0)])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    kill_if_running()
+                    return
+
+        threads = (
+            threading.Thread(
+                target=drain,
+                args=(process.stdout, stdout, MAX_GIT_STDOUT_BYTES),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=drain,
+                args=(process.stderr, stderr, MAX_GIT_STDERR_BYTES),
+                daemon=True,
             ),
         )
+        for thread in threads:
+            thread.start()
+        try:
+            returncode = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            kill_if_running()
+            process.wait()
+            raise
+        finally:
+            for thread in threads:
+                thread.join()
+        if overflow.is_set():
+            raise RepositoryUnsafeError("GIT_OUTPUT_LIMIT_EXCEEDED")
+        raw_stdout = bytes(stdout)
+        raw_stderr = bytes(stderr)
+        if text:
+            return subprocess.CompletedProcess(
+                argv,
+                returncode,
+                raw_stdout.decode("utf-8", errors="strict"),
+                raw_stderr.decode("utf-8", errors="replace"),
+            )
+        return subprocess.CompletedProcess(argv, returncode, raw_stdout, raw_stderr)
 
 
 class GitCommandRunner:
