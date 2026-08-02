@@ -195,9 +195,9 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 10 | `TASK-010` | M1-06 | DONE | `f69148b8a577a445d3e7bca76c44b7adabc846c3` |
 | Task 11A | `TASK-011A` | M1-06 | DONE | `fe6b1bc9589bcf3b8a170b2db6925f1c350ea19d` |
 | Task 11B | `TASK-011B` | M1-06 | DONE | `b0ab6a68c09b3f47f5d4a5fff1eb603a04522397` |
-| Task 12A | `TASK-012A` | M1-07 | NOT STARTED | Not created |
-| Task 12B | `TASK-012B` | M1-07 | NOT STARTED | Not created |
-| Task 13 | `TASK-013` | M1-07 | NOT STARTED | Not created |
+| Task 12A | `TASK-012A` | M1-07 | DONE | `08bda573114debf1de5728aec67afe76014c76e1` |
+| Task 12B | `TASK-012B` | M1-07 | DONE | `8eec9f9b1293ee4d9220966dba4271da9bbb97aa` |
+| Task 13 | `TASK-013` | M1-07 | DONE | `0046c4d03daeb4444135aaa904cc4cb6a273a278` |
 | Task 14 | `TASK-014` | M1-08 | NOT STARTED | Not created |
 | Task 15 | `TASK-015` | M1-08 | NOT STARTED | Not created |
 | Task 16 | `TASK-016` | M1-08 | NOT STARTED | Not created |

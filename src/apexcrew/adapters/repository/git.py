@@ -5,10 +5,11 @@ import hmac
 import os
 import struct
 import subprocess
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import IO, Literal, Protocol, cast
 
 from apexcrew.adapters.repository.no_follow import (
     HandleIdentity,
@@ -19,18 +20,262 @@ from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError as _Rep
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.domain.admission import (
+    PrivateRefAdmissionPort,
+    PrivateRefCasOutcome,
+    RefCasIntent,
+    RefEffectBinding,
+    RefPathBinding,
     RepositoryEffectError,
     ReservationAdminObservation,
     ReservationRegistrationObservation,
+    RuntimeStartBinding,
+    StartGuardBinding,
+    StartGuardDecision,
     TargetReservationGitPort,
+    TargetReservationObserver,
     TargetReservationOperation,
     TargetReservationOperationResult,
     TargetReservationWorktreeGuard,
 )
+from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimePermit
 from apexcrew.domain.effects import TargetReservation, canonical_json, sha256_digest
 from apexcrew.domain.plan import CanonicalPath, PathValidationError
 from apexcrew.domain.revisions import Sha256DigestText
-from apexcrew.domain.types import GitOid, RepositoryId
+from apexcrew.domain.types import AuditSequence, GitOid, RepositoryId, RunId
+
+
+class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
+    """Observes and initializes only one Run-owned private ref."""
+
+    def __init__(
+        self,
+        *,
+        repository: RepositoryInstance,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        runner: GitCommandRunner,
+        reservation_observer: TargetReservationObserver,
+        reservation: TargetReservation,
+        target_safety_digest: Sha256DigestText,
+        reflog_message: str,
+    ) -> None:
+        self._repository = repository
+        self._repository_id = repository_id
+        self._repository_instance_digest = repository_instance_digest
+        self._runner = runner
+        self._reservation_observer = reservation_observer
+        self._reservation = reservation
+        self._target_safety_digest = target_safety_digest
+        self._reflog_message = reflog_message
+
+    @staticmethod
+    def _identity_binding(node: OpenedNode | None) -> RefPathBinding:
+        if node is None:
+            return RefPathBinding(state="ABSENT")
+        if node.identity.kind != "file":
+            raise RepositoryEffectError("PRIVATE_REF_STORAGE_KIND_INVALID")
+        identity = node.identity
+        return RefPathBinding(
+            state="REGULAR_FILE",
+            identity_digest=sha256_digest(
+                canonical_json(
+                    {
+                        "file_id": identity.file_id,
+                        "kind": identity.kind,
+                        "platform": identity.platform,
+                        "volume": identity.volume,
+                    }
+                )
+            ),
+        )
+
+    def _effect_binding(self, run_id: RunId) -> RefEffectBinding:
+        ref_component = str(run_id)
+        GitCommandRunner._require_private_ref(f"refs/apexcrew/runs/{ref_component}")
+        handles = self._repository.handles
+        records_result = self._runner.run_bytes(self._repository, GitWorktreeListPorcelain())
+        if records_result.returncode != 0:
+            raise RepositoryEffectError("PRIVATE_REF_WORKTREE_LIST_FAILED")
+        records = parse_worktree_porcelain_nul(records_result.stdout)
+        if any(record.branch == f"refs/apexcrew/runs/{ref_component}" for record in records):
+            raise RepositoryEffectError("PRIVATE_REF_CHECKED_OUT")
+        checkout_digest = sha256_digest(
+            canonical_json(
+                {
+                    "records": [
+                        {
+                            "branch": record.branch,
+                            "detached": record.detached,
+                            "head_oid": record.head_oid,
+                            "locked": record.locked,
+                            "path": record.path,
+                        }
+                        for record in records
+                    ]
+                }
+            )
+        )
+        ref_path = f".git/refs/apexcrew/runs/{ref_component}"
+        reflog_path = f".git/logs/refs/apexcrew/runs/{ref_component}"
+        ref_file = self._identity_binding(handles.try_open_any(ref_path))
+        ref_lock = self._identity_binding(handles.try_open_any(ref_path + ".lock"))
+        reflog = self._identity_binding(handles.try_open_any(reflog_path))
+        reflog_lock = self._identity_binding(handles.try_open_any(reflog_path + ".lock"))
+        return RefEffectBinding(
+            repository_instance_digest=self._repository_instance_digest,
+            checkout_registration_digest=checkout_digest,
+            ref_file=ref_file,
+            ref_lock=ref_lock,
+            reflog=reflog,
+            reflog_lock=reflog_lock,
+            reflog_exists=reflog.state == "REGULAR_FILE",
+            reflog_message=self._reflog_message,
+        )
+
+    def inspect(
+        self,
+        *,
+        run_id: RunId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> StartGuardDecision:
+        del expected_sequence
+        if run_id != self._reservation.run_id:
+            return StartGuardDecision(ok=False, reason="START_GUARD_RUN_MISMATCH")
+        observed = self._reservation_observer.observe(self._reservation)
+        if not (
+            observed.observable
+            and observed.registration_present
+            and observed.path_present
+            and observed.locked
+            and observed.exact_identity
+            and observed.gitfile_only
+            and observed.admin_entry_name == self._reservation.reservation_id
+            and observed.admin_binding_digest is not None
+        ):
+            return StartGuardDecision(ok=False, reason="TARGET_UNSAFE")
+        target = self._runner.run(self._repository, GitShowRefVerify(self._reservation.target_ref))
+        if target.returncode != 0 or target.stdout != f"{self._reservation.pinned_target_oid}\n":
+            return StartGuardDecision(ok=False, reason="TARGET_MOVED")
+        private_name = f"refs/apexcrew/runs/{run_id}"
+        private = self._runner.run(self._repository, GitShowRefVerify(private_name))
+        if private.returncode == 0:
+            return StartGuardDecision(ok=False, reason="PRIVATE_REF_CONFLICT")
+        if private.returncode != 1:
+            return StartGuardDecision(ok=False, reason="PRIVATE_REF_UNOBSERVABLE")
+        try:
+            effect_binding = self._effect_binding(run_id)
+        except (RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return StartGuardDecision(ok=False, reason="PRIVATE_REF_UNOBSERVABLE")
+        if any(
+            item.state != "ABSENT"
+            for item in (
+                effect_binding.ref_file,
+                effect_binding.ref_lock,
+                effect_binding.reflog,
+                effect_binding.reflog_lock,
+            )
+        ):
+            return StartGuardDecision(ok=False, reason="PRIVATE_REF_CONFLICT")
+        return StartGuardDecision(
+            ok=True,
+            binding=StartGuardBinding(
+                run_id=run_id,
+                repository_id=self._repository_id,
+                target_reservation_id=self._reservation.reservation_id,
+                pinned_target_oid=self._reservation.pinned_target_oid,
+                target_safety_digest=self._target_safety_digest,
+                ref_effect_binding=effect_binding,
+                applicable_revision_digests=applicable_revision_digests,
+            ),
+        )
+
+    def validate_consumed(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        permit: RuntimePermit,
+        expected_sequence: AuditSequence,
+    ) -> StartGuardDecision:
+        if (
+            binding.sequence != expected_sequence
+            or binding.permit_generation != permit.generation
+            or binding.consumed_owner_id != permit.consumed_owner_id
+            or binding.consumed_sequence != permit.consumed_sequence
+            or permit.applicable_revision_digests != binding.guard.applicable_revision_digests
+            or permit.target_authority_digest != binding.guard.target_safety_digest
+        ):
+            return StartGuardDecision(ok=False, reason="START_GUARD_DENIED")
+        current = self.inspect(
+            run_id=binding.run_id,
+            applicable_revision_digests=permit.applicable_revision_digests,
+            expected_sequence=expected_sequence,
+        )
+        if not current.ok or current.binding != binding.guard:
+            return StartGuardDecision(
+                ok=False,
+                reason=current.reason or "START_GUARD_BINDING_CHANGED",
+            )
+        return current
+
+    def initialize_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
+        try:
+            current_binding = self._effect_binding(intent.run_id)
+        except (RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class="PRIVATE_REF_UNOBSERVABLE",
+                observed_oid=None,
+            )
+        if (
+            intent.run_id != self._reservation.run_id
+            or intent.repository_id != self._repository_id
+            or intent.prepared_oid != self._reservation.pinned_target_oid
+            or intent.target_safety_digest != self._target_safety_digest
+            or intent.target_reservation_id != self._reservation.reservation_id
+            or intent.ref_effect_binding != current_binding
+        ):
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class="PRIVATE_REF_CONFLICT",
+                observed_oid=None,
+            )
+        result = self._runner.run(
+            self._repository,
+            GitCreatePrivateRef(
+                intent.ref_name,
+                intent.prepared_oid,
+                intent.ref_effect_binding.reflog_message,
+            ),
+        )
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+        observed = self._runner.run(self._repository, GitShowRefVerify(intent.ref_name))
+        if observed.returncode == 0 and observed.stdout == f"{intent.prepared_oid}\n":
+            result_class: Literal[
+                "PRIVATE_REF_INITIALIZED",
+                "PRIVATE_REF_ABSENT_FAILED",
+                "PRIVATE_REF_CONFLICT",
+                "PRIVATE_REF_UNOBSERVABLE",
+            ] = "PRIVATE_REF_INITIALIZED"
+            oid: GitOid | None = intent.prepared_oid
+        elif observed.returncode == 1 and result.returncode != 0:
+            result_class = "PRIVATE_REF_ABSENT_FAILED"
+            oid = None
+        elif observed.returncode == 0:
+            result_class = "PRIVATE_REF_CONFLICT"
+            oid = GitOid(observed.stdout.strip())
+        else:
+            result_class = "PRIVATE_REF_UNOBSERVABLE"
+            oid = None
+        return PrivateRefCasOutcome(
+            intent_id=intent.intent_id,
+            run_id=intent.run_id,
+            result_class=result_class,
+            observed_oid=oid,
+        )
+
 
 RepositoryUnsafeError = _RepositoryUnsafeError
 
@@ -45,6 +290,8 @@ MAX_WORKTREE_ADMIN_ENTRIES = 2
 MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES = 4_096
 MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 16
 MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
+MAX_GIT_STDOUT_BYTES = 2_000_000
+MAX_GIT_STDERR_BYTES = 65_536
 _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
 _TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES = frozenset(
     {"index", "locked", "logs", "ORIG_HEAD", "refs"}
@@ -101,7 +348,10 @@ def parse_worktree_porcelain_nul(output: bytes) -> tuple[WorktreePorcelainRecord
             or any(character not in "0123456789abcdef" for character in head_oid)
             or (
                 branch is not None
-                and (not branch.startswith("refs/heads/") or branch == "refs/heads/")
+                and (
+                    not branch.startswith(("refs/heads/", "refs/apexcrew/runs/"))
+                    or branch in {"refs/heads/", "refs/apexcrew/runs/"}
+                )
             )
         ):
             raise ValueError("WORKTREE_PORCELAIN_INVALID")
@@ -673,6 +923,13 @@ class GitShowRefVerify:
 
 
 @dataclass(frozen=True, slots=True)
+class GitCreatePrivateRef:
+    direct_ref: str
+    prepared_oid: GitOid
+    reflog_message: str
+
+
+@dataclass(frozen=True, slots=True)
 class GitWorktreeAddNoCheckout:
     reservation_path: Path
     target_ref: str
@@ -709,6 +966,7 @@ type GitOperation = (
     GitStatusPorcelain
     | GitWorktreeListPorcelain
     | GitShowRefVerify
+    | GitCreatePrivateRef
     | GitWorktreeAddNoCheckout
     | GitWorktreeLock
     | GitLsTreeRecursive
@@ -738,18 +996,71 @@ class SubprocessGitSpawner:
         *,
         text: bool,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
-        return cast(
-            subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
-            subprocess.run(
-                argv,
-                cwd=cwd,
-                env=dict(environment),
-                check=False,
-                capture_output=True,
-                text=text,
-                timeout=30,
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=dict(environment),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        overflow = threading.Event()
+        stdout = bytearray()
+        stderr = bytearray()
+
+        def kill_if_running() -> None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        def drain(stream: IO[bytes], destination: bytearray, maximum: int) -> None:
+            while True:
+                chunk = stream.read(65_536)
+                if not chunk:
+                    return
+                remaining = maximum - len(destination)
+                destination.extend(chunk[: max(remaining, 0)])
+                if len(chunk) > remaining:
+                    overflow.set()
+                    kill_if_running()
+                    return
+
+        threads = (
+            threading.Thread(
+                target=drain,
+                args=(process.stdout, stdout, MAX_GIT_STDOUT_BYTES),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=drain,
+                args=(process.stderr, stderr, MAX_GIT_STDERR_BYTES),
+                daemon=True,
             ),
         )
+        for thread in threads:
+            thread.start()
+        try:
+            returncode = process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            kill_if_running()
+            process.wait()
+            raise
+        finally:
+            for thread in threads:
+                thread.join()
+        if overflow.is_set():
+            raise RepositoryUnsafeError("GIT_OUTPUT_LIMIT_EXCEEDED")
+        raw_stdout = bytes(stdout)
+        raw_stderr = bytes(stderr)
+        if text:
+            return subprocess.CompletedProcess(
+                argv,
+                returncode,
+                raw_stdout.decode("utf-8", errors="strict"),
+                raw_stderr.decode("utf-8", errors="replace"),
+            )
+        return subprocess.CompletedProcess(argv, returncode, raw_stdout, raw_stderr)
 
 
 class GitCommandRunner:
@@ -788,6 +1099,7 @@ class GitCommandRunner:
                 GitStatusPorcelain,
                 GitWorktreeListPorcelain,
                 GitShowRefVerify,
+                GitCreatePrivateRef,
                 GitWorktreeAddNoCheckout,
                 GitWorktreeLock,
                 GitLsTreeRecursive,
@@ -826,8 +1138,20 @@ class GitCommandRunner:
             case GitWorktreeListPorcelain():
                 return ("worktree", "list", "--porcelain", "-z")
             case GitShowRefVerify(direct_ref=target):
-                self._require_direct_ref(target)
+                self._require_readable_ref(target)
                 return ("show-ref", "--verify", "--hash", "--", target)
+            case GitCreatePrivateRef(direct_ref=target, prepared_oid=oid, reflog_message=message):
+                self._require_private_ref(target)
+                self._require_reason(message)
+                return (
+                    "update-ref",
+                    "--create-reflog",
+                    "-m",
+                    message,
+                    target,
+                    self._require_oid(oid),
+                    "",
+                )
             case GitWorktreeAddNoCheckout(reservation_path=path, target_ref=target):
                 self._require_direct_ref(target)
                 self._require_operand_path(path)
@@ -862,6 +1186,28 @@ class GitCommandRunner:
             or any(character.isspace() or character == "\x00" for character in value)
         ):
             raise RepositoryUnsafeError("GIT_REF_OPERAND_INVALID")
+
+    @staticmethod
+    def _require_private_ref(value: str) -> None:
+        prefix = "refs/apexcrew/runs/"
+        component = value.removeprefix(prefix)
+        if (
+            not value.startswith(prefix)
+            or not component
+            or len(component) > 128
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+                for character in component
+            )
+        ):
+            raise RepositoryUnsafeError("GIT_PRIVATE_REF_OPERAND_INVALID")
+
+    @classmethod
+    def _require_readable_ref(cls, value: str) -> None:
+        if value.startswith("refs/heads/"):
+            cls._require_direct_ref(value)
+        else:
+            cls._require_private_ref(value)
 
     @staticmethod
     def _require_operand_path(value: Path) -> None:

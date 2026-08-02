@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Self, cast
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import (
@@ -23,8 +23,178 @@ from apexcrew.domain.types import (
     IntentId,
     RepositoryId,
     RunId,
+    RunState,
     RuntimeOwnerId,
 )
+
+
+def private_ref(run_id: RunId) -> str:
+    return f"refs/apexcrew/runs/{run_id}"
+
+
+class PrivateRefCasOutcome(FrozenDocument):
+    intent_id: IntentId
+    run_id: RunId
+    result_class: Literal[
+        "PRIVATE_REF_INITIALIZED",
+        "PRIVATE_REF_ABSENT_FAILED",
+        "PRIVATE_REF_CONFLICT",
+        "PRIVATE_REF_UNOBSERVABLE",
+    ]
+    observed_oid: GitOid | None
+
+    def to_effect_result(self, settled_sequence: AuditSequence) -> EffectResult:
+        payload = canonical_json(self.model_dump(mode="json"))
+        return EffectResult(
+            intent_id=self.intent_id,
+            run_id=self.run_id,
+            outcome=cast(
+                Literal["COMPLETED", "FAILED", "CONFLICT", "INDETERMINATE"],
+                {
+                    "PRIVATE_REF_INITIALIZED": "COMPLETED",
+                    "PRIVATE_REF_ABSENT_FAILED": "FAILED",
+                    "PRIVATE_REF_CONFLICT": "CONFLICT",
+                    "PRIVATE_REF_UNOBSERVABLE": "INDETERMINATE",
+                }[self.result_class],
+            ),
+            result_class=self.result_class,
+            result_digest=sha256_digest(payload),
+            bounded_result_json=payload,
+            settled_sequence=settled_sequence,
+        )
+
+
+class RefPathBinding(FrozenDocument):
+    state: Literal["ABSENT", "REGULAR_FILE"]
+    identity_digest: Sha256DigestText | None = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if (self.state == "REGULAR_FILE") != (self.identity_digest is not None):
+            raise ValueError("REF_PATH_BINDING_INVALID")
+        return self
+
+
+class RefEffectBinding(FrozenDocument):
+    repository_instance_digest: Sha256DigestText
+    checkout_registration_digest: Sha256DigestText
+    ref_file: RefPathBinding
+    ref_lock: RefPathBinding
+    reflog: RefPathBinding
+    reflog_lock: RefPathBinding
+    reflog_exists: bool
+    reflog_message: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_reflog_state(self) -> Self:
+        if self.reflog_exists != (self.reflog.state == "REGULAR_FILE"):
+            raise ValueError("REF_EFFECT_REFLOG_BINDING_INVALID")
+        return self
+
+
+class RefCasIntent(FrozenDocument):
+    intent_id: IntentId
+    run_id: RunId
+    kind: Literal["private_ref_init"]
+    repository_id: RepositoryId
+    ref_name: str
+    expected_old_oid: GitOid | None
+    prepared_oid: GitOid
+    target_safety_digest: Sha256DigestText
+    ref_effect_binding: RefEffectBinding
+    target_reservation_id: str
+    permit_generation: int = Field(ge=1)
+    applicable_revision_digests: ApplicableRevisionDigests
+    idempotency_key: str
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> Self:
+        if self.ref_name != private_ref(self.run_id) or self.expected_old_oid is not None:
+            raise ValueError("REF_CAS_KIND_BINDING_INVALID")
+        return self
+
+    def to_effect_intent(self, recorded_sequence: AuditSequence) -> EffectIntent:
+        payload = canonical_json(self.model_dump(mode="json"))
+        return EffectIntent(
+            intent_id=self.intent_id,
+            run_id=self.run_id,
+            kind=self.kind,
+            idempotency_key=self.idempotency_key,
+            applicable_revision_digests=self.applicable_revision_digests,
+            payload_digest=sha256_digest(payload),
+            normalized_payload_json=payload,
+            recorded_sequence=recorded_sequence,
+            expected_prestate_json=canonical_json(
+                {
+                    "expected_old_oid": None,
+                    "ref_effect_binding": self.ref_effect_binding.model_dump(mode="json"),
+                    "ref_name": self.ref_name,
+                    "repository_id": self.repository_id,
+                    "target_safety_digest": self.target_safety_digest,
+                }
+            ),
+        )
+
+    @classmethod
+    def from_effect_intent(cls, effect: EffectIntent) -> RefCasIntent:
+        candidate = cls.model_validate_json(effect.normalized_payload_json)
+        if candidate.to_effect_intent(effect.recorded_sequence) != effect:
+            raise ValueError("REF_CAS_EFFECT_INTENT_BINDING_MISMATCH")
+        return candidate
+
+
+class StartGuardBinding(FrozenDocument):
+    run_id: RunId
+    repository_id: RepositoryId
+    target_reservation_id: str
+    pinned_target_oid: GitOid
+    target_safety_digest: Sha256DigestText
+    ref_effect_binding: RefEffectBinding
+    applicable_revision_digests: ApplicableRevisionDigests
+
+
+class RuntimeStartBinding(FrozenDocument):
+    run_id: RunId
+    sequence: AuditSequence
+    state: Literal[RunState.READY_TO_START]
+    permit_generation: int
+    consumed_owner_id: RuntimeOwnerId
+    consumed_sequence: AuditSequence
+    guard: StartGuardBinding
+
+
+class StartGuardDecision(FrozenDocument):
+    ok: bool
+    reason: str | None = None
+    binding: StartGuardBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if self.ok != (self.reason is None and self.binding is not None):
+            raise ValueError("START_GUARD_DECISION_SHAPE_INVALID")
+        return self
+
+
+class StartGuard(Protocol):
+    def inspect(
+        self,
+        *,
+        run_id: RunId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> StartGuardDecision: ...
+
+    def validate_consumed(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        permit: RuntimePermit,
+        expected_sequence: AuditSequence,
+    ) -> StartGuardDecision: ...
+
+
+class PrivateRefAdmissionPort(Protocol):
+    def initialize_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome: ...
 
 
 class RepositoryEffectError(RuntimeError):
