@@ -9,7 +9,8 @@ from hashlib import sha256
 from typing import Literal, Protocol
 
 from apexcrew.domain.actions import ActionEnvelope
-from apexcrew.domain.effects import StateConflict
+from apexcrew.domain.commands import ApplicableRevisionDigests
+from apexcrew.domain.effects import EffectIntent, StateConflict
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     LogicalModelTurn,
@@ -33,6 +34,136 @@ from apexcrew.domain.types import (
 
 class AuthorityDenied(ValueError):
     """Closed pre-transaction rejection of untrusted authority input."""
+
+
+class ActionClass(StrEnum):
+    ORDINARY = "ORDINARY"
+    DECLARED_CHECK = "DECLARED_CHECK"
+
+
+@dataclass(frozen=True, slots=True)
+class ActionDeadline:
+    run_id: RunId
+    intent_id: IntentId
+    budget_digest: RevisionDigest
+    applicable_revision_digests: ApplicableRevisionDigests
+    action_class: ActionClass
+    started_at: datetime
+    expires_at: datetime
+    recorded_sequence: AuditSequence
+    check_id: str | None = None
+    snapshot_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        timeout_seconds = (
+            V01_MECHANISM_LIMITS.check_timeout_seconds
+            if self.action_class == ActionClass.DECLARED_CHECK
+            else V01_MECHANISM_LIMITS.ordinary_action_timeout_seconds
+        )
+        if (
+            self.started_at.tzinfo is None
+            or self.expires_at.tzinfo is None
+            or self.expires_at != self.started_at + timedelta(seconds=timeout_seconds)
+        ):
+            raise ValueError("ACTION_DEADLINE_INVALID")
+        check_binding_present = self.check_id is not None and self.snapshot_digest is not None
+        if (self.action_class == ActionClass.DECLARED_CHECK) != check_binding_present:
+            raise ValueError("ACTION_DEADLINE_CHECK_BINDING_INVALID")
+
+
+TimeoutOutcome = Literal["INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"]
+
+
+@dataclass(frozen=True, slots=True)
+class TimeoutDecision:
+    outcome: TimeoutOutcome
+    semantic_result: None
+    receipt: None
+    retry_scope: tuple[str, str] | None
+    retry_allowed: bool
+    full_reservation_charged: bool
+
+    def __post_init__(self) -> None:
+        if (
+            self.outcome not in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}
+            or self.semantic_result is not None
+            or self.receipt is not None
+            or not isinstance(self.retry_allowed, bool)
+            or not isinstance(self.full_reservation_charged, bool)
+        ):
+            raise ValueError("TIMEOUT_DECISION_BINDING_INVALID")
+        ordinary = self.outcome == "INDETERMINATE"
+        if ordinary != (
+            self.retry_scope is None and not self.retry_allowed and self.full_reservation_charged
+        ):
+            raise ValueError("TIMEOUT_DECISION_BINDING_INVALID")
+        if not ordinary and (self.retry_scope is None or self.full_reservation_charged):
+            raise ValueError("TIMEOUT_DECISION_BINDING_INVALID")
+
+
+def timeout_decision_to_json(decision: TimeoutDecision) -> str:
+    return json.dumps(
+        {
+            "full_reservation_charged": decision.full_reservation_charged,
+            "outcome": decision.outcome,
+            "retry_allowed": decision.retry_allowed,
+            "retry_scope": decision.retry_scope,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def timeout_decision_from_json(value: str) -> TimeoutDecision:
+    try:
+        data = json.loads(value)
+        outcome = data["outcome"]
+        scope = data["retry_scope"]
+        if outcome not in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}:
+            raise ValueError("TIMEOUT_DECISION_STORAGE_INVALID")
+        if scope is not None and (
+            not isinstance(scope, list)
+            or len(scope) != 2
+            or not all(isinstance(item, str) for item in scope)
+        ):
+            raise ValueError("TIMEOUT_DECISION_STORAGE_INVALID")
+        decision = TimeoutDecision(
+            outcome=outcome,
+            semantic_result=None,
+            receipt=None,
+            retry_scope=None if scope is None else (scope[0], scope[1]),
+            retry_allowed=data["retry_allowed"],
+            full_reservation_charged=data["full_reservation_charged"],
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("TIMEOUT_DECISION_STORAGE_INVALID") from error
+    if timeout_decision_to_json(decision) != value:
+        raise ValueError("TIMEOUT_DECISION_STORAGE_INVALID")
+    return decision
+
+
+def action_deadline_binding(
+    intent: EffectIntent,
+) -> tuple[ActionClass, str | None, str | None]:
+    if intent.kind != "check":
+        return ActionClass.ORDINARY, None, None
+    try:
+        payload = json.loads(intent.normalized_payload_json)
+        action = payload["action"]
+        check_id = action["check_id"]
+        snapshot_digest = payload["snapshot_digest"]
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise AuthorityDenied("CHECK_TIMEOUT_BINDING_REQUIRED") from error
+    if (
+        not isinstance(action, dict)
+        or action.get("kind") != "check"
+        or not isinstance(check_id, str)
+        or not check_id
+        or not isinstance(snapshot_digest, str)
+        or not snapshot_digest
+    ):
+        raise AuthorityDenied("CHECK_TIMEOUT_BINDING_REQUIRED")
+    return ActionClass.DECLARED_CHECK, check_id, snapshot_digest
 
 
 class GlobalBudgetMetric(StrEnum):
@@ -345,6 +476,16 @@ class MonotonicInstant:
 class MonotonicClock(Protocol):
     def now(self) -> MonotonicInstant:
         raise NotImplementedError
+
+
+class UtcClock(Protocol):
+    def now(self) -> datetime:
+        raise NotImplementedError
+
+
+class SystemUtcClock:
+    def now(self) -> datetime:
+        return datetime.now(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -770,6 +911,22 @@ class AuthorityState(Protocol):
     ) -> tuple[RevisionDigest, BudgetRevisionDocument]:
         raise NotImplementedError
 
+    def effect_intent(self, intent_id: IntentId) -> EffectIntent:
+        raise NotImplementedError
+
+    def record_action_deadline(
+        self, deadline: ActionDeadline, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        raise NotImplementedError
+
+    def settle_action_timeout(
+        self,
+        deadline: ActionDeadline,
+        decision: TimeoutDecision,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
+        raise NotImplementedError
+
     def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
         raise NotImplementedError
 
@@ -903,11 +1060,87 @@ class AuthorityState(Protocol):
 
 
 class AuthorityService:
-    def __init__(self, journal: AuthorityState) -> None:
+    def __init__(self, journal: AuthorityState, utc_clock: UtcClock | None = None) -> None:
         self._journal = journal
+        self._utc_clock = utc_clock or SystemUtcClock()
+
+    def _utc_now(self) -> datetime:
+        now = self._utc_clock.now()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise AuthorityDenied("UTC_CLOCK_REQUIRED")
+        return now.astimezone(UTC)
 
     def _budget(self, run_id: RunId) -> tuple[RevisionDigest, BudgetRevisionDocument]:
         return self._journal.current_approved_budget(run_id)
+
+    def open_action_deadline(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+        expected_sequence: AuditSequence,
+    ) -> ActionDeadline:
+        intent = self._journal.effect_intent(intent_id)
+        if intent.run_id != run_id:
+            raise AuthorityDenied("ACTION_DEADLINE_INTENT_RUN_MISMATCH")
+        action_class, check_id, snapshot_digest = action_deadline_binding(intent)
+        started_at = self._utc_now()
+        seconds = (
+            V01_MECHANISM_LIMITS.check_timeout_seconds
+            if action_class == ActionClass.DECLARED_CHECK
+            else V01_MECHANISM_LIMITS.ordinary_action_timeout_seconds
+        )
+        budget_digest, _ = self._budget(run_id)
+        deadline = ActionDeadline(
+            run_id=run_id,
+            intent_id=intent_id,
+            budget_digest=budget_digest,
+            applicable_revision_digests=intent.applicable_revision_digests,
+            action_class=action_class,
+            started_at=started_at,
+            expires_at=started_at + timedelta(seconds=seconds),
+            recorded_sequence=AuditSequence(expected_sequence + 1),
+            check_id=check_id,
+            snapshot_digest=snapshot_digest,
+        )
+        return self._journal.record_action_deadline(deadline, expected_sequence)
+
+    def deadline_state(self, deadline: ActionDeadline) -> Literal["OPEN", "TIMED_OUT"]:
+        return "TIMED_OUT" if self._utc_now() >= deadline.expires_at else "OPEN"
+
+    def remaining_budget_allows_retry(self, run_id: RunId) -> bool:
+        return self._journal.authorize_new_action(run_id).decision == "ALLOW"
+
+    def settle_timeout(
+        self,
+        deadline: ActionDeadline,
+        outcome_observable: bool,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
+        if outcome_observable:
+            raise AuthorityDenied("OBSERVABLE_RESULT_MUST_SETTLE_NORMALLY")
+        if self.deadline_state(deadline) != "TIMED_OUT":
+            raise AuthorityDenied("ACTION_DEADLINE_NOT_EXPIRED")
+        if deadline.action_class == ActionClass.ORDINARY:
+            decision = TimeoutDecision(
+                outcome="INDETERMINATE",
+                semantic_result=None,
+                receipt=None,
+                retry_scope=None,
+                retry_allowed=False,
+                full_reservation_charged=True,
+            )
+        else:
+            if deadline.check_id is None or deadline.snapshot_digest is None:
+                raise AuthorityDenied("CHECK_TIMEOUT_BINDING_REQUIRED")
+            decision = TimeoutDecision(
+                outcome="INFRASTRUCTURE_UNCERTAINTY",
+                semantic_result=None,
+                receipt=None,
+                retry_scope=(deadline.check_id, deadline.snapshot_digest),
+                retry_allowed=self.remaining_budget_allows_retry(deadline.run_id),
+                full_reservation_charged=False,
+            )
+        return self._journal.settle_action_timeout(deadline, decision, expected_sequence)
 
     def settle_global_usage(
         self,

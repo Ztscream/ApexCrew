@@ -14,10 +14,13 @@ from apexcrew.domain.admission import (
     TargetReservationCreationOutcome,
 )
 from apexcrew.domain.authority import (
+    ActionClass,
+    ActionDeadline,
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
     AtomicAction,
     AttemptLifecycleState,
+    AuthorityDenied,
     AuthorizationReason,
     AuthorizationRequest,
     BudgetSettlement,
@@ -39,9 +42,11 @@ from apexcrew.domain.authority import (
     TaskBudgetState,
     TaskLifecycleState,
     TaskStopDecision,
+    TimeoutDecision,
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
+    action_deadline_binding,
     crossed_threshold,
     global_ceiling_for,
     model_reservation_amounts,
@@ -244,6 +249,9 @@ class InMemoryStateStore:
         self._sequences: dict[RunId, AuditSequence] = {}
         self._effect_intents: dict[IntentId, EffectIntent] = {}
         self._effect_results: dict[IntentId, EffectResult] = {}
+        self._action_deadlines: dict[IntentId, ActionDeadline] = {}
+        self._timeout_decisions: dict[IntentId, TimeoutDecision] = {}
+        self._indeterminate_effect_intents: set[IntentId] = set()
         self._model_turns: dict[LogicalTurnId, LogicalModelTurn | CommittedModelTurn] = {}
         self._model_attempt_numbers: dict[tuple[RunId, LogicalTurnId, int], IntentId] = {}
         self._model_attempts: dict[IntentId, ModelRequestIntent | SettledModelAttempt] = {}
@@ -287,6 +295,9 @@ class InMemoryStateStore:
         copied._sequences = self._sequences.copy()
         copied._effect_intents = self._effect_intents.copy()
         copied._effect_results = self._effect_results.copy()
+        copied._action_deadlines = self._action_deadlines.copy()
+        copied._timeout_decisions = self._timeout_decisions.copy()
+        copied._indeterminate_effect_intents = self._indeterminate_effect_intents.copy()
         copied._model_turns = self._model_turns.copy()
         copied._model_attempt_numbers = self._model_attempt_numbers.copy()
         copied._model_attempts = self._model_attempts.copy()
@@ -320,6 +331,9 @@ class InMemoryStateStore:
         self._sequences = copied._sequences
         self._effect_intents = copied._effect_intents
         self._effect_results = copied._effect_results
+        self._action_deadlines = copied._action_deadlines
+        self._timeout_decisions = copied._timeout_decisions
+        self._indeterminate_effect_intents = copied._indeterminate_effect_intents
         self._model_turns = copied._model_turns
         self._model_attempt_numbers = copied._model_attempt_numbers
         self._model_attempts = copied._model_attempts
@@ -874,6 +888,23 @@ class InMemoryStateStore:
         if current is None or current[0] != budget_digest:
             raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
         return current[1]
+
+    def _require_current_revisions(
+        self,
+        run_id: RunId,
+        expected: ApplicableRevisionDigests,
+    ) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        current = ApplicableRevisionDigests(
+            plan_digest=run.current_plan_digest,
+            policy_digest=run.current_policy_digest,
+            budget_digest=run.current_budget_digest,
+            model_configuration_digest=run.current_model_configuration_digest,
+        )
+        if current != expected:
+            raise StateConflict("CURRENT_REVISION_BINDING_MISMATCH")
 
     def _require_dispatch_binding(self, run_id: RunId) -> None:
         if run_id not in self._runs:
@@ -2054,6 +2085,116 @@ class InMemoryStateStore:
         )
         return intent
 
+    @staticmethod
+    def _validate_action_deadline_binding(
+        deadline: ActionDeadline,
+        intent: EffectIntent,
+    ) -> None:
+        try:
+            action_class, check_id, snapshot_digest = action_deadline_binding(intent)
+        except AuthorityDenied as error:
+            raise StateConflict(str(error)) from error
+        if (
+            deadline.run_id != intent.run_id
+            or deadline.intent_id != intent.intent_id
+            or deadline.applicable_revision_digests != intent.applicable_revision_digests
+            or deadline.action_class != action_class
+            or deadline.check_id != check_id
+            or deadline.snapshot_digest != snapshot_digest
+        ):
+            raise StateConflict("ACTION_DEADLINE_INTENT_BINDING_MISMATCH")
+
+    def _require_unsettled_effect_intent(
+        self,
+        run_id: RunId,
+        intent_id: IntentId,
+    ) -> EffectIntent:
+        intent = self._effect_intents.get(intent_id)
+        if (
+            intent is None
+            or intent.run_id != run_id
+            or intent_id in self._effect_results
+            or intent_id in self._indeterminate_effect_intents
+        ):
+            raise StateConflict("UNSETTLED_EFFECT_INTENT_REQUIRED")
+        return intent
+
+    def record_action_deadline(
+        self,
+        deadline: ActionDeadline,
+        expected_sequence: AuditSequence,
+    ) -> ActionDeadline:
+        if deadline.recorded_sequence != AuditSequence(expected_sequence + 1):
+            raise StateConflict("ACTION_DEADLINE_SEQUENCE_MISMATCH")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_current_revisions(deadline.run_id, deadline.applicable_revision_digests)
+            copied._require_current_budget(deadline.run_id, deadline.budget_digest)
+            intent = copied._require_unsettled_effect_intent(deadline.run_id, deadline.intent_id)
+            copied._validate_action_deadline_binding(deadline, intent)
+            if deadline.intent_id in copied._action_deadlines:
+                raise StateConflict("ACTION_DEADLINE_ALREADY_RECORDED")
+            copied._action_deadlines[deadline.intent_id] = deadline
+
+        self._commit_state_and_event(
+            run_id=deadline.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_DEADLINE_RECORDED",
+                applicable_revision_digests=deadline.applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+        return deadline
+
+    def settle_action_timeout(
+        self,
+        deadline: ActionDeadline,
+        decision: TimeoutDecision,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_current_revisions(deadline.run_id, deadline.applicable_revision_digests)
+            copied._require_current_budget(deadline.run_id, deadline.budget_digest)
+            intent = copied._require_unsettled_effect_intent(deadline.run_id, deadline.intent_id)
+            copied._validate_action_deadline_binding(deadline, intent)
+            current = copied._action_deadlines.get(deadline.intent_id)
+            if current != deadline or deadline.intent_id in copied._timeout_decisions:
+                raise StateConflict("ACTION_TIMEOUT_NOT_CURRENT")
+            if deadline.action_class == ActionClass.ORDINARY:
+                if decision.outcome != "INDETERMINATE":
+                    raise StateConflict("ORDINARY_TIMEOUT_SUCCESSOR_REQUIRED")
+                copied._indeterminate_effect_intents.add(deadline.intent_id)
+            else:
+                copied._require_dispatch_binding(deadline.run_id)
+                if (
+                    decision.outcome != "INFRASTRUCTURE_UNCERTAINTY"
+                    or decision.retry_scope != (deadline.check_id, deadline.snapshot_digest)
+                    or decision.retry_allowed != copied._new_dispatch_open[deadline.run_id]
+                ):
+                    raise StateConflict("CHECK_TIMEOUT_SUCCESSOR_BINDING_MISMATCH")
+            copied._timeout_decisions[deadline.intent_id] = decision
+
+        self._commit_state_and_event(
+            run_id=deadline.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_TIMEOUT_SETTLED",
+                applicable_revision_digests=deadline.applicable_revision_digests,
+                result_class=decision.outcome,
+            ),
+            mutate=mutate,
+        )
+        return decision
+
+    def action_deadline(self, intent_id: IntentId) -> ActionDeadline | None:
+        with self._lock:
+            return self._action_deadlines.get(intent_id)
+
+    def timeout_decision(self, intent_id: IntentId) -> TimeoutDecision | None:
+        with self._lock:
+            return self._timeout_decisions.get(intent_id)
+
     def _validate_effect_intent(
         self, intent: EffectIntent, expected_sequence: AuditSequence
     ) -> None:
@@ -2133,7 +2274,9 @@ class InMemoryStateStore:
                     (
                         intent
                         for intent_id, intent in self._effect_intents.items()
-                        if intent.run_id == run_id and intent_id not in self._effect_results
+                        if intent.run_id == run_id
+                        and intent_id not in self._effect_results
+                        and intent_id not in self._indeterminate_effect_intents
                     ),
                     key=lambda intent: (intent.recorded_sequence, intent.intent_id),
                 )

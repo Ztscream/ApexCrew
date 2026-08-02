@@ -11,10 +11,12 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from apexcrew.domain.authority import (
+        ActionDeadline,
         AtomicAction,
         BudgetSettlement,
         GlobalBudgetMetric,
         GlobalUsageSnapshot,
+        TimeoutDecision,
     )
 
 from apexcrew.domain.commands import (
@@ -253,6 +255,19 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def record_intent(self, intent: EffectIntent, expected_sequence: AuditSequence) -> EffectIntent:
+        raise NotImplementedError
+
+    def record_action_deadline(
+        self, deadline: ActionDeadline, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        raise NotImplementedError
+
+    def settle_action_timeout(
+        self,
+        deadline: ActionDeadline,
+        decision: TimeoutDecision,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
         raise NotImplementedError
 
     def settle_intent(

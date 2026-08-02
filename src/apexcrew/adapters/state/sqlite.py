@@ -16,10 +16,13 @@ from apexcrew.domain.admission import (
     TargetReservationCreationOutcome,
 )
 from apexcrew.domain.authority import (
+    ActionClass,
+    ActionDeadline,
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
     AtomicAction,
     AttemptLifecycleState,
+    AuthorityDenied,
     AuthorizationReason,
     AuthorizationRequest,
     BudgetSettlement,
@@ -41,9 +44,11 @@ from apexcrew.domain.authority import (
     TaskBudgetState,
     TaskLifecycleState,
     TaskStopDecision,
+    TimeoutDecision,
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
+    action_deadline_binding,
     budget_warning_from_json,
     budget_warning_to_json,
     crossed_threshold,
@@ -54,6 +59,8 @@ from apexcrew.domain.authority import (
     model_reservation_amounts,
     normalize_global_budget_metric,
     progress_from_checks,
+    timeout_decision_from_json,
+    timeout_decision_to_json,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -426,6 +433,28 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 state TEXT NOT NULL CHECK(state IN ('IN_FLIGHT','SETTLED')),
                 opened_sequence INTEGER NOT NULL,
                 PRIMARY KEY(run_id, action_id)
+            )""",
+        ),
+    ),
+    (
+        9,
+        (
+            """CREATE TABLE action_deadlines (
+                intent_id TEXT PRIMARY KEY REFERENCES effect_intents(intent_id),
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                budget_digest TEXT NOT NULL,
+                applicable_revision_digests_json TEXT NOT NULL,
+                action_class TEXT NOT NULL CHECK(action_class IN ('ORDINARY','DECLARED_CHECK')),
+                started_at_utc TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                check_id TEXT,
+                snapshot_digest TEXT,
+                recorded_sequence INTEGER NOT NULL
+            )""",
+            """CREATE TABLE action_timeout_decisions (
+                intent_id TEXT PRIMARY KEY REFERENCES action_deadlines(intent_id),
+                decision_json TEXT NOT NULL,
+                settled_sequence INTEGER NOT NULL
             )""",
         ),
     ),
@@ -3754,6 +3783,184 @@ class SqliteStateStore:
         if row is None:
             raise StateConflict("UNSETTLED_EFFECT_INTENT_REQUIRED")
         return self._effect_intent_from_row(row)
+
+    @staticmethod
+    def _validate_action_deadline_binding(
+        deadline: ActionDeadline,
+        intent: EffectIntent,
+    ) -> None:
+        try:
+            action_class, check_id, snapshot_digest = action_deadline_binding(intent)
+        except AuthorityDenied as error:
+            raise StateConflict(str(error)) from error
+        if (
+            deadline.run_id != intent.run_id
+            or deadline.intent_id != intent.intent_id
+            or deadline.applicable_revision_digests != intent.applicable_revision_digests
+            or deadline.action_class != action_class
+            or deadline.check_id != check_id
+            or deadline.snapshot_digest != snapshot_digest
+        ):
+            raise StateConflict("ACTION_DEADLINE_INTENT_BINDING_MISMATCH")
+
+    def _read_action_deadline(
+        self,
+        connection: sqlite3.Connection,
+        intent_id: IntentId,
+    ) -> ActionDeadline | None:
+        row = connection.execute(
+            "SELECT * FROM action_deadlines WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return ActionDeadline(
+                run_id=RunId(str(row["run_id"])),
+                intent_id=IntentId(str(row["intent_id"])),
+                budget_digest=RevisionDigest(str(row["budget_digest"])),
+                applicable_revision_digests=ApplicableRevisionDigests.model_validate_json(
+                    str(row["applicable_revision_digests_json"])
+                ),
+                action_class=ActionClass(str(row["action_class"])),
+                started_at=datetime.fromisoformat(str(row["started_at_utc"])),
+                expires_at=datetime.fromisoformat(str(row["expires_at_utc"])),
+                recorded_sequence=AuditSequence(int(row["recorded_sequence"])),
+                check_id=None if row["check_id"] is None else str(row["check_id"]),
+                snapshot_digest=(
+                    None if row["snapshot_digest"] is None else str(row["snapshot_digest"])
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise StateConflict("ACTION_DEADLINE_STORAGE_INVALID") from error
+
+    def record_action_deadline(
+        self,
+        deadline: ActionDeadline,
+        expected_sequence: AuditSequence,
+    ) -> ActionDeadline:
+        if deadline.recorded_sequence != AuditSequence(expected_sequence + 1):
+            raise StateConflict("ACTION_DEADLINE_SEQUENCE_MISMATCH")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_current_revisions(
+                connection, deadline.run_id, deadline.applicable_revision_digests
+            )
+            self._approved_budget_for_update(connection, deadline.run_id, deadline.budget_digest)
+            intent = self._require_unsettled_effect_intent(
+                connection, deadline.run_id, deadline.intent_id
+            )
+            self._validate_action_deadline_binding(deadline, intent)
+            try:
+                connection.execute(
+                    "INSERT INTO action_deadlines(intent_id, run_id, budget_digest, "
+                    "applicable_revision_digests_json, action_class, started_at_utc, "
+                    "expires_at_utc, check_id, snapshot_digest, recorded_sequence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        deadline.intent_id,
+                        deadline.run_id,
+                        deadline.budget_digest,
+                        deadline.applicable_revision_digests.model_dump_json(),
+                        deadline.action_class,
+                        deadline.started_at.isoformat(),
+                        deadline.expires_at.isoformat(),
+                        deadline.check_id,
+                        deadline.snapshot_digest,
+                        deadline.recorded_sequence,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("ACTION_DEADLINE_ALREADY_RECORDED") from error
+
+        self._commit_state_and_event(
+            run_id=deadline.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_DEADLINE_RECORDED",
+                applicable_revision_digests=deadline.applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+        return deadline
+
+    def settle_action_timeout(
+        self,
+        deadline: ActionDeadline,
+        decision: TimeoutDecision,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_current_revisions(
+                connection, deadline.run_id, deadline.applicable_revision_digests
+            )
+            self._approved_budget_for_update(connection, deadline.run_id, deadline.budget_digest)
+            intent = self._require_unsettled_effect_intent(
+                connection, deadline.run_id, deadline.intent_id
+            )
+            self._validate_action_deadline_binding(deadline, intent)
+            if self._read_action_deadline(connection, deadline.intent_id) != deadline:
+                raise StateConflict("ACTION_TIMEOUT_NOT_CURRENT")
+            if deadline.action_class == ActionClass.ORDINARY:
+                if decision.outcome != "INDETERMINATE":
+                    raise StateConflict("ORDINARY_TIMEOUT_SUCCESSOR_REQUIRED")
+                if (
+                    connection.execute(
+                        "UPDATE effect_intents SET state = 'INDETERMINATE' "
+                        "WHERE intent_id = ? AND run_id = ? AND state = 'UNSETTLED'",
+                        (deadline.intent_id, deadline.run_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("ACTION_TIMEOUT_SUCCESSOR_COMPARE_AND_SET_FAILED")
+            else:
+                dispatch_open, _, _ = self._dispatch_state_for_update(connection, deadline.run_id)
+                if (
+                    decision.outcome != "INFRASTRUCTURE_UNCERTAINTY"
+                    or decision.retry_scope != (deadline.check_id, deadline.snapshot_digest)
+                    or decision.retry_allowed != dispatch_open
+                ):
+                    raise StateConflict("CHECK_TIMEOUT_SUCCESSOR_BINDING_MISMATCH")
+            try:
+                connection.execute(
+                    "INSERT INTO action_timeout_decisions"
+                    "(intent_id, decision_json, settled_sequence) VALUES (?, ?, ?)",
+                    (
+                        deadline.intent_id,
+                        timeout_decision_to_json(decision),
+                        expected_sequence + 1,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("ACTION_TIMEOUT_NOT_CURRENT") from error
+
+        self._commit_state_and_event(
+            run_id=deadline.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_TIMEOUT_SETTLED",
+                applicable_revision_digests=deadline.applicable_revision_digests,
+                result_class=decision.outcome,
+            ),
+            mutate=mutate,
+        )
+        return decision
+
+    def action_deadline(self, intent_id: IntentId) -> ActionDeadline | None:
+        with self._read_transaction() as connection:
+            return self._read_action_deadline(connection, intent_id)
+
+    def timeout_decision(self, intent_id: IntentId) -> TimeoutDecision | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT decision_json FROM action_timeout_decisions WHERE intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return timeout_decision_from_json(str(row["decision_json"]))
+        except ValueError as error:
+            raise StateConflict("TIMEOUT_DECISION_STORAGE_INVALID") from error
 
     def _insert_effect_result(
         self,
