@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
+    from apexcrew.domain.tools import ToolDenialAudit
 
 from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
@@ -4703,6 +4704,23 @@ class SqliteStateStore:
             run_id=run_id,
             expected_sequence=expected_sequence,
             event=event,
+            mutate=lambda connection: None,
+        )
+
+    def record_tool_denial(
+        self, denial: ToolDenialAudit, expected_sequence: AuditSequence
+    ) -> AuditSequence:
+        return self._commit_state_and_event(
+            run_id=denial.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TOOL_ACTION_DENIED",
+                task_id=denial.task_id,
+                attempt_id=denial.attempt_id,
+                action_id=denial.action_id,
+                applicable_revision_digests=denial.applicable_revision_digests,
+                result_class=denial.result_code,
+            ),
             mutate=lambda connection: None,
         )
 

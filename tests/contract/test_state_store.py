@@ -17,6 +17,7 @@ from helpers.application import (
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.domain.actions import ReadAction, SearchAction
 from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
@@ -64,6 +65,7 @@ from apexcrew.domain.revisions import (
     ModelPricingEntryDocument,
     revision_digest,
 )
+from apexcrew.domain.tools import ToolIntent
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -1338,3 +1340,54 @@ def test_unsettled_intents_have_identical_deterministic_order(
     store.record_intent(first, AuditSequence(0))
     store.record_intent(second, AuditSequence(1))
     assert store.unsettled_intents(run_id) == (first, second)
+
+
+def make_contract_tool_intent(*, intent_id: str, action: ReadAction | SearchAction) -> ToolIntent:
+    digest = "sha256:" + "1" * 64
+    return ToolIntent.for_authorized_worker_action(
+        intent_id=IntentId(intent_id),
+        run_id=RunId("run-tool-contract"),
+        task_id=TaskId("task-1"),
+        attempt_id=AttemptId("attempt-1"),
+        action_id=intent_id,
+        action=action,
+        authorization_binding_digest=digest,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        repository_id="repository-1",
+        snapshot_digest=digest,
+        scope_digest=digest,
+        dependency_fingerprint_basis=digest,
+        idempotency_key=f"tool:{intent_id}",
+        expected_prestate_json="{}",
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_read_and_search_tool_intents_use_the_same_effect_journal_contract(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    documents = (
+        make_contract_tool_intent(intent_id="intent-read", action=ReadAction(path="src/a.py")),
+        make_contract_tool_intent(
+            intent_id="intent-search",
+            action=SearchAction(query="name", paths=("src/**",)),
+        ),
+    )
+    effects = tuple(
+        document.to_effect_intent(AuditSequence(index + 1))
+        for index, document in enumerate(documents)
+    )
+    for index, effect in enumerate(effects):
+        store.record_intent(effect, AuditSequence(index))
+        assert (
+            ToolIntent.from_effect_intent(store.effect_intent(effect.intent_id)) == documents[index]
+        )
+    assert (
+        tuple(
+            ToolIntent.from_effect_intent(effect)
+            for effect in store.unsettled_intents(documents[0].run_id)
+        )
+        == documents
+    )
