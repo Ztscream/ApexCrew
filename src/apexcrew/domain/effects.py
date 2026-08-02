@@ -16,6 +16,10 @@ if TYPE_CHECKING:
         BudgetSettlement,
         GlobalBudgetMetric,
         GlobalUsageSnapshot,
+        ResumeTaskRequest,
+        TaskCounterSnapshot,
+        TaskPauseBinding,
+        TaskResumeDecision,
         TimeoutDecision,
     )
 
@@ -227,6 +231,26 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        raise NotImplementedError
+
+    def current_task_pause(self, run_id: RunId, task_id: TaskId) -> TaskPauseBinding | None:
+        raise NotImplementedError
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        raise NotImplementedError
+
+    def task_repair_observed(self, pause: TaskPauseBinding) -> bool:
+        raise NotImplementedError
+
+    def accept_task_resume(
+        self,
+        request: ResumeTaskRequest,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        usage: GlobalUsageSnapshot,
+        calls: int,
+    ) -> TaskResumeDecision:
         raise NotImplementedError
 
     def settle_global_usage(

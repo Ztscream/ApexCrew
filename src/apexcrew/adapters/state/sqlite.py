@@ -25,6 +25,7 @@ from apexcrew.domain.authority import (
     AuthorityDenied,
     AuthorizationReason,
     AuthorizationRequest,
+    BudgetCeilingExhaustion,
     BudgetSettlement,
     BudgetWarning,
     CheckpointKey,
@@ -39,16 +40,22 @@ from apexcrew.domain.authority import (
     MonotonicClock,
     MonotonicInstant,
     ProgressEvidence,
+    ResumeTaskRequest,
     RuntimeAuditStamp,
     TaskAuthority,
     TaskBudgetState,
+    TaskCounterSnapshot,
     TaskLifecycleState,
+    TaskPauseBinding,
+    TaskResumeDecision,
     TaskStopDecision,
     TimeoutDecision,
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
     action_deadline_binding,
+    budget_ceiling_exhaustions_from_json,
+    budget_ceiling_exhaustions_to_json,
     budget_warning_from_json,
     budget_warning_to_json,
     crossed_threshold,
@@ -59,6 +66,7 @@ from apexcrew.domain.authority import (
     model_reservation_amounts,
     normalize_global_budget_metric,
     progress_from_checks,
+    task_resume_ids,
     timeout_decision_from_json,
     timeout_decision_to_json,
 )
@@ -66,6 +74,8 @@ from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     CommandEnvelope,
     CommandOutcome,
+    applicable_revision_digests_from_json,
+    applicable_revision_digests_to_json,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
@@ -458,6 +468,56 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        10,
+        (
+            """CREATE TABLE task_pauses (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                task_id TEXT NOT NULL,
+                pause_sequence INTEGER NOT NULL,
+                pause_reason TEXT NOT NULL,
+                counter_snapshot_digest TEXT NOT NULL,
+                previous_attempt_id TEXT NOT NULL,
+                budget_digest_at_pause TEXT NOT NULL,
+                budget_ceiling_exhaustions_json TEXT NOT NULL,
+                applicable_revision_digests_json TEXT NOT NULL,
+                active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                PRIMARY KEY(run_id, task_id),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+            """CREATE TABLE task_resume_allocations (
+                allocation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                task_id TEXT NOT NULL,
+                reserved_attempt_id TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                applicable_revision_digests_json TEXT NOT NULL,
+                allocated_calls INTEGER NOT NULL CHECK(allocated_calls BETWEEN 1 AND 8),
+                state TEXT NOT NULL CHECK(state IN ('RESERVED','CONSUMED','INVALIDATED')),
+                created_sequence INTEGER NOT NULL,
+                UNIQUE(run_id, task_id, reserved_attempt_id),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+            """CREATE TABLE task_resume_metadata (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                next_lease_generation INTEGER NOT NULL CHECK(next_lease_generation >= 1),
+                failure_digests_json TEXT NOT NULL,
+                warning_keys_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, task_id),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+            """CREATE TABLE trusted_task_repairs (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                pause_sequence INTEGER NOT NULL,
+                pause_reason TEXT NOT NULL,
+                observation_digest TEXT NOT NULL,
+                PRIMARY KEY(run_id, task_id, pause_sequence, pause_reason),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+        ),
+    ),
 )
 
 
@@ -675,6 +735,24 @@ def _task_budget_from_json(value: str) -> TaskBudgetState:
     return state
 
 
+def _string_tuple_to_json(values: tuple[str, ...]) -> str:
+    return json.dumps(list(values), separators=(",", ":"))
+
+
+def _string_tuple_from_json(value: str, error_code: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise StateConflict(error_code) from error
+    if (
+        not isinstance(parsed, list)
+        or any(not isinstance(item, str) or not item for item in parsed)
+        or _string_tuple_to_json(tuple(parsed)) != value
+    ):
+        raise StateConflict(error_code)
+    return tuple(parsed)
+
+
 def _workspace_lease_from_row(row: sqlite3.Row) -> WorkspaceLease:
     try:
         return WorkspaceLease(
@@ -704,6 +782,12 @@ class _LeaseDenied(RuntimeError):
     def __init__(self, denial: LeaseDenial) -> None:
         super().__init__(denial.reason)
         self.denial = denial
+
+
+class _ResumeStale(RuntimeError):
+    def __init__(self, decision: TaskResumeDecision) -> None:
+        super().__init__(decision.failed_invariant)
+        self.decision = decision
 
 
 @dataclass(frozen=True, slots=True)
@@ -1396,6 +1480,493 @@ class SqliteStateStore:
         return state
 
     @staticmethod
+    def _task_pause_from_row(row: sqlite3.Row) -> TaskPauseBinding:
+        revisions_json = str(row["applicable_revision_digests_json"])
+        revisions = applicable_revision_digests_from_json(revisions_json)
+        if applicable_revision_digests_to_json(revisions) != revisions_json:
+            raise StateConflict("TASK_PAUSE_REVISION_BINDING_INVALID")
+        return TaskPauseBinding(
+            run_id=RunId(row["run_id"]),
+            task_id=TaskId(row["task_id"]),
+            pause_sequence=AuditSequence(row["pause_sequence"]),
+            pause_reason=str(row["pause_reason"]),
+            counter_snapshot_digest=str(row["counter_snapshot_digest"]),
+            previous_attempt_id=AttemptId(row["previous_attempt_id"]),
+            budget_digest_at_pause=RevisionDigest(row["budget_digest_at_pause"]),
+            applicable_revision_digests_at_pause=revisions,
+            budget_ceiling_exhaustions=budget_ceiling_exhaustions_from_json(
+                str(row["budget_ceiling_exhaustions_json"])
+            ),
+        )
+
+    @staticmethod
+    def _insert_task_pause(
+        connection: sqlite3.Connection,
+        pause: TaskPauseBinding,
+        applicable_revision_digests: ApplicableRevisionDigests,
+    ) -> None:
+        if pause.applicable_revision_digests_at_pause != applicable_revision_digests:
+            raise StateConflict("TASK_PAUSE_REVISION_BINDING_INVALID")
+        changed = connection.execute(
+            "INSERT INTO task_pauses(run_id, task_id, pause_sequence, pause_reason, "
+            "counter_snapshot_digest, previous_attempt_id, budget_digest_at_pause, "
+            "budget_ceiling_exhaustions_json, applicable_revision_digests_json, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(run_id, task_id) DO UPDATE SET "
+            "pause_sequence = excluded.pause_sequence, pause_reason = excluded.pause_reason, "
+            "counter_snapshot_digest = excluded.counter_snapshot_digest, "
+            "previous_attempt_id = excluded.previous_attempt_id, "
+            "budget_digest_at_pause = excluded.budget_digest_at_pause, "
+            "budget_ceiling_exhaustions_json = excluded.budget_ceiling_exhaustions_json, "
+            "applicable_revision_digests_json = excluded.applicable_revision_digests_json, "
+            "active = 1 WHERE task_pauses.active = 0",
+            (
+                pause.run_id,
+                pause.task_id,
+                pause.pause_sequence,
+                pause.pause_reason,
+                pause.counter_snapshot_digest,
+                pause.previous_attempt_id,
+                pause.budget_digest_at_pause,
+                budget_ceiling_exhaustions_to_json(pause.budget_ceiling_exhaustions),
+                applicable_revision_digests_to_json(applicable_revision_digests),
+            ),
+        ).rowcount
+        if changed != 1:
+            raise StateConflict("TASK_PAUSE_ALREADY_ACTIVE")
+
+    @classmethod
+    def _read_current_task_pause(
+        cls,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        task_id: TaskId,
+    ) -> TaskPauseBinding | None:
+        row = connection.execute(
+            "SELECT * FROM task_pauses WHERE run_id = ? AND task_id = ? AND active = 1",
+            (run_id, task_id),
+        ).fetchone()
+        return None if row is None else cls._task_pause_from_row(row)
+
+    def current_task_pause(self, run_id: RunId, task_id: TaskId) -> TaskPauseBinding | None:
+        with self._read_transaction() as connection:
+            return self._read_current_task_pause(connection, run_id, task_id)
+
+    def _task_counters_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        task_id: TaskId,
+    ) -> TaskCounterSnapshot:
+        task = connection.execute(
+            "SELECT 1 FROM tasks WHERE run_id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if task is None:
+            raise StateConflict("TASK_NOT_FOUND")
+        budget = self._task_budget_state(connection, run_id, task_id)
+        checkpoints = tuple(
+            CheckpointKey(str(row["tree_oid"]), str(row["check_set_digest"]))
+            for row in connection.execute(
+                "SELECT tree_oid, check_set_digest FROM task_checkpoints "
+                "WHERE run_id = ? AND task_id = ? ORDER BY observed_sequence",
+                (run_id, task_id),
+            )
+        )
+        invalid_actions = tuple(
+            str(row["action_digest"])
+            for row in connection.execute(
+                "SELECT action_digest FROM task_invalid_actions "
+                "WHERE run_id = ? AND task_id = ? ORDER BY observed_sequence",
+                (run_id, task_id),
+            )
+        )
+        metadata = connection.execute(
+            "SELECT next_lease_generation, failure_digests_json, warning_keys_json "
+            "FROM task_resume_metadata WHERE run_id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if metadata is None:
+            maximum_generation = connection.execute(
+                "SELECT MAX(generation) FROM workspace_leases WHERE run_id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()[0]
+            next_lease_generation = 1 if maximum_generation is None else int(maximum_generation) + 1
+            failure_digests: tuple[str, ...] = ()
+            warning_keys: tuple[str, ...] = ()
+        else:
+            next_lease_generation = int(metadata["next_lease_generation"])
+            failure_digests = _string_tuple_from_json(
+                str(metadata["failure_digests_json"]),
+                "TASK_FAILURE_HISTORY_INVALID",
+            )
+            warning_keys = _string_tuple_from_json(
+                str(metadata["warning_keys_json"]),
+                "TASK_WARNING_HISTORY_INVALID",
+            )
+        return TaskCounterSnapshot(
+            run_id=run_id,
+            task_id=task_id,
+            allocated_calls=budget.allocated_calls,
+            model_calls=budget.consumed_calls,
+            input_tokens=budget.input_tokens,
+            output_tokens=budget.output_tokens,
+            cost_reserve_usd=budget.cost_usd,
+            attempts=budget.attempts,
+            stale_refreshes=budget.stale_refreshes,
+            manual_resumes=budget.manual_resumes,
+            next_lease_generation=next_lease_generation,
+            failure_digests=failure_digests,
+            checkpoint_history=checkpoints,
+            invalid_action_history=invalid_actions,
+            warning_keys=warning_keys,
+        )
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        with self._read_transaction() as connection:
+            return self._task_counters_in_transaction(connection, run_id, task_id)
+
+    def _record_task_pause_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        pause_sequence: AuditSequence,
+        pause_reason: str,
+        budget_digest: RevisionDigest,
+        budget_ceiling_exhaustions: tuple[BudgetCeilingExhaustion, ...] = (),
+    ) -> None:
+        row = connection.execute(
+            "SELECT current_plan_digest, current_policy_digest, current_budget_digest, "
+            "current_model_configuration_digest FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        revisions = ApplicableRevisionDigests(
+            plan_digest=row["current_plan_digest"],
+            policy_digest=row["current_policy_digest"],
+            budget_digest=row["current_budget_digest"],
+            model_configuration_digest=row["current_model_configuration_digest"],
+        )
+        counters = self._task_counters_in_transaction(connection, run_id, task_id)
+        self._insert_task_pause(
+            connection,
+            TaskPauseBinding(
+                run_id=run_id,
+                task_id=task_id,
+                pause_sequence=pause_sequence,
+                pause_reason=pause_reason,
+                counter_snapshot_digest=counters.digest,
+                previous_attempt_id=attempt_id,
+                budget_digest_at_pause=budget_digest,
+                applicable_revision_digests_at_pause=revisions,
+                budget_ceiling_exhaustions=budget_ceiling_exhaustions,
+            ),
+            revisions,
+        )
+        close_cause = (
+            DispatchCloseCause.BUDGET_EXHAUSTED
+            if pause_reason == "LOWERED_BUDGET_CEILING" or budget_ceiling_exhaustions
+            else DispatchCloseCause.TASK_PAUSED
+        )
+        self._close_new_dispatch(connection, run_id, close_cause)
+
+    def install_task_pause_for_test(
+        self,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        applicable_revision_digests: ApplicableRevisionDigests,
+    ) -> None:
+        if (
+            counters.run_id != pause.run_id
+            or counters.task_id != pause.task_id
+            or counters.digest != pause.counter_snapshot_digest
+        ):
+            raise StateConflict("TASK_PAUSE_COUNTER_BINDING_INVALID")
+        with self._transaction("IMMEDIATE") as connection:
+            connection.execute(
+                "INSERT INTO tasks(run_id, task_id, state, pause_reason, pause_counter) "
+                "VALUES (?, ?, 'PAUSED', ?, 1) ON CONFLICT(run_id, task_id) DO UPDATE SET "
+                "state = 'PAUSED', pause_reason = excluded.pause_reason, pause_counter = 1",
+                (pause.run_id, pause.task_id, pause.pause_reason),
+            )
+            connection.execute(
+                "INSERT INTO attempts(run_id, task_id, attempt_id, state) "
+                "VALUES (?, ?, ?, 'FAILED') ON CONFLICT(run_id, attempt_id) DO UPDATE SET "
+                "task_id = excluded.task_id, state = 'FAILED'",
+                (pause.run_id, pause.task_id, pause.previous_attempt_id),
+            )
+            state = TaskBudgetState(
+                run_id=pause.run_id,
+                task_id=pause.task_id,
+                allocated_calls=counters.allocated_calls,
+                consumed_calls=counters.model_calls,
+                input_tokens=counters.input_tokens,
+                output_tokens=counters.output_tokens,
+                cost_usd=counters.cost_reserve_usd,
+                tranche_count=(counters.allocated_calls + 7) // 8,
+                bootstrap_tranches=min(2, (counters.allocated_calls + 7) // 8),
+                attempts=counters.attempts,
+                stale_refreshes=counters.stale_refreshes,
+                manual_resumes=counters.manual_resumes,
+            )
+            self._write_task_budget_state(connection, state)
+            connection.execute(
+                "DELETE FROM task_invalid_actions WHERE run_id = ? AND task_id = ?",
+                (pause.run_id, pause.task_id),
+            )
+            connection.execute(
+                "DELETE FROM task_checkpoints WHERE run_id = ? AND task_id = ?",
+                (pause.run_id, pause.task_id),
+            )
+            for index, checkpoint in enumerate(counters.checkpoint_history, start=1):
+                connection.execute(
+                    "INSERT INTO task_checkpoints(run_id, task_id, tree_oid, check_set_digest, "
+                    "budget_digest, observed_sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        pause.run_id,
+                        pause.task_id,
+                        checkpoint.tree_oid,
+                        checkpoint.check_set_digest,
+                        pause.budget_digest_at_pause,
+                        index,
+                    ),
+                )
+            for index, action_digest in enumerate(counters.invalid_action_history, start=1):
+                attempt_id = AttemptId(f"resume-history-{pause.task_id}-{index}")
+                connection.execute(
+                    "INSERT INTO attempts(run_id, task_id, attempt_id, state) "
+                    "VALUES (?, ?, ?, 'FAILED') ON CONFLICT(run_id, attempt_id) DO UPDATE SET "
+                    "task_id = excluded.task_id, state = 'FAILED'",
+                    (pause.run_id, pause.task_id, attempt_id),
+                )
+                connection.execute(
+                    "INSERT INTO task_invalid_actions(run_id, task_id, attempt_id, action_digest, "
+                    "budget_digest, observed_sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        pause.run_id,
+                        pause.task_id,
+                        attempt_id,
+                        action_digest,
+                        pause.budget_digest_at_pause,
+                        index,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO task_resume_metadata(run_id, task_id, next_lease_generation, "
+                "failure_digests_json, warning_keys_json) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id, task_id) DO UPDATE SET "
+                "next_lease_generation = excluded.next_lease_generation, "
+                "failure_digests_json = excluded.failure_digests_json, "
+                "warning_keys_json = excluded.warning_keys_json",
+                (
+                    pause.run_id,
+                    pause.task_id,
+                    counters.next_lease_generation,
+                    _string_tuple_to_json(counters.failure_digests),
+                    _string_tuple_to_json(counters.warning_keys),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM trusted_task_repairs WHERE run_id = ? AND task_id = ?",
+                (pause.run_id, pause.task_id),
+            )
+            connection.execute(
+                "DELETE FROM task_pauses WHERE run_id = ? AND task_id = ?",
+                (pause.run_id, pause.task_id),
+            )
+            self._insert_task_pause(connection, pause, applicable_revision_digests)
+            close_cause = (
+                DispatchCloseCause.BUDGET_EXHAUSTED
+                if pause.pause_reason == "LOWERED_BUDGET_CEILING"
+                or pause.budget_ceiling_exhaustions
+                else DispatchCloseCause.TASK_PAUSED
+            )
+            self._close_new_dispatch(connection, pause.run_id, close_cause)
+
+    def record_trusted_task_repair_for_test(
+        self,
+        pause: TaskPauseBinding,
+        observation_digest: str,
+    ) -> None:
+        if not observation_digest:
+            raise StateConflict("TASK_REPAIR_OBSERVATION_INVALID")
+        with self._transaction("IMMEDIATE") as connection:
+            if self._read_current_task_pause(connection, pause.run_id, pause.task_id) != pause:
+                raise StateConflict("TASK_REPAIR_PAUSE_BINDING_MISMATCH")
+            connection.execute(
+                "INSERT INTO trusted_task_repairs(run_id, task_id, pause_sequence, "
+                "pause_reason, observation_digest) VALUES (?, ?, ?, ?, ?)",
+                (
+                    pause.run_id,
+                    pause.task_id,
+                    pause.pause_sequence,
+                    pause.pause_reason,
+                    observation_digest,
+                ),
+            )
+
+    def task_repair_observed(self, pause: TaskPauseBinding) -> bool:
+        with self._read_transaction() as connection:
+            if self._read_current_task_pause(connection, pause.run_id, pause.task_id) != pause:
+                return False
+            row = connection.execute(
+                "SELECT observation_digest FROM trusted_task_repairs WHERE run_id = ? "
+                "AND task_id = ? AND pause_sequence = ? AND pause_reason = ?",
+                (pause.run_id, pause.task_id, pause.pause_sequence, pause.pause_reason),
+            ).fetchone()
+        return row is not None and bool(row["observation_digest"])
+
+    def _resolve_dispatch_close_cause_after_exact_resume(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        cause: DispatchCloseCause,
+    ) -> None:
+        is_open, causes, prior_json = self._dispatch_state_for_update(connection, run_id)
+        normalized = DispatchCloseCause(cause)
+        if normalized not in causes:
+            raise StateConflict("EXACT_RESUME_DISPATCH_CAUSE_MISMATCH")
+        remaining = causes - {normalized}
+        next_json = dispatch_close_causes_to_json(remaining)
+        changed = connection.execute(
+            "UPDATE runs SET new_dispatch_open = ?, dispatch_close_causes_json = ? "
+            "WHERE run_id = ? AND new_dispatch_open = ? AND dispatch_close_causes_json = ?",
+            (int(not remaining), next_json, run_id, int(is_open), prior_json),
+        ).rowcount
+        if changed != 1:
+            raise StateConflict("DISPATCH_REOPEN_COMPARE_AND_SET_FAILED")
+
+    def accept_task_resume(
+        self,
+        request: ResumeTaskRequest,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        usage: GlobalUsageSnapshot,
+        calls: int,
+    ) -> TaskResumeDecision:
+        allocation_id, new_attempt_id = task_resume_ids(
+            request,
+            pause,
+            counters,
+            budget_digest,
+            calls,
+        )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_current_revisions(
+                connection,
+                request.run_id,
+                request.applicable_revision_digests,
+            )
+            self._require_current_budget(connection, request.run_id, budget_digest)
+            current_pause = self._read_current_task_pause(
+                connection,
+                request.run_id,
+                request.task_id,
+            )
+            current_counters = self._task_counters_in_transaction(
+                connection,
+                request.run_id,
+                request.task_id,
+            )
+            current_usage = self._global_usage_snapshot_in_transaction(connection, request.run_id)
+            if (
+                current_pause != pause
+                or current_counters.digest != counters.digest
+                or current_usage != usage
+            ):
+                raise _ResumeStale(
+                    TaskResumeDecision.stale(
+                        request.run_id,
+                        request.task_id,
+                        "TASK_RESUME_COMPARE_AND_SET_FAILED",
+                    )
+                )
+            remaining = V01_MECHANISM_LIMITS.task_call_ceiling - counters.allocated_calls
+            if not 1 <= calls <= min(V01_MECHANISM_LIMITS.renewal_tranche_calls, remaining):
+                raise StateConflict("TASK_RESUME_ALLOCATION_INVALID")
+            current_budget = self._task_budget_state(
+                connection,
+                request.run_id,
+                request.task_id,
+            )
+            self._write_task_budget_state(
+                connection,
+                replace(current_budget, manual_resumes=current_budget.manual_resumes + 1),
+            )
+            connection.execute(
+                "INSERT INTO task_resume_allocations(allocation_id, run_id, task_id, "
+                "reserved_attempt_id, budget_digest, applicable_revision_digests_json, "
+                "allocated_calls, state, created_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'RESERVED', ?)",
+                (
+                    allocation_id,
+                    request.run_id,
+                    request.task_id,
+                    new_attempt_id,
+                    budget_digest,
+                    applicable_revision_digests_to_json(request.applicable_revision_digests),
+                    calls,
+                    request.expected_sequence + 1,
+                ),
+            )
+            task_changed = connection.execute(
+                "UPDATE tasks SET state = 'READY', pause_reason = NULL, pause_counter = NULL "
+                "WHERE run_id = ? AND task_id = ? AND state = 'PAUSED'",
+                (request.run_id, request.task_id),
+            ).rowcount
+            pause_changed = connection.execute(
+                "UPDATE task_pauses SET active = 0 WHERE run_id = ? AND task_id = ? "
+                "AND pause_sequence = ? AND active = 1",
+                (request.run_id, request.task_id, pause.pause_sequence),
+            ).rowcount
+            if task_changed != 1 or pause_changed != 1:
+                raise StateConflict("TASK_RESUME_COMPARE_AND_SET_FAILED")
+            close_cause = (
+                DispatchCloseCause.BUDGET_EXHAUSTED
+                if pause.pause_reason == "LOWERED_BUDGET_CEILING"
+                or pause.budget_ceiling_exhaustions
+                else DispatchCloseCause.TASK_PAUSED
+            )
+            self._resolve_dispatch_close_cause_after_exact_resume(
+                connection,
+                request.run_id,
+                close_cause,
+            )
+
+        try:
+            self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "TASK_RESUME_ALLOCATED",
+                    task_id=request.task_id,
+                    attempt_id=new_attempt_id,
+                    applicable_revision_digests=request.applicable_revision_digests,
+                    subject_digests=(counters.digest,),
+                ),
+                mutate=mutate,
+            )
+        except _ResumeStale as stale:
+            return stale.decision
+        return TaskResumeDecision(
+            "RESUME",
+            request.run_id,
+            request.task_id,
+            "READY",
+            allocation_id,
+            new_attempt_id,
+            calls,
+            None,
+            None,
+        )
+
+    @staticmethod
     def _require_current_task_budget(
         connection: sqlite3.Connection,
         task: TaskAuthority,
@@ -1439,7 +2010,7 @@ class SqliteStateStore:
         connection: sqlite3.Connection,
         run_id: RunId,
         task_id: TaskId,
-        reason: Literal["REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"],
+        reason: str,
         counter: int,
     ) -> None:
         cls._set_task_state(connection, run_id, task_id, "PAUSED")
@@ -1555,6 +2126,21 @@ class SqliteStateStore:
                     "REPEATED_CHECKPOINT",
                     count,
                 )
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM runs WHERE run_id = ?", (task.run_id,)
+                    ).fetchone()
+                    is not None
+                ):
+                    self._record_task_pause_binding(
+                        connection,
+                        run_id=task.run_id,
+                        task_id=task.task_id,
+                        attempt_id=task.attempt_id,
+                        pause_sequence=AuditSequence(expected_sequence + 1),
+                        pause_reason="REPEATED_CHECKPOINT",
+                        budget_digest=budget_digest,
+                    )
 
         sequence = self._commit_state_and_event(
             run_id=task.run_id,
@@ -1638,6 +2224,21 @@ class SqliteStateStore:
                     "REPEATED_INVALID_ACTION",
                     count,
                 )
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM runs WHERE run_id = ?", (task.run_id,)
+                    ).fetchone()
+                    is not None
+                ):
+                    self._record_task_pause_binding(
+                        connection,
+                        run_id=task.run_id,
+                        task_id=task.task_id,
+                        attempt_id=attempt_id,
+                        pause_sequence=AuditSequence(expected_sequence + 1),
+                        pause_reason="REPEATED_INVALID_ACTION",
+                        budget_digest=budget_digest,
+                    )
             else:
                 self._set_task_state(connection, task.run_id, task.task_id, "READY")
 
@@ -1896,20 +2497,23 @@ class SqliteStateStore:
             stopped,
         )
 
-    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
-        with self._read_transaction() as connection:
-            if (
-                connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()
-                is None
-            ):
-                raise StateConflict("RUN_NOT_FOUND")
-            rows = connection.execute(
-                "SELECT metric, absolute_used FROM global_budget_usage WHERE run_id = ?",
+    @staticmethod
+    def _global_usage_snapshot_in_transaction(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+    ) -> GlobalUsageSnapshot:
+        if (
+            connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?",
                 (run_id,),
-            ).fetchall()
+            ).fetchone()
+            is None
+        ):
+            raise StateConflict("RUN_NOT_FOUND")
+        rows = connection.execute(
+            "SELECT metric, absolute_used FROM global_budget_usage WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
         values = {
             normalize_global_budget_metric(row["metric"]): str(row["absolute_used"]) for row in rows
         }
@@ -1923,6 +2527,10 @@ class SqliteStateStore:
             cost_reserve_usd=Decimal(values.get(GlobalBudgetMetric.COST_RESERVE_USD, "0")),
             concurrent_workers=int(values.get(GlobalBudgetMetric.CONCURRENT_WORKERS, "0")),
         )
+
+    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        with self._read_transaction() as connection:
+            return self._global_usage_snapshot_in_transaction(connection, run_id)
 
     def settle_global_usage(
         self,
@@ -2729,6 +3337,20 @@ class SqliteStateStore:
             raise AssertionError("renewed lease missing after committed mutation")
         return renewed
 
+    def revision_binding_failure(
+        self,
+        run_id: RunId,
+        expected: ApplicableRevisionDigests,
+    ) -> str | None:
+        record = self.run_record(run_id)
+        current = ApplicableRevisionDigests(
+            plan_digest=record.current_plan_digest,
+            policy_digest=record.current_policy_digest,
+            budget_digest=record.current_budget_digest,
+            model_configuration_digest=record.current_model_configuration_digest,
+        )
+        return None if current == expected else "CURRENT_REVISION_BINDING_MISMATCH"
+
     def _require_current_revisions(
         self,
         connection: sqlite3.Connection,
@@ -2939,6 +3561,37 @@ class SqliteStateStore:
             elif not 1 <= calls <= 8 or reason not in {"BOOTSTRAP", "OBJECTIVE_PROGRESS"}:
                 raise StateConflict("TASK_TRANCHE_ALLOCATION_INVALID")
             self._write_task_budget_state(connection, after)
+            task_row = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (task.run_id, task.task_id),
+            ).fetchone()
+            run_row = connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (task.run_id,)
+            ).fetchone()
+            if calls == 0 and task_row is not None and run_row is not None:
+                pause_reason = "NO_PROGRESS" if reason == "NO_PROGRESS" else "TASK_CALL_CEILING"
+                self._pause_task(
+                    connection,
+                    task.run_id,
+                    task.task_id,
+                    pause_reason,
+                    1,
+                )
+                budget_row = connection.execute(
+                    "SELECT budget_digest FROM approved_budgets_for_test WHERE run_id = ?",
+                    (task.run_id,),
+                ).fetchone()
+                if budget_row is None:
+                    raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+                self._record_task_pause_binding(
+                    connection,
+                    run_id=task.run_id,
+                    task_id=task.task_id,
+                    attempt_id=task.attempt_id,
+                    pause_sequence=AuditSequence(expected_sequence + 1),
+                    pause_reason=pause_reason,
+                    budget_digest=RevisionDigest(str(budget_row["budget_digest"])),
+                )
             if tranche_id is not None:
                 connection.execute(
                     "INSERT INTO task_tranches(run_id, task_id, tranche_id, attempt_id, "

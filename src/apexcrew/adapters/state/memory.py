@@ -37,10 +37,15 @@ from apexcrew.domain.authority import (
     MonotonicClock,
     MonotonicInstant,
     ProgressEvidence,
+    ResumeTaskRequest,
     RuntimeAuditStamp,
     TaskAuthority,
     TaskBudgetState,
+    TaskCounterSnapshot,
     TaskLifecycleState,
+    TaskPauseBinding,
+    TaskResumeAllocation,
+    TaskResumeDecision,
     TaskStopDecision,
     TimeoutDecision,
     TrancheDecision,
@@ -52,6 +57,7 @@ from apexcrew.domain.authority import (
     model_reservation_amounts,
     normalize_global_budget_metric,
     progress_from_checks,
+    task_resume_ids,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -242,6 +248,12 @@ class _LeaseDenied(RuntimeError):
         self.denial = denial
 
 
+class _ResumeStale(RuntimeError):
+    def __init__(self, decision: TaskResumeDecision) -> None:
+        super().__init__(decision.failed_invariant)
+        self.decision = decision
+
+
 class InMemoryStateStore:
     def __init__(self, monotonic_clock: MonotonicClock | None = None) -> None:
         self._command_receipts: dict[str, tuple[str, RunId, str, str, AuditSequence]] = {}
@@ -284,6 +296,13 @@ class InMemoryStateStore:
         self._task_invalid_actions: dict[
             tuple[RunId, TaskId], list[tuple[AttemptId, str, RevisionDigest]]
         ] = {}
+        self._task_pauses: dict[tuple[RunId, TaskId], TaskPauseBinding] = {}
+        self._active_task_pauses: set[tuple[RunId, TaskId]] = set()
+        self._task_resume_metadata: dict[
+            tuple[RunId, TaskId], tuple[int, tuple[str, ...], tuple[str, ...]]
+        ] = {}
+        self._trusted_task_repairs: dict[tuple[RunId, TaskId, int, str], str] = {}
+        self._task_resume_allocations: dict[str, TaskResumeAllocation] = {}
         self._monotonic_clock = monotonic_clock
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
@@ -320,6 +339,11 @@ class InMemoryStateStore:
         copied._attempts = self._attempts.copy()
         copied._task_checkpoints = deepcopy(self._task_checkpoints)
         copied._task_invalid_actions = deepcopy(self._task_invalid_actions)
+        copied._task_pauses = self._task_pauses.copy()
+        copied._active_task_pauses = self._active_task_pauses.copy()
+        copied._task_resume_metadata = self._task_resume_metadata.copy()
+        copied._trusted_task_repairs = self._trusted_task_repairs.copy()
+        copied._task_resume_allocations = self._task_resume_allocations.copy()
         copied._monotonic_clock = self._monotonic_clock
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
@@ -356,6 +380,11 @@ class InMemoryStateStore:
         self._attempts = copied._attempts
         self._task_checkpoints = copied._task_checkpoints
         self._task_invalid_actions = copied._task_invalid_actions
+        self._task_pauses = copied._task_pauses
+        self._active_task_pauses = copied._active_task_pauses
+        self._task_resume_metadata = copied._task_resume_metadata
+        self._trusted_task_repairs = copied._trusted_task_repairs
+        self._task_resume_allocations = copied._task_resume_allocations
 
     def _commit_state_and_event(
         self,
@@ -687,6 +716,285 @@ class InMemoryStateStore:
             raise StateConflict("ATTEMPT_NOT_FOUND")
         return attempt[1]
 
+    def current_task_pause(self, run_id: RunId, task_id: TaskId) -> TaskPauseBinding | None:
+        key = (run_id, task_id)
+        with self._lock:
+            pause = self._task_pauses.get(key)
+            return pause if pause is not None and key in self._active_task_pauses else None
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        key = (run_id, task_id)
+        with self._lock:
+            if key not in self._tasks:
+                raise StateConflict("TASK_NOT_FOUND")
+            budget = self._task_budget_counters.get(
+                key,
+                TaskBudgetState(run_id=run_id, task_id=task_id),
+            )
+            metadata = self._task_resume_metadata.get(key)
+            if metadata is None:
+                generations = [
+                    lease.generation
+                    for lease in self._workspace_leases.values()
+                    if lease.run_id == run_id and lease.task_id == task_id
+                ]
+                next_lease_generation = max(generations, default=0) + 1
+                failure_digests: tuple[str, ...] = ()
+                warning_keys: tuple[str, ...] = ()
+            else:
+                next_lease_generation, failure_digests, warning_keys = metadata
+            return TaskCounterSnapshot(
+                run_id=run_id,
+                task_id=task_id,
+                allocated_calls=budget.allocated_calls,
+                model_calls=budget.consumed_calls,
+                input_tokens=budget.input_tokens,
+                output_tokens=budget.output_tokens,
+                cost_reserve_usd=budget.cost_usd,
+                attempts=budget.attempts,
+                stale_refreshes=budget.stale_refreshes,
+                manual_resumes=budget.manual_resumes,
+                next_lease_generation=next_lease_generation,
+                failure_digests=failure_digests,
+                checkpoint_history=tuple(
+                    checkpoint for checkpoint, _ in self._task_checkpoints.get(key, ())
+                ),
+                invalid_action_history=tuple(
+                    action_digest for _, action_digest, _ in self._task_invalid_actions.get(key, ())
+                ),
+                warning_keys=warning_keys,
+            )
+
+    def _record_task_pause_binding(
+        self,
+        *,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        pause_sequence: AuditSequence,
+        pause_reason: str,
+        budget_digest: RevisionDigest,
+    ) -> None:
+        if run_id not in self._runs:
+            return
+        key = (run_id, task_id)
+        if key in self._active_task_pauses:
+            raise StateConflict("TASK_PAUSE_ALREADY_ACTIVE")
+        counters = self.task_counters(run_id, task_id)
+        run = self._runs[run_id]
+        self._task_pauses[key] = TaskPauseBinding(
+            run_id=run_id,
+            task_id=task_id,
+            pause_sequence=pause_sequence,
+            pause_reason=pause_reason,
+            counter_snapshot_digest=counters.digest,
+            previous_attempt_id=attempt_id,
+            budget_digest_at_pause=budget_digest,
+            applicable_revision_digests_at_pause=ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            ),
+        )
+        self._active_task_pauses.add(key)
+        self._close_new_dispatch(run_id, DispatchCloseCause.TASK_PAUSED)
+
+    def install_task_pause_for_test(
+        self,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        applicable_revision_digests: ApplicableRevisionDigests,
+    ) -> None:
+        if (
+            counters.run_id != pause.run_id
+            or counters.task_id != pause.task_id
+            or counters.digest != pause.counter_snapshot_digest
+            or pause.applicable_revision_digests_at_pause != applicable_revision_digests
+        ):
+            raise StateConflict("TASK_PAUSE_COUNTER_BINDING_INVALID")
+        with self._lock:
+            self._require_current_revisions(pause.run_id, applicable_revision_digests)
+            key = (pause.run_id, pause.task_id)
+            self._tasks[key] = ("PAUSED", pause.pause_reason, 1)
+            self._attempts[(pause.run_id, pause.previous_attempt_id)] = (
+                pause.task_id,
+                "FAILED",
+            )
+            tranche_count = (counters.allocated_calls + 7) // 8
+            self._task_budget_counters[key] = TaskBudgetState(
+                run_id=pause.run_id,
+                task_id=pause.task_id,
+                allocated_calls=counters.allocated_calls,
+                consumed_calls=counters.model_calls,
+                input_tokens=counters.input_tokens,
+                output_tokens=counters.output_tokens,
+                cost_usd=counters.cost_reserve_usd,
+                tranche_count=tranche_count,
+                bootstrap_tranches=min(2, tranche_count),
+                attempts=counters.attempts,
+                stale_refreshes=counters.stale_refreshes,
+                manual_resumes=counters.manual_resumes,
+            )
+            self._task_checkpoints[key] = [
+                (checkpoint, pause.budget_digest_at_pause)
+                for checkpoint in counters.checkpoint_history
+            ]
+            self._task_invalid_actions[key] = []
+            for index, action_digest in enumerate(counters.invalid_action_history, start=1):
+                attempt_id = AttemptId(f"resume-history-{pause.task_id}-{index}")
+                self._attempts[(pause.run_id, attempt_id)] = (pause.task_id, "FAILED")
+                self._task_invalid_actions[key].append(
+                    (attempt_id, action_digest, pause.budget_digest_at_pause)
+                )
+            self._task_resume_metadata[key] = (
+                counters.next_lease_generation,
+                counters.failure_digests,
+                counters.warning_keys,
+            )
+            self._task_pauses[key] = pause
+            self._active_task_pauses.add(key)
+            close_cause = (
+                DispatchCloseCause.BUDGET_EXHAUSTED
+                if pause.pause_reason == "LOWERED_BUDGET_CEILING"
+                or pause.budget_ceiling_exhaustions
+                else DispatchCloseCause.TASK_PAUSED
+            )
+            self._close_new_dispatch(pause.run_id, close_cause)
+            self._trusted_task_repairs = {
+                repair_key: digest
+                for repair_key, digest in self._trusted_task_repairs.items()
+                if repair_key[:2] != key
+            }
+
+    def record_trusted_task_repair_for_test(
+        self,
+        pause: TaskPauseBinding,
+        observation_digest: str,
+    ) -> None:
+        if not observation_digest:
+            raise StateConflict("TASK_REPAIR_OBSERVATION_INVALID")
+        with self._lock:
+            if self.current_task_pause(pause.run_id, pause.task_id) != pause:
+                raise StateConflict("TASK_REPAIR_PAUSE_BINDING_MISMATCH")
+            self._trusted_task_repairs[
+                (pause.run_id, pause.task_id, pause.pause_sequence, pause.pause_reason)
+            ] = observation_digest
+
+    def task_repair_observed(self, pause: TaskPauseBinding) -> bool:
+        with self._lock:
+            return self.current_task_pause(pause.run_id, pause.task_id) == pause and bool(
+                self._trusted_task_repairs.get(
+                    (pause.run_id, pause.task_id, pause.pause_sequence, pause.pause_reason)
+                )
+            )
+
+    def accept_task_resume(
+        self,
+        request: ResumeTaskRequest,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        usage: GlobalUsageSnapshot,
+        calls: int,
+    ) -> TaskResumeDecision:
+        allocation_id, new_attempt_id = task_resume_ids(
+            request,
+            pause,
+            counters,
+            budget_digest,
+            calls,
+        )
+        result: list[TaskResumeDecision] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_current_revisions(
+                request.run_id,
+                request.applicable_revision_digests,
+            )
+            copied._require_current_budget(request.run_id, budget_digest)
+            current_pause = copied.current_task_pause(request.run_id, request.task_id)
+            current_counters = copied.task_counters(request.run_id, request.task_id)
+            current_usage = copied.global_usage_snapshot(request.run_id)
+            if (
+                current_pause != pause
+                or current_counters.digest != counters.digest
+                or current_usage != usage
+            ):
+                raise _ResumeStale(
+                    TaskResumeDecision.stale(
+                        request.run_id,
+                        request.task_id,
+                        "TASK_RESUME_COMPARE_AND_SET_FAILED",
+                    )
+                )
+            remaining = V01_MECHANISM_LIMITS.task_call_ceiling - counters.allocated_calls
+            if not 1 <= calls <= min(V01_MECHANISM_LIMITS.renewal_tranche_calls, remaining):
+                raise StateConflict("TASK_RESUME_ALLOCATION_INVALID")
+            key = (request.run_id, request.task_id)
+            current_budget = copied._task_budget_counters[key]
+            copied._task_budget_counters[key] = replace(
+                current_budget,
+                manual_resumes=current_budget.manual_resumes + 1,
+            )
+            copied._task_resume_allocations[allocation_id] = TaskResumeAllocation(
+                allocation_id=allocation_id,
+                run_id=request.run_id,
+                task_id=request.task_id,
+                reserved_attempt_id=new_attempt_id,
+                budget_digest=budget_digest,
+                applicable_revision_digests=request.applicable_revision_digests,
+                allocated_calls=calls,
+                state="RESERVED",
+                created_sequence=AuditSequence(request.expected_sequence + 1),
+            )
+            if copied._tasks.get(key, (None, None, None))[0] != "PAUSED":
+                raise StateConflict("TASK_RESUME_COMPARE_AND_SET_FAILED")
+            copied._tasks[key] = ("READY", None, None)
+            copied._active_task_pauses.remove(key)
+            causes = set(copied._dispatch_close_causes.get(request.run_id, ()))
+            close_cause = (
+                DispatchCloseCause.BUDGET_EXHAUSTED.value
+                if pause.pause_reason == "LOWERED_BUDGET_CEILING"
+                or pause.budget_ceiling_exhaustions
+                else DispatchCloseCause.TASK_PAUSED.value
+            )
+            if close_cause not in causes:
+                raise StateConflict("EXACT_RESUME_DISPATCH_CAUSE_MISMATCH")
+            causes.remove(close_cause)
+            copied._dispatch_close_causes[request.run_id] = tuple(sorted(causes))
+            copied._new_dispatch_open[request.run_id] = not causes
+            result.append(
+                TaskResumeDecision(
+                    "RESUME",
+                    request.run_id,
+                    request.task_id,
+                    "READY",
+                    allocation_id,
+                    new_attempt_id,
+                    calls,
+                    None,
+                    None,
+                )
+            )
+
+        try:
+            self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "TASK_RESUME_ALLOCATED",
+                    task_id=request.task_id,
+                    attempt_id=new_attempt_id,
+                    applicable_revision_digests=request.applicable_revision_digests,
+                    subject_digests=(counters.digest,),
+                ),
+                mutate=mutate,
+            )
+        except _ResumeStale as stale:
+            return stale.decision
+        return result[0]
+
     def _require_current_task_budget(
         self,
         task: TaskAuthority,
@@ -717,7 +1025,7 @@ class InMemoryStateStore:
         self,
         run_id: RunId,
         task_id: TaskId,
-        reason: Literal["REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"],
+        reason: str,
         counter: int,
     ) -> None:
         self._set_task_state(run_id, task_id, "PAUSED")
@@ -783,6 +1091,14 @@ class InMemoryStateStore:
                     "REPEATED_CHECKPOINT",
                     count,
                 )
+                copied._record_task_pause_binding(
+                    run_id=task.run_id,
+                    task_id=task.task_id,
+                    attempt_id=task.attempt_id,
+                    pause_sequence=AuditSequence(expected_sequence + 1),
+                    pause_reason="REPEATED_CHECKPOINT",
+                    budget_digest=budget_digest,
+                )
 
         sequence = self._commit_state_and_event(
             run_id=task.run_id,
@@ -834,6 +1150,14 @@ class InMemoryStateStore:
                     task.task_id,
                     "REPEATED_INVALID_ACTION",
                     count,
+                )
+                copied._record_task_pause_binding(
+                    run_id=task.run_id,
+                    task_id=task.task_id,
+                    attempt_id=attempt_id,
+                    pause_sequence=AuditSequence(expected_sequence + 1),
+                    pause_reason="REPEATED_INVALID_ACTION",
+                    budget_digest=budget_digest,
                 )
             else:
                 copied._set_task_state(task.run_id, task.task_id, "READY")
@@ -888,6 +1212,23 @@ class InMemoryStateStore:
         if current is None or current[0] != budget_digest:
             raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
         return current[1]
+
+    def revision_binding_failure(
+        self,
+        run_id: RunId,
+        expected: ApplicableRevisionDigests,
+    ) -> str | None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            current = ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            )
+        return None if current == expected else "CURRENT_REVISION_BINDING_MISMATCH"
 
     def _require_current_revisions(
         self,
@@ -2014,6 +2355,18 @@ class InMemoryStateStore:
             elif not 1 <= calls <= 8 or reason not in {"BOOTSTRAP", "OBJECTIVE_PROGRESS"}:
                 raise StateConflict("TASK_TRANCHE_ALLOCATION_INVALID")
             copied._task_budget_counters[key] = after
+            if calls == 0 and key in copied._tasks and task.run_id in copied._runs:
+                pause_reason = "NO_PROGRESS" if reason == "NO_PROGRESS" else "TASK_CALL_CEILING"
+                copied._pause_task(task.run_id, task.task_id, pause_reason, 1)
+                budget_digest, _ = copied._approved_budgets[task.run_id]
+                copied._record_task_pause_binding(
+                    run_id=task.run_id,
+                    task_id=task.task_id,
+                    attempt_id=task.attempt_id,
+                    pause_sequence=AuditSequence(expected_sequence + 1),
+                    pause_reason=pause_reason,
+                    budget_digest=budget_digest,
+                )
             if tranche_id is not None:
                 tranche_key = (task.run_id, task.task_id, tranche_id)
                 if tranche_key in copied._task_tranches:

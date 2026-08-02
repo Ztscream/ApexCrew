@@ -185,6 +185,7 @@ class DispatchCloseCause(StrEnum):
     IMMUTABLE_PLAN_INSUFFICIENCY = "IMMUTABLE_PLAN_INSUFFICIENCY"
     REVISION_REPLACEMENT = "REVISION_REPLACEMENT"
     RUNTIME_FAULT = "RUNTIME_FAULT"
+    TASK_PAUSED = "TASK_PAUSED"
 
 
 DECIMAL_GLOBAL_METRICS = frozenset(
@@ -860,6 +861,190 @@ class TaskStopDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskPauseBinding:
+    run_id: RunId
+    task_id: TaskId
+    pause_sequence: AuditSequence
+    pause_reason: str
+    counter_snapshot_digest: str
+    previous_attempt_id: AttemptId
+    budget_digest_at_pause: RevisionDigest
+    applicable_revision_digests_at_pause: ApplicableRevisionDigests
+    budget_ceiling_exhaustions: tuple[BudgetCeilingExhaustion, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeTaskRequest:
+    run_id: RunId
+    task_id: TaskId
+    pause_sequence: AuditSequence
+    pause_reason: str
+    applicable_revision_digests: ApplicableRevisionDigests
+    expected_sequence: AuditSequence
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResumeDecision:
+    decision: Literal["RESUME", "STALE", "DENY"]
+    run_id: RunId
+    task_id: TaskId
+    task_state: Literal["READY", "PAUSED"]
+    allocation_id: str | None
+    new_attempt_id: AttemptId | None
+    allocated_calls: int
+    failed_invariant: str | None
+    safe_next_action: str | None
+
+    @classmethod
+    def stale(cls, run_id: RunId, task_id: TaskId, invariant: str) -> TaskResumeDecision:
+        return cls("STALE", run_id, task_id, "PAUSED", None, None, 0, invariant, None)
+
+    @classmethod
+    def denied(
+        cls,
+        run_id: RunId,
+        task_id: TaskId,
+        invariant: str,
+        safe_next_action: str | None,
+    ) -> TaskResumeDecision:
+        return cls(
+            "DENY",
+            run_id,
+            task_id,
+            "PAUSED",
+            None,
+            None,
+            0,
+            invariant,
+            safe_next_action,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResumeAllocation:
+    allocation_id: str
+    run_id: RunId
+    task_id: TaskId
+    reserved_attempt_id: AttemptId
+    budget_digest: RevisionDigest
+    applicable_revision_digests: ApplicableRevisionDigests
+    allocated_calls: int
+    state: Literal["RESERVED", "CONSUMED", "INVALIDATED"]
+    created_sequence: AuditSequence
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCounterSnapshot:
+    run_id: RunId
+    task_id: TaskId
+    allocated_calls: int
+    model_calls: int
+    input_tokens: int
+    output_tokens: int
+    cost_reserve_usd: Decimal
+    attempts: int
+    stale_refreshes: int
+    manual_resumes: int
+    next_lease_generation: int
+    failure_digests: tuple[str, ...]
+    checkpoint_history: tuple[CheckpointKey, ...]
+    invalid_action_history: tuple[str, ...]
+    warning_keys: tuple[str, ...]
+
+    @property
+    def digest(self) -> str:
+        return "sha256:" + sha256(task_counter_snapshot_to_json(self).encode("utf-8")).hexdigest()
+
+
+def task_counter_snapshot_to_json(snapshot: TaskCounterSnapshot) -> str:
+    return json.dumps(
+        {
+            "allocated_calls": snapshot.allocated_calls,
+            "attempts": snapshot.attempts,
+            "checkpoint_history": [
+                {
+                    "check_set_digest": item.check_set_digest,
+                    "tree_oid": item.tree_oid,
+                }
+                for item in snapshot.checkpoint_history
+            ],
+            "cost_reserve_usd": str(snapshot.cost_reserve_usd),
+            "failure_digests": list(snapshot.failure_digests),
+            "input_tokens": snapshot.input_tokens,
+            "invalid_action_history": list(snapshot.invalid_action_history),
+            "manual_resumes": snapshot.manual_resumes,
+            "model_calls": snapshot.model_calls,
+            "next_lease_generation": snapshot.next_lease_generation,
+            "output_tokens": snapshot.output_tokens,
+            "run_id": snapshot.run_id,
+            "stale_refreshes": snapshot.stale_refreshes,
+            "task_id": snapshot.task_id,
+            "warning_keys": list(snapshot.warning_keys),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def task_counter_snapshot_from_json(value: str) -> TaskCounterSnapshot:
+    data = json.loads(value)
+    return TaskCounterSnapshot(
+        run_id=RunId(data["run_id"]),
+        task_id=TaskId(data["task_id"]),
+        allocated_calls=int(data["allocated_calls"]),
+        model_calls=int(data["model_calls"]),
+        input_tokens=int(data["input_tokens"]),
+        output_tokens=int(data["output_tokens"]),
+        cost_reserve_usd=Decimal(data["cost_reserve_usd"]),
+        attempts=int(data["attempts"]),
+        stale_refreshes=int(data["stale_refreshes"]),
+        manual_resumes=int(data["manual_resumes"]),
+        next_lease_generation=int(data["next_lease_generation"]),
+        failure_digests=tuple(data["failure_digests"]),
+        checkpoint_history=tuple(CheckpointKey(**item) for item in data["checkpoint_history"]),
+        invalid_action_history=tuple(data["invalid_action_history"]),
+        warning_keys=tuple(data["warning_keys"]),
+    )
+
+
+def task_resume_ids(
+    request: ResumeTaskRequest,
+    pause: TaskPauseBinding,
+    counters: TaskCounterSnapshot,
+    budget_digest: RevisionDigest,
+    calls: int,
+) -> tuple[str, AttemptId]:
+    binding = (
+        "sha256:"
+        + sha256(
+            json.dumps(
+                {
+                    "applicable_revision_digests": (
+                        request.applicable_revision_digests.model_dump(mode="json")
+                    ),
+                    "budget_digest": budget_digest,
+                    "calls": calls,
+                    "counter_snapshot_digest": counters.digest,
+                    "expected_sequence": request.expected_sequence,
+                    "pause_reason": pause.pause_reason,
+                    "pause_sequence": pause.pause_sequence,
+                    "run_id": pause.run_id,
+                    "task_id": pause.task_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    allocation_digest = sha256(f"task-resume-allocation:{binding}".encode()).hexdigest()
+    attempt_digest = sha256(f"task-resume-attempt:{binding}".encode()).hexdigest()
+    return (
+        f"resume-allocation-{allocation_digest}",
+        AttemptId(f"attempt-{attempt_digest}"),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DispatchAuthorization:
     decision: Literal["ALLOW", "DENY"]
     reason: Literal[
@@ -1011,6 +1196,31 @@ class AuthorityState(Protocol):
     def task_budget_state(self, run_id: RunId, task_id: TaskId) -> TaskBudgetState:
         raise NotImplementedError
 
+    def revision_binding_failure(
+        self, run_id: RunId, expected: ApplicableRevisionDigests
+    ) -> str | None:
+        raise NotImplementedError
+
+    def current_task_pause(self, run_id: RunId, task_id: TaskId) -> TaskPauseBinding | None:
+        raise NotImplementedError
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        raise NotImplementedError
+
+    def task_repair_observed(self, pause: TaskPauseBinding) -> bool:
+        raise NotImplementedError
+
+    def accept_task_resume(
+        self,
+        request: ResumeTaskRequest,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        usage: GlobalUsageSnapshot,
+        calls: int,
+    ) -> TaskResumeDecision:
+        raise NotImplementedError
+
     def allocate_task_tranche(
         self,
         task: TaskAuthority,
@@ -1059,6 +1269,103 @@ class AuthorityState(Protocol):
         raise NotImplementedError
 
 
+DIRECTLY_RESUMABLE_TASK_REASONS = frozenset(
+    {"NO_PROGRESS", "REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"}
+)
+NON_RESUMABLE_TASK_REASONS = frozenset(
+    {
+        "CONTEXT_OVERFLOW",
+        "SCOPE_EXPANSION_REQUIRED",
+        "RUN_CHECK_FAILED",
+        "FROZEN_BINDING_MISMATCH",
+    }
+)
+
+
+class CapacityKind(StrEnum):
+    AVAILABLE = "AVAILABLE"
+    CURRENT_REVISION_CEILING = "CURRENT_REVISION_CEILING"
+    FIXED_MAXIMUM = "FIXED_MAXIMUM"
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityAssessment:
+    kind: CapacityKind
+    metrics: tuple[GlobalBudgetMetric, ...]
+
+
+def _remaining_task_calls(counters: TaskCounterSnapshot) -> int:
+    return max(0, V01_MECHANISM_LIMITS.task_call_ceiling - counters.allocated_calls)
+
+
+def _table_or_task_hard_cap_reached(
+    counters: TaskCounterSnapshot,
+    usage: GlobalUsageSnapshot,
+    budget: BudgetRevisionDocument,
+) -> CapacityAssessment:
+    if (
+        counters.allocated_calls >= V01_MECHANISM_LIMITS.task_call_ceiling
+        or counters.attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling
+        or counters.stale_refreshes >= V01_MECHANISM_LIMITS.stale_refresh_ceiling
+        or counters.manual_resumes >= V01_MECHANISM_LIMITS.manual_resume_ceiling
+    ):
+        return CapacityAssessment(CapacityKind.FIXED_MAXIMUM, ())
+
+    fixed_metrics: list[GlobalBudgetMetric] = []
+    revision_metrics: list[GlobalBudgetMetric] = []
+    for metric in GlobalBudgetMetric:
+        used = usage.amount_for(metric)
+        maximum = global_budget_maximum_for(metric)
+        current = global_ceiling_for(budget, metric)
+        if used >= maximum:
+            fixed_metrics.append(metric)
+        elif used >= current:
+            revision_metrics.append(metric)
+    if fixed_metrics:
+        return CapacityAssessment(CapacityKind.FIXED_MAXIMUM, tuple(fixed_metrics))
+    if revision_metrics:
+        return CapacityAssessment(CapacityKind.CURRENT_REVISION_CEILING, tuple(revision_metrics))
+    return CapacityAssessment(CapacityKind.AVAILABLE, ())
+
+
+def _approved_higher_budget_restores_capacity(
+    pause: TaskPauseBinding,
+    current_budget_digest: RevisionDigest,
+    current_budget: BudgetRevisionDocument,
+    usage: GlobalUsageSnapshot,
+) -> bool:
+    if (
+        current_budget_digest == pause.budget_digest_at_pause
+        or not pause.budget_ceiling_exhaustions
+    ):
+        return False
+    return all(
+        global_ceiling_for(current_budget, exhausted.metric) > exhausted.ceiling
+        and usage.amount_for(exhausted.metric)
+        < global_ceiling_for(current_budget, exhausted.metric)
+        for exhausted in pause.budget_ceiling_exhaustions
+    )
+
+
+def _resume_revision_binding_matches(
+    pause: TaskPauseBinding,
+    request: ResumeTaskRequest,
+) -> bool:
+    paused = pause.applicable_revision_digests_at_pause
+    current = request.applicable_revision_digests
+    fixed_revisions_match = (
+        paused.plan_digest == current.plan_digest
+        and paused.policy_digest == current.policy_digest
+        and paused.model_configuration_digest == current.model_configuration_digest
+    )
+    budget_may_be_higher = pause.pause_reason == "LOWERED_BUDGET_CEILING" or bool(
+        pause.budget_ceiling_exhaustions
+    )
+    return fixed_revisions_match and (
+        budget_may_be_higher or paused.budget_digest == current.budget_digest
+    )
+
+
 class AuthorityService:
     def __init__(self, journal: AuthorityState, utc_clock: UtcClock | None = None) -> None:
         self._journal = journal
@@ -1072,6 +1379,116 @@ class AuthorityService:
 
     def _budget(self, run_id: RunId) -> tuple[RevisionDigest, BudgetRevisionDocument]:
         return self._journal.current_approved_budget(run_id)
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        return self._journal.task_counters(run_id, task_id)
+
+    def resume_task(self, request: ResumeTaskRequest) -> TaskResumeDecision:
+        pause = self._journal.current_task_pause(request.run_id, request.task_id)
+        if pause is None or (
+            pause.pause_sequence != request.pause_sequence
+            or pause.pause_reason != request.pause_reason
+        ):
+            return TaskResumeDecision.stale(
+                request.run_id,
+                request.task_id,
+                "TASK_PAUSE_BINDING_MISMATCH",
+            )
+        if self._journal.revision_binding_failure(
+            request.run_id, request.applicable_revision_digests
+        ) is not None or not _resume_revision_binding_matches(pause, request):
+            return TaskResumeDecision.stale(
+                request.run_id,
+                request.task_id,
+                "REVISION_BINDING_MISMATCH",
+            )
+        counters = self._journal.task_counters(request.run_id, request.task_id)
+        if counters.digest != pause.counter_snapshot_digest:
+            return TaskResumeDecision.stale(
+                request.run_id,
+                request.task_id,
+                "TASK_COUNTER_BINDING_MISMATCH",
+            )
+        budget_digest, budget = self._budget(request.run_id)
+        usage = self._journal.global_usage_snapshot(request.run_id)
+        denial = self._resume_denial(pause, counters, budget_digest, budget, usage)
+        if denial is not None:
+            return denial
+        calls = min(
+            V01_MECHANISM_LIMITS.renewal_tranche_calls,
+            _remaining_task_calls(counters),
+        )
+        return self._journal.accept_task_resume(
+            request,
+            pause,
+            counters,
+            budget_digest,
+            usage,
+            calls,
+        )
+
+    def _resume_denial(
+        self,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        budget: BudgetRevisionDocument,
+        usage: GlobalUsageSnapshot,
+    ) -> TaskResumeDecision | None:
+        capacity = _table_or_task_hard_cap_reached(counters, usage, budget)
+        if capacity.kind == CapacityKind.FIXED_MAXIMUM:
+            invariant = (
+                "MANUAL_RESUME_CAP_REACHED"
+                if counters.manual_resumes >= V01_MECHANISM_LIMITS.manual_resume_ceiling
+                else "NON_RAISEABLE_CAP_REACHED"
+            )
+            return TaskResumeDecision.denied(
+                pause.run_id,
+                pause.task_id,
+                invariant,
+                "CANCEL_AND_CREATE_NEW_RUN",
+            )
+        if (
+            capacity.kind == CapacityKind.CURRENT_REVISION_CEILING
+            or pause.pause_reason == "LOWERED_BUDGET_CEILING"
+        ):
+            if _approved_higher_budget_restores_capacity(
+                pause,
+                budget_digest,
+                budget,
+                usage,
+            ):
+                return None
+            return TaskResumeDecision.denied(
+                pause.run_id,
+                pause.task_id,
+                "HIGHER_APPROVED_BUDGET_REQUIRED",
+                None,
+            )
+        if pause.pause_reason in NON_RESUMABLE_TASK_REASONS:
+            return TaskResumeDecision.denied(
+                pause.run_id,
+                pause.task_id,
+                "TASK_PAUSE_NOT_RESUMABLE",
+                "CANCEL_AND_CREATE_NEW_RUN",
+            )
+        if pause.pause_reason == "CHECK_INFRASTRUCTURE_UNCERTAINTY":
+            if not self._journal.task_repair_observed(pause):
+                return TaskResumeDecision.denied(
+                    pause.run_id,
+                    pause.task_id,
+                    "INFRASTRUCTURE_CAUSE_NOT_REPAIRED",
+                    None,
+                )
+            return None
+        if pause.pause_reason not in DIRECTLY_RESUMABLE_TASK_REASONS:
+            return TaskResumeDecision.denied(
+                pause.run_id,
+                pause.task_id,
+                "UNKNOWN_TASK_PAUSE_REASON",
+                None,
+            )
+        return None
 
     def open_action_deadline(
         self,
