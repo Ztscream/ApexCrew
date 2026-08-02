@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.authority import (
     ActiveRunTimeState,
     AttemptAuthority,
+    BudgetWarning,
     CheckpointKey,
+    GlobalBudgetMetric,
     MonotonicInstant,
     TaskAuthority,
     TaskStopDecision,
@@ -285,7 +288,7 @@ def test_active_runtime_ceiling_closes_run_dispatch_without_reset(tmp_path: Path
     )
 
 
-def test_active_runtime_below_ceiling_does_not_append_audit(tmp_path: Path) -> None:
+def test_active_runtime_threshold_appends_exact_warning_audit(tmp_path: Path) -> None:
     store = seeded_open_runtime_time_store(
         tmp_path / "below-ceiling.db",
         ceiling_seconds=10,
@@ -294,15 +297,28 @@ def test_active_runtime_below_ceiling_does_not_append_audit(tmp_path: Path) -> N
         opened_at=MonotonicInstant(100_000_000_000),
     )
     authority = make_authority(store, active_run_seconds_ceiling=10)
-    before = store.audit_sequence(RunId("run-1"))
+    run_id = RunId("run-1")
+    before = store.audit_sequence(run_id)
 
-    decision = authority.evaluate_active_run_time_boundary(RunId("run-1"), before)
+    decision = authority.evaluate_active_run_time_boundary(run_id, before)
 
     assert decision.decision == "CONTINUE"
     assert decision.observed_nanoseconds == 9_000_000_000
-    assert decision.resulting_sequence == before
-    assert store.audit_sequence(RunId("run-1")) == before
-    assert store.new_dispatch_open(RunId("run-1")) is True
+    assert decision.resulting_sequence == before + 1
+    assert store.audit_sequence(run_id) == before + 1
+    assert store.audit_event_kinds(run_id)[-1] == "GLOBAL_BUDGET_USAGE_SETTLED"
+    budget_digest, _ = store.current_approved_budget(run_id)
+    assert store.budget_warnings(run_id, GlobalBudgetMetric.ACTIVE_RUN_SECONDS) == (
+        BudgetWarning(
+            run_id=run_id,
+            budget_digest=budget_digest,
+            metric=GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+            used=Decimal(9),
+            ceiling=10,
+            threshold_percent=80,
+        ),
+    )
+    assert store.new_dispatch_open(run_id) is True
 
 
 def test_memory_active_runtime_boundary_matches_sqlite(tmp_path: Path) -> None:

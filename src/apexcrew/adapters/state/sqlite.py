@@ -18,11 +18,17 @@ from apexcrew.domain.admission import (
 from apexcrew.domain.authority import (
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    AtomicAction,
     AttemptLifecycleState,
     AuthorizationReason,
     AuthorizationRequest,
+    BudgetSettlement,
+    BudgetWarning,
     CheckpointKey,
     DispatchAuthorization,
+    DispatchCloseCause,
+    GlobalBudgetMetric,
+    GlobalUsageSnapshot,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
@@ -38,7 +44,15 @@ from apexcrew.domain.authority import (
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
+    budget_warning_from_json,
+    budget_warning_to_json,
+    crossed_threshold,
+    dispatch_close_causes_from_json,
+    dispatch_close_causes_to_json,
+    global_ceiling_for,
+    global_numeric_from_text,
     model_reservation_amounts,
+    normalize_global_budget_metric,
     progress_from_checks,
 )
 from apexcrew.domain.commands import (
@@ -386,6 +400,33 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
             """CREATE INDEX task_invalid_action_matches
                 ON task_invalid_actions(run_id, task_id, action_digest)""",
+        ),
+    ),
+    (
+        8,
+        (
+            """CREATE TABLE global_budget_usage (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                metric TEXT NOT NULL,
+                absolute_used TEXT NOT NULL,
+                PRIMARY KEY(run_id, metric)
+            )""",
+            """CREATE TABLE budget_warnings (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                budget_digest TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                warning_percent INTEGER NOT NULL,
+                warning_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, budget_digest, metric, warning_percent)
+            )""",
+            """CREATE TABLE atomic_actions (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                action_id TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('IN_FLIGHT','SETTLED')),
+                opened_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, action_id)
+            )""",
         ),
     ),
 )
@@ -827,6 +868,21 @@ class SqliteStateStore:
         event: AuditEvent,
         mutate: Callable[[sqlite3.Connection], None],
     ) -> AuditSequence:
+        return self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (event,),
+            mutate=mutate,
+        )
+
+    def _commit_state_and_events(
+        self,
+        *,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        event_factory: Callable[[], tuple[AuditEvent, ...]],
+        mutate: Callable[[sqlite3.Connection], None],
+    ) -> AuditSequence:
         with self._lock:
             connection = self._connection
             if connection.in_transaction:
@@ -842,7 +898,17 @@ class SqliteStateStore:
                 if self._fail_next_commit_after_state_write:
                     self._fail_next_commit_after_state_write = False
                     raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
-                sequence = self._append_audit_event(connection, run_id, event, expected_sequence)
+                events = event_factory()
+                if not events:
+                    raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
+                sequence = expected_sequence
+                for event in events:
+                    sequence = self._append_audit_event(
+                        connection,
+                        run_id,
+                        event,
+                        sequence,
+                    )
             except BaseException:
                 connection.rollback()
                 raise
@@ -1376,8 +1442,8 @@ class SqliteStateStore:
         if changed != 1:
             raise StateConflict("ATTEMPT_STATE_TRANSITION_ILLEGAL")
 
-    @staticmethod
     def _release_attempt_lease(
+        self,
         connection: sqlite3.Connection,
         run_id: RunId,
         attempt_id: AttemptId,
@@ -1388,6 +1454,32 @@ class SqliteStateStore:
             "WHERE run_id = ? AND attempt_id = ? AND state = 'ACTIVE'",
             (terminal_sequence, run_id, attempt_id),
         )
+        if (
+            connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            is not None
+        ):
+            budget_row = connection.execute(
+                "SELECT budget_digest FROM approved_budgets_for_test WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if budget_row is None:
+                raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+            active_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE'",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+            self._settle_global_usage_in_transaction(
+                connection,
+                run_id,
+                RevisionDigest(str(budget_row["budget_digest"])),
+                GlobalBudgetMetric.CONCURRENT_WORKERS,
+                active_count,
+            )
 
     def record_task_checkpoint(
         self,
@@ -1557,8 +1649,12 @@ class SqliteStateStore:
         if task["state"] == "PAUSED":
             return DispatchAuthorization("DENY", "TASK_PAUSED")
         if run is not None and not bool(run["new_dispatch_open"]):
-            causes = tuple(json.loads(str(run["dispatch_close_causes_json"])))
-            if "ACTIVE_RUN_TIME_CEILING" in causes:
+            dispatch_close_causes_from_json(str(run["dispatch_close_causes_json"]))
+            budget_digest, budget = self.current_approved_budget(run_id)
+            del budget_digest
+            if self.global_usage_snapshot(run_id).active_run_seconds >= global_ceiling_for(
+                budget, GlobalBudgetMetric.ACTIVE_RUN_SECONDS
+            ):
                 return DispatchAuthorization("DENY", "ACTIVE_RUN_TIME_CEILING")
             return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
         if task["state"] != "READY":
@@ -1596,6 +1692,408 @@ class SqliteStateStore:
         if revision_digest(budget) != digest:
             raise StateConflict("APPROVED_BUDGET_STORAGE_INVALID")
         return digest, budget
+
+    @staticmethod
+    def _approved_budget_for_update(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+    ) -> BudgetRevisionDocument:
+        if not connection.in_transaction:
+            raise StateConflict("RUN_WRITE_TRANSACTION_REQUIRED")
+        row = connection.execute(
+            "SELECT budget_digest, budget_json FROM approved_budgets_for_test WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None or row["budget_digest"] != budget_digest:
+            raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+        budget = BudgetRevisionDocument.model_validate_json(str(row["budget_json"]))
+        if revision_digest(budget) != budget_digest:
+            raise StateConflict("APPROVED_BUDGET_STORAGE_INVALID")
+        return budget
+
+    @staticmethod
+    def _normalize_global_usage(
+        metric: GlobalBudgetMetric,
+        value: int | Decimal,
+    ) -> int | Decimal:
+        if metric in {
+            GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+            GlobalBudgetMetric.COST_RESERVE_USD,
+        }:
+            normalized: int | Decimal = Decimal(str(value))
+        elif isinstance(value, bool) or not isinstance(value, int):
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        else:
+            normalized = value
+        if normalized < 0:
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        return normalized
+
+    @staticmethod
+    def _dispatch_state_for_update(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+    ) -> tuple[bool, frozenset[DispatchCloseCause], str]:
+        if not connection.in_transaction:
+            raise StateConflict("RUN_WRITE_TRANSACTION_REQUIRED")
+        row = connection.execute(
+            "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        raw = str(row["dispatch_close_causes_json"])
+        causes = dispatch_close_causes_from_json(raw)
+        is_open = bool(row["new_dispatch_open"])
+        if is_open != (not causes):
+            raise StateConflict("DISPATCH_CLOSURE_BINDING_INVALID")
+        return is_open, causes, raw
+
+    def _require_new_dispatch_open(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+    ) -> None:
+        is_open, _, _ = self._dispatch_state_for_update(connection, run_id)
+        if not is_open:
+            raise StateConflict("NEW_DISPATCH_CLOSED")
+
+    def _close_new_dispatch(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        cause: DispatchCloseCause,
+    ) -> bool:
+        normalized = DispatchCloseCause(cause)
+        is_open, causes, prior_json = self._dispatch_state_for_update(connection, run_id)
+        if not is_open and normalized in causes:
+            return False
+        next_json = dispatch_close_causes_to_json(causes | {normalized})
+        if (
+            connection.execute(
+                "UPDATE runs SET new_dispatch_open = 0, dispatch_close_causes_json = ? "
+                "WHERE run_id = ? AND new_dispatch_open = ? "
+                "AND dispatch_close_causes_json = ?",
+                (next_json, run_id, int(is_open), prior_json),
+            ).rowcount
+            != 1
+        ):
+            raise StateConflict("DISPATCH_CLOSE_COMPARE_AND_SET_FAILED")
+        return True
+
+    @staticmethod
+    def _read_global_usage(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        metric: GlobalBudgetMetric,
+    ) -> int | Decimal:
+        normalized = normalize_global_budget_metric(metric)
+        row = connection.execute(
+            "SELECT absolute_used FROM global_budget_usage WHERE run_id = ? AND metric = ?",
+            (run_id, normalized.value),
+        ).fetchone()
+        value = "0" if row is None else str(row["absolute_used"])
+        return global_numeric_from_text(normalized, value)
+
+    def _settle_global_usage_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        *,
+        allow_reservation_reconciliation: bool = False,
+    ) -> tuple[BudgetSettlement, bool]:
+        budget = self._approved_budget_for_update(connection, run_id, budget_digest)
+        normalized_metric = normalize_global_budget_metric(metric)
+        normalized_used = self._normalize_global_usage(normalized_metric, absolute_used)
+        ceiling = global_ceiling_for(budget, normalized_metric)
+        previous = self._read_global_usage(connection, run_id, normalized_metric)
+        if (
+            normalized_used < previous
+            and normalized_metric != GlobalBudgetMetric.CONCURRENT_WORKERS
+            and not allow_reservation_reconciliation
+        ):
+            raise StateConflict("GLOBAL_USAGE_NOT_MONOTONIC")
+        connection.execute(
+            "INSERT INTO global_budget_usage(run_id, metric, absolute_used) "
+            "VALUES (?, ?, ?) ON CONFLICT(run_id, metric) DO UPDATE SET "
+            "absolute_used = excluded.absolute_used",
+            (run_id, normalized_metric.value, str(normalized_used)),
+        )
+        warning_percent = V01_MECHANISM_LIMITS.warning_percent
+        if crossed_threshold(previous, normalized_used, ceiling, warning_percent):
+            warning = BudgetWarning(
+                run_id,
+                budget_digest,
+                normalized_metric,
+                normalized_used,
+                ceiling,
+                warning_percent,
+            )
+            connection.execute(
+                "INSERT INTO budget_warnings(run_id, budget_digest, metric, "
+                "warning_percent, warning_json) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT DO NOTHING",
+                (
+                    run_id,
+                    budget_digest,
+                    normalized_metric.value,
+                    warning_percent,
+                    budget_warning_to_json(warning),
+                ),
+            )
+        pause = normalized_used >= ceiling
+        stopped = pause and self._close_new_dispatch(
+            connection,
+            run_id,
+            DispatchCloseCause.BUDGET_EXHAUSTED,
+        )
+        return (
+            BudgetSettlement(
+                run_id=run_id,
+                metric=normalized_metric,
+                absolute_used=normalized_used,
+                ceiling=ceiling,
+                action_state=None,
+                pause_after_barrier=pause,
+                pause_reason=(
+                    f"GLOBAL_{normalized_metric.value.removesuffix('S')}_CEILING" if pause else None
+                ),
+                resulting_sequence=AuditSequence(0),
+            ),
+            stopped,
+        )
+
+    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        with self._read_transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                is None
+            ):
+                raise StateConflict("RUN_NOT_FOUND")
+            rows = connection.execute(
+                "SELECT metric, absolute_used FROM global_budget_usage WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+        values = {
+            normalize_global_budget_metric(row["metric"]): str(row["absolute_used"]) for row in rows
+        }
+        return GlobalUsageSnapshot(
+            active_run_seconds=Decimal(values.get(GlobalBudgetMetric.ACTIVE_RUN_SECONDS, "0")),
+            tasks=int(values.get(GlobalBudgetMetric.TASKS, "0")),
+            planning_requests=int(values.get(GlobalBudgetMetric.PLANNING_REQUESTS, "0")),
+            model_calls=int(values.get(GlobalBudgetMetric.MODEL_CALLS, "0")),
+            input_tokens=int(values.get(GlobalBudgetMetric.INPUT_TOKENS, "0")),
+            output_tokens=int(values.get(GlobalBudgetMetric.OUTPUT_TOKENS, "0")),
+            cost_reserve_usd=Decimal(values.get(GlobalBudgetMetric.COST_RESERVE_USD, "0")),
+            concurrent_workers=int(values.get(GlobalBudgetMetric.CONCURRENT_WORKERS, "0")),
+        )
+
+    def settle_global_usage(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        result: list[BudgetSettlement] = []
+        events = [AuditEvent.kind("GLOBAL_BUDGET_USAGE_SETTLED")]
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            settlement, stopped = self._settle_global_usage_in_transaction(
+                connection,
+                run_id,
+                budget_digest,
+                metric,
+                absolute_used,
+            )
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            result.append(
+                replace(
+                    settlement,
+                    resulting_sequence=AuditSequence(expected_sequence + (2 if stopped else 1)),
+                )
+            )
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def begin_atomic_action(
+        self,
+        action: AtomicAction,
+        expected_sequence: AuditSequence,
+    ) -> AtomicAction:
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._approved_budget_for_update(
+                connection,
+                action.run_id,
+                action.budget_digest,
+            )
+            self._require_new_dispatch_open(connection, action.run_id)
+            try:
+                connection.execute(
+                    "INSERT INTO atomic_actions(run_id, action_id, budget_digest, "
+                    "state, opened_sequence) VALUES (?, ?, ?, 'IN_FLIGHT', ?)",
+                    (
+                        action.run_id,
+                        action.action_id,
+                        action.budget_digest,
+                        action.opened_sequence,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("ATOMIC_ACTION_ID_REUSED") from error
+
+        self._commit_state_and_event(
+            run_id=action.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("ATOMIC_ACTION_STARTED"),
+            mutate=mutate,
+        )
+        return action
+
+    def settle_atomic_action(
+        self,
+        action: AtomicAction,
+        model_calls: int,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        if isinstance(model_calls, bool) or not isinstance(model_calls, int) or model_calls < 0:
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        result: list[BudgetSettlement] = []
+        events = [AuditEvent.kind("ATOMIC_ACTION_SETTLED")]
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._approved_budget_for_update(
+                connection,
+                action.run_id,
+                action.budget_digest,
+            )
+            changed = connection.execute(
+                "UPDATE atomic_actions SET state = 'SETTLED' "
+                "WHERE run_id = ? AND action_id = ? AND budget_digest = ? "
+                "AND opened_sequence = ? AND state = 'IN_FLIGHT'",
+                (
+                    action.run_id,
+                    action.action_id,
+                    action.budget_digest,
+                    action.opened_sequence,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise StateConflict("ATOMIC_ACTION_SETTLE_COMPARE_AND_SET_FAILED")
+            previous = self._read_global_usage(
+                connection,
+                action.run_id,
+                GlobalBudgetMetric.MODEL_CALLS,
+            )
+            settlement, stopped = self._settle_global_usage_in_transaction(
+                connection,
+                action.run_id,
+                action.budget_digest,
+                GlobalBudgetMetric.MODEL_CALLS,
+                int(previous) + model_calls,
+            )
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            result.append(
+                replace(
+                    settlement,
+                    action_state="SETTLED",
+                    pause_reason=(
+                        "GLOBAL_MODEL_CALL_CEILING" if settlement.pause_after_barrier else None
+                    ),
+                    resulting_sequence=AuditSequence(expected_sequence + (2 if stopped else 1)),
+                )
+            )
+
+        self._commit_state_and_events(
+            run_id=action.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def authorize_new_action(self, run_id: RunId) -> DispatchAuthorization:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        causes = dispatch_close_causes_from_json(str(row["dispatch_close_causes_json"]))
+        is_open = bool(row["new_dispatch_open"])
+        if is_open != (not causes):
+            raise StateConflict("DISPATCH_CLOSURE_BINDING_INVALID")
+        if not is_open:
+            return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
+        return DispatchAuthorization("ALLOW", "AUTHORIZED")
+
+    def budget_warnings(
+        self,
+        run_id: RunId,
+        metric: GlobalBudgetMetric | str,
+    ) -> tuple[BudgetWarning, ...]:
+        normalized = normalize_global_budget_metric(metric)
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT warning_json FROM budget_warnings "
+                "WHERE run_id = ? AND metric = ? ORDER BY budget_digest, warning_percent",
+                (run_id, normalized.value),
+            ).fetchall()
+        return tuple(budget_warning_from_json(str(row["warning_json"])) for row in rows)
+
+    def budget_warning_metrics(self, run_id: RunId) -> tuple[GlobalBudgetMetric, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT metric FROM budget_warnings WHERE run_id = ? ORDER BY metric",
+                (run_id,),
+            ).fetchall()
+        return tuple(normalize_global_budget_metric(row["metric"]) for row in rows)
+
+    def dispatch_close_causes(self, run_id: RunId) -> frozenset[DispatchCloseCause]:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        causes = dispatch_close_causes_from_json(str(row["dispatch_close_causes_json"]))
+        if bool(row["new_dispatch_open"]) != (not causes):
+            raise StateConflict("DISPATCH_CLOSURE_BINDING_INVALID")
+        return causes
+
+    def audit_event_kinds(self, run_id: RunId) -> tuple[str, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT event_kind FROM audit_events WHERE run_id = ? ORDER BY sequence",
+                (run_id,),
+            ).fetchall()
+        return tuple(str(row["event_kind"]) for row in rows)
+
+    def runtime_barrier_state(self, run_id: RunId) -> Literal["IN_FLIGHT", "SETTLED"]:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM model_attempts WHERE run_id = ? AND state = 'RESERVED' LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return "IN_FLIGHT" if row is not None else "SETTLED"
 
     def _evaluate_model_reservation(
         self, connection: sqlite3.Connection, request: ModelReservationRequest
@@ -1771,11 +2269,20 @@ class SqliteStateStore:
                 current = self._evaluate_model_reservation(connection, request)
                 if current.reason != evaluation.reason:
                     raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
-                connection.execute(
-                    "UPDATE runs SET new_dispatch_open = 0, state = 'PAUSED', "
-                    "dispatch_close_causes_json = ? WHERE run_id = ?",
-                    (json.dumps([evaluation.reason]), request.run_id),
-                )
+                run_bound = connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (request.run_id,),
+                ).fetchone()
+                if run_bound is not None:
+                    self._close_new_dispatch(
+                        connection,
+                        request.run_id,
+                        DispatchCloseCause.BUDGET_EXHAUSTED,
+                    )
+                    connection.execute(
+                        "UPDATE runs SET state = 'PAUSED' WHERE run_id = ?",
+                        (request.run_id,),
+                    )
 
             sequence = self._commit_state_and_event(
                 run_id=request.run_id,
@@ -1794,12 +2301,30 @@ class SqliteStateStore:
         intent: ModelRequestIntent | None = None
         run_after: ModelCounters | None = None
         task_after: TaskBudgetState | None = None
+        producer_stopped = False
+        events = [
+            AuditEvent.kind(
+                "MODEL_ATTEMPT_RESERVED",
+                task_id=request.task_id,
+                attempt_id=request.attempt_id,
+                budget_delta_json=evaluation.amounts.to_json(),
+            )
+        ]
 
         def mutate(connection: sqlite3.Connection) -> None:
-            nonlocal turn, intent, run_after, task_after
+            nonlocal turn, intent, producer_stopped, run_after, task_after
             current = self._evaluate_model_reservation(connection, request)
             if current.reason is not None or current != evaluation:
                 raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+            run_bound = (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (request.run_id,),
+                ).fetchone()
+                is not None
+            )
+            if run_bound:
+                self._require_new_dispatch_open(connection, request.run_id)
             if request.turn is None:
                 turn = LogicalModelTurn.new(request.model_request)
                 connection.execute(
@@ -1895,15 +2420,38 @@ class SqliteStateStore:
                     (request.run_id, request.task_id, request.tranche_id),
                 )
 
-        sequence = self._commit_state_and_event(
+            if run_bound:
+                usage = (
+                    (
+                        GlobalBudgetMetric.PLANNING_REQUESTS,
+                        evaluation.planning_requests + 1,
+                    ),
+                    (GlobalBudgetMetric.MODEL_CALLS, run_after.calls),
+                    (GlobalBudgetMetric.INPUT_TOKENS, run_after.input_tokens),
+                    (GlobalBudgetMetric.OUTPUT_TOKENS, run_after.output_tokens),
+                    (GlobalBudgetMetric.COST_RESERVE_USD, run_after.cost_usd),
+                )
+                for metric, amount in usage:
+                    if (
+                        metric == GlobalBudgetMetric.PLANNING_REQUESTS
+                        and request.owner_kind != "PLANNING"
+                    ):
+                        continue
+                    _, stopped = self._settle_global_usage_in_transaction(
+                        connection,
+                        request.run_id,
+                        request.model_request.budget_digest,
+                        metric,
+                        amount,
+                    )
+                    producer_stopped = producer_stopped or stopped
+                if producer_stopped:
+                    events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+
+        sequence = self._commit_state_and_events(
             run_id=request.run_id,
             expected_sequence=request.expected_sequence,
-            event=AuditEvent.kind(
-                "MODEL_ATTEMPT_RESERVED",
-                task_id=request.task_id,
-                attempt_id=request.attempt_id,
-                budget_delta_json=evaluation.amounts.to_json(),
-            ),
+            event_factory=lambda: tuple(events),
             mutate=mutate,
         )
         if turn is None or intent is None or run_after is None:
@@ -1923,17 +2471,41 @@ class SqliteStateStore:
             task_counters_before=evaluation.task_counters,
             task_counters_after=task_after,
             deadline_at_utc=request.deadline_at_utc,
-            pause_after_barrier=False,
+            pause_after_barrier=producer_stopped,
             resulting_sequence=sequence,
         )
 
     def issue_workspace_lease(
         self,
         lease: WorkspaceLease,
-        worker_ceiling: int,
+        budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
     ) -> WorkspaceLease | LeaseDenial:
+        producer_stopped = False
+        events = [
+            AuditEvent.kind(
+                "WORKSPACE_LEASE_ISSUED",
+                task_id=lease.task_id,
+                attempt_id=lease.attempt_id,
+            )
+        ]
+
         def mutate(connection: sqlite3.Connection) -> None:
+            nonlocal producer_stopped
+            budget = self._approved_budget_for_update(
+                connection,
+                lease.run_id,
+                budget_digest,
+            )
+            run_bound = (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (lease.run_id,),
+                ).fetchone()
+                is not None
+            )
+            if run_bound:
+                self._require_new_dispatch_open(connection, lease.run_id)
             active = tuple(
                 _workspace_lease_from_row(row)
                 for row in connection.execute(
@@ -1942,7 +2514,7 @@ class SqliteStateStore:
                     (lease.run_id, lease.issued_at.isoformat()),
                 )
             )
-            if len(active) >= worker_ceiling:
+            if len(active) >= budget.concurrent_worker_ceiling:
                 raise _LeaseDenied(LeaseDenial(reason="WORKER_CEILING"))
             if any(
                 may_overlap(left, right)
@@ -1975,16 +2547,22 @@ class SqliteStateStore:
                     expected_sequence + 1,
                 ),
             )
+            if run_bound:
+                _, producer_stopped = self._settle_global_usage_in_transaction(
+                    connection,
+                    lease.run_id,
+                    budget_digest,
+                    GlobalBudgetMetric.CONCURRENT_WORKERS,
+                    len(active) + 1,
+                )
+                if producer_stopped:
+                    events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
 
         try:
-            self._commit_state_and_event(
+            self._commit_state_and_events(
                 run_id=lease.run_id,
                 expected_sequence=expected_sequence,
-                event=AuditEvent.kind(
-                    "WORKSPACE_LEASE_ISSUED",
-                    task_id=lease.task_id,
-                    attempt_id=lease.attempt_id,
-                ),
+                event_factory=lambda: tuple(events),
                 mutate=mutate,
             )
         except _LeaseDenied as denial:
@@ -2015,6 +2593,33 @@ class SqliteStateStore:
                 != 1
             ):
                 raise StateConflict("WORKSPACE_LEASE_NOT_ACTIVE")
+            if (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                is not None
+            ):
+                budget_row = connection.execute(
+                    "SELECT budget_digest FROM approved_budgets_for_test WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if budget_row is None:
+                    raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+                active_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM workspace_leases "
+                        "WHERE run_id = ? AND state = 'ACTIVE'",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                self._settle_global_usage_in_transaction(
+                    connection,
+                    run_id,
+                    RevisionDigest(str(budget_row["budget_digest"])),
+                    GlobalBudgetMetric.CONCURRENT_WORKERS,
+                    active_count,
+                )
 
         return self._commit_state_and_event(
             run_id=run_id,
@@ -2455,52 +3060,47 @@ class SqliteStateStore:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
                 now = self._monotonic_clock.now()
                 observed = current.observed_nanoseconds(now)
-            if observed < ceiling_nanoseconds:
+            observed_seconds = Decimal(observed) / Decimal(1_000_000_000)
+            warning_floor = (
+                Decimal(budget.active_run_seconds_ceiling)
+                * V01_MECHANISM_LIMITS.warning_percent
+                / 100
+            )
+            if observed_seconds < warning_floor and observed < ceiling_nanoseconds:
                 return ActiveRunTimeBoundaryDecision(
                     "CONTINUE",
                     observed,
                     ceiling_nanoseconds,
                     expected_sequence,
                 )
-            run_row = connection.execute(
-                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            if run_row is None:
-                raise StateConflict("RUN_NOT_FOUND")
-            stored_causes = json.loads(str(run_row["dispatch_close_causes_json"]))
-            if (
-                not isinstance(stored_causes, list)
-                or any(not isinstance(item, str) for item in stored_causes)
-                or stored_causes != sorted(set(stored_causes))
-            ):
-                raise StateConflict("DISPATCH_CLOSE_CAUSES_INVALID")
-            causes = set(stored_causes)
-            causes.add("ACTIVE_RUN_TIME_CEILING")
-            causes_json = json.dumps(sorted(causes), separators=(",", ":"))
-            if (
-                connection.execute(
-                    "UPDATE runs SET new_dispatch_open = 0, dispatch_close_causes_json = ? "
-                    "WHERE run_id = ? AND new_dispatch_open = ? AND dispatch_close_causes_json = ?",
-                    (
-                        causes_json,
-                        run_id,
-                        run_row["new_dispatch_open"],
-                        run_row["dispatch_close_causes_json"],
-                    ),
-                ).rowcount
-                != 1
-            ):
-                raise StateConflict("DISPATCH_CLOSE_COMPARE_AND_SET_FAILED")
+            _, stopped = self._settle_global_usage_in_transaction(
+                connection,
+                run_id,
+                budget_digest,
+                GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+                observed_seconds,
+            )
             sequence = self._append_audit_event(
                 connection,
                 run_id,
-                AuditEvent.kind("ACTIVE_RUN_TIME_CEILING_REACHED"),
+                AuditEvent.kind(
+                    "ACTIVE_RUN_TIME_CEILING_REACHED"
+                    if observed >= ceiling_nanoseconds
+                    else "GLOBAL_BUDGET_USAGE_SETTLED"
+                ),
                 expected_sequence,
                 runtime_now=now,
             )
+            if stopped:
+                sequence = self._append_audit_event(
+                    connection,
+                    run_id,
+                    AuditEvent.kind("BUDGET_STOP_REQUESTED"),
+                    sequence,
+                    runtime_now=now,
+                )
             return ActiveRunTimeBoundaryDecision(
-                "PAUSE",
+                "PAUSE" if observed >= ceiling_nanoseconds else "CONTINUE",
                 observed,
                 ceiling_nanoseconds,
                 sequence,
@@ -2509,12 +3109,16 @@ class SqliteStateStore:
     def new_dispatch_open(self, run_id: RunId) -> bool:
         with self._read_transaction() as connection:
             row = connection.execute(
-                "SELECT new_dispatch_open FROM runs WHERE run_id = ?",
+                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
             raise StateConflict("RUN_NOT_FOUND")
-        return bool(row["new_dispatch_open"])
+        causes = dispatch_close_causes_from_json(str(row["dispatch_close_causes_json"]))
+        is_open = bool(row["new_dispatch_open"])
+        if is_open != (not causes):
+            raise StateConflict("DISPATCH_CLOSURE_BINDING_INVALID")
+        return is_open
 
     def append_event(
         self,
@@ -2820,6 +3424,28 @@ class SqliteStateStore:
                 intent.reserved_amounts,
                 settled.charged_amounts,
             )
+            if (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (intent.run_id,),
+                ).fetchone()
+                is not None
+            ):
+                counters = self._model_counters(connection, intent.run_id)
+                for metric, amount in (
+                    (GlobalBudgetMetric.MODEL_CALLS, counters.calls),
+                    (GlobalBudgetMetric.INPUT_TOKENS, counters.input_tokens),
+                    (GlobalBudgetMetric.OUTPUT_TOKENS, counters.output_tokens),
+                    (GlobalBudgetMetric.COST_RESERVE_USD, counters.cost_usd),
+                ):
+                    self._settle_global_usage_in_transaction(
+                        connection,
+                        intent.run_id,
+                        intent.request.budget_digest,
+                        metric,
+                        amount,
+                        allow_reservation_reconciliation=True,
+                    )
             if settled.kind is ProviderAttemptKind.COMPLETED:
                 dispatch = settled.dispatch_result
                 if dispatch.outcome == "COMPLETED":

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal
 from threading import RLock
 from typing import Literal
 
@@ -15,11 +16,17 @@ from apexcrew.domain.admission import (
 from apexcrew.domain.authority import (
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    AtomicAction,
     AttemptLifecycleState,
     AuthorizationReason,
     AuthorizationRequest,
+    BudgetSettlement,
+    BudgetWarning,
     CheckpointKey,
     DispatchAuthorization,
+    DispatchCloseCause,
+    GlobalBudgetMetric,
+    GlobalUsageSnapshot,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
@@ -35,7 +42,10 @@ from apexcrew.domain.authority import (
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
+    crossed_threshold,
+    global_ceiling_for,
     model_reservation_amounts,
+    normalize_global_budget_metric,
     progress_from_checks,
 )
 from apexcrew.domain.commands import (
@@ -241,11 +251,17 @@ class InMemoryStateStore:
         self._runs: dict[RunId, RunRecord] = {}
         self._target_reservations: dict[str, TargetReservation] = {}
         self._approved_budgets: dict[RunId, tuple[RevisionDigest, BudgetRevisionDocument]] = {}
+        self._global_usage: dict[tuple[RunId, GlobalBudgetMetric], int | Decimal] = {}
+        self._budget_warnings: dict[
+            tuple[RunId, RevisionDigest, GlobalBudgetMetric, int], BudgetWarning
+        ] = {}
+        self._atomic_actions: dict[tuple[RunId, str], AtomicAction] = {}
         self._workspace_leases: dict[tuple[RunId, str], WorkspaceLease] = {}
         self._authorization_denials: dict[tuple[RunId, str], tuple[str, AuthorizationReason]] = {}
         self._task_budget_counters: dict[tuple[RunId, TaskId], TaskBudgetState] = {}
         self._planning_request_counts: dict[RunId, int] = {}
         self._dispatch_close_causes: dict[RunId, tuple[str, ...]] = {}
+        self._new_dispatch_open: dict[RunId, bool] = {}
         self._active_run_times: dict[RunId, ActiveRunTimeState] = {}
         self._task_tranches: dict[
             tuple[RunId, TaskId, str], tuple[AttemptId, int, int, str, str]
@@ -278,11 +294,15 @@ class InMemoryStateStore:
         copied._runs = self._runs.copy()
         copied._target_reservations = self._target_reservations.copy()
         copied._approved_budgets = self._approved_budgets.copy()
+        copied._global_usage = self._global_usage.copy()
+        copied._budget_warnings = self._budget_warnings.copy()
+        copied._atomic_actions = self._atomic_actions.copy()
         copied._workspace_leases = self._workspace_leases.copy()
         copied._authorization_denials = self._authorization_denials.copy()
         copied._task_budget_counters = self._task_budget_counters.copy()
         copied._planning_request_counts = self._planning_request_counts.copy()
         copied._dispatch_close_causes = self._dispatch_close_causes.copy()
+        copied._new_dispatch_open = self._new_dispatch_open.copy()
         copied._active_run_times = self._active_run_times.copy()
         copied._task_tranches = self._task_tranches.copy()
         copied._tasks = self._tasks.copy()
@@ -307,11 +327,15 @@ class InMemoryStateStore:
         self._runs = copied._runs
         self._target_reservations = copied._target_reservations
         self._approved_budgets = copied._approved_budgets
+        self._global_usage = copied._global_usage
+        self._budget_warnings = copied._budget_warnings
+        self._atomic_actions = copied._atomic_actions
         self._workspace_leases = copied._workspace_leases
         self._authorization_denials = copied._authorization_denials
         self._task_budget_counters = copied._task_budget_counters
         self._planning_request_counts = copied._planning_request_counts
         self._dispatch_close_causes = copied._dispatch_close_causes
+        self._new_dispatch_open = copied._new_dispatch_open
         self._active_run_times = copied._active_run_times
         self._task_tranches = copied._task_tranches
         self._tasks = copied._tasks
@@ -328,6 +352,23 @@ class InMemoryStateStore:
         mutate: Callable[[InMemoryStateStore], None],
         runtime_now: MonotonicInstant | None = None,
     ) -> AuditSequence:
+        return self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (event,),
+            mutate=mutate,
+            runtime_now=runtime_now,
+        )
+
+    def _commit_state_and_events(
+        self,
+        *,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        event_factory: Callable[[], tuple[AuditEvent, ...]],
+        mutate: Callable[[InMemoryStateStore], None],
+        runtime_now: MonotonicInstant | None = None,
+    ) -> AuditSequence:
         with self._lock:
             current = self._sequences.get(run_id, AuditSequence(0))
             if current != expected_sequence:
@@ -337,15 +378,18 @@ class InMemoryStateStore:
             if self._fail_next_commit_after_state_write:
                 self._fail_next_commit_after_state_write = False
                 raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
-            next_sequence = AuditSequence(expected_sequence + 1)
+            events = event_factory()
+            if not events:
+                raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
             runtime_state = copied._active_run_times.get(
                 run_id, ActiveRunTimeState(run_id, 0, None, None, None)
             )
-            committed_event = event
+            committed_events = events
             if runtime_state.open_owner_generation is None:
-                if (
+                if any(
                     event.runtime_owner_generation is not None
                     or event.runtime_monotonic_nanoseconds is not None
+                    for event in events
                 ):
                     raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
             else:
@@ -353,13 +397,19 @@ class InMemoryStateStore:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
                 now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
                 runtime_state.observed_nanoseconds(now)
-                committed_event = replace(
-                    event,
-                    runtime_owner_generation=runtime_state.open_owner_generation,
-                    runtime_monotonic_nanoseconds=now.nanoseconds,
+                committed_events = tuple(
+                    replace(
+                        event,
+                        runtime_owner_generation=runtime_state.open_owner_generation,
+                        runtime_monotonic_nanoseconds=now.nanoseconds,
+                    )
+                    for event in events
                 )
                 copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
-            copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+            for offset, committed_event in enumerate(committed_events, start=1):
+                next_sequence = AuditSequence(expected_sequence + offset)
+                copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+            next_sequence = AuditSequence(expected_sequence + len(committed_events))
             copied._sequences[run_id] = next_sequence
             self._publish(copied)
             return next_sequence
@@ -442,6 +492,7 @@ class InMemoryStateStore:
                 target_ref=reservation.target_ref,
                 pinned_target_oid=reservation.pinned_target_oid,
             )
+            copied._new_dispatch_open[run_id] = True
             copied._target_reservations[reservation.reservation_id] = reservation
 
         return self._commit_state_and_event(
@@ -679,6 +730,19 @@ class InMemoryStateStore:
                 and lease.state == "ACTIVE"
             ):
                 self._workspace_leases[key] = replace(lease, state="REVOKED")
+        if run_id in self._runs:
+            budget_digest, _ = self._approved_budgets[run_id]
+            active_count = sum(
+                1
+                for (lease_run, _), lease in self._workspace_leases.items()
+                if lease_run == run_id and lease.state == "ACTIVE"
+            )
+            self._settle_global_usage_for_producer(
+                run_id,
+                budget_digest,
+                GlobalBudgetMetric.CONCURRENT_WORKERS,
+                active_count,
+            )
 
     def record_task_checkpoint(
         self,
@@ -785,18 +849,401 @@ class InMemoryStateStore:
     def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
         with self._lock:
             task = self._tasks.get((run_id, task_id))
-            causes = self._dispatch_close_causes.get(run_id, ())
+            dispatch_open = self._new_dispatch_open.get(run_id, True)
         if task is None:
             raise StateConflict("TASK_NOT_FOUND")
         if task[0] == "PAUSED":
             return DispatchAuthorization("DENY", "TASK_PAUSED")
-        if causes:
-            if "ACTIVE_RUN_TIME_CEILING" in causes:
+        if not dispatch_open:
+            if self.global_usage_snapshot(run_id).active_run_seconds >= global_ceiling_for(
+                self.current_approved_budget(run_id)[1],
+                GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+            ):
                 return DispatchAuthorization("DENY", "ACTIVE_RUN_TIME_CEILING")
             return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
         if task[0] != "READY":
             return DispatchAuthorization("DENY", "TASK_NOT_READY")
         return DispatchAuthorization("ALLOW", "AUTHORIZED")
+
+    def _require_current_budget(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+    ) -> BudgetRevisionDocument:
+        current = self._approved_budgets.get(run_id)
+        if current is None or current[0] != budget_digest:
+            raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+        return current[1]
+
+    def _require_dispatch_binding(self, run_id: RunId) -> None:
+        if run_id not in self._runs:
+            raise StateConflict("RUN_NOT_FOUND")
+        is_open = self._new_dispatch_open.get(run_id, True)
+        causes = self._dispatch_close_causes.get(run_id, ())
+        if is_open != (not causes):
+            raise StateConflict("DISPATCH_CLOSURE_BINDING_INVALID")
+
+    def _close_new_dispatch(
+        self,
+        run_id: RunId,
+        cause: DispatchCloseCause,
+    ) -> bool:
+        self._require_dispatch_binding(run_id)
+        causes = set(self._dispatch_close_causes.get(run_id, ()))
+        if cause.value in causes:
+            return False
+        causes.add(cause.value)
+        self._dispatch_close_causes[run_id] = tuple(sorted(causes))
+        self._new_dispatch_open[run_id] = False
+        return True
+
+    def authorize_new_action(self, run_id: RunId) -> DispatchAuthorization:
+        with self._lock:
+            self._require_dispatch_binding(run_id)
+            is_open = self._new_dispatch_open[run_id]
+        if not is_open:
+            return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
+        return DispatchAuthorization("ALLOW", "AUTHORIZED")
+
+    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        with self._lock:
+            if run_id not in self._runs:
+                raise StateConflict("RUN_NOT_FOUND")
+            return GlobalUsageSnapshot(
+                active_run_seconds=Decimal(
+                    str(
+                        self._global_usage.get(
+                            (run_id, GlobalBudgetMetric.ACTIVE_RUN_SECONDS),
+                            "0",
+                        )
+                    )
+                ),
+                tasks=int(self._global_usage.get((run_id, GlobalBudgetMetric.TASKS), 0)),
+                planning_requests=int(
+                    self._global_usage.get(
+                        (run_id, GlobalBudgetMetric.PLANNING_REQUESTS),
+                        0,
+                    )
+                ),
+                model_calls=int(
+                    self._global_usage.get(
+                        (run_id, GlobalBudgetMetric.MODEL_CALLS),
+                        0,
+                    )
+                ),
+                input_tokens=int(
+                    self._global_usage.get(
+                        (run_id, GlobalBudgetMetric.INPUT_TOKENS),
+                        0,
+                    )
+                ),
+                output_tokens=int(
+                    self._global_usage.get(
+                        (run_id, GlobalBudgetMetric.OUTPUT_TOKENS),
+                        0,
+                    )
+                ),
+                cost_reserve_usd=Decimal(
+                    str(
+                        self._global_usage.get(
+                            (run_id, GlobalBudgetMetric.COST_RESERVE_USD),
+                            "0",
+                        )
+                    )
+                ),
+                concurrent_workers=int(
+                    self._global_usage.get(
+                        (run_id, GlobalBudgetMetric.CONCURRENT_WORKERS),
+                        0,
+                    )
+                ),
+            )
+
+    @staticmethod
+    def _normalize_global_usage(
+        metric: GlobalBudgetMetric,
+        value: int | Decimal,
+    ) -> int | Decimal:
+        if metric in {
+            GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+            GlobalBudgetMetric.COST_RESERVE_USD,
+        }:
+            normalized: int | Decimal = Decimal(str(value))
+        elif isinstance(value, bool) or not isinstance(value, int):
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        else:
+            normalized = value
+        if normalized < 0:
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        return normalized
+
+    def settle_global_usage(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        normalized_metric = normalize_global_budget_metric(metric)
+        normalized_used = self._normalize_global_usage(normalized_metric, absolute_used)
+        result: list[BudgetSettlement] = []
+        events = [AuditEvent.kind("GLOBAL_BUDGET_USAGE_SETTLED")]
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            budget = copied._require_current_budget(run_id, budget_digest)
+            ceiling = global_ceiling_for(budget, normalized_metric)
+            key = (run_id, normalized_metric)
+            previous = copied._global_usage.get(
+                key, Decimal(0) if isinstance(ceiling, Decimal) else 0
+            )
+            if (
+                normalized_used < previous
+                and normalized_metric != GlobalBudgetMetric.CONCURRENT_WORKERS
+            ):
+                raise StateConflict("GLOBAL_USAGE_NOT_MONOTONIC")
+            copied._global_usage[key] = normalized_used
+            warning_percent = V01_MECHANISM_LIMITS.warning_percent
+            warning_key = (run_id, budget_digest, normalized_metric, warning_percent)
+            if crossed_threshold(previous, normalized_used, ceiling, warning_percent):
+                copied._budget_warnings.setdefault(
+                    warning_key,
+                    BudgetWarning(
+                        run_id,
+                        budget_digest,
+                        normalized_metric,
+                        normalized_used,
+                        ceiling,
+                        warning_percent,
+                    ),
+                )
+            stopped = normalized_used >= ceiling and copied._close_new_dispatch(
+                run_id,
+                DispatchCloseCause.BUDGET_EXHAUSTED,
+            )
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            result.append(
+                BudgetSettlement(
+                    run_id=run_id,
+                    metric=normalized_metric,
+                    absolute_used=normalized_used,
+                    ceiling=ceiling,
+                    action_state=None,
+                    pause_after_barrier=normalized_used >= ceiling,
+                    pause_reason=(
+                        f"GLOBAL_{normalized_metric.value.removesuffix('S')}_CEILING"
+                        if normalized_used >= ceiling
+                        else None
+                    ),
+                    resulting_sequence=AuditSequence(expected_sequence + (2 if stopped else 1)),
+                )
+            )
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def _settle_global_usage_for_producer(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        *,
+        allow_reservation_reconciliation: bool = False,
+    ) -> tuple[BudgetSettlement, bool]:
+        budget = self._require_current_budget(run_id, budget_digest)
+        normalized_metric = normalize_global_budget_metric(metric)
+        normalized_used = self._normalize_global_usage(normalized_metric, absolute_used)
+        ceiling = global_ceiling_for(budget, normalized_metric)
+        key = (run_id, normalized_metric)
+        previous = self._global_usage.get(
+            key,
+            Decimal(0) if isinstance(ceiling, Decimal) else 0,
+        )
+        if (
+            normalized_used < previous
+            and normalized_metric != GlobalBudgetMetric.CONCURRENT_WORKERS
+            and not allow_reservation_reconciliation
+        ):
+            raise StateConflict("GLOBAL_USAGE_NOT_MONOTONIC")
+        self._global_usage[key] = normalized_used
+        warning_percent = V01_MECHANISM_LIMITS.warning_percent
+        if crossed_threshold(previous, normalized_used, ceiling, warning_percent):
+            self._budget_warnings.setdefault(
+                (run_id, budget_digest, normalized_metric, warning_percent),
+                BudgetWarning(
+                    run_id,
+                    budget_digest,
+                    normalized_metric,
+                    normalized_used,
+                    ceiling,
+                    warning_percent,
+                ),
+            )
+        pause = normalized_used >= ceiling
+        stopped = pause and self._close_new_dispatch(
+            run_id,
+            DispatchCloseCause.BUDGET_EXHAUSTED,
+        )
+        return (
+            BudgetSettlement(
+                run_id=run_id,
+                metric=normalized_metric,
+                absolute_used=normalized_used,
+                ceiling=ceiling,
+                action_state=None,
+                pause_after_barrier=pause,
+                pause_reason=(
+                    f"GLOBAL_{normalized_metric.value.removesuffix('S')}_CEILING" if pause else None
+                ),
+                resulting_sequence=AuditSequence(0),
+            ),
+            stopped,
+        )
+
+    def begin_atomic_action(
+        self,
+        action: AtomicAction,
+        expected_sequence: AuditSequence,
+    ) -> AtomicAction:
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_current_budget(action.run_id, action.budget_digest)
+            copied._require_dispatch_binding(action.run_id)
+            if not copied._new_dispatch_open[action.run_id]:
+                raise StateConflict("NEW_DISPATCH_CLOSED")
+            key = (action.run_id, action.action_id)
+            if key in copied._atomic_actions:
+                raise StateConflict("ATOMIC_ACTION_ID_REUSED")
+            copied._atomic_actions[key] = action
+
+        self._commit_state_and_event(
+            run_id=action.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("ATOMIC_ACTION_STARTED"),
+            mutate=mutate,
+        )
+        return action
+
+    def settle_atomic_action(
+        self,
+        action: AtomicAction,
+        model_calls: int,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        if isinstance(model_calls, bool) or not isinstance(model_calls, int) or model_calls < 0:
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        result: list[BudgetSettlement] = []
+        events = [AuditEvent.kind("ATOMIC_ACTION_SETTLED")]
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            budget = copied._require_current_budget(action.run_id, action.budget_digest)
+            key = (action.run_id, action.action_id)
+            if copied._atomic_actions.get(key) != action:
+                raise StateConflict("ATOMIC_ACTION_NOT_CURRENT")
+            copied._atomic_actions[key] = replace(action, state="SETTLED")
+            usage_key = (action.run_id, GlobalBudgetMetric.MODEL_CALLS)
+            previous = copied._global_usage.get(usage_key, 0)
+            calls = int(previous) + model_calls
+            copied._global_usage[usage_key] = calls
+            ceiling = global_ceiling_for(budget, GlobalBudgetMetric.MODEL_CALLS)
+            warning_percent = V01_MECHANISM_LIMITS.warning_percent
+            if crossed_threshold(previous, calls, ceiling, warning_percent):
+                copied._budget_warnings.setdefault(
+                    (
+                        action.run_id,
+                        action.budget_digest,
+                        GlobalBudgetMetric.MODEL_CALLS,
+                        warning_percent,
+                    ),
+                    BudgetWarning(
+                        action.run_id,
+                        action.budget_digest,
+                        GlobalBudgetMetric.MODEL_CALLS,
+                        calls,
+                        ceiling,
+                        warning_percent,
+                    ),
+                )
+            pause = calls >= ceiling
+            stopped = pause and copied._close_new_dispatch(
+                action.run_id,
+                DispatchCloseCause.BUDGET_EXHAUSTED,
+            )
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            result.append(
+                BudgetSettlement(
+                    run_id=action.run_id,
+                    metric=GlobalBudgetMetric.MODEL_CALLS,
+                    absolute_used=calls,
+                    ceiling=ceiling,
+                    action_state="SETTLED",
+                    pause_after_barrier=pause,
+                    pause_reason="GLOBAL_MODEL_CALL_CEILING" if pause else None,
+                    resulting_sequence=AuditSequence(expected_sequence + (2 if stopped else 1)),
+                )
+            )
+
+        self._commit_state_and_events(
+            run_id=action.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def budget_warnings(
+        self,
+        run_id: RunId,
+        metric: GlobalBudgetMetric | str,
+    ) -> tuple[BudgetWarning, ...]:
+        normalized = normalize_global_budget_metric(metric)
+        with self._lock:
+            return tuple(
+                warning
+                for (warning_run, _, warning_metric, _), warning in self._budget_warnings.items()
+                if warning_run == run_id and warning_metric == normalized
+            )
+
+    def budget_warning_metrics(self, run_id: RunId) -> tuple[GlobalBudgetMetric, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    {
+                        metric
+                        for (warning_run, _, metric, _) in self._budget_warnings
+                        if warning_run == run_id
+                    },
+                    key=lambda metric: metric.value,
+                )
+            )
+
+    def audit_event_kinds(self, run_id: RunId) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(event.event_kind for _, event in self._audit_events.get(run_id, ()))
+
+    def runtime_barrier_state(self, run_id: RunId) -> Literal["IN_FLIGHT", "SETTLED"]:
+        with self._lock:
+            in_flight = any(
+                isinstance(attempt, ModelRequestIntent)
+                and attempt.run_id == run_id
+                and attempt.state == "RESERVED"
+                for attempt in self._model_attempts.values()
+            )
+        return "IN_FLIGHT" if in_flight else "SETTLED"
+
+    def dispatch_close_causes(self, run_id: RunId) -> frozenset[DispatchCloseCause]:
+        with self._lock:
+            self._require_dispatch_binding(run_id)
+            return frozenset(
+                DispatchCloseCause(cause) for cause in self._dispatch_close_causes.get(run_id, ())
+            )
 
     def evaluate_active_run_time_boundary(
         self,
@@ -829,7 +1276,13 @@ class InMemoryStateStore:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
                 now = self._monotonic_clock.now()
                 observed = current.observed_nanoseconds(now)
-            if observed < ceiling_nanoseconds:
+            observed_seconds = Decimal(observed) / Decimal(1_000_000_000)
+            warning_floor = (
+                Decimal(current_budget[1].active_run_seconds_ceiling)
+                * V01_MECHANISM_LIMITS.warning_percent
+                / 100
+            )
+            if observed_seconds < warning_floor and observed < ceiling_nanoseconds:
                 return ActiveRunTimeBoundaryDecision(
                     "CONTINUE",
                     observed,
@@ -837,25 +1290,40 @@ class InMemoryStateStore:
                     expected_sequence,
                 )
 
+            events = [
+                AuditEvent.kind(
+                    "ACTIVE_RUN_TIME_CEILING_REACHED"
+                    if observed >= ceiling_nanoseconds
+                    else "GLOBAL_BUDGET_USAGE_SETTLED"
+                )
+            ]
+            stopped = False
+
             def mutate(copied: InMemoryStateStore) -> None:
+                nonlocal stopped
                 copied_budget = copied._approved_budgets.get(run_id)
                 if copied_budget is None or copied_budget[0] != budget_digest:
                     raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
                 if copied._active_run_times.get(run_id) != expected:
                     raise StateConflict("ACTIVE_RUN_TIME_SNAPSHOT_MISMATCH")
-                causes = set(copied._dispatch_close_causes.get(run_id, ()))
-                causes.add("ACTIVE_RUN_TIME_CEILING")
-                copied._dispatch_close_causes[run_id] = tuple(sorted(causes))
+                _, stopped = copied._settle_global_usage_for_producer(
+                    run_id,
+                    budget_digest,
+                    GlobalBudgetMetric.ACTIVE_RUN_SECONDS,
+                    observed_seconds,
+                )
+                if stopped:
+                    events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
 
-            sequence = self._commit_state_and_event(
+            sequence = self._commit_state_and_events(
                 run_id=run_id,
                 expected_sequence=expected_sequence,
-                event=AuditEvent.kind("ACTIVE_RUN_TIME_CEILING_REACHED"),
+                event_factory=lambda: tuple(events),
                 mutate=mutate,
                 runtime_now=now,
             )
             return ActiveRunTimeBoundaryDecision(
-                "PAUSE",
+                "PAUSE" if observed >= ceiling_nanoseconds else "CONTINUE",
                 observed,
                 ceiling_nanoseconds,
                 sequence,
@@ -863,9 +1331,8 @@ class InMemoryStateStore:
 
     def new_dispatch_open(self, run_id: RunId) -> bool:
         with self._lock:
-            if run_id not in self._runs:
-                raise StateConflict("RUN_NOT_FOUND")
-            return not self._dispatch_close_causes.get(run_id, ())
+            self._require_dispatch_binding(run_id)
+            return self._new_dispatch_open[run_id]
 
     def install_approved_budget_for_test(
         self,
@@ -1044,11 +1511,16 @@ class InMemoryStateStore:
                     current = copied._evaluate_model_reservation(request)
                     if current.reason != pause_reason:
                         raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
-                    copied._dispatch_close_causes[request.run_id] = (pause_reason,)
                     if request.run_id in copied._runs:
+                        copied._close_new_dispatch(
+                            request.run_id,
+                            DispatchCloseCause.BUDGET_EXHAUSTED,
+                        )
                         copied._runs[request.run_id] = replace(
                             copied._runs[request.run_id], state=RunState.PAUSED
                         )
+                    else:
+                        copied._dispatch_close_causes[request.run_id] = (pause_reason,)
 
                 sequence = self._commit_state_and_event(
                     run_id=request.run_id,
@@ -1067,12 +1539,26 @@ class InMemoryStateStore:
             intent: ModelRequestIntent | None = None
             run_after: ModelCounters | None = None
             task_after: TaskBudgetState | None = None
+            producer_stopped = False
+            events = [
+                AuditEvent.kind(
+                    "MODEL_ATTEMPT_RESERVED",
+                    task_id=request.task_id,
+                    attempt_id=request.attempt_id,
+                    budget_delta_json=evaluation.amounts.to_json(),
+                )
+            ]
 
             def mutate(copied: InMemoryStateStore) -> None:
-                nonlocal turn, intent, run_after, task_after
+                nonlocal turn, intent, producer_stopped, run_after, task_after
                 current = copied._evaluate_model_reservation(request)
                 if current.reason is not None or current != evaluation:
                     raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+                run_bound = request.run_id in copied._runs
+                if run_bound:
+                    copied._require_dispatch_binding(request.run_id)
+                    if not copied._new_dispatch_open[request.run_id]:
+                        raise StateConflict("NEW_DISPATCH_CLOSED")
                 if request.turn is None:
                     turn = LogicalModelTurn.new(request.model_request)
                     copied._model_turns[turn.logical_turn_id] = turn
@@ -1123,15 +1609,37 @@ class InMemoryStateStore:
                     )
                     copied._task_budget_counters[(request.run_id, request.task_id)] = task_after
 
-            sequence = self._commit_state_and_event(
+                if run_bound:
+                    usage = (
+                        (
+                            GlobalBudgetMetric.PLANNING_REQUESTS,
+                            evaluation.planning_requests + 1,
+                        ),
+                        (GlobalBudgetMetric.MODEL_CALLS, run_after.calls),
+                        (GlobalBudgetMetric.INPUT_TOKENS, run_after.input_tokens),
+                        (GlobalBudgetMetric.OUTPUT_TOKENS, run_after.output_tokens),
+                        (GlobalBudgetMetric.COST_RESERVE_USD, run_after.cost_usd),
+                    )
+                    for metric, amount in usage:
+                        if (
+                            metric == GlobalBudgetMetric.PLANNING_REQUESTS
+                            and request.owner_kind != "PLANNING"
+                        ):
+                            continue
+                        _, stopped = copied._settle_global_usage_for_producer(
+                            request.run_id,
+                            request.model_request.budget_digest,
+                            metric,
+                            amount,
+                        )
+                        producer_stopped = producer_stopped or stopped
+                    if producer_stopped:
+                        events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+
+            sequence = self._commit_state_and_events(
                 run_id=request.run_id,
                 expected_sequence=request.expected_sequence,
-                event=AuditEvent.kind(
-                    "MODEL_ATTEMPT_RESERVED",
-                    task_id=request.task_id,
-                    attempt_id=request.attempt_id,
-                    budget_delta_json=evaluation.amounts.to_json(),
-                ),
+                event_factory=lambda: tuple(events),
                 mutate=mutate,
             )
             if turn is None or intent is None or run_after is None:
@@ -1151,17 +1659,33 @@ class InMemoryStateStore:
                 task_counters_before=evaluation.task_counters,
                 task_counters_after=task_after,
                 deadline_at_utc=request.deadline_at_utc,
-                pause_after_barrier=False,
+                pause_after_barrier=producer_stopped,
                 resulting_sequence=sequence,
             )
 
     def issue_workspace_lease(
         self,
         lease: WorkspaceLease,
-        worker_ceiling: int,
+        budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
     ) -> WorkspaceLease | LeaseDenial:
+        producer_stopped = False
+        events = [
+            AuditEvent.kind(
+                "WORKSPACE_LEASE_ISSUED",
+                task_id=lease.task_id,
+                attempt_id=lease.attempt_id,
+            )
+        ]
+
         def mutate(copied: InMemoryStateStore) -> None:
+            nonlocal producer_stopped
+            budget = copied._require_current_budget(lease.run_id, budget_digest)
+            run_bound = lease.run_id in copied._runs
+            if run_bound:
+                copied._require_dispatch_binding(lease.run_id)
+                if not copied._new_dispatch_open[lease.run_id]:
+                    raise StateConflict("NEW_DISPATCH_CLOSED")
             active = tuple(
                 existing
                 for (run_id, _), existing in copied._workspace_leases.items()
@@ -1169,7 +1693,7 @@ class InMemoryStateStore:
                 and existing.state == "ACTIVE"
                 and existing.expires_at > lease.issued_at
             )
-            if len(active) >= worker_ceiling:
+            if len(active) >= budget.concurrent_worker_ceiling:
                 raise _LeaseDenied(LeaseDenial(reason="WORKER_CEILING"))
             if any(
                 may_overlap(left, right)
@@ -1182,16 +1706,21 @@ class InMemoryStateStore:
             if key in copied._workspace_leases:
                 raise StateConflict("WORKSPACE_LEASE_DUPLICATE")
             copied._workspace_leases[key] = lease
+            if run_bound:
+                _, producer_stopped = copied._settle_global_usage_for_producer(
+                    lease.run_id,
+                    budget_digest,
+                    GlobalBudgetMetric.CONCURRENT_WORKERS,
+                    len(active) + 1,
+                )
+                if producer_stopped:
+                    events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
 
         try:
-            self._commit_state_and_event(
+            self._commit_state_and_events(
                 run_id=lease.run_id,
                 expected_sequence=expected_sequence,
-                event=AuditEvent.kind(
-                    "WORKSPACE_LEASE_ISSUED",
-                    task_id=lease.task_id,
-                    attempt_id=lease.attempt_id,
-                ),
+                event_factory=lambda: tuple(events),
                 mutate=mutate,
             )
         except _LeaseDenied as denial:
@@ -1214,6 +1743,19 @@ class InMemoryStateStore:
             if lease is None or lease.state != "ACTIVE":
                 raise StateConflict("WORKSPACE_LEASE_NOT_ACTIVE")
             copied._workspace_leases[key] = replace(lease, state="EXPIRED")
+            if run_id in copied._runs:
+                budget_digest, _ = copied._approved_budgets[run_id]
+                active_count = sum(
+                    1
+                    for (lease_run, _), current in copied._workspace_leases.items()
+                    if lease_run == run_id and current.state == "ACTIVE"
+                )
+                copied._settle_global_usage_for_producer(
+                    run_id,
+                    budget_digest,
+                    GlobalBudgetMetric.CONCURRENT_WORKERS,
+                    active_count,
+                )
 
         return self._commit_state_and_event(
             run_id=run_id,
@@ -1697,9 +2239,24 @@ class InMemoryStateStore:
             if current != intent:
                 raise StateConflict("MODEL_ATTEMPT_BINDING_MISMATCH")
             copied._model_attempts[intent.intent_id] = settled
-            copied._model_counters[intent.run_id] = copied.model_counters(intent.run_id).settle(
+            counters = copied.model_counters(intent.run_id).settle(
                 settled.reserved_amounts, settled.charged_amounts
             )
+            copied._model_counters[intent.run_id] = counters
+            if intent.run_id in copied._runs:
+                for metric, amount in (
+                    (GlobalBudgetMetric.MODEL_CALLS, counters.calls),
+                    (GlobalBudgetMetric.INPUT_TOKENS, counters.input_tokens),
+                    (GlobalBudgetMetric.OUTPUT_TOKENS, counters.output_tokens),
+                    (GlobalBudgetMetric.COST_RESERVE_USD, counters.cost_usd),
+                ):
+                    copied._settle_global_usage_for_producer(
+                        intent.run_id,
+                        intent.request.budget_digest,
+                        metric,
+                        amount,
+                        allow_reservation_reconciliation=True,
+                    )
             if settled.kind is ProviderAttemptKind.COMPLETED:
                 dispatch = settled.dispatch_result
                 if dispatch.outcome == "COMPLETED":

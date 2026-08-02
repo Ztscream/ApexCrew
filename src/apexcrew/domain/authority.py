@@ -4,10 +4,12 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from hashlib import sha256
 from typing import Literal, Protocol
 
 from apexcrew.domain.actions import ActionEnvelope
+from apexcrew.domain.effects import StateConflict
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     LogicalModelTurn,
@@ -27,6 +29,279 @@ from apexcrew.domain.types import (
     RunId,
     TaskId,
 )
+
+
+class AuthorityDenied(ValueError):
+    """Closed pre-transaction rejection of untrusted authority input."""
+
+
+class GlobalBudgetMetric(StrEnum):
+    ACTIVE_RUN_SECONDS = "ACTIVE_RUN_SECONDS"
+    TASKS = "TASKS"
+    PLANNING_REQUESTS = "PLANNING_REQUESTS"
+    MODEL_CALLS = "MODEL_CALLS"
+    INPUT_TOKENS = "INPUT_TOKENS"
+    OUTPUT_TOKENS = "OUTPUT_TOKENS"
+    COST_RESERVE_USD = "COST_RESERVE_USD"
+    CONCURRENT_WORKERS = "CONCURRENT_WORKERS"
+
+
+class DispatchCloseCause(StrEnum):
+    MANUAL_PAUSE = "MANUAL_PAUSE"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    UNKNOWN_CHANGE = "UNKNOWN_CHANGE"
+    IMMUTABLE_PLAN_INSUFFICIENCY = "IMMUTABLE_PLAN_INSUFFICIENCY"
+    REVISION_REPLACEMENT = "REVISION_REPLACEMENT"
+    RUNTIME_FAULT = "RUNTIME_FAULT"
+
+
+DECIMAL_GLOBAL_METRICS = frozenset(
+    {GlobalBudgetMetric.ACTIVE_RUN_SECONDS, GlobalBudgetMetric.COST_RESERVE_USD}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetWarning:
+    run_id: RunId
+    budget_digest: RevisionDigest
+    metric: GlobalBudgetMetric
+    used: int | Decimal
+    ceiling: int | Decimal
+    threshold_percent: int
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetCeilingExhaustion:
+    metric: GlobalBudgetMetric
+    used: int | Decimal
+    ceiling: int | Decimal
+    budget_digest: RevisionDigest
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalUsageSnapshot:
+    active_run_seconds: Decimal = Decimal(0)
+    tasks: int = 0
+    planning_requests: int = 0
+    model_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_reserve_usd: Decimal = Decimal(0)
+    concurrent_workers: int = 0
+
+    @classmethod
+    def zero(cls) -> GlobalUsageSnapshot:
+        return cls()
+
+    def amount_for(self, metric: GlobalBudgetMetric) -> int | Decimal:
+        match metric:
+            case GlobalBudgetMetric.ACTIVE_RUN_SECONDS:
+                return self.active_run_seconds
+            case GlobalBudgetMetric.TASKS:
+                return self.tasks
+            case GlobalBudgetMetric.PLANNING_REQUESTS:
+                return self.planning_requests
+            case GlobalBudgetMetric.MODEL_CALLS:
+                return self.model_calls
+            case GlobalBudgetMetric.INPUT_TOKENS:
+                return self.input_tokens
+            case GlobalBudgetMetric.OUTPUT_TOKENS:
+                return self.output_tokens
+            case GlobalBudgetMetric.COST_RESERVE_USD:
+                return self.cost_reserve_usd
+            case GlobalBudgetMetric.CONCURRENT_WORKERS:
+                return self.concurrent_workers
+        raise AuthorityDenied("UNKNOWN_GLOBAL_BUDGET_METRIC")
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicAction:
+    run_id: RunId
+    action_id: str
+    budget_digest: RevisionDigest
+    state: Literal["IN_FLIGHT", "SETTLED"]
+    opened_sequence: AuditSequence
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetSettlement:
+    run_id: RunId
+    metric: GlobalBudgetMetric
+    absolute_used: int | Decimal
+    ceiling: int | Decimal
+    action_state: Literal["SETTLED"] | None
+    pause_after_barrier: bool
+    pause_reason: str | None
+    resulting_sequence: AuditSequence
+
+
+def normalize_global_budget_metric(
+    value: GlobalBudgetMetric | str,
+) -> GlobalBudgetMetric:
+    try:
+        return GlobalBudgetMetric(value)
+    except (TypeError, ValueError) as error:
+        raise AuthorityDenied("UNKNOWN_GLOBAL_BUDGET_METRIC") from error
+
+
+def crossed_threshold(
+    previous: int | Decimal,
+    current: int | Decimal,
+    ceiling: int | Decimal,
+    percent: int,
+) -> bool:
+    return previous * 100 < ceiling * percent <= current * 100
+
+
+def global_ceiling_for(
+    budget: BudgetRevisionDocument,
+    value: GlobalBudgetMetric | str,
+) -> int | Decimal:
+    metric = normalize_global_budget_metric(value)
+    match metric:
+        case GlobalBudgetMetric.ACTIVE_RUN_SECONDS:
+            return budget.active_run_seconds_ceiling
+        case GlobalBudgetMetric.TASKS:
+            return budget.task_ceiling
+        case GlobalBudgetMetric.PLANNING_REQUESTS:
+            return budget.planning_request_ceiling
+        case GlobalBudgetMetric.MODEL_CALLS:
+            return budget.model_call_ceiling
+        case GlobalBudgetMetric.INPUT_TOKENS:
+            return budget.input_token_ceiling
+        case GlobalBudgetMetric.OUTPUT_TOKENS:
+            return budget.output_token_ceiling
+        case GlobalBudgetMetric.COST_RESERVE_USD:
+            return budget.cost_reserve_usd
+        case GlobalBudgetMetric.CONCURRENT_WORKERS:
+            return budget.concurrent_worker_ceiling
+    raise AuthorityDenied("UNKNOWN_GLOBAL_BUDGET_METRIC")
+
+
+def global_budget_maximum_for(value: GlobalBudgetMetric | str) -> int | Decimal:
+    metric = normalize_global_budget_metric(value)
+    match metric:
+        case GlobalBudgetMetric.ACTIVE_RUN_SECONDS:
+            return 28_800
+        case GlobalBudgetMetric.TASKS:
+            return 12
+        case GlobalBudgetMetric.PLANNING_REQUESTS:
+            return 8
+        case GlobalBudgetMetric.MODEL_CALLS:
+            return 240
+        case GlobalBudgetMetric.INPUT_TOKENS:
+            return 2_000_000
+        case GlobalBudgetMetric.OUTPUT_TOKENS:
+            return 200_000
+        case GlobalBudgetMetric.COST_RESERVE_USD:
+            return Decimal(10)
+        case GlobalBudgetMetric.CONCURRENT_WORKERS:
+            return 3
+    raise AuthorityDenied("UNKNOWN_GLOBAL_BUDGET_METRIC")
+
+
+def global_numeric_from_text(
+    metric: GlobalBudgetMetric,
+    value: str,
+) -> int | Decimal:
+    return Decimal(value) if metric in DECIMAL_GLOBAL_METRICS else int(value)
+
+
+def dispatch_close_causes_to_json(causes: frozenset[DispatchCloseCause]) -> str:
+    return json.dumps(sorted(cause.value for cause in causes), separators=(",", ":"))
+
+
+def dispatch_close_causes_from_json(value: str) -> frozenset[DispatchCloseCause]:
+    try:
+        raw = json.loads(value)
+        if (
+            not isinstance(raw, list)
+            or any(not isinstance(item, str) for item in raw)
+            or raw != sorted(set(raw))
+        ):
+            raise ValueError
+        return frozenset(DispatchCloseCause(item) for item in raw)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise StateConflict("DISPATCH_CLOSE_CAUSES_INVALID") from error
+
+
+def budget_warning_to_json(warning: BudgetWarning) -> str:
+    return json.dumps(
+        {
+            "budget_digest": warning.budget_digest,
+            "ceiling": str(warning.ceiling),
+            "metric": warning.metric.value,
+            "run_id": warning.run_id,
+            "threshold_percent": warning.threshold_percent,
+            "used": str(warning.used),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def budget_warning_from_json(value: str) -> BudgetWarning:
+    data = json.loads(value)
+    metric = normalize_global_budget_metric(data["metric"])
+    return BudgetWarning(
+        run_id=RunId(data["run_id"]),
+        budget_digest=RevisionDigest(data["budget_digest"]),
+        metric=metric,
+        used=global_numeric_from_text(metric, data["used"]),
+        ceiling=global_numeric_from_text(metric, data["ceiling"]),
+        threshold_percent=int(data["threshold_percent"]),
+    )
+
+
+def budget_ceiling_exhaustions_to_json(
+    exhaustions: tuple[BudgetCeilingExhaustion, ...],
+) -> str:
+    return json.dumps(
+        [
+            {
+                "budget_digest": item.budget_digest,
+                "ceiling": str(item.ceiling),
+                "metric": item.metric.value,
+                "used": str(item.used),
+            }
+            for item in sorted(exhaustions, key=lambda item: item.metric.value)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def budget_ceiling_exhaustions_from_json(
+    value: str,
+) -> tuple[BudgetCeilingExhaustion, ...]:
+    data = json.loads(value)
+    if not isinstance(data, list):
+        raise TypeError("BUDGET_CEILING_EXHAUSTIONS_INVALID")
+    parsed: list[BudgetCeilingExhaustion] = []
+    for item in data:
+        if not isinstance(item, dict) or set(item) != {
+            "budget_digest",
+            "ceiling",
+            "metric",
+            "used",
+        }:
+            raise ValueError("BUDGET_CEILING_EXHAUSTIONS_INVALID")
+        metric = normalize_global_budget_metric(item["metric"])
+        parsed.append(
+            BudgetCeilingExhaustion(
+                metric=metric,
+                used=global_numeric_from_text(metric, str(item["used"])),
+                ceiling=global_numeric_from_text(metric, str(item["ceiling"])),
+                budget_digest=RevisionDigest(item["budget_digest"]),
+            )
+        )
+    metrics = tuple(item.metric for item in parsed)
+    if len(metrics) != len(set(metrics)) or metrics != tuple(
+        sorted(metrics, key=lambda metric: metric.value)
+    ):
+        raise ValueError("BUDGET_CEILING_EXHAUSTIONS_INVALID")
+    return tuple(parsed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +770,37 @@ class AuthorityState(Protocol):
     ) -> tuple[RevisionDigest, BudgetRevisionDocument]:
         raise NotImplementedError
 
+    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        raise NotImplementedError
+
+    def settle_global_usage(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        raise NotImplementedError
+
+    def begin_atomic_action(
+        self,
+        action: AtomicAction,
+        expected_sequence: AuditSequence,
+    ) -> AtomicAction:
+        raise NotImplementedError
+
+    def settle_atomic_action(
+        self,
+        action: AtomicAction,
+        model_calls: int,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        raise NotImplementedError
+
+    def authorize_new_action(self, run_id: RunId) -> DispatchAuthorization:
+        raise NotImplementedError
+
     def reserve_authorized_model_attempt(
         self, request: ModelReservationRequest
     ) -> ModelReservation:
@@ -503,7 +809,7 @@ class AuthorityState(Protocol):
     def issue_workspace_lease(
         self,
         lease: WorkspaceLease,
-        worker_ceiling: int,
+        budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
     ) -> WorkspaceLease | LeaseDenial:
         raise NotImplementedError
@@ -603,6 +909,54 @@ class AuthorityService:
     def _budget(self, run_id: RunId) -> tuple[RevisionDigest, BudgetRevisionDocument]:
         return self._journal.current_approved_budget(run_id)
 
+    def settle_global_usage(
+        self,
+        run_id: RunId,
+        metric: GlobalBudgetMetric | str,
+        absolute_used: int | Decimal,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        normalized = normalize_global_budget_metric(metric)
+        budget_digest, _ = self._budget(run_id)
+        return self._journal.settle_global_usage(
+            run_id,
+            budget_digest,
+            normalized,
+            absolute_used,
+            expected_sequence,
+        )
+
+    def begin_atomic_action(
+        self,
+        run_id: RunId,
+        action_id: str,
+        expected_sequence: AuditSequence,
+    ) -> AtomicAction:
+        budget_digest, _ = self._budget(run_id)
+        action = AtomicAction(
+            run_id=run_id,
+            action_id=action_id,
+            budget_digest=budget_digest,
+            state="IN_FLIGHT",
+            opened_sequence=AuditSequence(expected_sequence + 1),
+        )
+        return self._journal.begin_atomic_action(action, expected_sequence)
+
+    def settle_atomic_action(
+        self,
+        action: AtomicAction,
+        model_calls: int,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        return self._journal.settle_atomic_action(
+            action,
+            model_calls,
+            expected_sequence,
+        )
+
+    def authorize_new_action(self, run_id: RunId) -> DispatchAuthorization:
+        return self._journal.authorize_new_action(run_id)
+
     def reserve_model_attempt(self, request: ModelReservationRequest) -> ModelReservation:
         return self._journal.reserve_authorized_model_attempt(request)
 
@@ -674,7 +1028,7 @@ class AuthorityService:
                 + check_inputs
             )
         )
-        _, budget = self._budget(attempt.run_id)
+        budget_digest, _ = self._budget(attempt.run_id)
         identity = json.dumps(
             {
                 "attempt_id": attempt.attempt_id,
@@ -702,7 +1056,9 @@ class AuthorityService:
             state="ACTIVE",
         )
         return self._journal.issue_workspace_lease(
-            lease, budget.concurrent_worker_ceiling, expected_sequence
+            lease,
+            budget_digest,
+            expected_sequence,
         )
 
     def renew_lease(
