@@ -16,9 +16,13 @@ from apexcrew.domain.admission import (
     TargetReservationCreationOutcome,
 )
 from apexcrew.domain.authority import (
+    ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    AttemptLifecycleState,
     AuthorizationReason,
     AuthorizationRequest,
+    CheckpointKey,
+    DispatchAuthorization,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
@@ -29,6 +33,8 @@ from apexcrew.domain.authority import (
     RuntimeAuditStamp,
     TaskAuthority,
     TaskBudgetState,
+    TaskLifecycleState,
+    TaskStopDecision,
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
@@ -52,6 +58,7 @@ from apexcrew.domain.effects import (
     classify_reservation_creation,
     sha256_digest,
 )
+from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     CommittedModelTurn,
     LogicalModelTurn,
@@ -332,6 +339,53 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 budget_digest TEXT NOT NULL,
                 budget_json TEXT NOT NULL
             )""",
+        ),
+    ),
+    (
+        7,
+        (
+            """CREATE TABLE tasks (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'READY', 'PAUSED')),
+                pause_reason TEXT,
+                pause_counter INTEGER CHECK(pause_counter IS NULL OR pause_counter >= 1),
+                PRIMARY KEY(run_id, task_id)
+            )""",
+            """CREATE TABLE attempts (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('RUNNING', 'FAILED')),
+                PRIMARY KEY(run_id, attempt_id),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+            """CREATE TABLE task_checkpoints (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                tree_oid TEXT NOT NULL,
+                check_set_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                observed_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, task_id, observed_sequence),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+            )""",
+            """CREATE INDEX task_checkpoint_matches
+                ON task_checkpoints(run_id, task_id, tree_oid, check_set_digest)""",
+            """CREATE TABLE task_invalid_actions (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                action_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                observed_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, task_id, observed_sequence),
+                UNIQUE(run_id, attempt_id),
+                FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id),
+                FOREIGN KEY(run_id, attempt_id) REFERENCES attempts(run_id, attempt_id)
+            )""",
+            """CREATE INDEX task_invalid_action_matches
+                ON task_invalid_actions(run_id, task_id, action_digest)""",
         ),
     ),
 )
@@ -686,6 +740,7 @@ class SqliteStateStore:
         run_id: RunId,
         event: AuditEvent,
         expected_sequence: AuditSequence,
+        runtime_now: MonotonicInstant | None = None,
     ) -> AuditSequence:
         next_sequence = AuditSequence(expected_sequence + 1)
         runtime_owner_generation: int | None = None
@@ -708,7 +763,7 @@ class SqliteStateStore:
             opened = run["runtime_interval_opened_nanoseconds"]
             if opened is None:
                 raise StateConflict("ACTIVE_RUN_TIME_OPEN_BINDING_INCOMPLETE")
-            now = self._monotonic_clock.now()
+            now = self._monotonic_clock.now() if runtime_now is None else runtime_now
             latest = connection.execute(
                 "SELECT runtime_monotonic_nanoseconds FROM audit_events WHERE run_id = ? "
                 "AND runtime_owner_generation = ? ORDER BY sequence DESC LIMIT 1",
@@ -1188,6 +1243,327 @@ class SqliteStateStore:
                 "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
             ).fetchone()
         return AuditSequence(0 if row is None else row["current_sequence"])
+
+    def install_running_attempt_for_test(self, task: TaskAuthority) -> None:
+        with self._transaction("IMMEDIATE") as connection:
+            task_row = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (task.run_id, task.task_id),
+            ).fetchone()
+            if task_row is None:
+                connection.execute(
+                    "INSERT INTO tasks(run_id, task_id, state) VALUES (?, ?, 'ACTIVE')",
+                    (task.run_id, task.task_id),
+                )
+            elif task_row["state"] == "PAUSED":
+                raise StateConflict("TASK_NOT_STARTABLE")
+            else:
+                connection.execute(
+                    "UPDATE tasks SET state = 'ACTIVE', pause_reason = NULL, "
+                    "pause_counter = NULL WHERE run_id = ? AND task_id = ?",
+                    (task.run_id, task.task_id),
+                )
+            attempt_row = connection.execute(
+                "SELECT task_id, state FROM attempts WHERE run_id = ? AND attempt_id = ?",
+                (task.run_id, task.attempt_id),
+            ).fetchone()
+            if attempt_row is None:
+                connection.execute(
+                    "INSERT INTO attempts(run_id, task_id, attempt_id, state) "
+                    "VALUES (?, ?, ?, 'RUNNING')",
+                    (task.run_id, task.task_id, task.attempt_id),
+                )
+            elif attempt_row["task_id"] != task.task_id or attempt_row["state"] != "RUNNING":
+                raise StateConflict("ATTEMPT_NOT_STARTABLE")
+
+    def task_lifecycle_state(self, run_id: RunId, task_id: TaskId) -> TaskLifecycleState:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TASK_NOT_FOUND")
+        state: TaskLifecycleState = row["state"]
+        return state
+
+    def attempt_lifecycle_state(
+        self, run_id: RunId, attempt_id: AttemptId
+    ) -> AttemptLifecycleState:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM attempts WHERE run_id = ? AND attempt_id = ?",
+                (run_id, attempt_id),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("ATTEMPT_NOT_FOUND")
+        state: AttemptLifecycleState = row["state"]
+        return state
+
+    @staticmethod
+    def _require_current_task_budget(
+        connection: sqlite3.Connection,
+        task: TaskAuthority,
+        budget_digest: RevisionDigest,
+    ) -> None:
+        row = connection.execute(
+            "SELECT budget_digest FROM approved_budgets_for_test WHERE run_id = ?",
+            (task.run_id,),
+        ).fetchone()
+        if row is None or row["budget_digest"] != budget_digest:
+            raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+
+    @staticmethod
+    def _set_task_state(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        task_id: TaskId,
+        state: TaskLifecycleState,
+    ) -> None:
+        legal_sources: dict[TaskLifecycleState, frozenset[TaskLifecycleState]] = {
+            "ACTIVE": frozenset(),
+            "READY": frozenset({"ACTIVE", "PAUSED"}),
+            "PAUSED": frozenset({"ACTIVE"}),
+        }
+        sources = legal_sources[state]
+        if not sources:
+            raise StateConflict("TASK_STATE_TRANSITION_ILLEGAL")
+        placeholders = ", ".join("?" for _ in sources)
+        parameters = (state, run_id, task_id, *sorted(sources))
+        changed = connection.execute(
+            f"UPDATE tasks SET state = ? WHERE run_id = ? AND task_id = ? "
+            f"AND state IN ({placeholders})",
+            parameters,
+        ).rowcount
+        if changed != 1:
+            raise StateConflict("TASK_STATE_TRANSITION_ILLEGAL")
+
+    @classmethod
+    def _pause_task(
+        cls,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        task_id: TaskId,
+        reason: Literal["REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"],
+        counter: int,
+    ) -> None:
+        cls._set_task_state(connection, run_id, task_id, "PAUSED")
+        if (
+            connection.execute(
+                "UPDATE tasks SET pause_reason = ?, pause_counter = ? "
+                "WHERE run_id = ? AND task_id = ? AND state = 'PAUSED'",
+                (reason, counter, run_id, task_id),
+            ).rowcount
+            != 1
+        ):
+            raise StateConflict("TASK_PAUSE_PERSIST_FAILED")
+
+    @staticmethod
+    def _finish_attempt(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        state: AttemptLifecycleState,
+    ) -> None:
+        if state != "FAILED":
+            raise StateConflict("ATTEMPT_STATE_TRANSITION_ILLEGAL")
+        changed = connection.execute(
+            "UPDATE attempts SET state = 'FAILED' WHERE run_id = ? AND task_id = ? "
+            "AND attempt_id = ? AND state = 'RUNNING'",
+            (run_id, task_id, attempt_id),
+        ).rowcount
+        if changed != 1:
+            raise StateConflict("ATTEMPT_STATE_TRANSITION_ILLEGAL")
+
+    @staticmethod
+    def _release_attempt_lease(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        attempt_id: AttemptId,
+        terminal_sequence: AuditSequence,
+    ) -> None:
+        connection.execute(
+            "UPDATE workspace_leases SET state = 'REVOKED', terminal_sequence = ? "
+            "WHERE run_id = ? AND attempt_id = ? AND state = 'ACTIVE'",
+            (terminal_sequence, run_id, attempt_id),
+        )
+
+    def record_task_checkpoint(
+        self,
+        task: TaskAuthority,
+        checkpoint: CheckpointKey,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        count = 0
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            nonlocal count
+            self._require_current_task_budget(connection, task, budget_digest)
+            row = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (task.run_id, task.task_id),
+            ).fetchone()
+            if row is None or row["state"] != "ACTIVE":
+                raise StateConflict("TASK_CHECKPOINT_SOURCE_STATE_ILLEGAL")
+            connection.execute(
+                "INSERT INTO task_checkpoints(run_id, task_id, tree_oid, check_set_digest, "
+                "budget_digest, observed_sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task.run_id,
+                    task.task_id,
+                    checkpoint.tree_oid,
+                    checkpoint.check_set_digest,
+                    budget_digest,
+                    expected_sequence + 1,
+                ),
+            )
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_checkpoints WHERE run_id = ? AND task_id = ? "
+                    "AND tree_oid = ? AND check_set_digest = ?",
+                    (task.run_id, task.task_id, checkpoint.tree_oid, checkpoint.check_set_digest),
+                ).fetchone()[0]
+            )
+            if count >= V01_MECHANISM_LIMITS.repeated_checkpoint_ceiling:
+                self._pause_task(
+                    connection,
+                    task.run_id,
+                    task.task_id,
+                    "REPEATED_CHECKPOINT",
+                    count,
+                )
+
+        sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_CHECKPOINT_RECORDED",
+                task_id=task.task_id,
+                attempt_id=task.attempt_id,
+            ),
+            mutate=mutate,
+        )
+        paused = count >= V01_MECHANISM_LIMITS.repeated_checkpoint_ceiling
+        return TaskStopDecision(
+            decision="PAUSE" if paused else "CONTINUE",
+            run_id=task.run_id,
+            task_id=task.task_id,
+            task_state="PAUSED" if paused else "ACTIVE",
+            pause_reason="REPEATED_CHECKPOINT" if paused else None,
+            checkpoint_count=count,
+            resulting_sequence=sequence,
+        )
+
+    def record_invalid_action(
+        self,
+        task: TaskAuthority,
+        attempt_id: AttemptId,
+        action_digest: str,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        if attempt_id != task.attempt_id:
+            raise StateConflict("TASK_ATTEMPT_BINDING_MISMATCH")
+        count = 0
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            nonlocal count
+            self._require_current_task_budget(connection, task, budget_digest)
+            self._finish_attempt(
+                connection,
+                task.run_id,
+                task.task_id,
+                attempt_id,
+                "FAILED",
+            )
+            task_row = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (task.run_id, task.task_id),
+            ).fetchone()
+            if task_row is None or task_row["state"] != "ACTIVE":
+                raise StateConflict("TASK_INVALID_ACTION_SOURCE_STATE_ILLEGAL")
+            self._release_attempt_lease(
+                connection,
+                task.run_id,
+                attempt_id,
+                AuditSequence(expected_sequence + 1),
+            )
+            connection.execute(
+                "INSERT INTO task_invalid_actions(run_id, task_id, attempt_id, action_digest, "
+                "budget_digest, observed_sequence) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    task.run_id,
+                    task.task_id,
+                    attempt_id,
+                    action_digest,
+                    budget_digest,
+                    expected_sequence + 1,
+                ),
+            )
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_invalid_actions WHERE run_id = ? AND task_id = ? "
+                    "AND action_digest = ?",
+                    (task.run_id, task.task_id, action_digest),
+                ).fetchone()[0]
+            )
+            if count >= V01_MECHANISM_LIMITS.repeated_invalid_action_ceiling:
+                self._pause_task(
+                    connection,
+                    task.run_id,
+                    task.task_id,
+                    "REPEATED_INVALID_ACTION",
+                    count,
+                )
+            else:
+                self._set_task_state(connection, task.run_id, task.task_id, "READY")
+
+        sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "INVALID_ACTION_RECORDED",
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+            ),
+            mutate=mutate,
+        )
+        paused = count >= V01_MECHANISM_LIMITS.repeated_invalid_action_ceiling
+        return TaskStopDecision(
+            decision="PAUSE" if paused else "CONTINUE",
+            run_id=task.run_id,
+            task_id=task.task_id,
+            task_state="PAUSED" if paused else "READY",
+            pause_reason="REPEATED_INVALID_ACTION" if paused else None,
+            identical_invalid_action_count=count,
+            attempt_state="FAILED",
+            resulting_sequence=sequence,
+        )
+
+    def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
+        with self._read_transaction() as connection:
+            task = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            run = connection.execute(
+                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if task is None:
+            raise StateConflict("TASK_NOT_FOUND")
+        if task["state"] == "PAUSED":
+            return DispatchAuthorization("DENY", "TASK_PAUSED")
+        if run is not None and not bool(run["new_dispatch_open"]):
+            causes = tuple(json.loads(str(run["dispatch_close_causes_json"])))
+            if "ACTIVE_RUN_TIME_CEILING" in causes:
+                return DispatchAuthorization("DENY", "ACTIVE_RUN_TIME_CEILING")
+            return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
+        if task["state"] != "READY":
+            return DispatchAuthorization("DENY", "TASK_NOT_READY")
+        return DispatchAuthorization("ALLOW", "AUTHORIZED")
 
     def install_approved_budget_for_test(
         self,
@@ -2011,6 +2387,134 @@ class SqliteStateStore:
             ),
             latest_committed_at=None if stamp is None else stamp.monotonic_instant,
         )
+
+    @staticmethod
+    def _active_run_time_state_for_update(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+    ) -> ActiveRunTimeState:
+        row = connection.execute(
+            "SELECT active_runtime_nanoseconds, runtime_interval_owner_generation, "
+            "runtime_interval_opened_nanoseconds FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        generation = row["runtime_interval_owner_generation"]
+        stamp = None
+        if generation is not None:
+            stamp = connection.execute(
+                "SELECT runtime_monotonic_nanoseconds FROM audit_events WHERE run_id = ? "
+                "AND runtime_owner_generation = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id, generation),
+            ).fetchone()
+        return ActiveRunTimeState(
+            run_id=run_id,
+            cumulative_nanoseconds=int(row["active_runtime_nanoseconds"]),
+            open_owner_generation=None if generation is None else int(generation),
+            opened_at=(
+                None
+                if row["runtime_interval_opened_nanoseconds"] is None
+                else MonotonicInstant(int(row["runtime_interval_opened_nanoseconds"]))
+            ),
+            latest_committed_at=(
+                None
+                if stamp is None or stamp["runtime_monotonic_nanoseconds"] is None
+                else MonotonicInstant(int(stamp["runtime_monotonic_nanoseconds"]))
+            ),
+        )
+
+    def evaluate_active_run_time_boundary(
+        self,
+        *,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        expected: ActiveRunTimeState,
+        ceiling_nanoseconds: int,
+        expected_sequence: AuditSequence,
+    ) -> ActiveRunTimeBoundaryDecision:
+        with self._transaction("IMMEDIATE") as connection:
+            self._require_expected_sequence(connection, run_id, expected_sequence)
+            budget_row = connection.execute(
+                "SELECT budget_digest, budget_json FROM approved_budgets_for_test WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if budget_row is None or budget_row["budget_digest"] != budget_digest:
+                raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+            budget = BudgetRevisionDocument.model_validate_json(str(budget_row["budget_json"]))
+            if ceiling_nanoseconds != budget.active_run_seconds_ceiling * 1_000_000_000:
+                raise StateConflict("ACTIVE_RUN_TIME_CEILING_BINDING_MISMATCH")
+            current = self._active_run_time_state_for_update(connection, run_id)
+            if current != expected:
+                raise StateConflict("ACTIVE_RUN_TIME_SNAPSHOT_MISMATCH")
+            if current.open_owner_generation is None:
+                observed = current.cumulative_nanoseconds
+                now = None
+            else:
+                if self._monotonic_clock is None:
+                    raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+                now = self._monotonic_clock.now()
+                observed = current.observed_nanoseconds(now)
+            if observed < ceiling_nanoseconds:
+                return ActiveRunTimeBoundaryDecision(
+                    "CONTINUE",
+                    observed,
+                    ceiling_nanoseconds,
+                    expected_sequence,
+                )
+            run_row = connection.execute(
+                "SELECT new_dispatch_open, dispatch_close_causes_json FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            stored_causes = json.loads(str(run_row["dispatch_close_causes_json"]))
+            if (
+                not isinstance(stored_causes, list)
+                or any(not isinstance(item, str) for item in stored_causes)
+                or stored_causes != sorted(set(stored_causes))
+            ):
+                raise StateConflict("DISPATCH_CLOSE_CAUSES_INVALID")
+            causes = set(stored_causes)
+            causes.add("ACTIVE_RUN_TIME_CEILING")
+            causes_json = json.dumps(sorted(causes), separators=(",", ":"))
+            if (
+                connection.execute(
+                    "UPDATE runs SET new_dispatch_open = 0, dispatch_close_causes_json = ? "
+                    "WHERE run_id = ? AND new_dispatch_open = ? AND dispatch_close_causes_json = ?",
+                    (
+                        causes_json,
+                        run_id,
+                        run_row["new_dispatch_open"],
+                        run_row["dispatch_close_causes_json"],
+                    ),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("DISPATCH_CLOSE_COMPARE_AND_SET_FAILED")
+            sequence = self._append_audit_event(
+                connection,
+                run_id,
+                AuditEvent.kind("ACTIVE_RUN_TIME_CEILING_REACHED"),
+                expected_sequence,
+                runtime_now=now,
+            )
+            return ActiveRunTimeBoundaryDecision(
+                "PAUSE",
+                observed,
+                ceiling_nanoseconds,
+                sequence,
+            )
+
+    def new_dispatch_open(self, run_id: RunId) -> bool:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT new_dispatch_open FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        return bool(row["new_dispatch_open"])
 
     def append_event(
         self,

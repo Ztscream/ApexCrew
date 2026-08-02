@@ -412,6 +412,57 @@ class TaskAuthority:
     attempt_id: AttemptId
 
 
+TaskLifecycleState = Literal["ACTIVE", "READY", "PAUSED"]
+AttemptLifecycleState = Literal["RUNNING", "FAILED"]
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointKey:
+    tree_oid: str
+    check_set_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskStopDecision:
+    decision: Literal["CONTINUE", "PAUSE"]
+    run_id: RunId
+    task_id: TaskId
+    task_state: TaskLifecycleState
+    pause_reason: Literal["REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"] | None
+    resulting_sequence: AuditSequence
+    checkpoint_count: int = 0
+    identical_invalid_action_count: int = 0
+    attempt_state: Literal["FAILED"] | None = None
+
+    @property
+    def code(self) -> Literal["MALFORMED_ACTION", "TASK_OBSERVATION_RECORDED"]:
+        return "MALFORMED_ACTION" if self.attempt_state == "FAILED" else "TASK_OBSERVATION_RECORDED"
+
+    @property
+    def stop_reason(self) -> str | None:
+        return self.pause_reason
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchAuthorization:
+    decision: Literal["ALLOW", "DENY"]
+    reason: Literal[
+        "AUTHORIZED",
+        "TASK_NOT_READY",
+        "TASK_PAUSED",
+        "RUN_DISPATCH_CLOSED",
+        "ACTIVE_RUN_TIME_CEILING",
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRunTimeBoundaryDecision:
+    decision: Literal["CONTINUE", "PAUSE"]
+    observed_nanoseconds: int
+    ceiling_nanoseconds: int
+    resulting_sequence: AuditSequence
+
+
 TrancheReason = Literal["BOOTSTRAP", "OBJECTIVE_PROGRESS", "NO_PROGRESS", "TASK_CALL_CEILING"]
 
 
@@ -508,6 +559,42 @@ class AuthorityState(Protocol):
     ) -> TrancheDecision:
         raise NotImplementedError
 
+    def record_task_checkpoint(
+        self,
+        task: TaskAuthority,
+        checkpoint: CheckpointKey,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        raise NotImplementedError
+
+    def record_invalid_action(
+        self,
+        task: TaskAuthority,
+        attempt_id: AttemptId,
+        action_digest: str,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        raise NotImplementedError
+
+    def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
+        raise NotImplementedError
+
+    def active_run_time_state(self, run_id: RunId) -> ActiveRunTimeState:
+        raise NotImplementedError
+
+    def evaluate_active_run_time_boundary(
+        self,
+        *,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        expected: ActiveRunTimeState,
+        ceiling_nanoseconds: int,
+        expected_sequence: AuditSequence,
+    ) -> ActiveRunTimeBoundaryDecision:
+        raise NotImplementedError
+
 
 class AuthorityService:
     def __init__(self, journal: AuthorityState) -> None:
@@ -518,6 +605,54 @@ class AuthorityService:
 
     def reserve_model_attempt(self, request: ModelReservationRequest) -> ModelReservation:
         return self._journal.reserve_authorized_model_attempt(request)
+
+    def record_checkpoint(
+        self,
+        task: TaskAuthority,
+        checkpoint: CheckpointKey,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        budget_digest, _ = self._budget(task.run_id)
+        return self._journal.record_task_checkpoint(
+            task,
+            checkpoint,
+            budget_digest,
+            expected_sequence,
+        )
+
+    def record_invalid_action(
+        self,
+        task: TaskAuthority,
+        attempt_id: AttemptId,
+        action_digest: str,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        budget_digest, _ = self._budget(task.run_id)
+        return self._journal.record_invalid_action(
+            task,
+            attempt_id,
+            action_digest,
+            budget_digest,
+            expected_sequence,
+        )
+
+    def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
+        return self._journal.authorize_new_attempt(run_id, task_id)
+
+    def evaluate_active_run_time_boundary(
+        self,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+    ) -> ActiveRunTimeBoundaryDecision:
+        budget_digest, budget = self._budget(run_id)
+        expected = self._journal.active_run_time_state(run_id)
+        return self._journal.evaluate_active_run_time_boundary(
+            run_id=run_id,
+            budget_digest=budget_digest,
+            expected=expected,
+            ceiling_nanoseconds=budget.active_run_seconds_ceiling * 1_000_000_000,
+            expected_sequence=expected_sequence,
+        )
 
     def issue_lease(
         self,

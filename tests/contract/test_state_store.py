@@ -13,8 +13,10 @@ from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.authority import (
     AuthorityService,
+    CheckpointKey,
     ModelReservationRequest,
     MonotonicInstant,
+    TaskAuthority,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -211,6 +213,61 @@ def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
 
 def sqlite_store_factory(tmp_path: Path) -> SqliteStateStore:
     return SqliteStateStore(tmp_path / "state.db")
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_task_and_attempt_lifecycle_storage_matches(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    task = TaskAuthority(
+        run_id=RunId("run-lifecycle"),
+        task_id=TaskId("task-1"),
+        attempt_id=AttemptId("attempt-1"),
+    )
+
+    store.install_running_attempt_for_test(task)
+
+    assert store.task_lifecycle_state(task.run_id, task.task_id) == "ACTIVE"
+    assert store.attempt_lifecycle_state(task.run_id, task.attempt_id) == "RUNNING"
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_task_stop_cap_is_not_caller_selectable(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    make_authority(store, run_id="run-cap")
+    task = TaskAuthority(
+        run_id=RunId("run-cap"),
+        task_id=TaskId("task-cap"),
+        attempt_id=AttemptId("attempt-cap"),
+    )
+    store.install_running_attempt_for_test(task)
+    budget_digest, _ = store.current_approved_budget(task.run_id)
+
+    with pytest.raises(TypeError, match="ceiling"):
+        store.record_task_checkpoint(
+            task,
+            CheckpointKey("1" * 40, "sha256:" + "2" * 64),
+            budget_digest,
+            AuditSequence(0),
+            ceiling=1,
+        )
+    with pytest.raises(TypeError, match="ceiling"):
+        store.record_invalid_action(
+            task,
+            task.attempt_id,
+            "sha256:" + "3" * 64,
+            budget_digest,
+            AuditSequence(0),
+            ceiling=1,
+        )
+
+    assert store.task_lifecycle_state(task.run_id, task.task_id) == "ACTIVE"
+    assert store.audit_sequence(task.run_id) == 0
 
 
 def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:

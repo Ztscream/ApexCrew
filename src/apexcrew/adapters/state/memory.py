@@ -13,9 +13,13 @@ from apexcrew.domain.admission import (
     TargetReservationCreationOutcome,
 )
 from apexcrew.domain.authority import (
+    ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    AttemptLifecycleState,
     AuthorizationReason,
     AuthorizationRequest,
+    CheckpointKey,
+    DispatchAuthorization,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
@@ -26,6 +30,8 @@ from apexcrew.domain.authority import (
     RuntimeAuditStamp,
     TaskAuthority,
     TaskBudgetState,
+    TaskLifecycleState,
+    TaskStopDecision,
     TrancheDecision,
     TrancheReason,
     WorkspaceLease,
@@ -49,6 +55,7 @@ from apexcrew.domain.effects import (
     classify_reservation_creation,
     sha256_digest,
 )
+from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     CommittedModelTurn,
     LogicalModelTurn,
@@ -243,6 +250,16 @@ class InMemoryStateStore:
         self._task_tranches: dict[
             tuple[RunId, TaskId, str], tuple[AttemptId, int, int, str, str]
         ] = {}
+        self._tasks: dict[
+            tuple[RunId, TaskId], tuple[TaskLifecycleState, str | None, int | None]
+        ] = {}
+        self._attempts: dict[tuple[RunId, AttemptId], tuple[TaskId, AttemptLifecycleState]] = {}
+        self._task_checkpoints: dict[
+            tuple[RunId, TaskId], list[tuple[CheckpointKey, RevisionDigest]]
+        ] = {}
+        self._task_invalid_actions: dict[
+            tuple[RunId, TaskId], list[tuple[AttemptId, str, RevisionDigest]]
+        ] = {}
         self._monotonic_clock = monotonic_clock
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
@@ -268,6 +285,10 @@ class InMemoryStateStore:
         copied._dispatch_close_causes = self._dispatch_close_causes.copy()
         copied._active_run_times = self._active_run_times.copy()
         copied._task_tranches = self._task_tranches.copy()
+        copied._tasks = self._tasks.copy()
+        copied._attempts = self._attempts.copy()
+        copied._task_checkpoints = deepcopy(self._task_checkpoints)
+        copied._task_invalid_actions = deepcopy(self._task_invalid_actions)
         copied._monotonic_clock = self._monotonic_clock
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
@@ -293,6 +314,10 @@ class InMemoryStateStore:
         self._dispatch_close_causes = copied._dispatch_close_causes
         self._active_run_times = copied._active_run_times
         self._task_tranches = copied._task_tranches
+        self._tasks = copied._tasks
+        self._attempts = copied._attempts
+        self._task_checkpoints = copied._task_checkpoints
+        self._task_invalid_actions = copied._task_invalid_actions
 
     def _commit_state_and_event(
         self,
@@ -301,6 +326,7 @@ class InMemoryStateStore:
         expected_sequence: AuditSequence,
         event: AuditEvent,
         mutate: Callable[[InMemoryStateStore], None],
+        runtime_now: MonotonicInstant | None = None,
     ) -> AuditSequence:
         with self._lock:
             current = self._sequences.get(run_id, AuditSequence(0))
@@ -325,7 +351,7 @@ class InMemoryStateStore:
             else:
                 if copied._monotonic_clock is None:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
-                now = copied._monotonic_clock.now()
+                now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
                 runtime_state.observed_nanoseconds(now)
                 committed_event = replace(
                     event,
@@ -565,6 +591,281 @@ class InMemoryStateStore:
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         with self._lock:
             return self._sequences.get(run_id, AuditSequence(0))
+
+    def install_running_attempt_for_test(self, task: TaskAuthority) -> None:
+        with self._lock:
+            task_key = (task.run_id, task.task_id)
+            current_task = self._tasks.get(task_key)
+            if current_task is not None and current_task[0] == "PAUSED":
+                raise StateConflict("TASK_NOT_STARTABLE")
+            attempt_key = (task.run_id, task.attempt_id)
+            current_attempt = self._attempts.get(attempt_key)
+            if current_attempt is not None and current_attempt != (task.task_id, "RUNNING"):
+                raise StateConflict("ATTEMPT_NOT_STARTABLE")
+            self._tasks[task_key] = ("ACTIVE", None, None)
+            if current_attempt is None:
+                self._attempts[attempt_key] = (task.task_id, "RUNNING")
+
+    def task_lifecycle_state(self, run_id: RunId, task_id: TaskId) -> TaskLifecycleState:
+        with self._lock:
+            task = self._tasks.get((run_id, task_id))
+        if task is None:
+            raise StateConflict("TASK_NOT_FOUND")
+        return task[0]
+
+    def attempt_lifecycle_state(
+        self, run_id: RunId, attempt_id: AttemptId
+    ) -> AttemptLifecycleState:
+        with self._lock:
+            attempt = self._attempts.get((run_id, attempt_id))
+        if attempt is None:
+            raise StateConflict("ATTEMPT_NOT_FOUND")
+        return attempt[1]
+
+    def _require_current_task_budget(
+        self,
+        task: TaskAuthority,
+        budget_digest: RevisionDigest,
+    ) -> None:
+        current = self._approved_budgets.get(task.run_id)
+        if current is None or current[0] != budget_digest:
+            raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+
+    def _set_task_state(
+        self,
+        run_id: RunId,
+        task_id: TaskId,
+        state: TaskLifecycleState,
+    ) -> None:
+        legal_sources: dict[TaskLifecycleState, frozenset[TaskLifecycleState]] = {
+            "ACTIVE": frozenset(),
+            "READY": frozenset({"ACTIVE", "PAUSED"}),
+            "PAUSED": frozenset({"ACTIVE"}),
+        }
+        key = (run_id, task_id)
+        current = self._tasks.get(key)
+        if current is None or current[0] not in legal_sources[state]:
+            raise StateConflict("TASK_STATE_TRANSITION_ILLEGAL")
+        self._tasks[key] = (state, None, None)
+
+    def _pause_task(
+        self,
+        run_id: RunId,
+        task_id: TaskId,
+        reason: Literal["REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"],
+        counter: int,
+    ) -> None:
+        self._set_task_state(run_id, task_id, "PAUSED")
+        self._tasks[(run_id, task_id)] = ("PAUSED", reason, counter)
+
+    def _finish_attempt(
+        self,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        state: AttemptLifecycleState,
+    ) -> None:
+        key = (run_id, attempt_id)
+        current = self._attempts.get(key)
+        if state != "FAILED" or current != (task_id, "RUNNING"):
+            raise StateConflict("ATTEMPT_STATE_TRANSITION_ILLEGAL")
+        self._attempts[key] = (task_id, "FAILED")
+
+    def _release_attempt_lease(self, run_id: RunId, attempt_id: AttemptId) -> None:
+        for key, lease in tuple(self._workspace_leases.items()):
+            if (
+                lease.run_id == run_id
+                and lease.attempt_id == attempt_id
+                and lease.state == "ACTIVE"
+            ):
+                self._workspace_leases[key] = replace(lease, state="REVOKED")
+
+    def record_task_checkpoint(
+        self,
+        task: TaskAuthority,
+        checkpoint: CheckpointKey,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        count = 0
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            nonlocal count
+            copied._require_current_task_budget(task, budget_digest)
+            current = copied._tasks.get((task.run_id, task.task_id))
+            if current is None or current[0] != "ACTIVE":
+                raise StateConflict("TASK_CHECKPOINT_SOURCE_STATE_ILLEGAL")
+            history = copied._task_checkpoints.setdefault((task.run_id, task.task_id), [])
+            history.append((checkpoint, budget_digest))
+            count = sum(1 for observed, _ in history if observed == checkpoint)
+            if count >= V01_MECHANISM_LIMITS.repeated_checkpoint_ceiling:
+                copied._pause_task(
+                    task.run_id,
+                    task.task_id,
+                    "REPEATED_CHECKPOINT",
+                    count,
+                )
+
+        sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_CHECKPOINT_RECORDED",
+                task_id=task.task_id,
+                attempt_id=task.attempt_id,
+            ),
+            mutate=mutate,
+        )
+        paused = count >= V01_MECHANISM_LIMITS.repeated_checkpoint_ceiling
+        return TaskStopDecision(
+            decision="PAUSE" if paused else "CONTINUE",
+            run_id=task.run_id,
+            task_id=task.task_id,
+            task_state="PAUSED" if paused else "ACTIVE",
+            pause_reason="REPEATED_CHECKPOINT" if paused else None,
+            checkpoint_count=count,
+            resulting_sequence=sequence,
+        )
+
+    def record_invalid_action(
+        self,
+        task: TaskAuthority,
+        attempt_id: AttemptId,
+        action_digest: str,
+        budget_digest: RevisionDigest,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        if attempt_id != task.attempt_id:
+            raise StateConflict("TASK_ATTEMPT_BINDING_MISMATCH")
+        count = 0
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            nonlocal count
+            copied._require_current_task_budget(task, budget_digest)
+            copied._finish_attempt(task.run_id, task.task_id, attempt_id, "FAILED")
+            current = copied._tasks.get((task.run_id, task.task_id))
+            if current is None or current[0] != "ACTIVE":
+                raise StateConflict("TASK_INVALID_ACTION_SOURCE_STATE_ILLEGAL")
+            copied._release_attempt_lease(task.run_id, attempt_id)
+            history = copied._task_invalid_actions.setdefault((task.run_id, task.task_id), [])
+            history.append((attempt_id, action_digest, budget_digest))
+            count = sum(1 for _, observed, _ in history if observed == action_digest)
+            if count >= V01_MECHANISM_LIMITS.repeated_invalid_action_ceiling:
+                copied._pause_task(
+                    task.run_id,
+                    task.task_id,
+                    "REPEATED_INVALID_ACTION",
+                    count,
+                )
+            else:
+                copied._set_task_state(task.run_id, task.task_id, "READY")
+
+        sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "INVALID_ACTION_RECORDED",
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+            ),
+            mutate=mutate,
+        )
+        paused = count >= V01_MECHANISM_LIMITS.repeated_invalid_action_ceiling
+        return TaskStopDecision(
+            decision="PAUSE" if paused else "CONTINUE",
+            run_id=task.run_id,
+            task_id=task.task_id,
+            task_state="PAUSED" if paused else "READY",
+            pause_reason="REPEATED_INVALID_ACTION" if paused else None,
+            identical_invalid_action_count=count,
+            attempt_state="FAILED",
+            resulting_sequence=sequence,
+        )
+
+    def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
+        with self._lock:
+            task = self._tasks.get((run_id, task_id))
+            causes = self._dispatch_close_causes.get(run_id, ())
+        if task is None:
+            raise StateConflict("TASK_NOT_FOUND")
+        if task[0] == "PAUSED":
+            return DispatchAuthorization("DENY", "TASK_PAUSED")
+        if causes:
+            if "ACTIVE_RUN_TIME_CEILING" in causes:
+                return DispatchAuthorization("DENY", "ACTIVE_RUN_TIME_CEILING")
+            return DispatchAuthorization("DENY", "RUN_DISPATCH_CLOSED")
+        if task[0] != "READY":
+            return DispatchAuthorization("DENY", "TASK_NOT_READY")
+        return DispatchAuthorization("ALLOW", "AUTHORIZED")
+
+    def evaluate_active_run_time_boundary(
+        self,
+        *,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        expected: ActiveRunTimeState,
+        ceiling_nanoseconds: int,
+        expected_sequence: AuditSequence,
+    ) -> ActiveRunTimeBoundaryDecision:
+        with self._lock:
+            if self._sequences.get(run_id, AuditSequence(0)) != expected_sequence:
+                raise StateConflict("STALE_SEQUENCE")
+            current_budget = self._approved_budgets.get(run_id)
+            if current_budget is None or current_budget[0] != budget_digest:
+                raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+            if ceiling_nanoseconds != current_budget[1].active_run_seconds_ceiling * 1_000_000_000:
+                raise StateConflict("ACTIVE_RUN_TIME_CEILING_BINDING_MISMATCH")
+            current = self._active_run_times.get(
+                run_id,
+                ActiveRunTimeState(run_id, 0, None, None, None),
+            )
+            if current != expected:
+                raise StateConflict("ACTIVE_RUN_TIME_SNAPSHOT_MISMATCH")
+            if current.open_owner_generation is None:
+                observed = current.cumulative_nanoseconds
+                now = None
+            else:
+                if self._monotonic_clock is None:
+                    raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+                now = self._monotonic_clock.now()
+                observed = current.observed_nanoseconds(now)
+            if observed < ceiling_nanoseconds:
+                return ActiveRunTimeBoundaryDecision(
+                    "CONTINUE",
+                    observed,
+                    ceiling_nanoseconds,
+                    expected_sequence,
+                )
+
+            def mutate(copied: InMemoryStateStore) -> None:
+                copied_budget = copied._approved_budgets.get(run_id)
+                if copied_budget is None or copied_budget[0] != budget_digest:
+                    raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+                if copied._active_run_times.get(run_id) != expected:
+                    raise StateConflict("ACTIVE_RUN_TIME_SNAPSHOT_MISMATCH")
+                causes = set(copied._dispatch_close_causes.get(run_id, ()))
+                causes.add("ACTIVE_RUN_TIME_CEILING")
+                copied._dispatch_close_causes[run_id] = tuple(sorted(causes))
+
+            sequence = self._commit_state_and_event(
+                run_id=run_id,
+                expected_sequence=expected_sequence,
+                event=AuditEvent.kind("ACTIVE_RUN_TIME_CEILING_REACHED"),
+                mutate=mutate,
+                runtime_now=now,
+            )
+            return ActiveRunTimeBoundaryDecision(
+                "PAUSE",
+                observed,
+                ceiling_nanoseconds,
+                sequence,
+            )
+
+    def new_dispatch_open(self, run_id: RunId) -> bool:
+        with self._lock:
+            if run_id not in self._runs:
+                raise StateConflict("RUN_NOT_FOUND")
+            return not self._dispatch_close_causes.get(run_id, ())
 
     def install_approved_budget_for_test(
         self,
