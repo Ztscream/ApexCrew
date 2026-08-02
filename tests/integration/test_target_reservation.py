@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from helpers.application import make_permitted_draft_runtime
 
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
@@ -13,12 +14,15 @@ from apexcrew.adapters.repository.git import (
     GitTargetReservationRepository,
     NoFollowTargetReservationWorktreeGuard,
     RepositoryInstance,
+    reservation_for_operation,
 )
 from apexcrew.adapters.repository.no_follow import StableHandleTree
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.adapters.system import ReservationPathInspector
+from apexcrew.application.runtime import RuntimeStateStore
 from apexcrew.domain.admission import (
     RepositoryEffectError,
     TargetReservationAdmissionService,
@@ -27,9 +31,10 @@ from apexcrew.domain.admission import (
     TargetReservationOperation,
     TargetReservationOperationResult,
 )
-from apexcrew.domain.commands import ApplicableRevisionDigests
+from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import ReservationObservation, TargetReservation
-from apexcrew.domain.types import GitOid, IntentId, RepositoryId, RunId
+from apexcrew.domain.model import RecoveredModelAction
+from apexcrew.domain.types import GitOid, IntentId, RepositoryId, RunId, RunState, RunStopReason
 
 
 @dataclass
@@ -273,6 +278,44 @@ def test_real_git_adapter_reserves_symbolic_pinned_target_and_refreshes_guard(
         data_handles.close()
 
 
+def test_real_git_adapter_observes_exact_locked_registration_and_gitfile(
+    tmp_path: Path,
+) -> None:
+    adapter, add, data_handles, _, repository = real_git_reservation_adapter(tmp_path)
+    try:
+        adapter.apply(add)
+        adapter.apply(add.model_copy(update={"kind": "LOCK"}))
+        allocated = reservation_for_operation(add)
+
+        registration = adapter.observe_registration(allocated)
+        assert registration.registration_present
+        assert registration.locked
+        assert registration.exact_identity
+        assert not registration.unexpected_registration
+        assert registration.observable
+
+        backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
+        paths = ReservationPathInspector(
+            tmp_path / "data",
+            lambda value: (
+                b"gitdir: "
+                + os.fsencode(
+                    (repository.root / ".git" / "worktrees" / value.reservation_id).as_posix()
+                )
+                + b"\n"
+            ),
+            backend,
+        )
+        observed_path = paths.observe_path(allocated)
+        assert observed_path.path_present
+        assert observed_path.gitfile_only
+        assert observed_path.exact_back_reference
+        assert observed_path.observable
+    finally:
+        repository.close()
+        data_handles.close()
+
+
 def test_real_git_adapter_rejects_wrong_pinned_target_before_add(tmp_path: Path) -> None:
     adapter, add, data_handles, _, repository = real_git_reservation_adapter(
         tmp_path, pinned_target_oid=GitOid("2" * 40)
@@ -499,3 +542,143 @@ def test_conflict_settlement_allows_a_fresh_creation_intent(tmp_path: Path, back
     )
     assert second.intent_id != first.intent_id
     assert second.idempotency_key != first.idempotency_key
+
+
+@dataclass
+class RecordingPlanningProvider:
+    trace: list[str]
+    call_count: int = 0
+
+    def complete(self) -> None:
+        self.trace.append("provider")
+        self.call_count += 1
+
+
+class RecordingPlanningCoordinator:
+    def __init__(
+        self,
+        provider: RecordingPlanningProvider,
+        state: RuntimeStateStore,
+    ) -> None:
+        self._provider = provider
+        self._state = state
+
+    def run_planning_turn(self, run_id: RunId) -> RuntimeDecision:
+        self._provider.complete()
+        return RuntimeDecision.pause(
+            "TEST_AFTER_TARGET_RESERVATION", self._state.audit_sequence(run_id)
+        )
+
+    def resume_recovered_planning_action(
+        self, run_id: RunId, permit: RuntimePermit, action: RecoveredModelAction
+    ) -> RuntimeDecision:
+        raise AssertionError("no recovered planning action is valid in DRAFT")
+
+    def schedule(self, run_id: RunId) -> RuntimeDecision:
+        raise AssertionError("DRAFT delivery must not schedule a Worker")
+
+
+@dataclass
+class TracingReservationGit:
+    trace: list[str]
+
+    def apply(self, operation: TargetReservationOperation) -> TargetReservationOperationResult:
+        self.trace.append("add" if operation.kind == "ADD_NO_CHECKOUT" else "lock")
+        return operation.applied()
+
+
+@dataclass
+class RuntimeScriptedReservationObserver:
+    trace: list[str]
+    observations: deque[ReservationObservation]
+
+    def observe(self, reservation: TargetReservation) -> ReservationObservation:
+        del reservation
+        if len(self.observations) == 3:
+            self.trace.append("intent")
+        self.trace.append("observe")
+        observed = self.observations.popleft()
+        if not self.observations and "intent" in self.trace:
+            self.trace.append("settle")
+        return observed
+
+
+def exact_reservation_observation(locked: bool) -> ReservationObservation:
+    return ReservationObservation(
+        True,
+        True,
+        locked,
+        True,
+        True,
+        admin_entry_name="reservation-1",
+        admin_binding_digest="sha256:" + "b" * 64,
+    )
+
+
+def test_draft_permit_locks_exact_reservation_before_planning_provider_call(
+    tmp_path: Path,
+) -> None:
+    trace: list[str] = []
+    provider = RecordingPlanningProvider(trace)
+    app = make_permitted_draft_runtime(
+        tmp_path,
+        coordinator_factory=lambda store: RecordingPlanningCoordinator(provider, store),
+        reservation_git=TracingReservationGit(trace),
+        reservation_observer=RuntimeScriptedReservationObserver(
+            trace,
+            deque(
+                (
+                    ReservationObservation(False, False, False, False, False),
+                    ReservationObservation(False, False, False, False, False),
+                    exact_reservation_observation(False),
+                    exact_reservation_observation(True),
+                )
+            ),
+        ),
+    )
+
+    stop = app.runtime.run_until_blocked(app.run_id)
+
+    assert stop.reason == RunStopReason.PAUSED
+    assert trace == [
+        "observe",
+        "intent",
+        "observe",
+        "add",
+        "observe",
+        "lock",
+        "observe",
+        "settle",
+        "provider",
+    ]
+    assert provider.call_count == 1
+    assert app.store.run_record(app.run_id).state == RunState.PLANNING
+    assert app.store.target_reservation_for_run(app.run_id).phase == "REGISTERED_LOCKED"
+
+
+@pytest.mark.parametrize(
+    "observation",
+    (
+        ReservationObservation(True, False, False, False, False),
+        ReservationObservation(True, True, False, False, False),
+    ),
+    ids=("mixed", "third"),
+)
+def test_draft_reservation_mixed_or_third_state_pauses_before_provider_call(
+    tmp_path: Path, observation: ReservationObservation
+) -> None:
+    trace: list[str] = []
+    provider = RecordingPlanningProvider(trace)
+    app = make_permitted_draft_runtime(
+        tmp_path,
+        coordinator_factory=lambda store: RecordingPlanningCoordinator(provider, store),
+        reservation_git=TracingReservationGit(trace),
+        reservation_observer=RuntimeScriptedReservationObserver(trace, deque((observation,))),
+    )
+
+    stop = app.runtime.run_until_blocked(app.run_id)
+
+    assert stop.reason == RunStopReason.PAUSED
+    assert trace == ["observe"]
+    assert provider.call_count == 0
+    assert app.store.run_record(app.run_id).state == RunState.DRAFT

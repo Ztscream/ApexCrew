@@ -17,6 +17,7 @@ from helpers.application import (
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
     CheckpointKey,
@@ -34,6 +35,7 @@ from apexcrew.domain.commands import (
     CommandOutcome,
     PausePayload,
     ProposePolicyPayload,
+    RunStop,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
@@ -42,6 +44,7 @@ from apexcrew.domain.effects import (
     EffectResult,
     RecoveryOutcome,
     RecoveryService,
+    ReservationObservation,
     StateCommitFault,
     StateConflict,
     TargetReservation,
@@ -69,6 +72,7 @@ from apexcrew.domain.types import (
     RevisionDigest,
     RunId,
     RunState,
+    RunStopReason,
     RuntimeOwnerId,
     TaskId,
 )
@@ -825,6 +829,81 @@ def test_runtime_permit_consumption_is_atomic_and_one_use(
     )
     assert store.audit_sequence(run_id) == before_replay
     assert clock.readings == 2
+
+
+@pytest.mark.parametrize(
+    "store_factory", [memory_runtime_store_factory, sqlite_runtime_store_factory]
+)
+def test_runtime_reservation_barrier_and_interval_close_match_adapters(
+    tmp_path: Path,
+    store_factory: Callable[[Path, FixedMonotonicClock], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    clock = FixedMonotonicClock(MonotonicInstant(50_000_000_000))
+    store = store_factory(tmp_path, clock)
+    run_id, _ = seed_control_permit(store)
+    owner_id = RuntimeOwnerId("owner-contract")
+    permit = store.consume_current_runtime_permit(run_id, owner_id, store.audit_sequence(run_id))
+    assert permit is not None
+
+    intent = store.record_or_load_target_reservation_creation_intent_under_draft_permit(
+        run_id,
+        owner_id,
+        permit.generation,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    observation = ReservationObservation(
+        True,
+        True,
+        True,
+        True,
+        True,
+        admin_entry_name=intent.reservation_id,
+        admin_binding_digest="sha256:" + "b" * 64,
+    )
+    store.settle_target_reservation_creation_under_draft_permit(
+        intent,
+        TargetReservationCreationOutcome(
+            intent_id=intent.intent_id,
+            run_id=run_id,
+            result_class="REGISTERED_LOCKED",
+            observed=observation,
+        ),
+        owner_id,
+        permit.generation,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    assert store.load_runtime_state(run_id).state == RunState.PLANNING
+    assert store.target_reservation_for_run(run_id).phase == "REGISTERED_LOCKED"
+
+    store.begin_runtime_barrier(run_id, "contract-action", store.audit_sequence(run_id))
+    store.settle_runtime_barrier(
+        run_id,
+        "contract-action",
+        model_calls=0,
+        pending_stop_reason=None,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    clock.instant = MonotonicInstant(55_000_000_000)
+    stop = store.record_runtime_delivery_stop(
+        run_id,
+        owner_id,
+        permit.generation,
+        RunStop(
+            run_id=run_id,
+            state=RunState.PLANNING,
+            reason=RunStopReason.PAUSED,
+            last_sequence=store.audit_sequence(run_id),
+        ),
+        store.audit_sequence(run_id),
+    )
+    assert stop.last_sequence == store.audit_sequence(run_id)
+    assert store.runtime_owner(run_id) is None
+    assert store.active_run_time_state(run_id).cumulative_nanoseconds == 5_000_000_000
+    assert store.runtime_delivery_stop_count(run_id) == 1
+    assert store.audit_event_kinds(run_id)[-2:] == (
+        "RUNTIME_DELIVERY_STOP_RECORDED",
+        "RUNTIME_OWNER_RELEASED",
+    )
 
 
 def seed_mismatched_permit_phase(

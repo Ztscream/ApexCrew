@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from apexcrew.domain.commands import CommandEnvelope, CommandOutcome
+from apexcrew.domain.commands import CommandEnvelope, CommandOutcome, RunStop
 from apexcrew.domain.projection import RunReadModel
 from apexcrew.domain.types import RunId
 
@@ -17,4 +17,9 @@ class RunQueries(Protocol):
         raise NotImplementedError
 
 
-__all__ = ["CrewControl", "RunQueries"]
+class CrewRuntime(Protocol):
+    def run_until_blocked(self, run_id: RunId) -> RunStop:
+        raise NotImplementedError
+
+
+__all__ = ["CrewControl", "CrewRuntime", "RunQueries"]

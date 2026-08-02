@@ -12,7 +12,10 @@ from hashlib import sha256
 from hmac import compare_digest
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
 
 from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
@@ -92,8 +95,11 @@ from apexcrew.domain.commands import (
     ProposePolicyPayload,
     PublicRunSnapshot,
     ResumePayload,
+    RunStop,
     RuntimeAllowedPhase,
+    RuntimeDecision,
     RuntimePermit,
+    RuntimeState,
     applicable_revision_digests_from_json,
     applicable_revision_digests_to_json,
 )
@@ -101,6 +107,7 @@ from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    ReservationObservation,
     RunRecord,
     StateCommitFault,
     StateConflict,
@@ -123,6 +130,7 @@ from apexcrew.domain.model import (
     ModelRequestIntent,
     ProviderAttemptKind,
     ProviderAttemptResult,
+    RecoveredModelAction,
     SettledModelAttempt,
     model_dispatch_result_from_json,
     model_dispatch_result_to_json,
@@ -612,6 +620,50 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
             """CREATE UNIQUE INDEX one_unconsumed_runtime_permit
                 ON runtime_permits(run_id) WHERE state = 'UNCONSUMED'""",
+        ),
+    ),
+    (
+        12,
+        (
+            """CREATE TABLE runtime_interrupts (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                request_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN ('PAUSE','CANCEL')),
+                requested_sequence INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('PENDING','APPLIED','SUPERSEDED'))
+            )""",
+            """CREATE TABLE runtime_barriers (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                action_id TEXT,
+                effect_intent_id TEXT,
+                state TEXT NOT NULL CHECK(state IN ('IDLE','IN_FLIGHT','SETTLED','INDETERMINATE')),
+                pending_stop_reason TEXT,
+                pending_budget_digest TEXT,
+                pending_model_configuration_digest TEXT
+            )""",
+            """CREATE TABLE runtime_delivery_stops (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                permit_generation INTEGER NOT NULL,
+                owner_generation INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                stop_json TEXT NOT NULL,
+                interval_opened_nanoseconds INTEGER NOT NULL,
+                interval_closed_nanoseconds INTEGER NOT NULL,
+                interval_delta_nanoseconds INTEGER NOT NULL CHECK(interval_delta_nanoseconds >= 0),
+                cumulative_nanoseconds INTEGER NOT NULL CHECK(cumulative_nanoseconds >= 0),
+                recorded_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, permit_generation, recorded_sequence)
+            )""",
+            """CREATE TABLE runtime_faults (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                permit_generation INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                fault_code TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                resulting_sequence INTEGER NOT NULL,
+                barrier_state TEXT NOT NULL CHECK(barrier_state IN ('IDLE','SETTLED','INDETERMINATE')),
+                PRIMARY KEY(run_id, permit_generation, resulting_sequence)
+            )""",
         ),
     ),
 )
@@ -1115,6 +1167,7 @@ class SqliteStateStore:
         event_factory: Callable[[], tuple[AuditEvent, ...]],
         mutate: Callable[[sqlite3.Connection], None],
         runtime_now_factory: Callable[[], MonotonicInstant | None] | None = None,
+        finalize: Callable[[sqlite3.Connection], None] | None = None,
     ) -> AuditSequence:
         with self._lock:
             connection = self._connection
@@ -1144,6 +1197,8 @@ class SqliteStateStore:
                         sequence,
                         runtime_now=runtime_now,
                     )
+                if finalize is not None:
+                    finalize(connection)
             except BaseException:
                 connection.rollback()
                 raise
@@ -2846,13 +2901,15 @@ class SqliteStateStore:
             ).fetchall()
         return tuple(str(row["event_kind"]) for row in rows)
 
-    def runtime_barrier_state(self, run_id: RunId) -> Literal["IN_FLIGHT", "SETTLED"]:
+    def runtime_barrier_state(
+        self, run_id: RunId
+    ) -> Literal["IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"]:
         with self._read_transaction() as connection:
             row = connection.execute(
-                "SELECT 1 FROM model_attempts WHERE run_id = ? AND state = 'RESERVED' LIMIT 1",
+                "SELECT state FROM runtime_barriers WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
-        return "IN_FLIGHT" if row is not None else "SETTLED"
+        return "IDLE" if row is None else row["state"]
 
     def _evaluate_model_reservation(
         self, connection: sqlite3.Connection, request: ModelReservationRequest
@@ -6133,6 +6190,691 @@ class SqliteStateStore:
             CommandStatus.INVALID,
             "COMMAND_NOT_AVAILABLE_IN_TASK_10",
             "CONTROL_COMMAND_REJECTED",
+        )
+
+    def load_runtime_state(self, run_id: RunId) -> RuntimeState:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT runs.state, runs.runtime_progress_generation, "
+                "runs.current_plan_digest, runs.current_policy_digest, "
+                "runs.current_budget_digest, runs.current_model_configuration_digest, "
+                "COALESCE(run_sequences.current_sequence, 0) AS sequence "
+                "FROM runs LEFT JOIN run_sequences USING(run_id) WHERE runs.run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        if any(
+            row[name] is None
+            for name in (
+                "current_policy_digest",
+                "current_budget_digest",
+                "current_model_configuration_digest",
+            )
+        ):
+            raise StateConflict("RUNTIME_REVISION_BINDING_INCOMPLETE")
+        return RuntimeState(
+            run_id=run_id,
+            state=RunState(row["state"]),
+            sequence=AuditSequence(row["sequence"]),
+            runtime_progress_generation=int(row["runtime_progress_generation"]),
+            plan_digest=(
+                None
+                if row["current_plan_digest"] is None
+                else RevisionDigest(row["current_plan_digest"])
+            ),
+            policy_digest=RevisionDigest(row["current_policy_digest"]),
+            budget_digest=RevisionDigest(row["current_budget_digest"]),
+            model_configuration_digest=RevisionDigest(row["current_model_configuration_digest"]),
+        )
+
+    def target_reservation_for_run(self, run_id: RunId) -> TargetReservation:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM target_reservations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        return self._target_reservation_from_row(row)
+
+    def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
+        row = self._connection.execute(
+            "SELECT runtime_owner_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        return None if row[0] is None else RuntimeOwnerId(row[0])
+
+    def runtime_delivery_event(self, run_id: RunId) -> str | None:
+        row = self._connection.execute(
+            "SELECT event_kind FROM audit_events WHERE run_id = ? "
+            "AND event_kind IN ('RUNTIME_OWNER_RELEASED','RUNTIME_DELIVERY_STOP_RECORDED') "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def runtime_delivery_stop_count(self, run_id: RunId) -> int:
+        return int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM runtime_delivery_stops WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+        )
+
+    def model_attempt_count(self, logical_turn_id: LogicalTurnId) -> int:
+        return int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM model_attempts WHERE logical_turn_id = ?",
+                (logical_turn_id,),
+            ).fetchone()[0]
+        )
+
+    def unconsumed_permit_count(self, run_id: RunId) -> int:
+        return int(
+            self._connection.execute(
+                "SELECT COUNT(*) FROM runtime_permits WHERE run_id = ? AND state = 'UNCONSUMED'",
+                (run_id,),
+            ).fetchone()[0]
+        )
+
+    def _require_consumed_runtime_owner(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> tuple[RuntimePermit, sqlite3.Row]:
+        run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        permit_row = connection.execute(
+            "SELECT * FROM runtime_permits WHERE run_id = ? AND generation = ? "
+            "AND state = 'CONSUMED' AND consumed_owner_id = ?",
+            (run_id, permit_generation, owner_id),
+        ).fetchone()
+        if (
+            run is None
+            or permit_row is None
+            or run["runtime_owner_id"] != owner_id
+            or run["runtime_interval_owner_generation"] != run["runtime_owner_generation"]
+            or run["runtime_interval_opened_nanoseconds"] is None
+        ):
+            raise StateConflict("RUNTIME_OWNER_BINDING_MISMATCH")
+        permit = self._runtime_permit_from_row(permit_row)
+        return permit, run
+
+    def _require_consumed_draft_reservation_permit(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> RuntimePermit:
+        permit, run = self._require_consumed_runtime_owner(
+            connection, run_id, owner_id, permit_generation
+        )
+        if permit.allowed_phase != "DRAFT" or RunState(run["state"]) != RunState.DRAFT:
+            raise StateConflict("TARGET_RESERVATION_PERMIT_BINDING_MISMATCH")
+        return permit
+
+    def record_or_load_target_reservation_creation_intent_under_draft_permit(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> TargetReservationCreationIntent:
+        existing = self.target_reservation_for_run(run_id)
+        if existing.phase == "CREATION_INTENT_RECORDED":
+            with self._read_transaction() as connection:
+                return TargetReservationCreationIntent.from_effect_intent(
+                    self._unsettled_effect_for_reservation(connection, existing)
+                )
+        created: list[TargetReservationCreationIntent] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit = self._require_consumed_draft_reservation_permit(
+                connection, run_id, owner_id, permit_generation
+            )
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            intent = self._new_target_reservation_creation_intent(
+                connection, reservation, expected_sequence
+            ).model_copy(
+                update={
+                    "applicable_revision_digests": permit.applicable_revision_digests,
+                    "target_authority_digest": permit.target_authority_digest,
+                }
+            )
+            self._insert_effect_intent(
+                connection, intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            )
+            if (
+                connection.execute(
+                    "UPDATE target_reservations SET phase = 'CREATION_INTENT_RECORDED', "
+                    "creation_intent_id = ? WHERE reservation_id = ? AND phase = 'ALLOCATED'",
+                    (intent.intent_id, reservation.reservation_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("TARGET_RESERVATION_ALLOCATION_COMPARE_AND_SET_FAILED")
+            created.append(intent)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return created[0]
+
+    def settle_target_reservation_creation_under_draft_permit(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        _validate_reservation_outcome(intent, outcome)
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit = self._require_consumed_draft_reservation_permit(
+                connection, intent.run_id, owner_id, permit_generation
+            )
+            if (
+                intent.applicable_revision_digests != permit.applicable_revision_digests
+                or intent.target_authority_digest != permit.target_authority_digest
+            ):
+                raise StateConflict("TARGET_RESERVATION_PERMIT_AUTHORITY_MISMATCH")
+            reservation = self._target_reservation_for_run_for_update(connection, intent.run_id)
+            self._require_matching_unsettled_reservation_intent(connection, reservation, intent)
+            self._insert_effect_result(
+                connection,
+                intent.run_id,
+                intent.intent_id,
+                result,
+                intent.applicable_revision_digests,
+            )
+            if outcome.result_class == "REGISTERED_LOCKED":
+                if classify_reservation_creation(outcome.observed) != "SETTLE":
+                    raise StateConflict("TARGET_RESERVATION_SUCCESS_NOT_EXACT")
+                phase, state = "REGISTERED_LOCKED", RunState.PLANNING
+                admin_name = outcome.observed.admin_entry_name
+                admin_digest = outcome.observed.admin_binding_digest
+            elif outcome.result_class == "CONFLICT":
+                phase, state = "ALLOCATED", RunState.DRAFT
+                admin_name = admin_digest = None
+            else:
+                phase, state = "CREATION_INTENT_RECORDED", RunState.INDETERMINATE
+                admin_name = admin_digest = None
+                self._close_new_dispatch(
+                    connection, intent.run_id, DispatchCloseCause.RUNTIME_FAULT
+                )
+            connection.execute(
+                "UPDATE target_reservations SET phase = ?, admin_entry_name = ?, "
+                "admin_binding_digest = ? WHERE reservation_id = ?",
+                (phase, admin_name, admin_digest, reservation.reservation_id),
+            )
+            connection.execute(
+                "UPDATE runs SET state = ? WHERE run_id = ?", (state.value, intent.run_id)
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_SETTLED"),
+            mutate=mutate,
+        )
+
+    def reuse_locked_target_reservation_under_draft_permit(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if classify_reservation_creation(observed) != "SETTLE":
+            raise StateConflict("TARGET_RESERVATION_REUSE_NOT_EXACT")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_consumed_draft_reservation_permit(
+                connection, run_id, owner_id, permit_generation
+            )
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_REUSE_PHASE_INVALID")
+            if (
+                connection.execute(
+                    "UPDATE runs SET state = 'PLANNING' WHERE run_id = ? AND state = 'DRAFT'",
+                    (run_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("TARGET_RESERVATION_DRAFT_TRANSITION_REQUIRED")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_REUSED_AND_PLANNING_STARTED"),
+            mutate=mutate,
+        )
+
+    def record_target_reservation_pre_intent_stop(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        event = (
+            "TARGET_RESERVATION_OBSERVATION_INDETERMINATE"
+            if not observed.observable
+            else "TARGET_RESERVATION_INITIALIZATION_CONFLICT"
+        )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_consumed_draft_reservation_permit(
+                connection, run_id, owner_id, permit_generation
+            )
+            if not observed.observable:
+                connection.execute(
+                    "UPDATE runs SET state = 'INDETERMINATE' WHERE run_id = ?", (run_id,)
+                )
+                self._close_new_dispatch(connection, run_id, DispatchCloseCause.RUNTIME_FAULT)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(event),
+            mutate=mutate,
+        )
+
+    def begin_runtime_barrier(
+        self, run_id: RunId, action_id: str, expected_sequence: AuditSequence
+    ) -> str:
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_new_dispatch_open(connection, run_id)
+            current = connection.execute(
+                "SELECT state FROM runtime_barriers WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if current is not None and current[0] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            connection.execute(
+                "INSERT INTO runtime_barriers(run_id, action_id, state) "
+                "VALUES (?, ?, 'IN_FLIGHT') ON CONFLICT(run_id) DO UPDATE SET "
+                "action_id = excluded.action_id, effect_intent_id = NULL, "
+                "state = 'IN_FLIGHT', pending_stop_reason = NULL",
+                (run_id, action_id),
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_BARRIER_STARTED", action_id=action_id),
+            mutate=mutate,
+        )
+        return action_id
+
+    def settle_runtime_barrier(
+        self,
+        run_id: RunId,
+        action_id: str,
+        model_calls: int,
+        pending_stop_reason: str | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if isinstance(model_calls, bool) or model_calls < 0:
+            raise StateConflict("GLOBAL_USAGE_VALUE_INVALID")
+        events = [AuditEvent.kind("RUNTIME_BARRIER_SETTLED", action_id=action_id)]
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT state, action_id FROM runtime_barriers WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None or row["state"] != "IN_FLIGHT" or row["action_id"] != action_id:
+                raise StateConflict("RUNTIME_BARRIER_SETTLE_COMPARE_AND_SET_FAILED")
+            counters = self._model_counters(connection, run_id)
+            calls = counters.calls + model_calls
+            connection.execute(
+                "INSERT INTO model_counters(run_id, calls, input_tokens, output_tokens, cost_usd) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET calls = excluded.calls, "
+                "input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, "
+                "cost_usd = excluded.cost_usd",
+                (
+                    run_id,
+                    calls,
+                    counters.input_tokens,
+                    counters.output_tokens,
+                    str(counters.cost_usd),
+                ),
+            )
+            budget_digest = self._current_revision_digests_in_transaction(
+                connection, run_id
+            ).budget_digest
+            if budget_digest is None:
+                raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+            self._approved_budget_for_update(connection, run_id, budget_digest)
+            _settlement, stopped = self._settle_global_usage_in_transaction(
+                connection,
+                run_id,
+                budget_digest,
+                GlobalBudgetMetric.MODEL_CALLS,
+                calls,
+            )
+            derived = "BUDGET_STOP" if stopped else None
+            if pending_stop_reason != derived:
+                raise StateConflict("RUNTIME_BARRIER_STOP_CAUSE_MISMATCH")
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            connection.execute(
+                "UPDATE runtime_barriers SET state = 'SETTLED', pending_stop_reason = ? "
+                "WHERE run_id = ?",
+                (derived, run_id),
+            )
+
+        return self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+
+    def apply_post_barrier_controls(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision | None:
+        with self._read_transaction() as connection:
+            self._require_consumed_runtime_owner(connection, run_id, owner_id, permit_generation)
+            interrupt = connection.execute(
+                "SELECT kind FROM runtime_interrupts WHERE run_id = ? AND state = 'PENDING'",
+                (run_id,),
+            ).fetchone()
+            barrier = connection.execute(
+                "SELECT state, pending_stop_reason FROM runtime_barriers WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if interrupt is not None:
+            return RuntimeDecision.pause(str(interrupt["kind"]), expected_sequence)
+        if barrier is not None and barrier["pending_stop_reason"] == "BUDGET_STOP":
+            return RuntimeDecision.pause("GLOBAL_MODEL_CALL_CEILING", expected_sequence)
+        return None
+
+    def record_runtime_delivery_stop(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        candidate: RunStop,
+        expected_sequence: AuditSequence,
+    ) -> RunStop:
+        result: list[RunStop] = []
+        closed_at: list[MonotonicInstant] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit, run = self._require_consumed_runtime_owner(
+                connection, run_id, owner_id, permit_generation
+            )
+            barrier = connection.execute(
+                "SELECT state FROM runtime_barriers WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if barrier is not None and barrier["state"] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            generation = int(run["runtime_interval_owner_generation"])
+            opened = int(run["runtime_interval_opened_nanoseconds"])
+            latest = connection.execute(
+                "SELECT runtime_monotonic_nanoseconds FROM audit_events WHERE run_id = ? "
+                "AND runtime_owner_generation = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id, generation),
+            ).fetchone()
+            if self._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            closed = self._monotonic_clock.now()
+            floor = opened if latest is None else int(latest[0])
+            if closed.nanoseconds < floor:
+                raise StateConflict("MONOTONIC_CLOCK_REGRESSED")
+            closed_at.append(closed)
+            cumulative = int(run["active_runtime_nanoseconds"]) + closed.nanoseconds - opened
+            final = RunStop(
+                run_id=run_id,
+                state=RunState(run["state"]),
+                reason=candidate.reason,
+                last_sequence=AuditSequence(expected_sequence + 2),
+                pending=candidate.pending,
+            )
+            connection.execute(
+                "UPDATE runs SET active_runtime_nanoseconds = ? WHERE run_id = ?",
+                (cumulative, run_id),
+            )
+            connection.execute(
+                "INSERT INTO runtime_delivery_stops VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    permit.generation,
+                    generation,
+                    final.reason.value,
+                    final.model_dump_json(),
+                    opened,
+                    closed.nanoseconds,
+                    closed.nanoseconds - opened,
+                    cumulative,
+                    final.last_sequence,
+                ),
+            )
+            result.append(final)
+
+        def finalize(connection: sqlite3.Connection) -> None:
+            if (
+                connection.execute(
+                    "UPDATE runs SET runtime_owner_id = NULL, "
+                    "runtime_interval_owner_generation = NULL, "
+                    "runtime_interval_opened_nanoseconds = NULL WHERE run_id = ? "
+                    "AND runtime_owner_id = ?",
+                    (run_id, owner_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("RUNTIME_OWNER_RELEASE_COMPARE_AND_SET_FAILED")
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (
+                AuditEvent.kind("RUNTIME_DELIVERY_STOP_RECORDED"),
+                AuditEvent.kind("RUNTIME_OWNER_RELEASED"),
+            ),
+            mutate=mutate,
+            runtime_now_factory=lambda: closed_at[0],
+            finalize=finalize,
+        )
+        return result[0]
+
+    def record_runtime_fault_and_classify_barrier(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        fault: RuntimeFault,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeFaultDisposition:
+        from apexcrew.application.runtime import RuntimeFaultDisposition
+
+        dispositions: list[RuntimeFaultDisposition] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_consumed_runtime_owner(connection, run_id, owner_id, permit_generation)
+            barrier = connection.execute(
+                "SELECT state FROM runtime_barriers WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            stored_state = "IDLE" if barrier is None else str(barrier["state"])
+            state: Literal["IDLE", "SETTLED", "INDETERMINATE"]
+            stop_reason: Literal["RUNTIME_FAULT", "RUNTIME_CLOCK_REGRESSION", "INDETERMINATE"]
+            if stored_state == "IN_FLIGHT":
+                state = "INDETERMINATE"
+                connection.execute(
+                    "UPDATE runtime_barriers SET state = 'INDETERMINATE' WHERE run_id = ?",
+                    (run_id,),
+                )
+                connection.execute(
+                    "UPDATE runs SET state = 'INDETERMINATE' WHERE run_id = ?", (run_id,)
+                )
+                stop_reason = "INDETERMINATE"
+            else:
+                state = "SETTLED" if stored_state == "SETTLED" else "IDLE"
+                stop_reason = (
+                    "RUNTIME_CLOCK_REGRESSION"
+                    if fault.fault_code == "MONOTONIC_CLOCK_REGRESSED"
+                    else "RUNTIME_FAULT"
+                )
+            self._close_new_dispatch(connection, run_id, DispatchCloseCause.RUNTIME_FAULT)
+            connection.execute(
+                "INSERT INTO runtime_faults VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    permit_generation,
+                    fault.phase,
+                    fault.fault_code,
+                    fault.fingerprint,
+                    expected_sequence + 1,
+                    state,
+                ),
+            )
+            dispositions.append(
+                RuntimeFaultDisposition(AuditSequence(expected_sequence + 1), stop_reason, state)
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_FAULT_RECORDED"),
+            mutate=mutate,
+        )
+        return dispositions[0]
+
+    def latest_runtime_fault(self, run_id: RunId) -> object:
+        from apexcrew.application.runtime import RuntimeFault
+
+        row = self._connection.execute(
+            "SELECT phase, fault_code, fingerprint FROM runtime_faults WHERE run_id = ? "
+            "ORDER BY resulting_sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUNTIME_FAULT_NOT_FOUND")
+        return RuntimeFault(row["phase"], row["fault_code"], row["fingerprint"])
+
+    def recorded_stop_reason(self, run_id: RunId) -> str | None:
+        fault = self._connection.execute(
+            "SELECT fault_code FROM runtime_faults WHERE run_id = ? "
+            "ORDER BY resulting_sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if fault is not None:
+            return (
+                "RUNTIME_CLOCK_REGRESSION"
+                if fault[0] == "MONOTONIC_CLOCK_REGRESSED"
+                else "RUNTIME_FAULT"
+            )
+        barrier = self._connection.execute(
+            "SELECT pending_stop_reason FROM runtime_barriers WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return None if barrier is None else barrier[0]
+
+    def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None:
+        row = self._connection.execute(
+            "SELECT logical_turn_id FROM model_turns WHERE run_id = ? "
+            "AND state = 'COMPLETION_COMMITTED' AND downstream_intent_id IS NULL "
+            "ORDER BY committed_sequence, logical_turn_id LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return None if row is None else self.committed_model_turn(run_id, row[0])
+
+    def next_recovered_model_action(self, run_id: RunId) -> RecoveredModelAction | None:
+        row = self._connection.execute(
+            "SELECT model_turns.logical_turn_id, effect_intents.intent_id "
+            "FROM model_turns JOIN effect_intents "
+            "ON effect_intents.intent_id = model_turns.downstream_intent_id "
+            "WHERE model_turns.run_id = ? AND model_turns.state = 'DOWNSTREAM_INTENT_RECORDED' "
+            "AND effect_intents.kind = 'RECOVERED_MODEL_ACTION' "
+            "AND NOT EXISTS (SELECT 1 FROM effect_results "
+            "WHERE effect_results.intent_id = effect_intents.intent_id) "
+            "ORDER BY effect_intents.created_sequence LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        turn = self.committed_model_turn(run_id, row["logical_turn_id"])
+        if turn is None:
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH")
+        try:
+            return RecoveredModelAction.from_journal(turn, self.effect_intent(row["intent_id"]))
+        except ValueError as error:
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH") from error
+
+    def apply_runtime_continue(self, command: CommandEnvelope) -> CommandOutcome:
+        from apexcrew.domain.commands import ContinuePayload
+
+        if not isinstance(command.payload, ContinuePayload):
+            raise StateConflict("RUNTIME_CONTINUE_COMMAND_REQUIRED")
+        run_id = command.payload.run_id
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        target_digest = self.target_authority_digest(run_id)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run["runtime_owner_id"] is not None:
+                generation = run["runtime_interval_owner_generation"]
+                opened = run["runtime_interval_opened_nanoseconds"]
+                if generation is None or opened is None:
+                    raise StateConflict("ACTIVE_RUN_TIME_RECOVERY_INVALID")
+                last = connection.execute(
+                    "SELECT runtime_monotonic_nanoseconds FROM audit_events WHERE run_id = ? "
+                    "AND runtime_owner_generation = ? ORDER BY sequence DESC LIMIT 1",
+                    (run_id, generation),
+                ).fetchone()
+                if last is None or last[0] is None or int(last[0]) < int(opened):
+                    raise StateConflict("ACTIVE_RUN_TIME_RECOVERY_INVALID")
+                cumulative = int(run["active_runtime_nanoseconds"]) + int(last[0]) - int(opened)
+                connection.execute(
+                    "UPDATE runs SET active_runtime_nanoseconds = ?, runtime_owner_id = NULL, "
+                    "runtime_interval_owner_generation = NULL, "
+                    "runtime_interval_opened_nanoseconds = NULL WHERE run_id = ?",
+                    (cumulative, run_id),
+                )
+            state = RunState(run["state"])
+            allowed: RuntimeAllowedPhase = (
+                "TERMINAL_ADMINISTRATION"
+                if state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
+                else state.value  # type: ignore[assignment]
+            )
+            self._issue_runtime_permit_in_transaction(
+                connection,
+                command,
+                allowed,
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_OWNER_ORPHANED_AND_PERMIT_ISSUED",
+            mutate,
         )
 
     def fail_next_commit_after_state_write_for_test(self) -> None:

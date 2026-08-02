@@ -3,20 +3,54 @@ from __future__ import annotations
 import json
 import sqlite3
 from base64 import b32encode
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import date
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
+from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.adapters.system import SystemMonotonicClock
 from apexcrew.application.control import (
     BootstrapRepositoryAuthority,
     ControlCommandService,
     CrewControlService,
 )
 from apexcrew.application.queries import RunQueryService
-from apexcrew.domain.authority import TaskCounterSnapshot, TaskPauseBinding
+from apexcrew.application.runtime import (
+    FinalIntegrationDriver,
+    InjectedProcessCrash,
+    InMemoryRunOwnership,
+    PrivateRefDriver,
+    RecoveredActionRouter,
+    ResolutionDriver,
+    RuntimeCoordinator,
+    RuntimePhaseDriverService,
+    RuntimeService,
+    RuntimeStateStore,
+    RuntimeWorkerLoop,
+    TargetReservationDriverService,
+    TerminalCleanupDriver,
+)
+from apexcrew.domain.admission import (
+    TargetReservationAdmissionService,
+    TargetReservationBootstrapAdmissionService,
+    TargetReservationGitPort,
+    TargetReservationObserver,
+    TargetReservationOperation,
+    TargetReservationOperationResult,
+)
+from apexcrew.domain.authority import (
+    AuthorityService,
+    MonotonicClock,
+    MonotonicInstant,
+    TaskCounterSnapshot,
+    TaskPauseBinding,
+)
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     ApproveBudgetPayload,
@@ -25,14 +59,32 @@ from apexcrew.domain.commands import (
     ApprovePolicyPayload,
     BeginPlanningPayload,
     CommandEnvelope,
+    CommandOutcome,
     CommandPayload,
+    ContinuePayload,
     CreateRunPayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
     ResumePayload,
+    RuntimeDecision,
+    RuntimePermit,
 )
-from apexcrew.domain.effects import AuditEvent
+from apexcrew.domain.effects import (
+    AuditEvent,
+    RecoveryOutcome,
+    ReservationObservation,
+    TargetReservation,
+)
+from apexcrew.domain.model import (
+    CommittedModelTurn,
+    DurableModelClient,
+    ModelCompletion,
+    ModelRequest,
+    ModelUsage,
+    ProviderAttemptResult,
+    RecoveredModelAction,
+)
 from apexcrew.domain.projection import ProjectionService
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
@@ -52,11 +104,13 @@ from apexcrew.domain.revisions import (
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    CommandStatus,
     GitOid,
     RepositoryId,
     RevisionDigest,
     RunId,
     RunState,
+    RunStopReason,
     TaskId,
 )
 
@@ -104,11 +158,13 @@ class ApplicationFixture:
         self.store.close()
 
 
-def make_application(tmp_path: Path) -> ApplicationFixture:
+def make_application(
+    tmp_path: Path, *, monotonic_clock: MonotonicClock | None = None
+) -> ApplicationFixture:
     root = tmp_path / "application"
     root.mkdir()
     database = root / "state.db"
-    store = SqliteStateStore(database)
+    store = SqliteStateStore(database, monotonic_clock=monotonic_clock)
     target_authority = FixtureTargetAuthorityDigestService(store)
     control = CrewControlService(
         ControlCommandService(
@@ -354,7 +410,7 @@ def approve_current_policy_budget_and_model(app: ApplicationFixture, run_id: Run
 
 
 def make_begin_planning_command(
-    app: ApplicationFixture,
+    app: ApplicationFixture | RuntimeApplicationFixture,
     run_id: RunId,
     request_id: str = "begin-planning",
 ) -> CommandEnvelope:
@@ -566,3 +622,488 @@ def make_resume_command(
             pause_reason=pause_reason,
         ),
     )
+
+
+@dataclass
+class ManualMonotonicClock:
+    nanoseconds: int
+
+    @classmethod
+    def at_seconds(cls, seconds: int) -> ManualMonotonicClock:
+        return cls(seconds * 1_000_000_000)
+
+    def now(self) -> MonotonicInstant:
+        return MonotonicInstant(self.nanoseconds)
+
+    def advance_seconds(self, seconds: int) -> None:
+        if seconds < 0:
+            raise ValueError("MANUAL_MONOTONIC_ADVANCE_NEGATIVE")
+        self.nanoseconds += seconds * 1_000_000_000
+
+
+@dataclass
+class RegressOnceMonotonicClock:
+    first: MonotonicInstant
+    regressed: MonotonicInstant
+    calls: int = 0
+
+    def now(self) -> MonotonicInstant:
+        self.calls += 1
+        return self.regressed if self.calls == 2 else self.first
+
+
+class RuntimeAwareControl:
+    def __init__(
+        self,
+        base: CrewControlService,
+        store: SqliteStateStore,
+        ownership: InMemoryRunOwnership,
+    ) -> None:
+        self._base = base
+        self._store = store
+        self._ownership = ownership
+
+    def handle(self, command: CommandEnvelope) -> CommandOutcome:
+        if not isinstance(command.payload, ContinuePayload):
+            return self._base.handle(command)
+        with self._ownership.acquire(command.payload.run_id) as owner:
+            if owner is None:
+                return CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.CONFLICT,
+                    run_id=command.payload.run_id,
+                    resulting_sequence=self._store.audit_sequence(command.payload.run_id),
+                    failed_invariant="RUNTIME_DELIVERY_PENDING",
+                )
+            return self._store.apply_runtime_continue(command)
+
+
+@dataclass(slots=True)
+class RuntimeApplicationFixture:
+    root: Path
+    store: SqliteStateStore
+    control: RuntimeAwareControl
+    queries: RunQueryService
+    runtime: RuntimeService
+    model: ScriptedMockLLM
+    git_spawner: RecordingGitSpawner
+    ownership: InMemoryRunOwnership
+    monotonic_clock: MonotonicClock
+    run_id: RunId
+    begin_command: CommandEnvelope | None = None
+
+    def reopen(self) -> RuntimeApplicationFixture:
+        self.store.close()
+        return open_runtime_application(
+            self.root,
+            self.run_id,
+            model=self.model,
+            monotonic_clock=self.monotonic_clock,
+        )
+
+
+@dataclass
+class RecordingGitSpawner:
+    call_count: int = 0
+
+
+class FailClosedPrivateRefDriver(PrivateRefDriver):
+    def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        del run_id, permit
+        return RuntimeDecision.pause("PRIVATE_REF_DRIVER_NOT_INSTALLED")
+
+
+class FailClosedResolutionDriver(ResolutionDriver):
+    def resume(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        del run_id, permit
+        return RuntimeDecision.pause("RESOLUTION_DRIVER_NOT_INSTALLED")
+
+
+class FailClosedFinalIntegrationDriver(FinalIntegrationDriver):
+    def integrate(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        del run_id, permit
+        return RuntimeDecision.pause("FINAL_INTEGRATION_DRIVER_NOT_INSTALLED")
+
+
+class FailClosedTerminalCleanupDriver(TerminalCleanupDriver):
+    def reconcile(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        del run_id, permit
+        return RuntimeDecision.pause("TERMINAL_CLEANUP_DRIVER_NOT_INSTALLED")
+
+
+class NoEffectRecoveryService:
+    def __init__(self, store: SqliteStateStore) -> None:
+        self._store = store
+
+    def reconcile(self, run_id: RunId) -> RecoveryOutcome:
+        if self._store.unsettled_intents(run_id):
+            raise AssertionError("test fixture must install a recovery strategy")
+        return RecoveryOutcome.empty()
+
+
+class StaticToolSchemaProvider:
+    @property
+    def schema_digest(self) -> Sha256DigestText:
+        return Sha256DigestText(FIXTURE_TOOL_SCHEMA_DIGEST)
+
+
+class FixtureStoppingCoordinator:
+    def __init__(self, store: RuntimeStateStore) -> None:
+        self._store = store
+
+    def run_planning_turn(self, run_id: RunId) -> RuntimeDecision:
+        return RuntimeDecision.pause("FIXTURE_PLANNING_STOP", self._store.audit_sequence(run_id))
+
+    def resume_recovered_planning_action(
+        self, run_id: RunId, permit: RuntimePermit, action: RecoveredModelAction
+    ) -> RuntimeDecision:
+        del permit, action
+        return RuntimeDecision.pause("FIXTURE_RECOVERED_STOP", self._store.audit_sequence(run_id))
+
+    def schedule(self, run_id: RunId) -> RuntimeDecision:
+        return RuntimeDecision.pause("FIXTURE_WORKER_STOP", self._store.audit_sequence(run_id))
+
+
+class FixtureWorkerLoop:
+    def resume_recovered_worker_action(
+        self, run_id: RunId, permit: RuntimePermit, action: RecoveredModelAction
+    ) -> RuntimeDecision:
+        del run_id, permit, action
+        raise AssertionError("Task 11 fixture has no Worker recovery")
+
+
+@dataclass
+class FixtureReservationGit:
+    def apply(self, operation: TargetReservationOperation) -> TargetReservationOperationResult:
+        return operation.applied()
+
+
+def compose_runtime_fixture(
+    base: ApplicationFixture,
+    *,
+    model: ScriptedMockLLM,
+    coordinator: RuntimeCoordinator,
+    workers: RuntimeWorkerLoop,
+    reservation_git: TargetReservationGitPort,
+    monotonic_clock: MonotonicClock,
+    reservation_observer: TargetReservationObserver,
+) -> RuntimeApplicationFixture:
+    reservation_effects = TargetReservationAdmissionService(reservation_observer, reservation_git)
+    target_driver = TargetReservationDriverService(
+        TargetReservationBootstrapAdmissionService(
+            state=base.store,
+            observer=reservation_observer,
+            effects=reservation_effects,
+        )
+    )
+    phase_drivers = RuntimePhaseDriverService(
+        recovered_actions=RecoveredActionRouter(coordinator, workers),
+        target_reservations=target_driver,
+        private_refs=FailClosedPrivateRefDriver(),
+        resolution=FailClosedResolutionDriver(),
+        integration=FailClosedFinalIntegrationDriver(),
+        cleanup=FailClosedTerminalCleanupDriver(),
+    )
+    ownership = InMemoryRunOwnership()
+    runtime = RuntimeService(
+        store=base.store,
+        ownership=ownership,
+        journal=base.store,
+        authority=AuthorityService(journal=base.store),
+        recovery=NoEffectRecoveryService(base.store),
+        coordinator=coordinator,
+        model_client=DurableModelClient(model=model, journal=base.store),
+        tools=StaticToolSchemaProvider(),
+        phase_drivers=phase_drivers,
+    )
+    if base.run_id is None:
+        raise AssertionError("runtime fixture requires a control-created Run")
+    spawner = RecordingGitSpawner()
+    return RuntimeApplicationFixture(
+        root=base.root,
+        store=base.store,
+        control=RuntimeAwareControl(base.control, base.store, ownership),
+        queries=base.queries,
+        runtime=runtime,
+        model=model,
+        git_spawner=spawner,
+        ownership=ownership,
+        monotonic_clock=monotonic_clock,
+        run_id=base.run_id,
+    )
+
+
+@dataclass
+class ExactReservationObserver:
+    calls: int = 0
+
+    def observe(self, reservation: TargetReservation) -> ReservationObservation:
+        self.calls += 1
+        if self.calls <= 2:
+            return ReservationObservation(False, False, False, False, False)
+        return ReservationObservation(
+            True,
+            True,
+            self.calls >= 4,
+            True,
+            True,
+            admin_entry_name=reservation.reservation_id,
+            admin_binding_digest="sha256:" + "b" * 64,
+        )
+
+
+def create_approved_draft(app: RuntimeApplicationFixture) -> RunId:
+    return app.run_id
+
+
+def make_runtime_application(
+    tmp_path: Path,
+    *,
+    model: ScriptedMockLLM | None = None,
+    coordinator_factory: Callable[
+        [RuntimeStateStore], RuntimeCoordinator
+    ] = FixtureStoppingCoordinator,
+    reservation_git: TargetReservationGitPort | None = None,
+    budget: BudgetRevisionDocument | None = None,
+    monotonic_clock: MonotonicClock | None = None,
+    reservation_observer: TargetReservationObserver | None = None,
+) -> RuntimeApplicationFixture:
+    runtime_clock = SystemMonotonicClock() if monotonic_clock is None else monotonic_clock
+    base = make_application(tmp_path, monotonic_clock=runtime_clock)
+    run_id = create_draft_with_three_proposals(base, budget=budget)
+    approve_current_policy_budget_and_model(base, run_id)
+    base.bind_run(run_id)
+    return compose_runtime_fixture(
+        base,
+        model=ScriptedMockLLM([]) if model is None else model,
+        coordinator=coordinator_factory(base.store),
+        workers=FixtureWorkerLoop(),
+        reservation_git=FixtureReservationGit() if reservation_git is None else reservation_git,
+        monotonic_clock=runtime_clock,
+        reservation_observer=(
+            ExactReservationObserver() if reservation_observer is None else reservation_observer
+        ),
+    )
+
+
+def make_continue_command(
+    app: RuntimeApplicationFixture,
+    run_id: RunId,
+    *,
+    request_id: str,
+) -> CommandEnvelope:
+    return _envelope(
+        request_id,
+        app.store.audit_sequence(run_id),
+        app.store.current_revision_digests(run_id),
+        ContinuePayload(run_id=run_id),
+    )
+
+
+def make_permitted_draft_runtime(
+    tmp_path: Path,
+    *,
+    model: ScriptedMockLLM | None = None,
+    coordinator_factory: Callable[
+        [RuntimeStateStore], RuntimeCoordinator
+    ] = FixtureStoppingCoordinator,
+    reservation_git: TargetReservationGitPort | None = None,
+    monotonic_clock: MonotonicClock | None = None,
+    reservation_observer: TargetReservationObserver | None = None,
+) -> RuntimeApplicationFixture:
+    app = make_runtime_application(
+        tmp_path,
+        model=model,
+        coordinator_factory=coordinator_factory,
+        reservation_git=reservation_git,
+        monotonic_clock=monotonic_clock,
+        reservation_observer=reservation_observer,
+    )
+    command = make_begin_planning_command(app, app.run_id, request_id="begin-draft")
+    assert app.control.handle(command).status == "ACCEPTED"
+    return replace(app, begin_command=command)
+
+
+def make_permitted_planning_application(
+    tmp_path: Path,
+    *,
+    model: ScriptedMockLLM,
+    coordinator_factory: Callable[
+        [RuntimeStateStore], RuntimeCoordinator
+    ] = FixtureStoppingCoordinator,
+    monotonic_clock: MonotonicClock | None = None,
+) -> RuntimeApplicationFixture:
+    app = make_permitted_draft_runtime(
+        tmp_path,
+        model=model,
+        coordinator_factory=coordinator_factory,
+        monotonic_clock=monotonic_clock,
+    )
+    assert app.runtime.run_until_blocked(app.run_id).reason == RunStopReason.PAUSED
+    assert app.store.run_record(app.run_id).state == RunState.PLANNING
+    command = make_continue_command(app, app.run_id, request_id="continue-planning")
+    assert app.control.handle(command).status == "ACCEPTED"
+    return replace(app, begin_command=command)
+
+
+def seed_runtime_active_state_for_test(app: RuntimeApplicationFixture, *, model_calls: int) -> None:
+    expected = app.store.audit_sequence(app.run_id)
+
+    def mutate(connection: sqlite3.Connection) -> None:
+        if (
+            connection.execute(
+                "UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?", (app.run_id,)
+            ).rowcount
+            != 1
+        ):
+            raise AssertionError("fixture Run missing")
+        connection.execute(
+            "INSERT INTO model_counters(run_id, calls, input_tokens, output_tokens, cost_usd) "
+            "VALUES (?, ?, 0, 0, '0') ON CONFLICT(run_id) DO UPDATE SET calls = excluded.calls, "
+            "input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, "
+            "cost_usd = excluded.cost_usd",
+            (app.run_id, model_calls),
+        )
+
+    app.store._commit_state_and_event(
+        run_id=app.run_id,
+        expected_sequence=expected,
+        event=AuditEvent.kind("TEST_RUNTIME_ACTIVE_STATE_SEEDED"),
+        mutate=mutate,
+    )
+
+
+def make_permitted_active_runtime(
+    tmp_path: Path,
+    *,
+    model_calls: int,
+    model_call_ceiling: int,
+    coordinator_factory: Callable[[RuntimeStateStore], RuntimeCoordinator],
+    active_run_seconds_ceiling: int = 28_800,
+    monotonic_clock: MonotonicClock | None = None,
+) -> RuntimeApplicationFixture:
+    budget = fixture_budget(
+        active_run_seconds_ceiling=active_run_seconds_ceiling,
+        model_call_ceiling=model_call_ceiling,
+    )
+    app = make_runtime_application(
+        tmp_path,
+        coordinator_factory=coordinator_factory,
+        budget=budget,
+        monotonic_clock=monotonic_clock,
+    )
+    seed_runtime_active_state_for_test(app, model_calls=model_calls)
+    command = make_continue_command(app, app.run_id, request_id="continue-active")
+    assert app.control.handle(command).status == "ACCEPTED"
+    return replace(app, begin_command=command)
+
+
+@contextmanager
+def hold_runtime_owner(app: RuntimeApplicationFixture, run_id: RunId) -> Iterator[None]:
+    with app.ownership.acquire(run_id) as owner:
+        assert owner is not None
+        yield
+
+
+class CrashAfterPermitCoordinator(FixtureStoppingCoordinator):
+    def __init__(self, store: RuntimeStateStore) -> None:
+        super().__init__(store)
+        self._planning_calls = 0
+
+    def run_planning_turn(self, run_id: RunId) -> RuntimeDecision:
+        self._planning_calls += 1
+        if self._planning_calls == 1:
+            return super().run_planning_turn(run_id)
+        raise InjectedProcessCrash()
+
+
+def crash_after_permit_consumption_application(
+    tmp_path: Path,
+) -> RuntimeApplicationFixture:
+    return make_permitted_planning_application(
+        tmp_path,
+        model=ScriptedMockLLM([]),
+        coordinator_factory=CrashAfterPermitCoordinator,
+    )
+
+
+def open_runtime_application(
+    root: Path,
+    run_id: RunId,
+    *,
+    model: ScriptedMockLLM,
+    monotonic_clock: MonotonicClock,
+) -> RuntimeApplicationFixture:
+    store = SqliteStateStore(root / "state.db", monotonic_clock=monotonic_clock)
+    target_authority = FixtureTargetAuthorityDigestService(store)
+    base = ApplicationFixture(
+        root=root,
+        database=root / "state.db",
+        store=store,
+        control=CrewControlService(
+            ControlCommandService(
+                state=store,
+                target_authority=target_authority,
+                repository_authority=FixtureRepositoryBootstrapAuthorityService(),
+            )
+        ),
+        queries=RunQueryService(ProjectionService(store)),
+        target_authority_digest=target_authority.current_for(run_id),
+    )
+    base.bind_run(run_id)
+    return compose_runtime_fixture(
+        base,
+        model=model,
+        coordinator=FixtureStoppingCoordinator(store),
+        workers=FixtureWorkerLoop(),
+        reservation_git=FixtureReservationGit(),
+        monotonic_clock=monotonic_clock,
+        reservation_observer=ExactReservationObserver(),
+    )
+
+
+def seed_unreleased_committed_completion(
+    store: SqliteStateStore,
+    *,
+    run_id: RunId,
+    owner_kind: Literal["PLANNING", "WORKER"],
+    normalized_action: dict[str, object],
+) -> CommittedModelTurn:
+    bindings = store.current_revision_digests(run_id)
+    assert bindings.policy_digest is not None
+    assert bindings.budget_digest is not None
+    assert bindings.model_configuration_digest is not None
+    request = ModelRequest(
+        run_id=run_id,
+        plan_digest=bindings.plan_digest,
+        policy_digest=bindings.policy_digest,
+        budget_digest=bindings.budget_digest,
+        model_configuration_digest=bindings.model_configuration_digest,
+        requested_model_id="mock-model",
+        allowed_model_ids=frozenset({"mock-model"}),
+        prompt=({"role": "user", "content": "finish"},),
+        tool_schema_digest=FIXTURE_TOOL_SCHEMA_DIGEST,
+        request_digest="sha256:" + "6" * 64,
+        idempotency_key=f"fixture-recovery:{run_id}:{store.audit_sequence(run_id)}",
+        max_input_tokens=100,
+        max_output_tokens=20,
+        reserved_cost_usd=Decimal("0.001"),
+        owner_kind=owner_kind,
+        task_id=None,
+        attempt_id=None,
+        tranche_id=None,
+    )
+    completion = ModelCompletion(
+        response_id="fixture-response",
+        requested_model_id="mock-model",
+        returned_model_id="mock-model",
+        usage=ModelUsage(10, 2, Decimal("0.000012")),
+        normalized_action=normalized_action,
+    )
+    result = DurableModelClient(
+        model=ScriptedMockLLM([ProviderAttemptResult.completed(completion)]),
+        journal=store,
+    ).complete(request)
+    committed = store.committed_model_turn(run_id, result.logical_turn_id)
+    assert committed is not None
+    return committed

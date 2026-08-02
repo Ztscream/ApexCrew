@@ -33,12 +33,12 @@ from apexcrew.domain.commands import (
 from apexcrew.domain.types import GitOid, RunId
 
 
-def test_task_10_exports_only_control_and_query_application_protocols() -> None:
-    assert application_surface.__all__ == ["CrewControl", "RunQueries"]
-    assert apexcrew.__all__ == ["__version__"]
-    assert not hasattr(apexcrew, "CrewControl")
-    assert not hasattr(apexcrew, "CrewRuntime")
-    assert not hasattr(apexcrew, "RunQueries")
+def test_exports_only_three_run_facing_application_protocols() -> None:
+    assert application_surface.__all__ == ["CrewControl", "CrewRuntime", "RunQueries"]
+    assert apexcrew.__all__ == ["CrewControl", "CrewRuntime", "RunQueries", "__version__"]
+    assert apexcrew.CrewControl is application_surface.CrewControl
+    assert apexcrew.CrewRuntime is application_surface.CrewRuntime
+    assert apexcrew.RunQueries is application_surface.RunQueries
 
 
 def test_unknown_run_returns_closed_control_and_query_models(tmp_path: Path) -> None:

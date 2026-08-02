@@ -11,7 +11,10 @@ from hashlib import sha256
 from hmac import compare_digest
 from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
 
 from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
@@ -82,13 +85,17 @@ from apexcrew.domain.commands import (
     ProposePolicyPayload,
     PublicRunSnapshot,
     ResumePayload,
+    RunStop,
     RuntimeAllowedPhase,
+    RuntimeDecision,
     RuntimePermit,
+    RuntimeState,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    ReservationObservation,
     RunRecord,
     StateCommitFault,
     StateConflict,
@@ -111,6 +118,7 @@ from apexcrew.domain.model import (
     ModelRequestIntent,
     ProviderAttemptKind,
     ProviderAttemptResult,
+    RecoveredModelAction,
     SettledModelAttempt,
 )
 from apexcrew.domain.plan import may_overlap
@@ -372,6 +380,11 @@ class InMemoryStateStore:
         self._runtime_permits: dict[tuple[RunId, int], RuntimePermit] = {}
         self._runtime_progress_generations: dict[RunId, int] = {}
         self._runtime_owners: dict[RunId, tuple[RuntimeOwnerId, int]] = {}
+        self._runtime_barriers: dict[RunId, tuple[str | None, str, str | None]] = {}
+        self._runtime_interrupts: dict[RunId, tuple[str, str, int, str]] = {}
+        self._runtime_delivery_stops: dict[tuple[RunId, int], RunStop] = {}
+        self._runtime_faults: dict[RunId, object] = {}
+        self._runtime_recorded_stop_reasons: dict[RunId, str] = {}
         self._approved_budgets: dict[RunId, tuple[RevisionDigest, BudgetRevisionDocument]] = {}
         self._global_usage: dict[tuple[RunId, GlobalBudgetMetric], int | Decimal] = {}
         self._budget_warnings: dict[
@@ -432,6 +445,11 @@ class InMemoryStateStore:
         copied._runtime_permits = self._runtime_permits.copy()
         copied._runtime_progress_generations = self._runtime_progress_generations.copy()
         copied._runtime_owners = self._runtime_owners.copy()
+        copied._runtime_barriers = self._runtime_barriers.copy()
+        copied._runtime_interrupts = self._runtime_interrupts.copy()
+        copied._runtime_delivery_stops = self._runtime_delivery_stops.copy()
+        copied._runtime_faults = self._runtime_faults.copy()
+        copied._runtime_recorded_stop_reasons = self._runtime_recorded_stop_reasons.copy()
         copied._approved_budgets = self._approved_budgets.copy()
         copied._global_usage = self._global_usage.copy()
         copied._budget_warnings = self._budget_warnings.copy()
@@ -480,6 +498,11 @@ class InMemoryStateStore:
         self._runtime_permits = copied._runtime_permits
         self._runtime_progress_generations = copied._runtime_progress_generations
         self._runtime_owners = copied._runtime_owners
+        self._runtime_barriers = copied._runtime_barriers
+        self._runtime_interrupts = copied._runtime_interrupts
+        self._runtime_delivery_stops = copied._runtime_delivery_stops
+        self._runtime_faults = copied._runtime_faults
+        self._runtime_recorded_stop_reasons = copied._runtime_recorded_stop_reasons
         self._approved_budgets = copied._approved_budgets
         self._global_usage = copied._global_usage
         self._budget_warnings = copied._budget_warnings
@@ -528,6 +551,7 @@ class InMemoryStateStore:
         mutate: Callable[[InMemoryStateStore], None],
         runtime_now: MonotonicInstant | None = None,
         runtime_now_factory: Callable[[], MonotonicInstant] | None = None,
+        finalize: Callable[[InMemoryStateStore], None] | None = None,
     ) -> AuditSequence:
         with self._lock:
             current = self._sequences.get(run_id, AuditSequence(0))
@@ -552,6 +576,7 @@ class InMemoryStateStore:
                     for event in events
                 ):
                     raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+                copied._active_run_times[run_id] = runtime_state
             else:
                 if copied._monotonic_clock is None:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
@@ -572,6 +597,8 @@ class InMemoryStateStore:
             for offset, committed_event in enumerate(committed_events, start=1):
                 next_sequence = AuditSequence(expected_sequence + offset)
                 copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+            if finalize is not None:
+                finalize(copied)
             next_sequence = AuditSequence(expected_sequence + len(committed_events))
             copied._sequences[run_id] = next_sequence
             self._publish(copied)
@@ -1720,15 +1747,12 @@ class InMemoryStateStore:
         with self._lock:
             return tuple(event.event_kind for _, event in self._audit_events.get(run_id, ()))
 
-    def runtime_barrier_state(self, run_id: RunId) -> Literal["IN_FLIGHT", "SETTLED"]:
+    def runtime_barrier_state(
+        self, run_id: RunId
+    ) -> Literal["IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"]:
         with self._lock:
-            in_flight = any(
-                isinstance(attempt, ModelRequestIntent)
-                and attempt.run_id == run_id
-                and attempt.state == "RESERVED"
-                for attempt in self._model_attempts.values()
-            )
-        return "IN_FLIGHT" if in_flight else "SETTLED"
+            barrier = self._runtime_barriers.get(run_id)
+            return "IDLE" if barrier is None else barrier[1]  # type: ignore[return-value]
 
     def dispatch_close_causes(self, run_id: RunId) -> frozenset[DispatchCloseCause]:
         with self._lock:
@@ -3998,3 +4022,537 @@ class InMemoryStateStore:
     def fail_next_commit_after_state_write_for_test(self) -> None:
         with self._lock:
             self._fail_next_commit_after_state_write = True
+
+    def load_runtime_state(self, run_id: RunId) -> RuntimeState:
+        run = self.run_record(run_id)
+        if (
+            run.current_policy_digest is None
+            or run.current_budget_digest is None
+            or run.current_model_configuration_digest is None
+        ):
+            raise StateConflict("RUNTIME_REVISION_BINDING_INCOMPLETE")
+        return RuntimeState(
+            run_id,
+            run.state,
+            self.audit_sequence(run_id),
+            self._runtime_progress_generations.get(run_id, 0),
+            run.current_plan_digest,
+            run.current_policy_digest,
+            run.current_budget_digest,
+            run.current_model_configuration_digest,
+        )
+
+    def target_reservation_for_run(self, run_id: RunId) -> TargetReservation:
+        matches = tuple(
+            reservation
+            for reservation in self._target_reservations.values()
+            if reservation.run_id == run_id
+        )
+        if len(matches) != 1:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        return matches[0]
+
+    def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
+        owner = self._runtime_owners.get(run_id)
+        return None if owner is None else owner[0]
+
+    def runtime_delivery_event(self, run_id: RunId) -> str | None:
+        values = [
+            event.event_kind
+            for _, event in self._audit_events.get(run_id, ())
+            if event.event_kind in {"RUNTIME_DELIVERY_STOP_RECORDED", "RUNTIME_OWNER_RELEASED"}
+        ]
+        return None if not values else values[-1]
+
+    def runtime_delivery_stop_count(self, run_id: RunId) -> int:
+        return sum(key[0] == run_id for key in self._runtime_delivery_stops)
+
+    def model_attempt_count(self, logical_turn_id: LogicalTurnId) -> int:
+        return sum(
+            attempt.logical_turn_id == logical_turn_id for attempt in self._model_attempts.values()
+        )
+
+    def unconsumed_permit_count(self, run_id: RunId) -> int:
+        return sum(
+            permit.run_id == run_id and permit.state == "UNCONSUMED"
+            for permit in self._runtime_permits.values()
+        )
+
+    @staticmethod
+    def _require_consumed_runtime_owner_on_copy(
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> tuple[RuntimePermit, int]:
+        owner = copied._runtime_owners.get(run_id)
+        permit = copied._runtime_permits.get((run_id, permit_generation))
+        if (
+            owner is None
+            or owner[0] != owner_id
+            or permit is None
+            or permit.state != "CONSUMED"
+            or permit.consumed_owner_id != owner_id
+        ):
+            raise StateConflict("RUNTIME_OWNER_BINDING_MISMATCH")
+        active = copied._active_run_times.get(run_id)
+        if active is None or active.open_owner_generation != owner[1]:
+            raise StateConflict("RUNTIME_OWNER_BINDING_MISMATCH")
+        return permit, owner[1]
+
+    @staticmethod
+    def _require_consumed_draft_permit_on_copy(
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> RuntimePermit:
+        permit, _ = InMemoryStateStore._require_consumed_runtime_owner_on_copy(
+            copied, run_id, owner_id, permit_generation
+        )
+        if permit.allowed_phase != "DRAFT" or copied._runs[run_id].state != RunState.DRAFT:
+            raise StateConflict("TARGET_RESERVATION_PERMIT_BINDING_MISMATCH")
+        return permit
+
+    def record_or_load_target_reservation_creation_intent_under_draft_permit(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> TargetReservationCreationIntent:
+        reservation = self.target_reservation_for_run(run_id)
+        if reservation.phase == "CREATION_INTENT_RECORDED":
+            return self.unsettled_target_reservation_creation(run_id)
+        created: list[TargetReservationCreationIntent] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = self._require_consumed_draft_permit_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            current = copied.target_reservation_for_run(run_id)
+            intent = _new_target_reservation_creation_intent(
+                copied._runs[run_id], current, expected_sequence
+            ).model_copy(
+                update={
+                    "applicable_revision_digests": permit.applicable_revision_digests,
+                    "target_authority_digest": permit.target_authority_digest,
+                }
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            if effect.intent_id in copied._effect_intents:
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._target_reservations[current.reservation_id] = replace(
+                current, phase="CREATION_INTENT_RECORDED"
+            )
+            created.append(intent)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return created[0]
+
+    def settle_target_reservation_creation_under_draft_permit(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        _validate_reservation_outcome(intent, outcome)
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = self._require_consumed_draft_permit_on_copy(
+                copied, intent.run_id, owner_id, permit_generation
+            )
+            if (
+                intent.applicable_revision_digests != permit.applicable_revision_digests
+                or intent.target_authority_digest != permit.target_authority_digest
+            ):
+                raise StateConflict("TARGET_RESERVATION_PERMIT_AUTHORITY_MISMATCH")
+            reservation = copied._target_reservations[intent.reservation_id]
+            effect = copied._effect_intents.get(intent.intent_id)
+            if (
+                reservation.phase != "CREATION_INTENT_RECORDED"
+                or effect
+                != intent.to_effect_intent(effect.recorded_sequence if effect else AuditSequence(0))
+                or intent.intent_id in copied._effect_results
+            ):
+                raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = result
+            if outcome.result_class == "REGISTERED_LOCKED":
+                if classify_reservation_creation(outcome.observed) != "SETTLE":
+                    raise StateConflict("TARGET_RESERVATION_SUCCESS_NOT_EXACT")
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="REGISTERED_LOCKED",
+                    admin_entry_name=outcome.observed.admin_entry_name,
+                    admin_binding_digest=outcome.observed.admin_binding_digest,
+                )
+                state = RunState.PLANNING
+            elif outcome.result_class == "CONFLICT":
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="ALLOCATED",
+                    admin_entry_name=None,
+                    admin_binding_digest=None,
+                )
+                state = RunState.DRAFT
+            else:
+                copied._close_new_dispatch(intent.run_id, DispatchCloseCause.RUNTIME_FAULT)
+                state = RunState.INDETERMINATE
+            copied._runs[intent.run_id] = replace(copied._runs[intent.run_id], state=state)
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_SETTLED"),
+            mutate=mutate,
+        )
+
+    def reuse_locked_target_reservation_under_draft_permit(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if classify_reservation_creation(observed) != "SETTLE":
+            raise StateConflict("TARGET_RESERVATION_REUSE_NOT_EXACT")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_draft_permit_on_copy(copied, run_id, owner_id, permit_generation)
+            reservation = copied.target_reservation_for_run(run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_REUSE_PHASE_INVALID")
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.PLANNING)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_REUSED_AND_PLANNING_STARTED"),
+            mutate=mutate,
+        )
+
+    def record_target_reservation_pre_intent_stop(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        event = (
+            "TARGET_RESERVATION_OBSERVATION_INDETERMINATE"
+            if not observed.observable
+            else "TARGET_RESERVATION_INITIALIZATION_CONFLICT"
+        )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_draft_permit_on_copy(copied, run_id, owner_id, permit_generation)
+            if not observed.observable:
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+                copied._close_new_dispatch(run_id, DispatchCloseCause.RUNTIME_FAULT)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(event),
+            mutate=mutate,
+        )
+
+    def begin_runtime_barrier(
+        self, run_id: RunId, action_id: str, expected_sequence: AuditSequence
+    ) -> str:
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_dispatch_binding(run_id)
+            if not copied._new_dispatch_open.get(run_id, True):
+                raise StateConflict("RUN_DISPATCH_CLOSED")
+            current = copied._runtime_barriers.get(run_id)
+            if current is not None and current[1] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            copied._runtime_barriers[run_id] = (action_id, "IN_FLIGHT", None)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_BARRIER_STARTED", action_id=action_id),
+            mutate=mutate,
+        )
+        return action_id
+
+    def settle_runtime_barrier(
+        self,
+        run_id: RunId,
+        action_id: str,
+        model_calls: int,
+        pending_stop_reason: str | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        events = [AuditEvent.kind("RUNTIME_BARRIER_SETTLED", action_id=action_id)]
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            current = copied._runtime_barriers.get(run_id)
+            if current != (action_id, "IN_FLIGHT", None):
+                raise StateConflict("RUNTIME_BARRIER_SETTLE_COMPARE_AND_SET_FAILED")
+            counters = copied.model_counters(run_id)
+            calls = counters.calls + model_calls
+            copied._model_counters[run_id] = replace(counters, calls=calls)
+            budget_digest = copied.current_revision_digests(run_id).budget_digest
+            if budget_digest is None:
+                raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+            _, stopped = copied._settle_global_usage_for_producer(
+                run_id, budget_digest, GlobalBudgetMetric.MODEL_CALLS, calls
+            )
+            derived = "BUDGET_STOP" if stopped else None
+            if pending_stop_reason != derived:
+                raise StateConflict("RUNTIME_BARRIER_STOP_CAUSE_MISMATCH")
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            copied._runtime_barriers[run_id] = (action_id, "SETTLED", derived)
+
+        return self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+
+    def apply_post_barrier_controls(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision | None:
+        self._require_consumed_runtime_owner_on_copy(self, run_id, owner_id, permit_generation)
+        interrupt = self._runtime_interrupts.get(run_id)
+        if interrupt is not None and interrupt[3] == "PENDING":
+            return RuntimeDecision.pause(interrupt[1], expected_sequence)
+        barrier = self._runtime_barriers.get(run_id)
+        if barrier is not None and barrier[2] == "BUDGET_STOP":
+            return RuntimeDecision.pause("GLOBAL_MODEL_CALL_CEILING", expected_sequence)
+        return None
+
+    def record_runtime_delivery_stop(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        candidate: RunStop,
+        expected_sequence: AuditSequence,
+    ) -> RunStop:
+        result: list[RunStop] = []
+        closed_at: list[MonotonicInstant] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            barrier = copied._runtime_barriers.get(run_id)
+            if barrier is not None and barrier[1] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            closed = copied._monotonic_clock.now()
+            active = copied._active_run_times[run_id]
+            cumulative = active.observed_nanoseconds(closed)
+            closed_at.append(closed)
+            final = RunStop(
+                run_id=run_id,
+                state=copied._runs[run_id].state,
+                reason=candidate.reason,
+                last_sequence=AuditSequence(expected_sequence + 2),
+                pending=candidate.pending,
+            )
+            copied._active_run_times[run_id] = replace(active, cumulative_nanoseconds=cumulative)
+            copied._runtime_delivery_stops[(run_id, permit_generation)] = final
+            result.append(final)
+
+        def finalize(copied: InMemoryStateStore) -> None:
+            copied._runtime_owners.pop(run_id, None)
+            active = copied._active_run_times[run_id]
+            copied._active_run_times[run_id] = ActiveRunTimeState(
+                run_id, active.cumulative_nanoseconds, None, None, None
+            )
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (
+                AuditEvent.kind("RUNTIME_DELIVERY_STOP_RECORDED"),
+                AuditEvent.kind("RUNTIME_OWNER_RELEASED"),
+            ),
+            mutate=mutate,
+            runtime_now_factory=lambda: closed_at[0],
+            finalize=finalize,
+        )
+        return result[0]
+
+    def record_runtime_fault_and_classify_barrier(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        fault: RuntimeFault,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeFaultDisposition:
+        from apexcrew.application.runtime import RuntimeFaultDisposition
+
+        result: list[RuntimeFaultDisposition] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            barrier = copied._runtime_barriers.get(run_id)
+            stored_state = "IDLE" if barrier is None else barrier[1]
+            if stored_state not in {"IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"}:
+                raise StateConflict("RUNTIME_BARRIER_STATE_INVALID")
+            state = cast(
+                Literal["IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"],
+                stored_state,
+            )
+            if state == "IN_FLIGHT":
+                assert barrier is not None
+                copied._runtime_barriers[run_id] = (
+                    barrier[0],
+                    "INDETERMINATE",
+                    barrier[2],
+                )
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+                state = "INDETERMINATE"
+                reason: Literal["RUNTIME_FAULT", "RUNTIME_CLOCK_REGRESSION", "INDETERMINATE"] = (
+                    "INDETERMINATE"
+                )
+            else:
+                state = "SETTLED" if state == "SETTLED" else "IDLE"
+                reason = (
+                    "RUNTIME_CLOCK_REGRESSION"
+                    if fault.fault_code == "MONOTONIC_CLOCK_REGRESSED"
+                    else "RUNTIME_FAULT"
+                )
+            copied._close_new_dispatch(run_id, DispatchCloseCause.RUNTIME_FAULT)
+            copied._runtime_faults[run_id] = fault
+            copied._runtime_recorded_stop_reasons[run_id] = reason
+            result.append(
+                RuntimeFaultDisposition(AuditSequence(expected_sequence + 1), reason, state)
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_FAULT_RECORDED"),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def latest_runtime_fault(self, run_id: RunId) -> object:
+        try:
+            return self._runtime_faults[run_id]
+        except KeyError as error:
+            raise StateConflict("RUNTIME_FAULT_NOT_FOUND") from error
+
+    def recorded_stop_reason(self, run_id: RunId) -> str | None:
+        if run_id in self._runtime_recorded_stop_reasons:
+            return self._runtime_recorded_stop_reasons[run_id]
+        barrier = self._runtime_barriers.get(run_id)
+        return None if barrier is None else barrier[2]
+
+    def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None:
+        candidates = sorted(
+            (
+                turn
+                for turn in self._model_turns.values()
+                if isinstance(turn, CommittedModelTurn)
+                and turn.run_id == run_id
+                and turn.state == "COMPLETION_COMMITTED"
+                and turn.downstream_intent_id is None
+            ),
+            key=lambda turn: (turn.committed_sequence, turn.logical_turn_id),
+        )
+        return None if not candidates else candidates[0]
+
+    def next_recovered_model_action(self, run_id: RunId) -> RecoveredModelAction | None:
+        candidates = sorted(
+            (
+                intent
+                for intent in self._effect_intents.values()
+                if intent.run_id == run_id
+                and intent.kind == "RECOVERED_MODEL_ACTION"
+                and intent.intent_id not in self._effect_results
+            ),
+            key=lambda intent: intent.recorded_sequence,
+        )
+        if not candidates:
+            return None
+        intent = candidates[0]
+        turn = self._model_turns.get(intent.action_id or "")
+        if not isinstance(turn, CommittedModelTurn):
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH")
+        try:
+            return RecoveredModelAction.from_journal(turn, intent)
+        except ValueError as error:
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH") from error
+
+    def apply_runtime_continue(self, command: CommandEnvelope) -> CommandOutcome:
+        from apexcrew.domain.commands import ContinuePayload
+
+        if not isinstance(command.payload, ContinuePayload):
+            raise StateConflict("RUNTIME_CONTINUE_COMMAND_REQUIRED")
+        run_id = command.payload.run_id
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        target_digest = self.target_authority_digest(run_id)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if run_id in copied._runtime_owners:
+                active = copied._active_run_times.get(run_id)
+                if (
+                    active is None
+                    or active.opened_at is None
+                    or active.latest_committed_at is None
+                    or active.latest_committed_at < active.opened_at
+                ):
+                    raise StateConflict("ACTIVE_RUN_TIME_RECOVERY_INVALID")
+                cumulative = active.observed_nanoseconds(active.latest_committed_at)
+                copied._runtime_owners.pop(run_id)
+                copied._active_run_times[run_id] = ActiveRunTimeState(
+                    run_id, cumulative, None, None, None
+                )
+            state = copied._runs[run_id].state
+            allowed: RuntimeAllowedPhase = (
+                "TERMINAL_ADMINISTRATION"
+                if state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
+                else state.value  # type: ignore[assignment]
+            )
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                allowed,
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_OWNER_ORPHANED_AND_PERMIT_ISSUED",
+            mutate,
+        )
