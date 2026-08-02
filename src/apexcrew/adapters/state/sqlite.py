@@ -103,6 +103,18 @@ from apexcrew.domain.commands import (
     applicable_revision_digests_from_json,
     applicable_revision_digests_to_json,
 )
+from apexcrew.domain.coordination import (
+    PlanProposal,
+    check_definition_from_json,
+    check_definition_json,
+    plan_proposal_record_from_json,
+    plan_proposal_record_json,
+    run_check_set_digest,
+    task_contract_digest,
+    task_contract_from_json,
+    task_contract_json,
+    validate_plan_proposal,
+)
 from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
@@ -139,7 +151,13 @@ from apexcrew.domain.model import (
     model_request_from_json,
     model_request_to_json,
 )
-from apexcrew.domain.plan import GlobPattern, may_overlap
+from apexcrew.domain.plan import (
+    CheckDefinition,
+    GlobPattern,
+    PlanRevision,
+    TaskContract,
+    may_overlap,
+)
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
@@ -663,6 +681,72 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 resulting_sequence INTEGER NOT NULL,
                 barrier_state TEXT NOT NULL CHECK(barrier_state IN ('IDLE','SETTLED','INDETERMINATE')),
                 PRIMARY KEY(run_id, permit_generation, resulting_sequence)
+            )""",
+        ),
+    ),
+    (
+        13,
+        (
+            """CREATE TABLE plans (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                plan_digest TEXT NOT NULL,
+                base_run_head_oid TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                model_configuration_digest TEXT NOT NULL,
+                run_check_set_digest TEXT NOT NULL,
+                planning_request_count INTEGER NOT NULL
+                    CHECK(planning_request_count BETWEEN 1 AND 8),
+                state TEXT NOT NULL CHECK(state IN ('PROPOSED','APPROVED','STALE')),
+                proposal_json TEXT NOT NULL,
+                PRIMARY KEY(run_id, plan_digest),
+                UNIQUE(plan_digest)
+            )""",
+            """CREATE TABLE task_contracts (
+                plan_digest TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task_revision INTEGER NOT NULL CHECK(task_revision = 1),
+                contract_digest TEXT NOT NULL,
+                contract_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'BLOCKED','READY','ACTIVE','CANDIDATE_READY','PROMOTED',
+                    'PAUSED','FAILED','CANCELLED'
+                )),
+                PRIMARY KEY(plan_digest, task_id),
+                UNIQUE(plan_digest, contract_digest),
+                FOREIGN KEY(plan_digest) REFERENCES plans(plan_digest)
+            )""",
+            """CREATE TABLE task_dependencies (
+                plan_digest TEXT NOT NULL,
+                predecessor_task_id TEXT NOT NULL,
+                successor_task_id TEXT NOT NULL,
+                PRIMARY KEY(plan_digest, predecessor_task_id, successor_task_id),
+                FOREIGN KEY(plan_digest, predecessor_task_id)
+                    REFERENCES task_contracts(plan_digest, task_id),
+                FOREIGN KEY(plan_digest, successor_task_id)
+                    REFERENCES task_contracts(plan_digest, task_id)
+            )""",
+            """CREATE TABLE hazard_edges (
+                plan_digest TEXT NOT NULL,
+                predecessor_task_id TEXT NOT NULL,
+                successor_task_id TEXT NOT NULL,
+                hazard_class TEXT NOT NULL CHECK(hazard_class = 'PROMOTION'),
+                PRIMARY KEY(
+                    plan_digest, predecessor_task_id, successor_task_id, hazard_class
+                ),
+                FOREIGN KEY(plan_digest, predecessor_task_id)
+                    REFERENCES task_contracts(plan_digest, task_id),
+                FOREIGN KEY(plan_digest, successor_task_id)
+                    REFERENCES task_contracts(plan_digest, task_id)
+            )""",
+            """CREATE TABLE run_checks (
+                plan_digest TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                check_digest TEXT NOT NULL,
+                check_json TEXT NOT NULL,
+                PRIMARY KEY(plan_digest, ordinal),
+                UNIQUE(plan_digest, check_digest),
+                FOREIGN KEY(plan_digest) REFERENCES plans(plan_digest)
             )""",
         ),
     ),
@@ -2499,6 +2583,309 @@ class SqliteStateStore:
         if revision_digest(budget) != digest:
             raise StateConflict("APPROVED_BUDGET_STORAGE_INVALID")
         return digest, budget
+
+    @staticmethod
+    def _task_contracts_in_transaction(
+        connection: sqlite3.Connection,
+        plan_digest: RevisionDigest,
+    ) -> tuple[TaskContract, ...]:
+        rows = connection.execute(
+            "SELECT task_id, task_revision, contract_digest, contract_json "
+            "FROM task_contracts WHERE plan_digest = ? ORDER BY task_id",
+            (plan_digest,),
+        ).fetchall()
+        if not rows:
+            raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+        contracts: list[TaskContract] = []
+        try:
+            for row in rows:
+                contract = task_contract_from_json(str(row["contract_json"]))
+                if (
+                    row["task_revision"] != 1
+                    or row["task_id"] != contract.task_id
+                    or row["contract_digest"] != task_contract_digest(contract)
+                ):
+                    raise StateConflict("TASK_CONTRACT_STORAGE_BINDING_MISMATCH")
+                contracts.append(contract)
+        except (TypeError, ValueError) as error:
+            raise StateConflict("TASK_CONTRACT_STORAGE_BINDING_MISMATCH") from error
+        return tuple(contracts)
+
+    @staticmethod
+    def _task_edges_in_transaction(
+        connection: sqlite3.Connection,
+        table: Literal["task_dependencies", "hazard_edges"],
+        plan_digest: RevisionDigest,
+    ) -> tuple[tuple[TaskId, TaskId], ...]:
+        rows = connection.execute(
+            f"SELECT predecessor_task_id, successor_task_id FROM {table} "
+            "WHERE plan_digest = ? ORDER BY predecessor_task_id, successor_task_id",
+            (plan_digest,),
+        ).fetchall()
+        return tuple(
+            (TaskId(row["predecessor_task_id"]), TaskId(row["successor_task_id"])) for row in rows
+        )
+
+    @staticmethod
+    def _run_check_set_in_transaction(
+        connection: sqlite3.Connection,
+        plan_digest: RevisionDigest,
+    ) -> tuple[CheckDefinition, ...]:
+        rows = connection.execute(
+            "SELECT ordinal, check_digest, check_json FROM run_checks "
+            "WHERE plan_digest = ? ORDER BY ordinal",
+            (plan_digest,),
+        ).fetchall()
+        if tuple(row["ordinal"] for row in rows) != tuple(range(len(rows))):
+            raise StateConflict("RUN_CHECK_STORAGE_BINDING_MISMATCH")
+        checks: list[CheckDefinition] = []
+        try:
+            for row in rows:
+                check = check_definition_from_json(str(row["check_json"]))
+                if row["check_digest"] != sha256_digest(check_definition_json(check)):
+                    raise StateConflict("RUN_CHECK_STORAGE_BINDING_MISMATCH")
+                checks.append(check)
+        except ValueError as error:
+            raise StateConflict("RUN_CHECK_STORAGE_BINDING_MISMATCH") from error
+        return tuple(checks)
+
+    def persist_plan_proposal(
+        self,
+        proposal: PlanProposal,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        try:
+            validate_plan_proposal(proposal)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        events = [AuditEvent.kind("PLAN_PROPOSED")]
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            run = connection.execute(
+                "SELECT state, pinned_target_oid, current_plan_digest, current_policy_digest, "
+                "current_budget_digest, current_model_configuration_digest, new_dispatch_open "
+                "FROM runs WHERE run_id = ?",
+                (proposal.run_id,),
+            ).fetchone()
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run["state"] != RunState.PLANNING:
+                raise StateConflict("PLAN_PROPOSAL_REQUIRES_PLANNING")
+            if run["pinned_target_oid"] != proposal.base_run_head_oid:
+                raise StateConflict("PLAN_BASE_BINDING_MISMATCH")
+            current = ApplicableRevisionDigests(
+                plan_digest=run["current_plan_digest"],
+                policy_digest=run["current_policy_digest"],
+                budget_digest=run["current_budget_digest"],
+                model_configuration_digest=run["current_model_configuration_digest"],
+            )
+            if current != proposal.applicable_revision_digests:
+                raise StateConflict("PLAN_REVISION_BINDING_MISMATCH")
+            planning_row = connection.execute(
+                "SELECT planning_requests FROM run_authority_counters WHERE run_id = ?",
+                (proposal.run_id,),
+            ).fetchone()
+            planning_count = 0 if planning_row is None else int(planning_row["planning_requests"])
+            if planning_count != proposal.planning_request_count:
+                raise StateConflict("PLANNING_REQUEST_COUNT_MISMATCH")
+            budget_digest = proposal.applicable_revision_digests.budget_digest
+            if budget_digest is None:
+                raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+            budget = self._approved_budget_for_update(connection, proposal.run_id, budget_digest)
+            if len(proposal.plan.tasks) > budget.task_ceiling:
+                raise StateConflict("PLAN_TASK_CEILING")
+            if not bool(run["new_dispatch_open"]):
+                raise StateConflict("NEW_DISPATCH_CLOSED")
+            try:
+                connection.execute(
+                    "INSERT INTO plans(run_id, plan_digest, base_run_head_oid, policy_digest, "
+                    "budget_digest, model_configuration_digest, run_check_set_digest, "
+                    "planning_request_count, state, proposal_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PROPOSED', ?)",
+                    (
+                        proposal.run_id,
+                        proposal.plan_digest,
+                        proposal.base_run_head_oid,
+                        proposal.applicable_revision_digests.policy_digest,
+                        budget_digest,
+                        proposal.applicable_revision_digests.model_configuration_digest,
+                        run_check_set_digest(proposal.run_check_set),
+                        proposal.planning_request_count,
+                        plan_proposal_record_json(proposal),
+                    ),
+                )
+                for task in proposal.plan.tasks:
+                    connection.execute(
+                        "INSERT INTO task_contracts(plan_digest, task_id, task_revision, "
+                        "contract_digest, contract_json, state) VALUES (?, ?, 1, ?, ?, ?)",
+                        (
+                            proposal.plan_digest,
+                            task.task_id,
+                            task_contract_digest(task),
+                            task_contract_json(task),
+                            "BLOCKED" if task.dependency_task_ids else "READY",
+                        ),
+                    )
+                connection.executemany(
+                    "INSERT INTO task_dependencies(plan_digest, predecessor_task_id, "
+                    "successor_task_id) VALUES (?, ?, ?)",
+                    (
+                        (proposal.plan_digest, predecessor, successor)
+                        for predecessor, successor in proposal.dependency_edges
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO hazard_edges(plan_digest, predecessor_task_id, "
+                    "successor_task_id, hazard_class) VALUES (?, ?, ?, 'PROMOTION')",
+                    (
+                        (proposal.plan_digest, predecessor, successor)
+                        for predecessor, successor in proposal.hazard_edges
+                    ),
+                )
+                for ordinal, check in enumerate(proposal.run_check_set):
+                    check_json = check_definition_json(check)
+                    connection.execute(
+                        "INSERT INTO run_checks(plan_digest, ordinal, check_digest, check_json) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            proposal.plan_digest,
+                            ordinal,
+                            sha256_digest(check_json),
+                            check_json,
+                        ),
+                    )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("PLAN_GRAPH_STORAGE_CONFLICT") from error
+            task_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_contracts WHERE plan_digest = ?",
+                    (proposal.plan_digest,),
+                ).fetchone()[0]
+            )
+            settlement, stopped = self._settle_global_usage_in_transaction(
+                connection,
+                proposal.run_id,
+                budget_digest,
+                GlobalBudgetMetric.TASKS,
+                task_count,
+            )
+            if settlement.pause_after_barrier != stopped:
+                raise StateConflict("PLAN_TASK_STOP_BINDING_INVALID")
+            next_state = RunState.PAUSED if stopped else RunState.AWAITING_PLAN_APPROVAL
+            if (
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ? AND state = 'PLANNING'",
+                    (next_state.value, proposal.run_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("PLAN_PROPOSAL_STATE_COMPARE_AND_SET_FAILED")
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+
+        return self._commit_state_and_events(
+            run_id=proposal.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+
+    def plan_proposal(self, run_id: RunId, plan_digest: RevisionDigest) -> PlanProposal:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM plans WHERE run_id = ? AND plan_digest = ?",
+                (run_id, plan_digest),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+            tasks = self._task_contracts_in_transaction(connection, plan_digest)
+            dependencies = self._task_edges_in_transaction(
+                connection, "task_dependencies", plan_digest
+            )
+            hazards = self._task_edges_in_transaction(connection, "hazard_edges", plan_digest)
+            checks = self._run_check_set_in_transaction(connection, plan_digest)
+            try:
+                canonical_plan_json, promotion_order = plan_proposal_record_from_json(
+                    str(row["proposal_json"])
+                )
+                proposal = PlanProposal.from_validated_plan(
+                    run_id=RunId(row["run_id"]),
+                    canonical_plan_json=canonical_plan_json,
+                    plan=PlanRevision(tasks=tasks, proposed_promotion_order=promotion_order),
+                    base_run_head_oid=GitOid(row["base_run_head_oid"]),
+                    applicable_revision_digests=ApplicableRevisionDigests(
+                        policy_digest=RevisionDigest(row["policy_digest"]),
+                        budget_digest=RevisionDigest(row["budget_digest"]),
+                        model_configuration_digest=RevisionDigest(
+                            row["model_configuration_digest"]
+                        ),
+                    ),
+                    run_check_set=checks,
+                    planning_request_count=int(row["planning_request_count"]),
+                )
+            except ValueError as error:
+                raise StateConflict("PLAN_PROPOSAL_STORAGE_BINDING_MISMATCH") from error
+            if (
+                proposal.plan_digest != row["plan_digest"]
+                or proposal.dependency_edges != dependencies
+                or proposal.hazard_edges != hazards
+                or run_check_set_digest(checks) != row["run_check_set_digest"]
+            ):
+                raise StateConflict("PLAN_PROPOSAL_STORAGE_BINDING_MISMATCH")
+            return proposal
+
+    def task_contracts(self, plan_digest: RevisionDigest) -> tuple[TaskContract, ...]:
+        with self._read_transaction() as connection:
+            return self._task_contracts_in_transaction(connection, plan_digest)
+
+    def task_dependency_edges(
+        self, plan_digest: RevisionDigest
+    ) -> tuple[tuple[TaskId, TaskId], ...]:
+        with self._read_transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM plans WHERE plan_digest = ?", (plan_digest,)
+                ).fetchone()
+                is None
+            ):
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+            return self._task_edges_in_transaction(connection, "task_dependencies", plan_digest)
+
+    def hazard_edges(self, plan_digest: RevisionDigest) -> tuple[tuple[TaskId, TaskId], ...]:
+        with self._read_transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM plans WHERE plan_digest = ?", (plan_digest,)
+                ).fetchone()
+                is None
+            ):
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+            return self._task_edges_in_transaction(connection, "hazard_edges", plan_digest)
+
+    def run_check_set(self, plan_digest: RevisionDigest) -> tuple[CheckDefinition, ...]:
+        with self._read_transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM plans WHERE plan_digest = ?", (plan_digest,)
+                ).fetchone()
+                is None
+            ):
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+            return self._run_check_set_in_transaction(connection, plan_digest)
+
+    def planning_request_count(self, run_id: RunId) -> int:
+        with self._read_transaction() as connection:
+            if (
+                connection.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+                is None
+            ):
+                raise StateConflict("RUN_NOT_FOUND")
+            row = connection.execute(
+                "SELECT planning_requests FROM run_authority_counters WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            return 0 if row is None else int(row["planning_requests"])
 
     @staticmethod
     def _approved_budget_for_update(

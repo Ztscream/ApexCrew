@@ -91,6 +91,7 @@ from apexcrew.domain.commands import (
     RuntimePermit,
     RuntimeState,
 )
+from apexcrew.domain.coordination import PlanProposal, validate_plan_proposal
 from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
@@ -121,7 +122,7 @@ from apexcrew.domain.model import (
     RecoveredModelAction,
     SettledModelAttempt,
 )
-from apexcrew.domain.plan import may_overlap
+from apexcrew.domain.plan import CheckDefinition, TaskContract, may_overlap
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
@@ -386,6 +387,11 @@ class InMemoryStateStore:
         self._runtime_faults: dict[RunId, object] = {}
         self._runtime_recorded_stop_reasons: dict[RunId, str] = {}
         self._approved_budgets: dict[RunId, tuple[RevisionDigest, BudgetRevisionDocument]] = {}
+        self._plan_proposals: dict[tuple[RunId, RevisionDigest], PlanProposal] = {}
+        self._plan_task_contracts: dict[RevisionDigest, tuple[TaskContract, ...]] = {}
+        self._plan_dependency_edges: dict[RevisionDigest, tuple[tuple[TaskId, TaskId], ...]] = {}
+        self._plan_hazard_edges: dict[RevisionDigest, tuple[tuple[TaskId, TaskId], ...]] = {}
+        self._plan_run_checks: dict[RevisionDigest, tuple[CheckDefinition, ...]] = {}
         self._global_usage: dict[tuple[RunId, GlobalBudgetMetric], int | Decimal] = {}
         self._budget_warnings: dict[
             tuple[RunId, RevisionDigest, GlobalBudgetMetric, int], BudgetWarning
@@ -451,6 +457,11 @@ class InMemoryStateStore:
         copied._runtime_faults = self._runtime_faults.copy()
         copied._runtime_recorded_stop_reasons = self._runtime_recorded_stop_reasons.copy()
         copied._approved_budgets = self._approved_budgets.copy()
+        copied._plan_proposals = self._plan_proposals.copy()
+        copied._plan_task_contracts = self._plan_task_contracts.copy()
+        copied._plan_dependency_edges = self._plan_dependency_edges.copy()
+        copied._plan_hazard_edges = self._plan_hazard_edges.copy()
+        copied._plan_run_checks = self._plan_run_checks.copy()
         copied._global_usage = self._global_usage.copy()
         copied._budget_warnings = self._budget_warnings.copy()
         copied._atomic_actions = self._atomic_actions.copy()
@@ -504,6 +515,11 @@ class InMemoryStateStore:
         self._runtime_faults = copied._runtime_faults
         self._runtime_recorded_stop_reasons = copied._runtime_recorded_stop_reasons
         self._approved_budgets = copied._approved_budgets
+        self._plan_proposals = copied._plan_proposals
+        self._plan_task_contracts = copied._plan_task_contracts
+        self._plan_dependency_edges = copied._plan_dependency_edges
+        self._plan_hazard_edges = copied._plan_hazard_edges
+        self._plan_run_checks = copied._plan_run_checks
         self._global_usage = copied._global_usage
         self._budget_warnings = copied._budget_warnings
         self._atomic_actions = copied._atomic_actions
@@ -1869,6 +1885,123 @@ class InMemoryStateStore:
                 return self._approved_budgets[run_id]
             except KeyError as error:
                 raise StateConflict("APPROVED_BUDGET_NOT_FOUND") from error
+
+    def persist_plan_proposal(
+        self,
+        proposal: PlanProposal,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        try:
+            validate_plan_proposal(proposal)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        events = [AuditEvent.kind("PLAN_PROPOSED")]
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(proposal.run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run.state != RunState.PLANNING:
+                raise StateConflict("PLAN_PROPOSAL_REQUIRES_PLANNING")
+            if run.pinned_target_oid != proposal.base_run_head_oid:
+                raise StateConflict("PLAN_BASE_BINDING_MISMATCH")
+            current = ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            )
+            if current != proposal.applicable_revision_digests:
+                raise StateConflict("PLAN_REVISION_BINDING_MISMATCH")
+            if copied._planning_request_counts.get(proposal.run_id, 0) != (
+                proposal.planning_request_count
+            ):
+                raise StateConflict("PLANNING_REQUEST_COUNT_MISMATCH")
+            budget_digest = proposal.applicable_revision_digests.budget_digest
+            if budget_digest is None:
+                raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+            budget = copied._require_current_budget(proposal.run_id, budget_digest)
+            if len(proposal.plan.tasks) > budget.task_ceiling:
+                raise StateConflict("PLAN_TASK_CEILING")
+            copied._require_dispatch_binding(proposal.run_id)
+            if not copied._new_dispatch_open[proposal.run_id]:
+                raise StateConflict("NEW_DISPATCH_CLOSED")
+            key = (proposal.run_id, proposal.plan_digest)
+            if key in copied._plan_proposals or proposal.plan_digest in (
+                digest for _, digest in copied._plan_proposals
+            ):
+                raise StateConflict("PLAN_PROPOSAL_DUPLICATE")
+            copied._plan_proposals[key] = proposal
+            copied._plan_task_contracts[proposal.plan_digest] = proposal.plan.tasks
+            copied._plan_dependency_edges[proposal.plan_digest] = proposal.dependency_edges
+            copied._plan_hazard_edges[proposal.plan_digest] = proposal.hazard_edges
+            copied._plan_run_checks[proposal.plan_digest] = proposal.run_check_set
+            task_count = len(copied._plan_task_contracts[proposal.plan_digest])
+            settlement, stopped = copied._settle_global_usage_for_producer(
+                proposal.run_id,
+                budget_digest,
+                GlobalBudgetMetric.TASKS,
+                task_count,
+            )
+            if settlement.pause_after_barrier != stopped:
+                raise StateConflict("PLAN_TASK_STOP_BINDING_INVALID")
+            copied._runs[proposal.run_id] = replace(
+                run,
+                state=(RunState.PAUSED if stopped else RunState.AWAITING_PLAN_APPROVAL),
+            )
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+
+        return self._commit_state_and_events(
+            run_id=proposal.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+
+    def plan_proposal(self, run_id: RunId, plan_digest: RevisionDigest) -> PlanProposal:
+        with self._lock:
+            try:
+                return self._plan_proposals[(run_id, plan_digest)]
+            except KeyError as error:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
+
+    def task_contracts(self, plan_digest: RevisionDigest) -> tuple[TaskContract, ...]:
+        with self._lock:
+            try:
+                return self._plan_task_contracts[plan_digest]
+            except KeyError as error:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
+
+    def task_dependency_edges(
+        self, plan_digest: RevisionDigest
+    ) -> tuple[tuple[TaskId, TaskId], ...]:
+        with self._lock:
+            try:
+                return self._plan_dependency_edges[plan_digest]
+            except KeyError as error:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
+
+    def hazard_edges(self, plan_digest: RevisionDigest) -> tuple[tuple[TaskId, TaskId], ...]:
+        with self._lock:
+            try:
+                return self._plan_hazard_edges[plan_digest]
+            except KeyError as error:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
+
+    def run_check_set(self, plan_digest: RevisionDigest) -> tuple[CheckDefinition, ...]:
+        with self._lock:
+            try:
+                return self._plan_run_checks[plan_digest]
+            except KeyError as error:
+                raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
+
+    def planning_request_count(self, run_id: RunId) -> int:
+        with self._lock:
+            if run_id not in self._runs:
+                raise StateConflict("RUN_NOT_FOUND")
+            return self._planning_request_counts.get(run_id, 0)
 
     def _evaluate_model_reservation(
         self, request: ModelReservationRequest
