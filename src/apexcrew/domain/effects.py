@@ -3,10 +3,25 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from apexcrew.domain.authority import (
+        ActionDeadline,
+        AtomicAction,
+        BudgetSettlement,
+        GlobalBudgetMetric,
+        GlobalUsageSnapshot,
+        ResumeTaskRequest,
+        TaskCounterSnapshot,
+        TaskPauseBinding,
+        TaskResumeDecision,
+        TimeoutDecision,
+    )
 
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -165,6 +180,8 @@ class AuditEvent:
     subject_digests: tuple[str, ...] = ()
     timing_ms: int | None = None
     budget_delta_json: str | None = None
+    runtime_owner_generation: int | None = None
+    runtime_monotonic_nanoseconds: int | None = None
 
     @classmethod
     def kind(cls, event_kind: str, **fields: Any) -> AuditEvent:
@@ -213,7 +230,68 @@ class EffectJournal(Protocol):
     ) -> AuditSequence:
         raise NotImplementedError
 
+    def global_usage_snapshot(self, run_id: RunId) -> GlobalUsageSnapshot:
+        raise NotImplementedError
+
+    def current_task_pause(self, run_id: RunId, task_id: TaskId) -> TaskPauseBinding | None:
+        raise NotImplementedError
+
+    def task_counters(self, run_id: RunId, task_id: TaskId) -> TaskCounterSnapshot:
+        raise NotImplementedError
+
+    def task_repair_observed(self, pause: TaskPauseBinding) -> bool:
+        raise NotImplementedError
+
+    def accept_task_resume(
+        self,
+        request: ResumeTaskRequest,
+        pause: TaskPauseBinding,
+        counters: TaskCounterSnapshot,
+        budget_digest: RevisionDigest,
+        usage: GlobalUsageSnapshot,
+        calls: int,
+    ) -> TaskResumeDecision:
+        raise NotImplementedError
+
+    def settle_global_usage(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        metric: GlobalBudgetMetric,
+        absolute_used: int | Decimal,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        raise NotImplementedError
+
+    def begin_atomic_action(
+        self,
+        action: AtomicAction,
+        expected_sequence: AuditSequence,
+    ) -> AtomicAction:
+        raise NotImplementedError
+
+    def settle_atomic_action(
+        self,
+        action: AtomicAction,
+        model_calls: int,
+        expected_sequence: AuditSequence,
+    ) -> BudgetSettlement:
+        raise NotImplementedError
+
     def record_intent(self, intent: EffectIntent, expected_sequence: AuditSequence) -> EffectIntent:
+        raise NotImplementedError
+
+    def record_action_deadline(
+        self, deadline: ActionDeadline, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        raise NotImplementedError
+
+    def settle_action_timeout(
+        self,
+        deadline: ActionDeadline,
+        decision: TimeoutDecision,
+        expected_sequence: AuditSequence,
+    ) -> TimeoutDecision:
         raise NotImplementedError
 
     def settle_intent(
