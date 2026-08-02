@@ -192,9 +192,9 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 9B | `TASK-009B` | M1-05 | DONE | `75fb5765c7290faf96dfa1cf21cb90794084ca67` |
 | Task 9C | `TASK-009C` | M1-05 | DONE | `0e6bc7800fad1059c47aceccff95121bc3703742` |
 | Task 9D | `TASK-009D` | M1-05 | DONE | `3dd8dcc0fcf8fbfdcb823cb339a8a2fd8bb7377b` |
-| Task 10 | `TASK-010` | M1-06 | NOT STARTED | Not created |
-| Task 11A | `TASK-011A` | M1-06 | NOT STARTED | Not created |
-| Task 11B | `TASK-011B` | M1-06 | NOT STARTED | Not created |
+| Task 10 | `TASK-010` | M1-06 | DONE | `f69148b8a577a445d3e7bca76c44b7adabc846c3` |
+| Task 11A | `TASK-011A` | M1-06 | DONE | `fe6b1bc9589bcf3b8a170b2db6925f1c350ea19d` |
+| Task 11B | `TASK-011B` | M1-06 | DONE | `b0ab6a68c09b3f47f5d4a5fff1eb603a04522397` |
 | Task 12A | `TASK-012A` | M1-07 | NOT STARTED | Not created |
 | Task 12B | `TASK-012B` | M1-07 | NOT STARTED | Not created |
 | Task 13 | `TASK-013` | M1-07 | NOT STARTED | Not created |

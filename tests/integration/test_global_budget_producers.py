@@ -182,7 +182,7 @@ def test_authorized_model_reservation_produces_five_global_metrics_atomically(
         GlobalBudgetMetric.COST_RESERVE_USD,
     }
     assert store.new_dispatch_open("run-1") is False
-    assert store.runtime_barrier_state("run-1") == "IN_FLIGHT"
+    assert store.runtime_barrier_state("run-1") == "IDLE"
 
 
 def test_zero_cost_reserve_pauses_before_provider_dispatch(tmp_path: Path) -> None:

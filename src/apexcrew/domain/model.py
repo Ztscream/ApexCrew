@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from apexcrew.domain.effects import EffectIntent
 
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.types import (
@@ -313,6 +316,87 @@ class CommittedModelTurn:
     state: Literal["COMPLETION_COMMITTED", "DOWNSTREAM_INTENT_RECORDED"]
     downstream_intent_id: IntentId | None
     downstream_sequence: AuditSequence | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveredModelAction:
+    """A committed completion journaled before its owning loop interprets it."""
+
+    effect_intent: EffectIntent
+    turn: CommittedModelTurn
+    normalized_action: Mapping[str, object]
+
+    @classmethod
+    def for_committed_turn(
+        cls,
+        turn: CommittedModelTurn,
+        *,
+        intent_id: IntentId,
+        recorded_sequence: AuditSequence,
+    ) -> RecoveredModelAction:
+        from apexcrew.domain.commands import ApplicableRevisionDigests
+        from apexcrew.domain.effects import EffectIntent
+
+        if (
+            turn.state != "COMPLETION_COMMITTED"
+            or turn.downstream_intent_id is not None
+            or turn.dispatch_result.normalized_action != turn.normalized_payload
+            or turn.dispatch_result.normalized_payload_digest != turn.normalized_output_digest
+        ):
+            raise ValueError("RECOVERED_MODEL_TURN_NOT_RELEASABLE")
+        payload = {
+            "action": dict(turn.normalized_payload),
+            "attempt_id": turn.attempt_id,
+            "logical_turn_id": turn.logical_turn_id,
+            "owner_kind": turn.owner_kind,
+            "recovery_binding": {
+                "budget_digest": turn.recovery_binding.budget_digest,
+                "model_configuration_digest": turn.recovery_binding.model_configuration_digest,
+                "plan_digest": turn.recovery_binding.plan_digest,
+                "policy_digest": turn.recovery_binding.policy_digest,
+                "request_digest": turn.recovery_binding.request_digest,
+                "tool_schema_digest": turn.recovery_binding.tool_schema_digest,
+            },
+            "task_id": turn.task_id,
+            "tranche_id": turn.tranche_id,
+        }
+        normalized_payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        intent = EffectIntent(
+            intent_id=intent_id,
+            run_id=turn.run_id,
+            kind="RECOVERED_MODEL_ACTION",
+            idempotency_key=f"recovered-model-action:{turn.run_id}:{turn.logical_turn_id}",
+            applicable_revision_digests=ApplicableRevisionDigests(
+                plan_digest=turn.recovery_binding.plan_digest,
+                policy_digest=turn.recovery_binding.policy_digest,
+                budget_digest=turn.recovery_binding.budget_digest,
+                model_configuration_digest=turn.recovery_binding.model_configuration_digest,
+            ),
+            payload_digest="sha256:" + sha256(normalized_payload_json.encode("utf-8")).hexdigest(),
+            normalized_payload_json=normalized_payload_json,
+            recorded_sequence=recorded_sequence,
+            task_id=turn.task_id,
+            attempt_id=turn.attempt_id,
+            action_id=turn.logical_turn_id,
+        )
+        return cls(intent, turn, dict(turn.normalized_payload))
+
+    @classmethod
+    def from_journal(cls, turn: CommittedModelTurn, intent: EffectIntent) -> RecoveredModelAction:
+        if (
+            turn.state != "DOWNSTREAM_INTENT_RECORDED"
+            or turn.downstream_intent_id != intent.intent_id
+            or intent.run_id != turn.run_id
+        ):
+            raise ValueError("RECOVERED_MODEL_ACTION_BINDING_MISMATCH")
+        expected = cls.for_committed_turn(
+            replace(turn, state="COMPLETION_COMMITTED", downstream_intent_id=None),
+            intent_id=intent.intent_id,
+            recorded_sequence=intent.recorded_sequence,
+        )
+        if intent != expected.effect_intent:
+            raise ValueError("RECOVERED_MODEL_ACTION_BINDING_MISMATCH")
+        return cls(intent, turn, expected.normalized_action)
 
 
 def _normalized_payload_digest(payload: Mapping[str, object]) -> str:

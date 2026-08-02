@@ -21,6 +21,7 @@ from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBacken
 from apexcrew.domain.admission import (
     RepositoryEffectError,
     ReservationAdminObservation,
+    ReservationRegistrationObservation,
     TargetReservationGitPort,
     TargetReservationOperation,
     TargetReservationOperationResult,
@@ -43,10 +44,77 @@ MAX_GIT_ADMIN_ENTRIES = 4_096
 MAX_WORKTREE_ADMIN_ENTRIES = 2
 MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES = 4_096
 MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 16
+MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
 _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
 _TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES = frozenset(
     {"index", "locked", "logs", "ORIG_HEAD", "refs"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class WorktreePorcelainRecord:
+    path: str
+    head_oid: str
+    branch: str | None
+    locked: bool
+    detached: bool
+
+
+def parse_worktree_porcelain_nul(output: bytes) -> tuple[WorktreePorcelainRecord, ...]:
+    if not output or len(output) > MAX_WORKTREE_PORCELAIN_BYTES or not output.endswith(b"\0\0"):
+        raise ValueError("WORKTREE_PORCELAIN_UNTERMINATED")
+    records: list[WorktreePorcelainRecord] = []
+    for raw_record in output[:-2].split(b"\0\0"):
+        if not raw_record:
+            raise ValueError("WORKTREE_PORCELAIN_INVALID")
+        fields: dict[bytes, bytes] = {}
+        for raw_field in raw_record.split(b"\0"):
+            key, separator, value = raw_field.partition(b" ")
+            if key in {b"locked", b"detached"} and not separator:
+                value = b""
+            elif key not in {b"worktree", b"HEAD", b"branch", b"locked"} or not separator:
+                raise ValueError("WORKTREE_PORCELAIN_INVALID")
+            if key in fields or len(value) > 32_768:
+                raise ValueError("WORKTREE_PORCELAIN_INVALID")
+            fields[key] = value
+        required = {b"worktree", b"HEAD"}
+        if not required.issubset(fields) or (b"branch" in fields) == (b"detached" in fields):
+            raise ValueError("WORKTREE_PORCELAIN_INVALID")
+        if not set(fields).issubset(required | {b"branch", b"locked", b"detached"}):
+            raise ValueError("WORKTREE_PORCELAIN_INVALID")
+        try:
+            path = fields[b"worktree"].decode("utf-8", errors="strict")
+            head_oid = fields[b"HEAD"].decode("ascii", errors="strict")
+            branch = (
+                None
+                if b"branch" not in fields
+                else fields[b"branch"].decode("utf-8", errors="strict")
+            )
+            if b"locked" in fields:
+                fields[b"locked"].decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("WORKTREE_PORCELAIN_NON_UTF8") from error
+        if (
+            not path
+            or any(character in path for character in "\r\n\x00")
+            or len(head_oid) != 40
+            or any(character not in "0123456789abcdef" for character in head_oid)
+            or (
+                branch is not None
+                and (not branch.startswith("refs/heads/") or branch == "refs/heads/")
+            )
+        ):
+            raise ValueError("WORKTREE_PORCELAIN_INVALID")
+        records.append(
+            WorktreePorcelainRecord(
+                path,
+                head_oid,
+                branch,
+                b"locked" in fields,
+                b"detached" in fields,
+            )
+        )
+    return tuple(records)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1096,6 +1164,64 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         self._repository = self._repository.refresh_after_verified_owned_transition()
         self._require_pinned_target(operation)
         return TargetReservationOperationResult(intent_id=operation.intent_id, kind=operation.kind)
+
+    def observe_registration(
+        self, reservation: TargetReservation
+    ) -> ReservationRegistrationObservation:
+        try:
+            self._worktree_guard.require_safe_before_list(reservation)
+            admin = self._worktree_guard.require_compatible_observation(reservation)
+            result = self._runner.run_bytes(self._repository, GitWorktreeListPorcelain())
+        except (RepositoryEffectError, RepositoryUnsafeError):
+            return ReservationRegistrationObservation(False, False, False, True, False)
+        if result.returncode != 0:
+            return ReservationRegistrationObservation(False, False, False, True, False)
+        try:
+            records = parse_worktree_porcelain_nul(result.stdout)
+        except ValueError:
+            return ReservationRegistrationObservation(False, False, False, True, False)
+
+        by_path = tuple(record for record in records if Path(record.path) == reservation.path)
+        by_target = tuple(record for record in records if record.branch == reservation.target_ref)
+        record = by_path[0] if len(by_path) == 1 else None
+        others = tuple(item for item in records if item is not record)
+        main = others[0] if len(others) == 1 else None
+        safe_main = (
+            main is not None
+            and Path(main.path) == self._repository.root
+            and main.detached
+            and not main.locked
+            and main.head_oid == reservation.pinned_target_oid
+        )
+        unexpected = (
+            len(by_path) > 1
+            or len(by_target) > 1
+            or (record is None and bool(by_target))
+            or (
+                record is not None
+                and (
+                    len(records) != 2
+                    or len(by_target) != 1
+                    or by_target[0] != record
+                    or not safe_main
+                )
+            )
+            or (record is None and (len(records) != 1 or not safe_main))
+        )
+        exact = (
+            not unexpected
+            and record is not None
+            and record.head_oid == reservation.pinned_target_oid
+        )
+        return ReservationRegistrationObservation(
+            registration_present=record is not None,
+            locked=False if record is None else record.locked,
+            exact_identity=exact,
+            unexpected_registration=unexpected,
+            observable=True,
+            admin_entry_name=admin.admin_entry_name,
+            admin_binding_digest=admin.admin_binding_digest,
+        )
 
     def _require_pinned_target(self, operation: TargetReservationOperation) -> None:
         result = self._runner.run(self._repository, GitShowRefVerify(operation.target_ref))

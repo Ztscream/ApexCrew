@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import json
+from base64 import b32encode
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from hashlib import sha256
+from hmac import compare_digest
+from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, cast
 
+if TYPE_CHECKING:
+    from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
+
+from apexcrew.application.control import (
+    RepositoryBootstrapAuthorityService,
+    TargetAuthorityDigestService,
+)
 from apexcrew.domain.admission import (
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
@@ -61,13 +72,30 @@ from apexcrew.domain.authority import (
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
+    ApproveBudgetPayload,
+    ApproveModelConfigurationPayload,
+    ApprovePlanPayload,
+    ApprovePolicyPayload,
+    BeginPlanningPayload,
     CommandEnvelope,
     CommandOutcome,
+    CreateRunPayload,
+    ProposeBudgetPayload,
+    ProposeModelConfigurationPayload,
+    ProposePolicyPayload,
+    PublicRunSnapshot,
+    ResumePayload,
+    RunStop,
+    RuntimeAllowedPhase,
+    RuntimeDecision,
+    RuntimePermit,
+    RuntimeState,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    ReservationObservation,
     RunRecord,
     StateCommitFault,
     StateConflict,
@@ -90,20 +118,39 @@ from apexcrew.domain.model import (
     ModelRequestIntent,
     ProviderAttemptKind,
     ProviderAttemptResult,
+    RecoveredModelAction,
     SettledModelAttempt,
 )
 from apexcrew.domain.plan import may_overlap
-from apexcrew.domain.revisions import BudgetRevisionDocument, Sha256DigestText, revision_digest
+from apexcrew.domain.revisions import (
+    BudgetRevisionDocument,
+    FrozenDocument,
+    Sha256DigestText,
+    revision_digest,
+)
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CommandStatus,
     IntentId,
     RepositoryId,
+    RequestId,
     RevisionDigest,
     RunId,
     RunState,
+    RuntimeOwnerId,
     TaskId,
+)
+
+_EXECUTION_REVISION_STATES = frozenset(
+    {
+        RunState.ACTIVE,
+        RunState.VERIFYING_RUN,
+        RunState.READY_FOR_APPROVAL,
+        RunState.APPLYING,
+        RunState.PAUSED,
+        RunState.INDETERMINATE,
+    }
 )
 
 
@@ -147,7 +194,9 @@ def _target_authority_digest(run: RunRecord, reservation: TargetReservation) -> 
                 "repository_instance_digest": run.repository_instance_digest,
                 "reservation_id": reservation.reservation_id,
                 "reservation_path": str(reservation.path),
+                "reservation_pinned_target_oid": reservation.pinned_target_oid,
                 "target_ref": reservation.target_ref,
+                "target_safety_digest": reservation.admin_binding_digest,
             }
         )
     )
@@ -213,6 +262,54 @@ def _command_digest(command: CommandEnvelope) -> str:
     return sha256_digest(canonical_json(command.model_dump(mode="json")))
 
 
+def _approval_confirmation_code(
+    command_kind: str,
+    run_id: RunId,
+    revision_class: str,
+    revision_digest_value: RevisionDigest,
+) -> str:
+    payload = canonical_json(
+        {
+            "command_kind": command_kind,
+            "revision_class": revision_class,
+            "revision_digest": revision_digest_value,
+            "run_id": run_id,
+        }
+    ).encode("utf-8")
+    return b32encode(sha256(payload).digest()).decode("ascii")[:6]
+
+
+def _run_revision_digest(run: RunRecord, revision_class: str) -> RevisionDigest | None:
+    return {
+        "PLAN": run.current_plan_digest,
+        "POLICY": run.current_policy_digest,
+        "BUDGET": run.current_budget_digest,
+        "MODEL_CONFIGURATION": run.current_model_configuration_digest,
+    }[revision_class]
+
+
+def _replace_run_revision(
+    run: RunRecord,
+    revision_class: str,
+    digest: RevisionDigest,
+    *,
+    return_to_draft: bool = False,
+) -> RunRecord:
+    if revision_class == "PLAN":
+        result = replace(run, current_plan_digest=digest)
+    elif revision_class == "POLICY":
+        result = replace(run, current_policy_digest=digest)
+    elif revision_class == "BUDGET":
+        result = replace(run, current_budget_digest=digest)
+    elif revision_class == "MODEL_CONFIGURATION":
+        result = replace(run, current_model_configuration_digest=digest)
+    else:
+        raise StateConflict("REVISION_CLASS_INVALID")
+    if return_to_draft:
+        result = replace(result, state=RunState.DRAFT, current_plan_digest=None)
+    return result
+
+
 def _outcome_json(outcome: CommandOutcome) -> str:
     return canonical_json(outcome.model_dump(mode="json"))
 
@@ -270,6 +367,24 @@ class InMemoryStateStore:
         self._model_counters: dict[RunId, ModelCounters] = {}
         self._runs: dict[RunId, RunRecord] = {}
         self._target_reservations: dict[str, TargetReservation] = {}
+        self._bootstrap_inputs: dict[RunId, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
+        self._revision_documents: dict[
+            tuple[RunId, str, RevisionDigest], tuple[FrozenDocument, AuditSequence, str]
+        ] = {}
+        self._revision_approvals: dict[
+            tuple[RunId, str, RevisionDigest], tuple[str, AuditSequence, str]
+        ] = {}
+        self._pending_revision_replacements: dict[
+            tuple[RunId, str], tuple[RevisionDigest, AuditSequence]
+        ] = {}
+        self._runtime_permits: dict[tuple[RunId, int], RuntimePermit] = {}
+        self._runtime_progress_generations: dict[RunId, int] = {}
+        self._runtime_owners: dict[RunId, tuple[RuntimeOwnerId, int]] = {}
+        self._runtime_barriers: dict[RunId, tuple[str | None, str, str | None]] = {}
+        self._runtime_interrupts: dict[RunId, tuple[str, str, int, str]] = {}
+        self._runtime_delivery_stops: dict[tuple[RunId, int], RunStop] = {}
+        self._runtime_faults: dict[RunId, object] = {}
+        self._runtime_recorded_stop_reasons: dict[RunId, str] = {}
         self._approved_budgets: dict[RunId, tuple[RevisionDigest, BudgetRevisionDocument]] = {}
         self._global_usage: dict[tuple[RunId, GlobalBudgetMetric], int | Decimal] = {}
         self._budget_warnings: dict[
@@ -323,6 +438,18 @@ class InMemoryStateStore:
         copied._model_counters = self._model_counters.copy()
         copied._runs = self._runs.copy()
         copied._target_reservations = self._target_reservations.copy()
+        copied._bootstrap_inputs = self._bootstrap_inputs.copy()
+        copied._revision_documents = self._revision_documents.copy()
+        copied._revision_approvals = self._revision_approvals.copy()
+        copied._pending_revision_replacements = self._pending_revision_replacements.copy()
+        copied._runtime_permits = self._runtime_permits.copy()
+        copied._runtime_progress_generations = self._runtime_progress_generations.copy()
+        copied._runtime_owners = self._runtime_owners.copy()
+        copied._runtime_barriers = self._runtime_barriers.copy()
+        copied._runtime_interrupts = self._runtime_interrupts.copy()
+        copied._runtime_delivery_stops = self._runtime_delivery_stops.copy()
+        copied._runtime_faults = self._runtime_faults.copy()
+        copied._runtime_recorded_stop_reasons = self._runtime_recorded_stop_reasons.copy()
         copied._approved_budgets = self._approved_budgets.copy()
         copied._global_usage = self._global_usage.copy()
         copied._budget_warnings = self._budget_warnings.copy()
@@ -364,6 +491,18 @@ class InMemoryStateStore:
         self._model_counters = copied._model_counters
         self._runs = copied._runs
         self._target_reservations = copied._target_reservations
+        self._bootstrap_inputs = copied._bootstrap_inputs
+        self._revision_documents = copied._revision_documents
+        self._revision_approvals = copied._revision_approvals
+        self._pending_revision_replacements = copied._pending_revision_replacements
+        self._runtime_permits = copied._runtime_permits
+        self._runtime_progress_generations = copied._runtime_progress_generations
+        self._runtime_owners = copied._runtime_owners
+        self._runtime_barriers = copied._runtime_barriers
+        self._runtime_interrupts = copied._runtime_interrupts
+        self._runtime_delivery_stops = copied._runtime_delivery_stops
+        self._runtime_faults = copied._runtime_faults
+        self._runtime_recorded_stop_reasons = copied._runtime_recorded_stop_reasons
         self._approved_budgets = copied._approved_budgets
         self._global_usage = copied._global_usage
         self._budget_warnings = copied._budget_warnings
@@ -411,6 +550,8 @@ class InMemoryStateStore:
         event_factory: Callable[[], tuple[AuditEvent, ...]],
         mutate: Callable[[InMemoryStateStore], None],
         runtime_now: MonotonicInstant | None = None,
+        runtime_now_factory: Callable[[], MonotonicInstant] | None = None,
+        finalize: Callable[[InMemoryStateStore], None] | None = None,
     ) -> AuditSequence:
         with self._lock:
             current = self._sequences.get(run_id, AuditSequence(0))
@@ -435,10 +576,14 @@ class InMemoryStateStore:
                     for event in events
                 ):
                     raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+                copied._active_run_times[run_id] = runtime_state
             else:
                 if copied._monotonic_clock is None:
                     raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
-                now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
+                if runtime_now_factory is not None:
+                    now = runtime_now_factory()
+                else:
+                    now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
                 runtime_state.observed_nanoseconds(now)
                 committed_events = tuple(
                     replace(
@@ -452,6 +597,8 @@ class InMemoryStateStore:
             for offset, committed_event in enumerate(committed_events, start=1):
                 next_sequence = AuditSequence(expected_sequence + offset)
                 copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+            if finalize is not None:
+                finalize(copied)
             next_sequence = AuditSequence(expected_sequence + len(committed_events))
             copied._sequences[run_id] = next_sequence
             self._publish(copied)
@@ -1600,15 +1747,12 @@ class InMemoryStateStore:
         with self._lock:
             return tuple(event.event_kind for _, event in self._audit_events.get(run_id, ()))
 
-    def runtime_barrier_state(self, run_id: RunId) -> Literal["IN_FLIGHT", "SETTLED"]:
+    def runtime_barrier_state(
+        self, run_id: RunId
+    ) -> Literal["IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"]:
         with self._lock:
-            in_flight = any(
-                isinstance(attempt, ModelRequestIntent)
-                and attempt.run_id == run_id
-                and attempt.state == "RESERVED"
-                for attempt in self._model_attempts.values()
-            )
-        return "IN_FLIGHT" if in_flight else "SETTLED"
+            barrier = self._runtime_barriers.get(run_id)
+            return "IDLE" if barrier is None else barrier[1]  # type: ignore[return-value]
 
     def dispatch_close_causes(self, run_id: RunId) -> frozenset[DispatchCloseCause]:
         with self._lock:
@@ -2880,6 +3024,1535 @@ class InMemoryStateStore:
         with self._lock:
             return sum(intent.run_id == run_id for intent in self._model_attempts.values())
 
+    def target_authority_digest(self, run_id: RunId) -> Sha256DigestText:
+        with self._lock:
+            run = self._runs.get(run_id)
+            reservation = next(
+                (item for item in self._target_reservations.values() if item.run_id == run_id),
+                None,
+            )
+            if run is None or reservation is None:
+                raise StateConflict("RUN_OR_TARGET_RESERVATION_NOT_FOUND")
+            return _target_authority_digest(run, reservation)
+
+    def current_revision_digests(self, run_id: RunId) -> ApplicableRevisionDigests:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            return ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            )
+
+    def _approved_revision_bindings(self, run_id: RunId) -> ApplicableRevisionDigests:
+        current = self.current_revision_digests(run_id)
+        approved = {
+            revision_class
+            for (stored_run_id, revision_class, digest) in self._revision_approvals
+            if stored_run_id == run_id
+            and digest
+            == {
+                "PLAN": current.plan_digest,
+                "POLICY": current.policy_digest,
+                "BUDGET": current.budget_digest,
+                "MODEL_CONFIGURATION": current.model_configuration_digest,
+            }[revision_class]
+        }
+        return ApplicableRevisionDigests(
+            plan_digest=current.plan_digest if "PLAN" in approved else None,
+            policy_digest=current.policy_digest if "POLICY" in approved else None,
+            budget_digest=current.budget_digest if "BUDGET" in approved else None,
+            model_configuration_digest=(
+                current.model_configuration_digest if "MODEL_CONFIGURATION" in approved else None
+            ),
+        )
+
+    def approved_revision_classes(self, run_id: RunId) -> tuple[str, ...]:
+        with self._lock:
+            approved = self._approved_revision_bindings(run_id)
+            values = {
+                "PLAN": approved.plan_digest,
+                "POLICY": approved.policy_digest,
+                "BUDGET": approved.budget_digest,
+                "MODEL_CONFIGURATION": approved.model_configuration_digest,
+            }
+            return tuple(
+                item
+                for item in ("PLAN", "POLICY", "BUDGET", "MODEL_CONFIGURATION")
+                if values[item] is not None
+            )
+
+    def current_budget_digest(self, run_id: RunId) -> RevisionDigest | None:
+        return self.current_revision_digests(run_id).budget_digest
+
+    def current_model_configuration_digest(self, run_id: RunId) -> RevisionDigest | None:
+        return self.current_revision_digests(run_id).model_configuration_digest
+
+    def pending_budget_replacement(self, run_id: RunId) -> RevisionDigest | None:
+        with self._lock:
+            pending = self._pending_revision_replacements.get((run_id, "BUDGET"))
+            return None if pending is None else pending[0]
+
+    def run_count(self) -> int:
+        with self._lock:
+            return len(self._runs)
+
+    def target_reservation_count(self, run_id: RunId) -> int:
+        with self._lock:
+            return sum(
+                reservation.run_id == run_id for reservation in self._target_reservations.values()
+            )
+
+    def public_run_snapshot(
+        self, run_id: RunId, at_sequence: int | None
+    ) -> PublicRunSnapshot | None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return None
+            current = self._sequences.get(run_id, AuditSequence(0))
+            requested = int(current) if at_sequence is None else at_sequence
+            if requested < 0 or requested > current:
+                return None
+            if requested != current and not any(
+                sequence == requested for sequence, _ in self._audit_events.get(run_id, ())
+            ):
+                return None
+            return PublicRunSnapshot(AuditSequence(requested), run.state)
+
+    def runtime_permit(self, run_id: RunId, generation: int) -> RuntimePermit:
+        with self._lock:
+            permit = self._runtime_permits.get((run_id, generation))
+            if permit is None:
+                raise StateConflict("RUNTIME_PERMIT_NOT_FOUND")
+            return permit
+
+    def unconsumed_permit(self, run_id: RunId) -> RuntimePermit:
+        with self._lock:
+            permits = [
+                permit
+                for (stored_run_id, _), permit in self._runtime_permits.items()
+                if stored_run_id == run_id and permit.state == "UNCONSUMED"
+            ]
+            if len(permits) != 1:
+                raise StateConflict("RUNTIME_PERMIT_NOT_FOUND")
+            return permits[0]
+
+    @staticmethod
+    def _issue_runtime_permit_on_copy(
+        copied: InMemoryStateStore,
+        command: CommandEnvelope,
+        allowed_phase: RuntimeAllowedPhase,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        target_authority_digest: Sha256DigestText,
+        issued_sequence: AuditSequence,
+    ) -> RuntimePermit:
+        if isinstance(command.payload, CreateRunPayload):
+            raise TypeError("runtime Permit source must identify a Run")
+        run_id = RunId(command.payload.run_id)
+        run = copied._runs.get(run_id)
+        if run is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        if (
+            run.state.value != allowed_phase
+            or copied.current_revision_digests(run_id) != applicable_revision_digests
+            or copied.target_authority_digest(run_id) != target_authority_digest
+        ):
+            raise StateConflict("RUNTIME_PERMIT_BINDING_MISMATCH")
+        source_digest = Sha256DigestText(_command_digest(command))
+        if (
+            any(
+                (permit.run_id == run_id and permit.state == "UNCONSUMED")
+                or (
+                    permit.source_request_id == command.request_id
+                    and permit.source_envelope_digest == source_digest
+                )
+                for permit in copied._runtime_permits.values()
+            )
+            or run_id in copied._runtime_owners
+        ):
+            raise StateConflict("RUNTIME_DELIVERY_PENDING")
+        generation = (
+            max(
+                (
+                    generation
+                    for stored_run_id, generation in copied._runtime_permits
+                    if stored_run_id == run_id
+                ),
+                default=0,
+            )
+            + 1
+        )
+        permit = RuntimePermit(
+            run_id=run_id,
+            generation=generation,
+            source_request_id=RequestId(command.request_id),
+            source_envelope_digest=source_digest,
+            issued_sequence=issued_sequence,
+            allowed_phase=allowed_phase,
+            applicable_revision_digests=applicable_revision_digests,
+            target_authority_digest=target_authority_digest,
+            expected_runtime_progress_generation=copied._runtime_progress_generations.get(
+                run_id, 0
+            ),
+            state="UNCONSUMED",
+        )
+        copied._runtime_permits[(run_id, generation)] = permit
+        return permit
+
+    def issue_runtime_permit(
+        self,
+        command: CommandEnvelope,
+        allowed_phase: RuntimeAllowedPhase,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        target_authority_digest: Sha256DigestText,
+        expected_sequence: AuditSequence,
+    ) -> RuntimePermit:
+        if not isinstance(command.payload, (BeginPlanningPayload, ResumePayload)):
+            raise StateConflict("RUNTIME_PERMIT_SOURCE_COMMAND_INVALID")
+        required_phase: RuntimeAllowedPhase = (
+            "DRAFT" if isinstance(command.payload, BeginPlanningPayload) else "PAUSED"
+        )
+        if allowed_phase != required_phase:
+            raise StateConflict("RUNTIME_PERMIT_PHASE_MISMATCH")
+        issued: list[RuntimePermit] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            receipt = copied._command_receipts.get(command.request_id)
+            if receipt is None or receipt[2] != _command_digest(command):
+                raise StateConflict("RUNTIME_PERMIT_SOURCE_COMMAND_NOT_ACCEPTED")
+            outcome = CommandOutcome.validate_for_payload(command.payload, _json_object(receipt[3]))
+            if outcome.status != CommandStatus.ACCEPTED:
+                raise StateConflict("RUNTIME_PERMIT_SOURCE_COMMAND_NOT_ACCEPTED")
+            issued.append(
+                self._issue_runtime_permit_on_copy(
+                    copied,
+                    command,
+                    allowed_phase,
+                    applicable_revision_digests,
+                    target_authority_digest,
+                    AuditSequence(expected_sequence + 1),
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=RunId(command.payload.run_id),
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_PERMIT_ISSUED"),
+            mutate=mutate,
+        )
+        return issued[0]
+
+    def consume_current_runtime_permit(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        expected_sequence: AuditSequence,
+    ) -> RuntimePermit | None:
+        with self._lock:
+            try:
+                existing = self.unconsumed_permit(run_id)
+            except StateConflict:
+                return None
+        consumed: list[RuntimePermit] = []
+        event_kinds: list[str] = []
+        opened_at: list[MonotonicInstant] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = copied._runtime_permits[(run_id, existing.generation)]
+            if permit.state != "UNCONSUMED":
+                raise StateConflict("RUNTIME_PERMIT_CONSUME_COMPARE_AND_SET_FAILED")
+            run = copied._runs[run_id]
+            ordinary_phase_matches = permit.allowed_phase == run.state.value
+            terminal_matches = permit.allowed_phase == "TERMINAL_ADMINISTRATION" and run.state in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }
+            valid = (
+                (ordinary_phase_matches or terminal_matches)
+                and permit.applicable_revision_digests == copied.current_revision_digests(run_id)
+                and permit.target_authority_digest == copied.target_authority_digest(run_id)
+                and permit.expected_runtime_progress_generation
+                == copied._runtime_progress_generations.get(run_id, 0)
+            )
+            if not valid:
+                copied._runtime_permits[(run_id, permit.generation)] = permit.model_copy(
+                    update={"state": "INVALIDATED"}
+                )
+                event_kinds.append("RUNTIME_PERMIT_INVALIDATED")
+                return
+            if run_id in copied._runtime_owners:
+                raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            active = copied._active_run_times.get(
+                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            )
+            if active.open_owner_generation is not None:
+                raise StateConflict("RUNTIME_DELIVERY_PENDING")
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            now = copied._monotonic_clock.now()
+            opened_at.append(now)
+            consumed_sequence = AuditSequence(expected_sequence + 1)
+            result = permit.model_copy(
+                update={
+                    "state": "CONSUMED",
+                    "consumed_owner_id": owner_id,
+                    "consumed_sequence": consumed_sequence,
+                }
+            )
+            copied._runtime_permits[(run_id, permit.generation)] = result
+            owner_generation = copied._runtime_owners.get(run_id, (owner_id, 0))[1] + 1
+            copied._runtime_owners[run_id] = (owner_id, owner_generation)
+            copied._runtime_progress_generations[run_id] = (
+                copied._runtime_progress_generations.get(run_id, 0) + 1
+            )
+            copied._active_run_times[run_id] = ActiveRunTimeState(
+                run_id=run_id,
+                cumulative_nanoseconds=active.cumulative_nanoseconds,
+                open_owner_generation=owner_generation,
+                opened_at=now,
+                latest_committed_at=now,
+            )
+            consumed.append(result)
+            event_kinds.append("RUNTIME_PERMIT_CONSUMED")
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
+            mutate=mutate,
+            runtime_now_factory=lambda: opened_at[0],
+        )
+        return consumed[0] if consumed else None
+
+    def _existing_control_outcome(self, command: CommandEnvelope) -> CommandOutcome | None:
+        with self._lock:
+            receipt = self._command_receipts.get(command.request_id)
+            if receipt is None:
+                return None
+            _, _, stored_digest, outcome_json, _ = receipt
+            stored = CommandOutcome.validate_for_payload(
+                command.payload, _json_object(outcome_json)
+            )
+            if stored_digest == _command_digest(command):
+                return stored
+            return CommandOutcome.for_payload(
+                command.payload,
+                status=CommandStatus.CONFLICT,
+                run_id=stored.run_id,
+                resulting_sequence=stored.resulting_sequence,
+                failed_invariant="IDEMPOTENCY_KEY_REUSE",
+            )
+
+    def _record_control_outcome(
+        self,
+        command: CommandEnvelope,
+        run_id: RunId,
+        status: CommandStatus,
+        failed_invariant: str | None,
+        event_kind: str,
+        mutate_domain: Callable[[InMemoryStateStore], None] | None = None,
+    ) -> CommandOutcome:
+        if command.expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        expected = AuditSequence(command.expected_sequence)
+        outcome = CommandOutcome.for_payload(
+            command.payload,
+            status=status,
+            run_id=run_id,
+            resulting_sequence=AuditSequence(expected + 1),
+            failed_invariant=failed_invariant,
+        )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if mutate_domain is not None:
+                mutate_domain(copied)
+            copied._command_receipts[command.request_id] = (
+                run.repository_id,
+                run_id,
+                _command_digest(command),
+                _outcome_json(outcome),
+                AuditSequence(expected + 1),
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected,
+            event=AuditEvent.kind(
+                event_kind,
+                applicable_revision_digests=command.applicable_revision_digests,
+                result_class=status,
+            ),
+            mutate=mutate,
+        )
+        return outcome
+
+    def create_bootstrap_run(
+        self,
+        command: CommandEnvelope,
+        repository_authority: RepositoryBootstrapAuthorityService,
+    ) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, CreateRunPayload):
+            raise TypeError("create payload required")
+        if command.expected_sequence is not None or command.applicable_revision_digests != (
+            ApplicableRevisionDigests()
+        ):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.INVALID,
+                run_id=None,
+                resulting_sequence=None,
+                failed_invariant="CREATE_RUN_BINDING_INVALID",
+            )
+        authority = repository_authority.inspect(payload.repository_root, payload.target_ref)
+        priced = {entry.returned_model_id for entry in payload.budget_revision.pricing_entries}
+        returned = {
+            alias.returned_model_id
+            for alias in payload.model_configuration_revision.returned_model_aliases
+        }
+        if (
+            not payload.target_ref.startswith("refs/heads/")
+            or payload.target_ref == "refs/heads/"
+            or any(character.isspace() or character == "\x00" for character in payload.target_ref)
+        ):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.INVALID,
+                run_id=None,
+                resulting_sequence=None,
+                failed_invariant="TARGET_REF_NOT_DIRECT_LOCAL_BRANCH",
+            )
+        if (
+            authority.repository_root != payload.repository_root
+            or authority.target_ref != payload.target_ref
+            or authority.target_oid != payload.expected_target_oid
+        ):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.INVALID,
+                run_id=None,
+                resulting_sequence=None,
+                failed_invariant="CREATE_RUN_BINDING_INVALID",
+            )
+        if not returned.issubset(priced):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.INVALID,
+                run_id=None,
+                resulting_sequence=None,
+                failed_invariant="MODEL_CONFIGURATION_UNPRICED",
+            )
+        binding = _command_digest(command)[7:]
+        run_id = RunId(f"run-{binding[:32]}")
+        repository_id = authority.repository_id
+        repository_instance_digest = authority.repository_instance_digest
+        reservation_id = f"reservation-{binding[32:64]}"
+        revisions: dict[str, FrozenDocument] = {
+            "POLICY": payload.policy_revision,
+            "BUDGET": payload.budget_revision,
+            "MODEL_CONFIGURATION": payload.model_configuration_revision,
+        }
+        digests = {
+            revision_class: revision_digest(document)
+            for revision_class, document in revisions.items()
+        }
+        outcome = CommandOutcome.for_payload(
+            payload,
+            status=CommandStatus.ACCEPTED,
+            run_id=run_id,
+            resulting_sequence=AuditSequence(1),
+        )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._runs[run_id] = RunRecord(
+                run_id=run_id,
+                repository_id=repository_id,
+                repository_instance_digest=repository_instance_digest,
+                state=RunState.DRAFT,
+                target_ref=payload.target_ref,
+                pinned_target_oid=payload.expected_target_oid,
+                current_policy_digest=digests["POLICY"],
+                current_budget_digest=digests["BUDGET"],
+                current_model_configuration_digest=digests["MODEL_CONFIGURATION"],
+            )
+            copied._new_dispatch_open[run_id] = True
+            copied._runtime_progress_generations[run_id] = 0
+            copied._target_reservations[reservation_id] = TargetReservation(
+                reservation_id=reservation_id,
+                run_id=run_id,
+                target_ref=payload.target_ref,
+                pinned_target_oid=payload.expected_target_oid,
+                path=Path.cwd() / "data" / "reservations" / reservation_id,
+                phase="ALLOCATED",
+            )
+            copied._bootstrap_inputs[run_id] = (
+                payload.goal,
+                payload.constraints,
+                payload.acceptance_criteria,
+            )
+            for revision_class, document in revisions.items():
+                copied._revision_documents[
+                    (
+                        run_id,
+                        revision_class,
+                        digests[revision_class],
+                    )
+                ] = (document, AuditSequence(1), "CURRENT")
+            copied._command_receipts[command.request_id] = (
+                repository_id,
+                run_id,
+                _command_digest(command),
+                _outcome_json(outcome),
+                AuditSequence(1),
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=AuditSequence(0),
+            event=AuditEvent.kind("RUN_CREATED"),
+            mutate=mutate,
+        )
+        return outcome
+
+    def propose_revision(
+        self, command: CommandEnvelope, run_id: RunId, state: RunState
+    ) -> CommandOutcome:
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        payload = command.payload
+        document: FrozenDocument
+        if isinstance(payload, ProposePolicyPayload):
+            revision_class, document = (
+                "POLICY",
+                payload.policy_revision,
+            )
+        elif isinstance(payload, ProposeBudgetPayload):
+            revision_class, document = (
+                "BUDGET",
+                payload.budget_revision,
+            )
+        elif isinstance(payload, ProposeModelConfigurationPayload):
+            revision_class, document = (
+                "MODEL_CONFIGURATION",
+                payload.model_configuration_revision,
+            )
+        else:
+            raise TypeError("revision proposal required")
+        if state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED} or (
+            state in _EXECUTION_REVISION_STATES and revision_class == "POLICY"
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "REVISION_FROZEN",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        required = (
+            self.current_revision_digests(run_id)
+            if state in _EXECUTION_REVISION_STATES
+            else self._approved_revision_bindings(run_id)
+        )
+        if command.applicable_revision_digests != required:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "REVISION_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        if isinstance(payload, ProposeModelConfigurationPayload):
+            budget_digest = self.current_revision_digests(run_id).budget_digest
+            assert budget_digest is not None
+            budget_record = self._revision_documents[(run_id, "BUDGET", budget_digest)]
+            budget = BudgetRevisionDocument.model_validate(
+                budget_record[0].model_dump(mode="python")
+            )
+            priced = {entry.returned_model_id for entry in budget.pricing_entries}
+            returned = {
+                alias.returned_model_id
+                for alias in payload.model_configuration_revision.returned_model_aliases
+            }
+            if not returned.issubset(priced):
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "MODEL_CONFIGURATION_UNPRICED",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+        digest = revision_digest(document)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs[run_id]
+            current_digest = _run_revision_digest(run, revision_class)
+            if current_digest == digest:
+                return
+            copied._revision_documents[(run_id, revision_class, digest)] = (
+                document,
+                AuditSequence(expected_sequence + 1),
+                "PROPOSED" if state in _EXECUTION_REVISION_STATES else "CURRENT",
+            )
+            if state not in _EXECUTION_REVISION_STATES:
+                for key, value in tuple(copied._revision_documents.items()):
+                    if key[0] == run_id and key[1] == revision_class and key[2] != digest:
+                        copied._revision_documents[key] = (value[0], value[1], "STALE")
+                copied._runs[run_id] = _replace_run_revision(
+                    run, revision_class, digest, return_to_draft=True
+                )
+                copied._revision_approvals = {
+                    key: value
+                    for key, value in copied._revision_approvals.items()
+                    if key[0] != run_id or key[1] not in {revision_class, "PLAN"}
+                }
+                copied._runtime_permits = {
+                    key: (
+                        permit.model_copy(update={"state": "INVALIDATED"})
+                        if permit.run_id == run_id and permit.state == "UNCONSUMED"
+                        else permit
+                    )
+                    for key, permit in copied._runtime_permits.items()
+                }
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "REVISION_PROPOSED",
+            mutate,
+        )
+
+    def approve_revision(
+        self, command: CommandEnvelope, run_id: RunId, state: RunState
+    ) -> CommandOutcome:
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        payload = command.payload
+        if isinstance(payload, ApprovePolicyPayload):
+            revision_class, digest, code = (
+                "POLICY",
+                payload.policy_digest,
+                payload.confirmation_code,
+            )
+        elif isinstance(payload, ApproveBudgetPayload):
+            revision_class, digest, code = (
+                "BUDGET",
+                payload.budget_digest,
+                payload.confirmation_code,
+            )
+        elif isinstance(payload, ApproveModelConfigurationPayload):
+            revision_class, digest, code = (
+                "MODEL_CONFIGURATION",
+                payload.model_configuration_digest,
+                payload.confirmation_code,
+            )
+        elif isinstance(payload, ApprovePlanPayload):
+            revision_class, digest, code = (
+                "PLAN",
+                payload.plan_digest,
+                payload.confirmation_code,
+            )
+        else:
+            raise TypeError("revision approval required")
+        if state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED} or (
+            state in _EXECUTION_REVISION_STATES and revision_class in {"PLAN", "POLICY"}
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "REVISION_FROZEN",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        expected_code = _approval_confirmation_code(payload.kind, run_id, revision_class, digest)
+        if not compare_digest(code, expected_code):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "REVISION_CONFIRMATION_CODE_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        required = (
+            self.current_revision_digests(run_id)
+            if state in _EXECUTION_REVISION_STATES
+            else self._approved_revision_bindings(run_id)
+        )
+        if command.applicable_revision_digests != required:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "REVISION_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        record = self._revision_documents.get((run_id, revision_class, digest))
+        if record is None or record[2] == "STALE":
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "REVISION_PROPOSAL_NOT_CURRENT",
+                "CONTROL_COMMAND_REJECTED",
+            )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            key = (run_id, revision_class, digest)
+            copied._revision_approvals.setdefault(
+                key,
+                (
+                    command.request_id,
+                    AuditSequence(expected_sequence + 1),
+                    expected_code,
+                ),
+            )
+            run = copied._runs[run_id]
+            in_flight = any(
+                action.run_id == run_id and action.state == "IN_FLIGHT"
+                for action in copied._atomic_actions.values()
+            )
+            if (
+                state in _EXECUTION_REVISION_STATES
+                and _run_revision_digest(run, revision_class) != digest
+                and in_flight
+            ):
+                copied._pending_revision_replacements[(run_id, revision_class)] = (
+                    digest,
+                    AuditSequence(expected_sequence + 1),
+                )
+                causes = set(copied._dispatch_close_causes.get(run_id, ()))
+                causes.add(DispatchCloseCause.REVISION_REPLACEMENT.value)
+                copied._dispatch_close_causes[run_id] = tuple(sorted(causes))
+                copied._new_dispatch_open[run_id] = False
+                return
+            if _run_revision_digest(run, revision_class) != digest:
+                for candidate, value in tuple(copied._revision_documents.items()):
+                    if candidate[0] == run_id and candidate[1] == revision_class:
+                        copied._revision_documents[candidate] = (
+                            value[0],
+                            value[1],
+                            "CURRENT" if candidate[2] == digest else "STALE",
+                        )
+                copied._runs[run_id] = _replace_run_revision(run, revision_class, digest)
+            if revision_class == "BUDGET":
+                copied._approved_budgets[run_id] = (
+                    digest,
+                    BudgetRevisionDocument.model_validate(record[0].model_dump(mode="python")),
+                )
+            copied._pending_revision_replacements.pop((run_id, revision_class), None)
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "REVISION_APPROVED",
+            mutate,
+        )
+
+    def _apply_begin_planning(
+        self,
+        command: CommandEnvelope,
+        run_id: RunId,
+        target_authority: TargetAuthorityDigestService,
+    ) -> CommandOutcome:
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        approved = self._approved_revision_bindings(run_id)
+        if command.applicable_revision_digests != current:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "REVISION_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        required = (
+            current.policy_digest,
+            current.budget_digest,
+            current.model_configuration_digest,
+        )
+        if (
+            any(item is None for item in required)
+            or (
+                approved.policy_digest,
+                approved.budget_digest,
+                approved.model_configuration_digest,
+            )
+            != required
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "BOOTSTRAP_REVISIONS_NOT_APPROVED",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        target_digest = self.target_authority_digest(run_id)
+        if target_authority.current_for(run_id) != target_digest:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "TARGET_AUTHORITY_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                "DRAFT",
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        try:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.ACCEPTED,
+                None,
+                "RUNTIME_PERMIT_ISSUED",
+                mutate,
+            )
+        except StateConflict as error:
+            if str(error) != "RUNTIME_DELIVERY_PENDING":
+                raise
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.CONFLICT,
+                "RUNTIME_DELIVERY_PENDING",
+                "CONTROL_COMMAND_REJECTED",
+            )
+
+    def _apply_task_resume(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        payload = command.payload
+        if not isinstance(payload, ResumePayload) or payload.task_id is None:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "RUN_RESUME_NOT_OWNED_BY_TASK_10",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        task_id = payload.task_id
+        pause = self.current_task_pause(run_id, task_id)
+        counters = self.task_counters(run_id, task_id)
+        current = self.current_revision_digests(run_id)
+        if (
+            command.applicable_revision_digests != current
+            or pause is None
+            or pause.pause_sequence != payload.pause_sequence
+            or pause.pause_reason != payload.pause_reason
+            or pause.counter_snapshot_digest != counters.digest
+            or pause.applicable_revision_digests_at_pause != current
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "TASK_PAUSE_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        remaining = V01_MECHANISM_LIMITS.task_call_ceiling - counters.allocated_calls
+        calls = min(V01_MECHANISM_LIMITS.renewal_tranche_calls, remaining)
+        if (
+            payload.pause_reason
+            not in {"NO_PROGRESS", "REPEATED_CHECKPOINT", "REPEATED_INVALID_ACTION"}
+            or calls < 1
+            or counters.manual_resumes >= V01_MECHANISM_LIMITS.manual_resume_ceiling
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "TASK_PAUSE_NOT_RESUMABLE",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        budget_digest = current.budget_digest
+        if budget_digest is None:
+            raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+        request = ResumeTaskRequest(
+            run_id=run_id,
+            task_id=task_id,
+            pause_sequence=payload.pause_sequence,
+            pause_reason=payload.pause_reason,
+            applicable_revision_digests=current,
+            expected_sequence=AuditSequence(expected_sequence),
+        )
+        allocation_id, new_attempt_id = task_resume_ids(
+            request, pause, counters, budget_digest, calls
+        )
+        target_digest = self.target_authority_digest(run_id)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            key = (run_id, task_id)
+            budget = copied._task_budget_counters[key]
+            copied._task_budget_counters[key] = replace(
+                budget, manual_resumes=budget.manual_resumes + 1
+            )
+            copied._task_resume_allocations[allocation_id] = TaskResumeAllocation(
+                allocation_id=allocation_id,
+                run_id=run_id,
+                task_id=task_id,
+                reserved_attempt_id=new_attempt_id,
+                budget_digest=budget_digest,
+                applicable_revision_digests=current,
+                allocated_calls=calls,
+                state="RESERVED",
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._tasks[key] = ("READY", None, None)
+            copied._active_task_pauses.remove(key)
+            causes = set(copied._dispatch_close_causes.get(run_id, ()))
+            causes.remove(DispatchCloseCause.TASK_PAUSED.value)
+            copied._dispatch_close_causes[run_id] = tuple(sorted(causes))
+            copied._new_dispatch_open[run_id] = not causes
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                "PAUSED",
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "TASK_RESUME_AND_RUNTIME_PERMIT_ISSUED",
+            mutate,
+        )
+
+    def apply_control_command(
+        self,
+        command: CommandEnvelope,
+        target_authority: TargetAuthorityDigestService,
+        repository_authority: RepositoryBootstrapAuthorityService,
+    ) -> CommandOutcome:
+        existing = self._existing_control_outcome(command)
+        if existing is not None:
+            return existing
+        if isinstance(command.payload, CreateRunPayload):
+            return self.create_bootstrap_run(command, repository_authority)
+        run_id = RunId(command.payload.run_id)
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.INVALID,
+                    run_id=run_id,
+                    resulting_sequence=None,
+                    failed_invariant="RUN_NOT_FOUND",
+                )
+            sequence = self._sequences.get(run_id, AuditSequence(0))
+        if command.expected_sequence != sequence:
+            return CommandOutcome.for_payload(
+                command.payload,
+                status=CommandStatus.STALE,
+                run_id=run_id,
+                resulting_sequence=sequence,
+                failed_invariant="STALE_SEQUENCE",
+            )
+        if isinstance(
+            command.payload,
+            (ProposePolicyPayload, ProposeBudgetPayload, ProposeModelConfigurationPayload),
+        ):
+            return self.propose_revision(command, run_id, run.state)
+        if isinstance(
+            command.payload,
+            (
+                ApprovePolicyPayload,
+                ApproveBudgetPayload,
+                ApproveModelConfigurationPayload,
+                ApprovePlanPayload,
+            ),
+        ):
+            return self.approve_revision(command, run_id, run.state)
+        if isinstance(command.payload, BeginPlanningPayload):
+            if run.state != RunState.DRAFT:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "BEGIN_PLANNING_REQUIRES_DRAFT",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            return self._apply_begin_planning(command, run_id, target_authority)
+        if isinstance(command.payload, ResumePayload):
+            if run.state != RunState.PAUSED:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "RESUME_REQUIRES_PAUSED",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            return self._apply_task_resume(command, run_id)
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.INVALID,
+            "COMMAND_NOT_AVAILABLE_IN_TASK_10",
+            "CONTROL_COMMAND_REJECTED",
+        )
+
     def fail_next_commit_after_state_write_for_test(self) -> None:
         with self._lock:
             self._fail_next_commit_after_state_write = True
+
+    def load_runtime_state(self, run_id: RunId) -> RuntimeState:
+        run = self.run_record(run_id)
+        if (
+            run.current_policy_digest is None
+            or run.current_budget_digest is None
+            or run.current_model_configuration_digest is None
+        ):
+            raise StateConflict("RUNTIME_REVISION_BINDING_INCOMPLETE")
+        return RuntimeState(
+            run_id,
+            run.state,
+            self.audit_sequence(run_id),
+            self._runtime_progress_generations.get(run_id, 0),
+            run.current_plan_digest,
+            run.current_policy_digest,
+            run.current_budget_digest,
+            run.current_model_configuration_digest,
+        )
+
+    def target_reservation_for_run(self, run_id: RunId) -> TargetReservation:
+        matches = tuple(
+            reservation
+            for reservation in self._target_reservations.values()
+            if reservation.run_id == run_id
+        )
+        if len(matches) != 1:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        return matches[0]
+
+    def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
+        owner = self._runtime_owners.get(run_id)
+        return None if owner is None else owner[0]
+
+    def runtime_delivery_event(self, run_id: RunId) -> str | None:
+        values = [
+            event.event_kind
+            for _, event in self._audit_events.get(run_id, ())
+            if event.event_kind in {"RUNTIME_DELIVERY_STOP_RECORDED", "RUNTIME_OWNER_RELEASED"}
+        ]
+        return None if not values else values[-1]
+
+    def runtime_delivery_stop_count(self, run_id: RunId) -> int:
+        return sum(key[0] == run_id for key in self._runtime_delivery_stops)
+
+    def model_attempt_count(self, logical_turn_id: LogicalTurnId) -> int:
+        return sum(
+            attempt.logical_turn_id == logical_turn_id for attempt in self._model_attempts.values()
+        )
+
+    def unconsumed_permit_count(self, run_id: RunId) -> int:
+        return sum(
+            permit.run_id == run_id and permit.state == "UNCONSUMED"
+            for permit in self._runtime_permits.values()
+        )
+
+    @staticmethod
+    def _require_consumed_runtime_owner_on_copy(
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> tuple[RuntimePermit, int]:
+        owner = copied._runtime_owners.get(run_id)
+        permit = copied._runtime_permits.get((run_id, permit_generation))
+        if (
+            owner is None
+            or owner[0] != owner_id
+            or permit is None
+            or permit.state != "CONSUMED"
+            or permit.consumed_owner_id != owner_id
+        ):
+            raise StateConflict("RUNTIME_OWNER_BINDING_MISMATCH")
+        active = copied._active_run_times.get(run_id)
+        if active is None or active.open_owner_generation != owner[1]:
+            raise StateConflict("RUNTIME_OWNER_BINDING_MISMATCH")
+        return permit, owner[1]
+
+    @staticmethod
+    def _require_consumed_draft_permit_on_copy(
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+    ) -> RuntimePermit:
+        permit, _ = InMemoryStateStore._require_consumed_runtime_owner_on_copy(
+            copied, run_id, owner_id, permit_generation
+        )
+        if permit.allowed_phase != "DRAFT" or copied._runs[run_id].state != RunState.DRAFT:
+            raise StateConflict("TARGET_RESERVATION_PERMIT_BINDING_MISMATCH")
+        return permit
+
+    def record_or_load_target_reservation_creation_intent_under_draft_permit(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> TargetReservationCreationIntent:
+        reservation = self.target_reservation_for_run(run_id)
+        if reservation.phase == "CREATION_INTENT_RECORDED":
+            return self.unsettled_target_reservation_creation(run_id)
+        created: list[TargetReservationCreationIntent] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = self._require_consumed_draft_permit_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            current = copied.target_reservation_for_run(run_id)
+            intent = _new_target_reservation_creation_intent(
+                copied._runs[run_id], current, expected_sequence
+            ).model_copy(
+                update={
+                    "applicable_revision_digests": permit.applicable_revision_digests,
+                    "target_authority_digest": permit.target_authority_digest,
+                }
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            if effect.intent_id in copied._effect_intents:
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._target_reservations[current.reservation_id] = replace(
+                current, phase="CREATION_INTENT_RECORDED"
+            )
+            created.append(intent)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return created[0]
+
+    def settle_target_reservation_creation_under_draft_permit(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        _validate_reservation_outcome(intent, outcome)
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = self._require_consumed_draft_permit_on_copy(
+                copied, intent.run_id, owner_id, permit_generation
+            )
+            if (
+                intent.applicable_revision_digests != permit.applicable_revision_digests
+                or intent.target_authority_digest != permit.target_authority_digest
+            ):
+                raise StateConflict("TARGET_RESERVATION_PERMIT_AUTHORITY_MISMATCH")
+            reservation = copied._target_reservations[intent.reservation_id]
+            effect = copied._effect_intents.get(intent.intent_id)
+            if (
+                reservation.phase != "CREATION_INTENT_RECORDED"
+                or effect
+                != intent.to_effect_intent(effect.recorded_sequence if effect else AuditSequence(0))
+                or intent.intent_id in copied._effect_results
+            ):
+                raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = result
+            if outcome.result_class == "REGISTERED_LOCKED":
+                if classify_reservation_creation(outcome.observed) != "SETTLE":
+                    raise StateConflict("TARGET_RESERVATION_SUCCESS_NOT_EXACT")
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="REGISTERED_LOCKED",
+                    admin_entry_name=outcome.observed.admin_entry_name,
+                    admin_binding_digest=outcome.observed.admin_binding_digest,
+                )
+                state = RunState.PLANNING
+            elif outcome.result_class == "CONFLICT":
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="ALLOCATED",
+                    admin_entry_name=None,
+                    admin_binding_digest=None,
+                )
+                state = RunState.DRAFT
+            else:
+                copied._close_new_dispatch(intent.run_id, DispatchCloseCause.RUNTIME_FAULT)
+                state = RunState.INDETERMINATE
+            copied._runs[intent.run_id] = replace(copied._runs[intent.run_id], state=state)
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_SETTLED"),
+            mutate=mutate,
+        )
+
+    def reuse_locked_target_reservation_under_draft_permit(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if classify_reservation_creation(observed) != "SETTLE":
+            raise StateConflict("TARGET_RESERVATION_REUSE_NOT_EXACT")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_draft_permit_on_copy(copied, run_id, owner_id, permit_generation)
+            reservation = copied.target_reservation_for_run(run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_REUSE_PHASE_INVALID")
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.PLANNING)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_REUSED_AND_PLANNING_STARTED"),
+            mutate=mutate,
+        )
+
+    def record_target_reservation_pre_intent_stop(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        event = (
+            "TARGET_RESERVATION_OBSERVATION_INDETERMINATE"
+            if not observed.observable
+            else "TARGET_RESERVATION_INITIALIZATION_CONFLICT"
+        )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_draft_permit_on_copy(copied, run_id, owner_id, permit_generation)
+            if not observed.observable:
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+                copied._close_new_dispatch(run_id, DispatchCloseCause.RUNTIME_FAULT)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(event),
+            mutate=mutate,
+        )
+
+    def begin_runtime_barrier(
+        self, run_id: RunId, action_id: str, expected_sequence: AuditSequence
+    ) -> str:
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._require_dispatch_binding(run_id)
+            if not copied._new_dispatch_open.get(run_id, True):
+                raise StateConflict("RUN_DISPATCH_CLOSED")
+            current = copied._runtime_barriers.get(run_id)
+            if current is not None and current[1] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            copied._runtime_barriers[run_id] = (action_id, "IN_FLIGHT", None)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_BARRIER_STARTED", action_id=action_id),
+            mutate=mutate,
+        )
+        return action_id
+
+    def settle_runtime_barrier(
+        self,
+        run_id: RunId,
+        action_id: str,
+        model_calls: int,
+        pending_stop_reason: str | None,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        events = [AuditEvent.kind("RUNTIME_BARRIER_SETTLED", action_id=action_id)]
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            current = copied._runtime_barriers.get(run_id)
+            if current != (action_id, "IN_FLIGHT", None):
+                raise StateConflict("RUNTIME_BARRIER_SETTLE_COMPARE_AND_SET_FAILED")
+            counters = copied.model_counters(run_id)
+            calls = counters.calls + model_calls
+            copied._model_counters[run_id] = replace(counters, calls=calls)
+            budget_digest = copied.current_revision_digests(run_id).budget_digest
+            if budget_digest is None:
+                raise StateConflict("CURRENT_BUDGET_NOT_FOUND")
+            _, stopped = copied._settle_global_usage_for_producer(
+                run_id, budget_digest, GlobalBudgetMetric.MODEL_CALLS, calls
+            )
+            derived = "BUDGET_STOP" if stopped else None
+            if pending_stop_reason != derived:
+                raise StateConflict("RUNTIME_BARRIER_STOP_CAUSE_MISMATCH")
+            if stopped:
+                events.append(AuditEvent.kind("BUDGET_STOP_REQUESTED"))
+            copied._runtime_barriers[run_id] = (action_id, "SETTLED", derived)
+
+        return self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: tuple(events),
+            mutate=mutate,
+        )
+
+    def apply_post_barrier_controls(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision | None:
+        self._require_consumed_runtime_owner_on_copy(self, run_id, owner_id, permit_generation)
+        interrupt = self._runtime_interrupts.get(run_id)
+        if interrupt is not None and interrupt[3] == "PENDING":
+            return RuntimeDecision.pause(interrupt[1], expected_sequence)
+        barrier = self._runtime_barriers.get(run_id)
+        if barrier is not None and barrier[2] == "BUDGET_STOP":
+            return RuntimeDecision.pause("GLOBAL_MODEL_CALL_CEILING", expected_sequence)
+        return None
+
+    def record_runtime_delivery_stop(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        candidate: RunStop,
+        expected_sequence: AuditSequence,
+    ) -> RunStop:
+        result: list[RunStop] = []
+        closed_at: list[MonotonicInstant] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            barrier = copied._runtime_barriers.get(run_id)
+            if barrier is not None and barrier[1] == "IN_FLIGHT":
+                raise StateConflict("RUNTIME_BARRIER_IN_FLIGHT")
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            closed = copied._monotonic_clock.now()
+            active = copied._active_run_times[run_id]
+            cumulative = active.observed_nanoseconds(closed)
+            closed_at.append(closed)
+            final = RunStop(
+                run_id=run_id,
+                state=copied._runs[run_id].state,
+                reason=candidate.reason,
+                last_sequence=AuditSequence(expected_sequence + 2),
+                pending=candidate.pending,
+            )
+            copied._active_run_times[run_id] = replace(active, cumulative_nanoseconds=cumulative)
+            copied._runtime_delivery_stops[(run_id, permit_generation)] = final
+            result.append(final)
+
+        def finalize(copied: InMemoryStateStore) -> None:
+            copied._runtime_owners.pop(run_id, None)
+            active = copied._active_run_times[run_id]
+            copied._active_run_times[run_id] = ActiveRunTimeState(
+                run_id, active.cumulative_nanoseconds, None, None, None
+            )
+
+        self._commit_state_and_events(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (
+                AuditEvent.kind("RUNTIME_DELIVERY_STOP_RECORDED"),
+                AuditEvent.kind("RUNTIME_OWNER_RELEASED"),
+            ),
+            mutate=mutate,
+            runtime_now_factory=lambda: closed_at[0],
+            finalize=finalize,
+        )
+        return result[0]
+
+    def record_runtime_fault_and_classify_barrier(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        fault: RuntimeFault,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeFaultDisposition:
+        from apexcrew.application.runtime import RuntimeFaultDisposition
+
+        result: list[RuntimeFaultDisposition] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            barrier = copied._runtime_barriers.get(run_id)
+            stored_state = "IDLE" if barrier is None else barrier[1]
+            if stored_state not in {"IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"}:
+                raise StateConflict("RUNTIME_BARRIER_STATE_INVALID")
+            state = cast(
+                Literal["IDLE", "IN_FLIGHT", "SETTLED", "INDETERMINATE"],
+                stored_state,
+            )
+            if state == "IN_FLIGHT":
+                assert barrier is not None
+                copied._runtime_barriers[run_id] = (
+                    barrier[0],
+                    "INDETERMINATE",
+                    barrier[2],
+                )
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+                state = "INDETERMINATE"
+                reason: Literal["RUNTIME_FAULT", "RUNTIME_CLOCK_REGRESSION", "INDETERMINATE"] = (
+                    "INDETERMINATE"
+                )
+            else:
+                state = "SETTLED" if state == "SETTLED" else "IDLE"
+                reason = (
+                    "RUNTIME_CLOCK_REGRESSION"
+                    if fault.fault_code == "MONOTONIC_CLOCK_REGRESSED"
+                    else "RUNTIME_FAULT"
+                )
+            copied._close_new_dispatch(run_id, DispatchCloseCause.RUNTIME_FAULT)
+            copied._runtime_faults[run_id] = fault
+            copied._runtime_recorded_stop_reasons[run_id] = reason
+            result.append(
+                RuntimeFaultDisposition(AuditSequence(expected_sequence + 1), reason, state)
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_FAULT_RECORDED"),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def latest_runtime_fault(self, run_id: RunId) -> object:
+        try:
+            return self._runtime_faults[run_id]
+        except KeyError as error:
+            raise StateConflict("RUNTIME_FAULT_NOT_FOUND") from error
+
+    def recorded_stop_reason(self, run_id: RunId) -> str | None:
+        if run_id in self._runtime_recorded_stop_reasons:
+            return self._runtime_recorded_stop_reasons[run_id]
+        barrier = self._runtime_barriers.get(run_id)
+        return None if barrier is None else barrier[2]
+
+    def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None:
+        candidates = sorted(
+            (
+                turn
+                for turn in self._model_turns.values()
+                if isinstance(turn, CommittedModelTurn)
+                and turn.run_id == run_id
+                and turn.state == "COMPLETION_COMMITTED"
+                and turn.downstream_intent_id is None
+            ),
+            key=lambda turn: (turn.committed_sequence, turn.logical_turn_id),
+        )
+        return None if not candidates else candidates[0]
+
+    def next_recovered_model_action(self, run_id: RunId) -> RecoveredModelAction | None:
+        candidates = sorted(
+            (
+                intent
+                for intent in self._effect_intents.values()
+                if intent.run_id == run_id
+                and intent.kind == "RECOVERED_MODEL_ACTION"
+                and intent.intent_id not in self._effect_results
+            ),
+            key=lambda intent: intent.recorded_sequence,
+        )
+        if not candidates:
+            return None
+        intent = candidates[0]
+        turn = self._model_turns.get(intent.action_id or "")
+        if not isinstance(turn, CommittedModelTurn):
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH")
+        try:
+            return RecoveredModelAction.from_journal(turn, intent)
+        except ValueError as error:
+            raise StateConflict("RECOVERED_MODEL_ACTION_BINDING_MISMATCH") from error
+
+    def apply_runtime_continue(self, command: CommandEnvelope) -> CommandOutcome:
+        from apexcrew.domain.commands import ContinuePayload
+
+        if not isinstance(command.payload, ContinuePayload):
+            raise StateConflict("RUNTIME_CONTINUE_COMMAND_REQUIRED")
+        run_id = command.payload.run_id
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        target_digest = self.target_authority_digest(run_id)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if run_id in copied._runtime_owners:
+                active = copied._active_run_times.get(run_id)
+                if (
+                    active is None
+                    or active.opened_at is None
+                    or active.latest_committed_at is None
+                    or active.latest_committed_at < active.opened_at
+                ):
+                    raise StateConflict("ACTIVE_RUN_TIME_RECOVERY_INVALID")
+                cumulative = active.observed_nanoseconds(active.latest_committed_at)
+                copied._runtime_owners.pop(run_id)
+                copied._active_run_times[run_id] = ActiveRunTimeState(
+                    run_id, cumulative, None, None, None
+                )
+            state = copied._runs[run_id].state
+            allowed: RuntimeAllowedPhase = (
+                "TERMINAL_ADMINISTRATION"
+                if state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
+                else state.value  # type: ignore[assignment]
+            )
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                allowed,
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_OWNER_ORPHANED_AND_PERMIT_ISSUED",
+            mutate,
+        )

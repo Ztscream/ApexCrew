@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import Field
 
-from apexcrew.domain.commands import ApplicableRevisionDigests
+from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import (
     EffectIntent,
     EffectResult,
@@ -22,6 +23,7 @@ from apexcrew.domain.types import (
     IntentId,
     RepositoryId,
     RunId,
+    RuntimeOwnerId,
 )
 
 
@@ -110,6 +112,68 @@ class TargetReservationGitPort(Protocol):
 class TargetReservationObserver(Protocol):
     def observe(self, reservation: TargetReservation) -> ReservationObservation:
         raise NotImplementedError
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationRegistrationObservation:
+    registration_present: bool
+    locked: bool
+    exact_identity: bool
+    unexpected_registration: bool
+    observable: bool
+    admin_entry_name: str | None = None
+    admin_binding_digest: Sha256DigestText | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationPathObservation:
+    path_present: bool
+    gitfile_only: bool
+    exact_back_reference: bool
+    observable: bool
+
+
+class TargetReservationRegistrationReader(Protocol):
+    def observe_registration(
+        self, reservation: TargetReservation
+    ) -> ReservationRegistrationObservation:
+        raise NotImplementedError
+
+
+class TargetReservationPathReader(Protocol):
+    def observe_path(self, reservation: TargetReservation) -> ReservationPathObservation:
+        raise NotImplementedError
+
+
+class TargetReservationObservationService(TargetReservationObserver):
+    def __init__(
+        self,
+        registrations: TargetReservationRegistrationReader,
+        paths: TargetReservationPathReader,
+    ) -> None:
+        self._registrations = registrations
+        self._paths = paths
+
+    def observe(self, reservation: TargetReservation) -> ReservationObservation:
+        registration = self._registrations.observe_registration(reservation)
+        path = self._paths.observe_path(reservation)
+        if not registration.observable or not path.observable:
+            return ReservationObservation(False, False, False, False, False, observable=False)
+        return ReservationObservation(
+            registration_present=(
+                registration.registration_present or registration.unexpected_registration
+            ),
+            path_present=path.path_present,
+            locked=registration.locked,
+            exact_identity=(
+                registration.exact_identity
+                and not registration.unexpected_registration
+                and path.exact_back_reference
+            ),
+            gitfile_only=path.gitfile_only,
+            admin_entry_name=registration.admin_entry_name,
+            admin_binding_digest=registration.admin_binding_digest,
+        )
 
 
 class ReservationAdminObservation(FrozenDocument):
@@ -253,3 +317,137 @@ class TargetReservationAdmissionService(TargetReservationAdmission):
     ) -> None:
         if result.intent_id != intent.intent_id or result.kind != kind:
             raise ValueError("TARGET_RESERVATION_OPERATION_RESULT_MISMATCH")
+
+
+class TargetReservationBootstrapState(Protocol):
+    def target_reservation_for_run(self, run_id: RunId) -> TargetReservation:
+        raise NotImplementedError
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        raise NotImplementedError
+
+    def record_or_load_target_reservation_creation_intent_under_draft_permit(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> TargetReservationCreationIntent:
+        raise NotImplementedError
+
+    def settle_target_reservation_creation_under_draft_permit(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+    def reuse_locked_target_reservation_under_draft_permit(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+    def record_target_reservation_pre_intent_stop(
+        self,
+        run_id: RunId,
+        observed: ReservationObservation,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+
+class TargetReservationBootstrapAdmissionService:
+    def __init__(
+        self,
+        state: TargetReservationBootstrapState,
+        observer: TargetReservationObserver,
+        effects: TargetReservationAdmission,
+    ) -> None:
+        self._state = state
+        self._observer = observer
+        self._effects = effects
+
+    def initialize_target_reservation(
+        self, run_id: RunId, permit: RuntimePermit
+    ) -> RuntimeDecision:
+        owner_id = permit.consumed_owner_id
+        if (
+            permit.run_id != run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "DRAFT"
+            or owner_id is None
+        ):
+            raise ValueError("TARGET_RESERVATION_PERMIT_BINDING_MISMATCH")
+        reservation = self._state.target_reservation_for_run(run_id)
+        observed = self._observer.observe(reservation)
+        if reservation.phase == "REGISTERED_LOCKED":
+            if classify_reservation_creation(observed) == "SETTLE":
+                sequence = self._state.reuse_locked_target_reservation_under_draft_permit(
+                    run_id,
+                    observed,
+                    owner_id,
+                    permit.generation,
+                    expected_sequence=self._state.audit_sequence(run_id),
+                )
+                return RuntimeDecision(
+                    code="CONTINUE",
+                    resulting_sequence=sequence,
+                    phase_transition="TARGET_RESERVATION_INITIALIZED",
+                )
+            sequence = self._state.record_target_reservation_pre_intent_stop(
+                run_id,
+                observed,
+                owner_id,
+                permit.generation,
+                expected_sequence=self._state.audit_sequence(run_id),
+            )
+            return RuntimeDecision.pause("TARGET_RESERVATION_REUSE_NOT_EXACT", sequence)
+        if reservation.phase == "ALLOCATED" and classify_reservation_creation(observed) != "ADD":
+            sequence = self._state.record_target_reservation_pre_intent_stop(
+                run_id,
+                observed,
+                owner_id,
+                permit.generation,
+                expected_sequence=self._state.audit_sequence(run_id),
+            )
+            return RuntimeDecision.pause("TARGET_RESERVATION_CONFLICT", sequence)
+        intent = self._state.record_or_load_target_reservation_creation_intent_under_draft_permit(
+            run_id,
+            owner_id,
+            permit.generation,
+            expected_sequence=self._state.audit_sequence(run_id),
+        )
+        outcome = self._effects.execute_creation(intent)
+        sequence = self._state.settle_target_reservation_creation_under_draft_permit(
+            intent,
+            outcome,
+            owner_id,
+            permit.generation,
+            expected_sequence=self._state.audit_sequence(run_id),
+        )
+        if outcome.result_class == "REGISTERED_LOCKED":
+            return RuntimeDecision(
+                code="CONTINUE",
+                resulting_sequence=sequence,
+                phase_transition="TARGET_RESERVATION_INITIALIZED",
+            )
+        return RuntimeDecision.pause(
+            "INDETERMINATE"
+            if outcome.result_class == "UNOBSERVABLE"
+            else "TARGET_RESERVATION_CONFLICT",
+            sequence,
+        )

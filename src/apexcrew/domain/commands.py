@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, Self
@@ -29,10 +30,12 @@ from apexcrew.domain.types import (
     GitOid,
     IntentId,
     PendingActionId,
+    RequestId,
     RevisionDigest,
     RunId,
     RunState,
     RunStopReason,
+    RuntimeOwnerId,
     TaskId,
     UnresolvedSetDigest,
 )
@@ -50,6 +53,60 @@ class ApplicableRevisionDigests(FrozenDocument):
     policy_digest: RevisionDigest | None = None
     budget_digest: RevisionDigest | None = None
     model_configuration_digest: RevisionDigest | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PublicRunSnapshot:
+    sequence: AuditSequence
+    state: RunState
+
+
+RuntimeAllowedPhase = Literal[
+    "DRAFT",
+    "PLANNING",
+    "READY_TO_START",
+    "ACTIVE",
+    "PAUSED",
+    "INDETERMINATE",
+    "READY_FOR_APPROVAL",
+    "TERMINAL_ADMINISTRATION",
+]
+
+
+class RuntimePermit(FrozenDocument):
+    run_id: RunId
+    generation: int = Field(ge=1)
+    source_request_id: RequestId
+    source_envelope_digest: Sha256DigestText
+    issued_sequence: AuditSequence = Field(ge=1)
+    allowed_phase: RuntimeAllowedPhase
+    applicable_revision_digests: ApplicableRevisionDigests
+    target_authority_digest: Sha256DigestText
+    expected_runtime_progress_generation: int = Field(ge=0)
+    state: Literal["UNCONSUMED", "CONSUMED", "INVALIDATED"]
+    consumed_owner_id: RuntimeOwnerId | None = None
+    consumed_sequence: AuditSequence | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_consumption_binding(self) -> Self:
+        consumed = self.state == "CONSUMED"
+        if consumed != (self.consumed_owner_id is not None):
+            raise ValueError("consumed Permit must bind an owner")
+        if consumed != (self.consumed_sequence is not None):
+            raise ValueError("consumed Permit must bind its sequence")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeState:
+    run_id: RunId
+    state: RunState
+    sequence: AuditSequence
+    runtime_progress_generation: int
+    plan_digest: RevisionDigest | None
+    policy_digest: RevisionDigest
+    budget_digest: RevisionDigest
+    model_configuration_digest: RevisionDigest
 
 
 def applicable_revision_digests_to_json(

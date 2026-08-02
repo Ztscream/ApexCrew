@@ -1,4 +1,5 @@
 import sqlite3
+from base64 import b32encode
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -8,9 +9,15 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from helpers.application import (
+    FixtureRepositoryBootstrapAuthorityService,
+    fixture_policy,
+    make_create_run_command,
+)
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
     CheckpointKey,
@@ -20,9 +27,15 @@ from apexcrew.domain.authority import (
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
+    ApproveBudgetPayload,
+    ApproveModelConfigurationPayload,
+    ApprovePolicyPayload,
+    BeginPlanningPayload,
     CommandEnvelope,
     CommandOutcome,
     PausePayload,
+    ProposePolicyPayload,
+    RunStop,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
@@ -31,9 +44,11 @@ from apexcrew.domain.effects import (
     EffectResult,
     RecoveryOutcome,
     RecoveryService,
+    ReservationObservation,
     StateCommitFault,
     StateConflict,
     TargetReservation,
+    canonical_json,
 )
 from apexcrew.domain.model import (
     LogicalModelTurn,
@@ -56,6 +71,9 @@ from apexcrew.domain.types import (
     RepositoryId,
     RevisionDigest,
     RunId,
+    RunState,
+    RunStopReason,
+    RuntimeOwnerId,
     TaskId,
 )
 
@@ -167,8 +185,10 @@ def seeded_authority_store(database: Path, run_id: str) -> SqliteStateStore:
 @dataclass
 class FixedMonotonicClock:
     instant: MonotonicInstant
+    readings: int = 0
 
     def now(self) -> MonotonicInstant:
+        self.readings += 1
         return self.instant
 
 
@@ -213,6 +233,15 @@ def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
 
 def sqlite_store_factory(tmp_path: Path) -> SqliteStateStore:
     return SqliteStateStore(tmp_path / "state.db")
+
+
+def memory_runtime_store_factory(tmp_path: Path, clock: FixedMonotonicClock) -> InMemoryStateStore:
+    del tmp_path
+    return InMemoryStateStore(monotonic_clock=clock)
+
+
+def sqlite_runtime_store_factory(tmp_path: Path, clock: FixedMonotonicClock) -> SqliteStateStore:
+    return SqliteStateStore(tmp_path / "state.db", monotonic_clock=clock)
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
@@ -523,6 +552,402 @@ def test_request_id_reuse_conflicts_without_appending_audit(
     assert conflict.resulting_sequence == 1
     assert store.audit_sequence(RunId("run-command")) == 2
     assert store.audit_sequence(RunId("run-other")) == 1
+
+
+class StoreTargetAuthority:
+    def __init__(self, store: InMemoryStateStore | SqliteStateStore) -> None:
+        self._store = store
+
+    def current_for(self, run_id: RunId) -> str:
+        return self._store.target_authority_digest(run_id)
+
+
+def control_approval_code(
+    command_kind: str,
+    run_id: RunId,
+    revision_class: str,
+    digest: RevisionDigest,
+) -> str:
+    payload = canonical_json(
+        {
+            "command_kind": command_kind,
+            "revision_class": revision_class,
+            "revision_digest": digest,
+            "run_id": run_id,
+        }
+    ).encode("utf-8")
+    return b32encode(sha256(payload).digest()).decode("ascii")[:6]
+
+
+def approved_control_bindings(
+    store: InMemoryStateStore | SqliteStateStore, run_id: RunId
+) -> ApplicableRevisionDigests:
+    current = store.current_revision_digests(run_id)
+    approved = frozenset(store.approved_revision_classes(run_id))
+    return ApplicableRevisionDigests(
+        policy_digest=current.policy_digest if "POLICY" in approved else None,
+        budget_digest=current.budget_digest if "BUDGET" in approved else None,
+        model_configuration_digest=(
+            current.model_configuration_digest if "MODEL_CONFIGURATION" in approved else None
+        ),
+    )
+
+
+def seed_control_permit(
+    store: InMemoryStateStore | SqliteStateStore,
+) -> tuple[RunId, StoreTargetAuthority]:
+    target_authority = StoreTargetAuthority(store)
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    created = store.apply_control_command(
+        make_create_run_command(request_id="contract-create"),
+        target_authority,
+        repository_authority,
+    )
+    assert created.run_id is not None
+    run_id = created.run_id
+    current = store.current_revision_digests(run_id)
+    approvals = (
+        (
+            "contract-policy",
+            "approve_policy",
+            "POLICY",
+            current.policy_digest,
+            ApprovePolicyPayload,
+        ),
+        (
+            "contract-budget",
+            "approve_budget",
+            "BUDGET",
+            current.budget_digest,
+            ApproveBudgetPayload,
+        ),
+        (
+            "contract-model",
+            "approve_model_configuration",
+            "MODEL_CONFIGURATION",
+            current.model_configuration_digest,
+            ApproveModelConfigurationPayload,
+        ),
+    )
+    for request_id, command_kind, revision_class, digest, payload_type in approvals:
+        assert digest is not None
+        code = control_approval_code(command_kind, run_id, revision_class, digest)
+        if payload_type is ApprovePolicyPayload:
+            payload = payload_type(run_id=run_id, policy_digest=digest, confirmation_code=code)
+        elif payload_type is ApproveBudgetPayload:
+            payload = payload_type(run_id=run_id, budget_digest=digest, confirmation_code=code)
+        else:
+            payload = payload_type(
+                run_id=run_id,
+                model_configuration_digest=digest,
+                confirmation_code=code,
+            )
+        outcome = store.apply_control_command(
+            CommandEnvelope(
+                request_id=request_id,
+                expected_sequence=store.audit_sequence(run_id),
+                applicable_revision_digests=approved_control_bindings(store, run_id),
+                payload=payload,
+            ),
+            target_authority,
+            repository_authority,
+        )
+        assert outcome.status == CommandStatus.ACCEPTED
+    begin = store.apply_control_command(
+        CommandEnvelope(
+            request_id="contract-begin",
+            expected_sequence=store.audit_sequence(run_id),
+            applicable_revision_digests=store.current_revision_digests(run_id),
+            payload=BeginPlanningPayload(run_id=run_id),
+        ),
+        target_authority,
+        repository_authority,
+    )
+    assert begin.status == CommandStatus.ACCEPTED
+    return run_id, target_authority
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_control_transaction_rolls_back_complete_bootstrap_state(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    store.fail_next_commit_after_state_write_for_test()
+    command = make_create_run_command(request_id="faulted-create")
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):
+        store.apply_control_command(command, StoreTargetAuthority(store), repository_authority)
+    assert store.run_count() == 0
+    accepted = store.apply_control_command(
+        command, StoreTargetAuthority(store), repository_authority
+    )
+    assert accepted.status == CommandStatus.ACCEPTED
+    assert accepted.run_id is not None
+    assert store.target_reservation_count(accepted.run_id) == 1
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_revision_approval_cannot_be_repurposed_as_runtime_authority(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    target_authority = StoreTargetAuthority(store)
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    created = store.apply_control_command(
+        make_create_run_command(request_id="invalid-permit-create"),
+        target_authority,
+        repository_authority,
+    )
+    assert created.run_id is not None
+    run_id = created.run_id
+    current = store.current_revision_digests(run_id)
+    assert current.policy_digest is not None
+    approval = CommandEnvelope(
+        request_id="invalid-permit-policy-approval",
+        expected_sequence=store.audit_sequence(run_id),
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        payload=ApprovePolicyPayload(
+            run_id=run_id,
+            policy_digest=current.policy_digest,
+            confirmation_code=control_approval_code(
+                "approve_policy", run_id, "POLICY", current.policy_digest
+            ),
+        ),
+    )
+    outcome = store.apply_control_command(approval, target_authority, repository_authority)
+    assert outcome.status == CommandStatus.ACCEPTED
+    before = store.audit_sequence(run_id)
+    with pytest.raises(StateConflict, match="RUNTIME_PERMIT_SOURCE_COMMAND_INVALID"):
+        store.issue_runtime_permit(
+            approval,
+            "DRAFT",
+            store.current_revision_digests(run_id),
+            store.target_authority_digest(run_id),
+            before,
+        )
+    assert store.audit_sequence(run_id) == before
+    with pytest.raises(StateConflict, match="RUNTIME_PERMIT_NOT_FOUND"):
+        store.unconsumed_permit(run_id)
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_stale_revision_document_cannot_be_reapproved(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    target_authority = StoreTargetAuthority(store)
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    created = store.apply_control_command(
+        make_create_run_command(request_id="stale-revision-create"),
+        target_authority,
+        repository_authority,
+    )
+    assert created.run_id is not None
+    run_id = created.run_id
+    old_digest = store.current_revision_digests(run_id).policy_digest
+    assert old_digest is not None
+    replacement = fixture_policy().model_copy(update={"grant_ttl_seconds": 599})
+    proposed = store.apply_control_command(
+        CommandEnvelope(
+            request_id="replace-policy",
+            expected_sequence=store.audit_sequence(run_id),
+            applicable_revision_digests=ApplicableRevisionDigests(),
+            payload=ProposePolicyPayload(run_id=run_id, policy_revision=replacement),
+        ),
+        target_authority,
+        repository_authority,
+    )
+    assert proposed.status == CommandStatus.ACCEPTED
+    replacement_digest = store.current_revision_digests(run_id).policy_digest
+    assert replacement_digest is not None and replacement_digest != old_digest
+    stale_approval = store.apply_control_command(
+        CommandEnvelope(
+            request_id="approve-stale-policy",
+            expected_sequence=store.audit_sequence(run_id),
+            applicable_revision_digests=ApplicableRevisionDigests(),
+            payload=ApprovePolicyPayload(
+                run_id=run_id,
+                policy_digest=old_digest,
+                confirmation_code=control_approval_code(
+                    "approve_policy", run_id, "POLICY", old_digest
+                ),
+            ),
+        ),
+        target_authority,
+        repository_authority,
+    )
+    assert stale_approval.status == CommandStatus.STALE
+    assert stale_approval.failed_invariant == "REVISION_PROPOSAL_NOT_CURRENT"
+    assert store.current_revision_digests(run_id).policy_digest == replacement_digest
+
+
+@pytest.mark.parametrize(
+    "store_factory", [memory_runtime_store_factory, sqlite_runtime_store_factory]
+)
+def test_runtime_permit_consumption_is_atomic_and_one_use(
+    tmp_path: Path,
+    store_factory: Callable[[Path, FixedMonotonicClock], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    clock = FixedMonotonicClock(MonotonicInstant(50_000_000_000))
+    store = store_factory(tmp_path, clock)
+    run_id, _ = seed_control_permit(store)
+    permit = store.unconsumed_permit(run_id)
+    store.fail_next_commit_after_state_write_for_test()
+    with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):
+        store.consume_current_runtime_permit(
+            run_id,
+            RuntimeOwnerId("owner-faulted"),
+            store.audit_sequence(run_id),
+        )
+    assert store.runtime_permit(run_id, permit.generation).state == "UNCONSUMED"
+    assert store.active_run_time_state(run_id).open_owner_generation is None
+    assert store.last_runtime_audit_event(run_id, owner_generation=1) is None
+    assert clock.readings == 1
+    consumed = store.consume_current_runtime_permit(
+        run_id,
+        RuntimeOwnerId("owner-1"),
+        store.audit_sequence(run_id),
+    )
+    assert consumed is not None
+    assert consumed.state == "CONSUMED"
+    assert consumed.consumed_owner_id == "owner-1"
+    active = store.active_run_time_state(run_id)
+    assert active.open_owner_generation == 1
+    assert active.opened_at == MonotonicInstant(50_000_000_000)
+    assert active.latest_committed_at == MonotonicInstant(50_000_000_000)
+    stamp = store.last_runtime_audit_event(run_id, owner_generation=1)
+    assert stamp is not None
+    assert stamp.monotonic_instant == MonotonicInstant(50_000_000_000)
+    assert clock.readings == 2
+    before_replay = store.audit_sequence(run_id)
+    assert (
+        store.consume_current_runtime_permit(run_id, RuntimeOwnerId("owner-2"), before_replay)
+        is None
+    )
+    assert store.audit_sequence(run_id) == before_replay
+    assert clock.readings == 2
+
+
+@pytest.mark.parametrize(
+    "store_factory", [memory_runtime_store_factory, sqlite_runtime_store_factory]
+)
+def test_runtime_reservation_barrier_and_interval_close_match_adapters(
+    tmp_path: Path,
+    store_factory: Callable[[Path, FixedMonotonicClock], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    clock = FixedMonotonicClock(MonotonicInstant(50_000_000_000))
+    store = store_factory(tmp_path, clock)
+    run_id, _ = seed_control_permit(store)
+    owner_id = RuntimeOwnerId("owner-contract")
+    permit = store.consume_current_runtime_permit(run_id, owner_id, store.audit_sequence(run_id))
+    assert permit is not None
+
+    intent = store.record_or_load_target_reservation_creation_intent_under_draft_permit(
+        run_id,
+        owner_id,
+        permit.generation,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    observation = ReservationObservation(
+        True,
+        True,
+        True,
+        True,
+        True,
+        admin_entry_name=intent.reservation_id,
+        admin_binding_digest="sha256:" + "b" * 64,
+    )
+    store.settle_target_reservation_creation_under_draft_permit(
+        intent,
+        TargetReservationCreationOutcome(
+            intent_id=intent.intent_id,
+            run_id=run_id,
+            result_class="REGISTERED_LOCKED",
+            observed=observation,
+        ),
+        owner_id,
+        permit.generation,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    assert store.load_runtime_state(run_id).state == RunState.PLANNING
+    assert store.target_reservation_for_run(run_id).phase == "REGISTERED_LOCKED"
+
+    store.begin_runtime_barrier(run_id, "contract-action", store.audit_sequence(run_id))
+    store.settle_runtime_barrier(
+        run_id,
+        "contract-action",
+        model_calls=0,
+        pending_stop_reason=None,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    clock.instant = MonotonicInstant(55_000_000_000)
+    stop = store.record_runtime_delivery_stop(
+        run_id,
+        owner_id,
+        permit.generation,
+        RunStop(
+            run_id=run_id,
+            state=RunState.PLANNING,
+            reason=RunStopReason.PAUSED,
+            last_sequence=store.audit_sequence(run_id),
+        ),
+        store.audit_sequence(run_id),
+    )
+    assert stop.last_sequence == store.audit_sequence(run_id)
+    assert store.runtime_owner(run_id) is None
+    assert store.active_run_time_state(run_id).cumulative_nanoseconds == 5_000_000_000
+    assert store.runtime_delivery_stop_count(run_id) == 1
+    assert store.audit_event_kinds(run_id)[-2:] == (
+        "RUNTIME_DELIVERY_STOP_RECORDED",
+        "RUNTIME_OWNER_RELEASED",
+    )
+
+
+def seed_mismatched_permit_phase(
+    store: InMemoryStateStore | SqliteStateStore, run_id: RunId
+) -> None:
+    expected = store.audit_sequence(run_id)
+    if isinstance(store, InMemoryStateStore):
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.ACTIVE)
+
+    else:
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            connection.execute("UPDATE runs SET state = 'ACTIVE' WHERE run_id = ?", (run_id,))
+
+    store._commit_state_and_event(
+        run_id=run_id,
+        expected_sequence=expected,
+        event=AuditEvent.kind("TEST_RUNTIME_PHASE_CHANGED"),
+        mutate=mutate,
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_runtime_permit_is_bound_to_its_issued_phase(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id, _ = seed_control_permit(store)
+    permit = store.unconsumed_permit(run_id)
+    assert permit.allowed_phase == "DRAFT"
+    seed_mismatched_permit_phase(store, run_id)
+    assert (
+        store.consume_current_runtime_permit(
+            run_id,
+            RuntimeOwnerId("owner-wrong-phase"),
+            store.audit_sequence(run_id),
+        )
+        is None
+    )
+    assert store.runtime_permit(run_id, permit.generation).state == "INVALIDATED"
+    assert store.audit_event_kinds(run_id)[-1] == "RUNTIME_PERMIT_INVALIDATED"
 
 
 def test_sqlite_command_replay_survives_restart(tmp_path: Path) -> None:
