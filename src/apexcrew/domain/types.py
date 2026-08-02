@@ -2,6 +2,7 @@ from enum import StrEnum
 from typing import NewType
 
 RunId = NewType("RunId", str)
+RepositoryId = NewType("RepositoryId", str)
 RequestId = NewType("RequestId", str)
 TaskId = NewType("TaskId", str)
 AttemptId = NewType("AttemptId", str)

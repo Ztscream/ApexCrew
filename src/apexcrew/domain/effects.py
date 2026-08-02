@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from apexcrew.domain.commands import (
@@ -23,15 +24,112 @@ from apexcrew.domain.model import (
     ProviderAttemptResult,
     SettledModelAttempt,
 )
-from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    GitOid,
     IntentId,
+    RepositoryId,
+    RevisionDigest,
     RunId,
+    RunState,
     TaskId,
     UnresolvedSetDigest,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TargetReservation:
+    reservation_id: str
+    run_id: RunId
+    target_ref: str
+    pinned_target_oid: GitOid
+    path: Path
+    phase: Literal[
+        "ALLOCATED",
+        "CREATION_INTENT_RECORDED",
+        "REGISTERED_LOCKED",
+        "CLEANUP_SETTLED",
+    ]
+    admin_entry_name: str | None = None
+    admin_binding_digest: Sha256DigestText | None = None
+
+
+class ReservationObservation(FrozenDocument):
+    registration_present: bool
+    path_present: bool
+    locked: bool
+    exact_identity: bool
+    gitfile_only: bool
+    admin_entry_name: str | None = None
+    admin_binding_digest: Sha256DigestText | None = None
+    observable: bool = True
+
+    def __init__(
+        self,
+        registration_present: bool,
+        path_present: bool,
+        locked: bool,
+        exact_identity: bool,
+        gitfile_only: bool,
+        admin_entry_name: str | None = None,
+        admin_binding_digest: Sha256DigestText | None = None,
+        observable: bool = True,
+    ) -> None:
+        super().__init__(  # type: ignore[call-arg]
+            registration_present=registration_present,
+            path_present=path_present,
+            locked=locked,
+            exact_identity=exact_identity,
+            gitfile_only=gitfile_only,
+            admin_entry_name=admin_entry_name,
+            admin_binding_digest=admin_binding_digest,
+            observable=observable,
+        )
+
+
+ReservationCreationNext = Literal["ADD", "LOCK", "SETTLE", "CONFLICT", "UNOBSERVABLE"]
+
+
+def classify_reservation_creation(
+    observed: ReservationObservation,
+) -> ReservationCreationNext:
+    if not observed.observable:
+        return "UNOBSERVABLE"
+    if not observed.registration_present and not observed.path_present:
+        return "ADD"
+    if (
+        observed.registration_present
+        and observed.path_present
+        and observed.exact_identity
+        and observed.gitfile_only
+        and not observed.locked
+    ):
+        return "LOCK"
+    if (
+        observed.registration_present
+        and observed.path_present
+        and observed.exact_identity
+        and observed.gitfile_only
+        and observed.locked
+    ):
+        return "SETTLE"
+    return "CONFLICT"
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecord:
+    run_id: RunId
+    repository_id: RepositoryId
+    repository_instance_digest: Sha256DigestText
+    state: RunState
+    target_ref: str
+    pinned_target_oid: GitOid
+    current_plan_digest: RevisionDigest | None = None
+    current_policy_digest: RevisionDigest | None = None
+    current_budget_digest: RevisionDigest | None = None
+    current_model_configuration_digest: RevisionDigest | None = None
 
 
 class StateConflict(RuntimeError):

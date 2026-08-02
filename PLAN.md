@@ -175,18 +175,18 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 
 | Slice | `AGENT_LOG.md` label | Module PR | Status | Implementation commit |
 | --- | --- | --- | --- | --- |
-| Task 1 | `TASK-001` | M1-01 | NOT STARTED | Not created |
-| Task 2A | `TASK-002A` | M1-01 | NOT STARTED | Not created |
-| Task 2B | `TASK-002B` | M1-01 | NOT STARTED | Not created |
-| Task 3 | `TASK-003` | M1-02 | NOT STARTED | Not created |
-| Task 4 | `TASK-004` | M1-02 | NOT STARTED | Not created |
-| Task 4A | `TASK-004A` | M1-02 | NOT STARTED | Not created |
-| Task 4B | `TASK-004B` | M1-02 | NOT STARTED | Not created |
-| Task 5 | `TASK-005` | M1-03 | NOT STARTED | Not created |
-| Task 6 | `TASK-006` | M1-03 | NOT STARTED | Not created |
-| Task 7A | `TASK-007A` | M1-04 | NOT STARTED | Not created |
-| Task 7B | `TASK-007B` | M1-04 | NOT STARTED | Not created |
-| Task 8 | `TASK-008` | M1-04 | NOT STARTED | Not created |
+| Task 1 | `TASK-001` | M1-01 | DONE | `12d112ed4d7b937202d147794c9fc34d16347ba6` |
+| Task 2A | `TASK-002A` | M1-01 | DONE | `2a0f7556da49c6889cfa2c6b3249a75c1158c689` |
+| Task 2B | `TASK-002B` | M1-01 | DONE | `bdc6414a0202dbea57d812884cb632188893ae12` |
+| Task 3 | `TASK-003` | M1-02 | DONE | `627fda6e5a21485437da22d0136aaf4e3755d5e0` |
+| Task 4 | `TASK-004` | M1-02 | DONE | `e7497d6fdddbcbc31405bea3116ddd5d85acfdfb` |
+| Task 4A | `TASK-004A` | M1-02 | DONE | `cbb44878467fe323880da9260f8c3cf8d2a971aa` |
+| Task 4B | `TASK-004B` | M1-02 | DONE | `54ddb2f78d6273afab338c395601af1f873d22c7` |
+| Task 5 | `TASK-005` | M1-03 | DONE | `a1663fa0d6a60ccd3ee7a2e3577a7055db90ce11` |
+| Task 6 | `TASK-006` | M1-03 | DONE | `336a8ed63b9e89eb93ad7847b224249ce7fbe59f` |
+| Task 7A | `TASK-007A` | M1-04 | DONE | `bf9638ec725cd93cecf22c42d7daa603492b6bb0` |
+| Task 7B | `TASK-007B` | M1-04 | DONE | `98b08f2545e5dc09576f88dff531ec7c10c2c46d` |
+| Task 8 | `TASK-008` | M1-04 | DONE | `73fac5dfc548cb8e2b216b139ae476198ba326c0` |
 | Task 9 | `TASK-009` | M1-05 | NOT STARTED | Not created |
 | Task 9A | `TASK-009A` | M1-05 | NOT STARTED | Not created |
 | Task 9B | `TASK-009B` | M1-05 | NOT STARTED | Not created |

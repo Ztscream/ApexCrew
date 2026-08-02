@@ -9,6 +9,10 @@ from decimal import Decimal
 from pathlib import Path
 from threading import RLock
 
+from apexcrew.domain.admission import (
+    TargetReservationCreationIntent,
+    TargetReservationCreationOutcome,
+)
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     CommandEnvelope,
@@ -18,9 +22,12 @@ from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    RunRecord,
     StateCommitFault,
     StateConflict,
+    TargetReservation,
     canonical_json,
+    classify_reservation_creation,
     sha256_digest,
 )
 from apexcrew.domain.model import (
@@ -49,8 +56,12 @@ from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CommandStatus,
+    GitOid,
     IntentId,
+    RepositoryId,
+    RevisionDigest,
     RunId,
+    RunState,
     TaskId,
 )
 
@@ -171,6 +182,45 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE model_turns ADD COLUMN downstream_sequence INTEGER",
         ),
     ),
+    (
+        5,
+        (
+            """CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                repository_instance_digest TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'DRAFT','PLANNING','AWAITING_PLAN_APPROVAL','READY_TO_START','ACTIVE',
+                    'VERIFYING_RUN','READY_FOR_APPROVAL','APPLYING','PAUSED','INDETERMINATE',
+                    'COMPLETED','FAILED','CANCELLED'
+                )),
+                target_ref TEXT NOT NULL,
+                pinned_target_oid TEXT NOT NULL,
+                run_head_oid TEXT,
+                runtime_progress_generation INTEGER NOT NULL DEFAULT 0,
+                runtime_owner_id TEXT,
+                runtime_owner_generation INTEGER NOT NULL DEFAULT 0,
+                current_plan_digest TEXT,
+                current_policy_digest TEXT,
+                current_budget_digest TEXT,
+                current_model_configuration_digest TEXT,
+                UNIQUE(repository_id, run_id)
+            )""",
+            """CREATE TABLE target_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+                target_ref TEXT NOT NULL,
+                pinned_target_oid TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                phase TEXT NOT NULL CHECK(phase IN (
+                    'ALLOCATED','CREATION_INTENT_RECORDED','REGISTERED_LOCKED','CLEANUP_SETTLED'
+                )),
+                creation_intent_id TEXT REFERENCES effect_intents(intent_id),
+                admin_entry_name TEXT UNIQUE,
+                admin_binding_digest TEXT
+            )""",
+        ),
+    ),
 )
 
 
@@ -199,6 +249,53 @@ def _json_object(value: str, error_code: str = "STORED_JSON_OBJECT_REQUIRED") ->
 def _require_canonical_json_object(value: str, error_code: str) -> None:
     if canonical_json(_json_object(value, error_code)) != value:
         raise StateConflict(error_code)
+
+
+def _validate_draft_reservation(
+    run_id: RunId,
+    repository_id: RepositoryId,
+    repository_instance_digest: Sha256DigestText,
+    reservation: TargetReservation,
+) -> None:
+    oid = str(reservation.pinned_target_oid)
+    if (
+        reservation.run_id != run_id
+        or not str(repository_id)
+        or reservation.phase != "ALLOCATED"
+        or reservation.admin_entry_name is not None
+        or reservation.admin_binding_digest is not None
+        or not reservation.target_ref.startswith("refs/heads/")
+        or reservation.target_ref == "refs/heads/"
+        or any(character.isspace() or character == "\x00" for character in reservation.target_ref)
+        or len(oid) != 40
+        or any(character not in "0123456789abcdef" for character in oid)
+        or not reservation.path.is_absolute()
+        or reservation.path.name != reservation.reservation_id
+        or reservation.path.parent.name != "reservations"
+    ):
+        raise StateConflict("TARGET_RESERVATION_BINDING_INVALID")
+    if (
+        len(repository_instance_digest) != 71
+        or not repository_instance_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in repository_instance_digest[7:])
+    ):
+        raise StateConflict("REPOSITORY_INSTANCE_DIGEST_INVALID")
+
+
+def _validate_reservation_outcome(
+    intent: TargetReservationCreationIntent,
+    outcome: TargetReservationCreationOutcome,
+) -> None:
+    if outcome.intent_id != intent.intent_id or outcome.run_id != intent.run_id:
+        raise StateConflict("TARGET_RESERVATION_OUTCOME_BINDING_MISMATCH")
+    if outcome.result_class == "REGISTERED_LOCKED":
+        if classify_reservation_creation(outcome.observed) != "SETTLE":
+            raise StateConflict("TARGET_RESERVATION_SUCCESS_NOT_EXACT")
+        if (
+            outcome.observed.admin_entry_name is None
+            or outcome.observed.admin_binding_digest is None
+        ):
+            raise StateConflict("TARGET_RESERVATION_ADMIN_BINDING_MISSING")
 
 
 def effect_intent_to_storage_json(intent: EffectIntent) -> str:
@@ -447,6 +544,11 @@ class SqliteStateStore:
             run_id = _command_run_id(command, outcome)
             envelope_digest = _command_digest(command)
             with self._read_transaction() as connection:
+                run = connection.execute(
+                    "SELECT repository_id FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+                if run is None:
+                    raise StateConflict("RUN_NOT_FOUND")
                 existing = connection.execute(
                     "SELECT repository_id, run_id, envelope_digest, outcome_json, "
                     "resulting_sequence FROM command_receipts WHERE request_id = ?",
@@ -457,7 +559,7 @@ class SqliteStateStore:
                 ).fetchone()
             if existing is not None:
                 if (
-                    existing["repository_id"] == ""
+                    existing["repository_id"] == run["repository_id"]
                     and existing["run_id"] == run_id
                     and existing["envelope_digest"] == envelope_digest
                 ):
@@ -488,7 +590,7 @@ class SqliteStateStore:
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         command.request_id,
-                        "",
+                        run["repository_id"],
                         run_id,
                         envelope_digest,
                         outcome_json,
@@ -507,6 +609,322 @@ class SqliteStateStore:
                 mutate=mutate,
             )
             return outcome
+
+    def create_draft_with_reservation(
+        self,
+        run_id: RunId,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        reservation: TargetReservation,
+    ) -> AuditSequence:
+        _validate_draft_reservation(run_id, repository_id, repository_instance_digest, reservation)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            try:
+                connection.execute(
+                    "INSERT INTO runs(run_id, repository_id, repository_instance_digest, "
+                    "state, target_ref, pinned_target_oid) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        repository_id,
+                        repository_instance_digest,
+                        RunState.DRAFT,
+                        reservation.target_ref,
+                        reservation.pinned_target_oid,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO target_reservations(reservation_id, run_id, target_ref, "
+                    "pinned_target_oid, path, phase) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        reservation.reservation_id,
+                        run_id,
+                        reservation.target_ref,
+                        reservation.pinned_target_oid,
+                        str(reservation.path),
+                        reservation.phase,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("RUN_OR_TARGET_RESERVATION_DUPLICATE") from error
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=AuditSequence(0),
+            event=AuditEvent.kind("RUN_DRAFT_AND_TARGET_RESERVATION_ALLOCATED"),
+            mutate=mutate,
+        )
+
+    @staticmethod
+    def _target_reservation_from_row(row: sqlite3.Row) -> TargetReservation:
+        return TargetReservation(
+            reservation_id=row["reservation_id"],
+            run_id=RunId(row["run_id"]),
+            target_ref=row["target_ref"],
+            pinned_target_oid=GitOid(row["pinned_target_oid"]),
+            path=Path(row["path"]),
+            phase=row["phase"],
+            admin_entry_name=row["admin_entry_name"],
+            admin_binding_digest=row["admin_binding_digest"],
+        )
+
+    @staticmethod
+    def _run_record_from_row(row: sqlite3.Row) -> RunRecord:
+        return RunRecord(
+            run_id=RunId(row["run_id"]),
+            repository_id=RepositoryId(row["repository_id"]),
+            repository_instance_digest=Sha256DigestText(row["repository_instance_digest"]),
+            state=RunState(row["state"]),
+            target_ref=row["target_ref"],
+            pinned_target_oid=GitOid(row["pinned_target_oid"]),
+            current_plan_digest=(
+                None
+                if row["current_plan_digest"] is None
+                else RevisionDigest(row["current_plan_digest"])
+            ),
+            current_policy_digest=(
+                None
+                if row["current_policy_digest"] is None
+                else RevisionDigest(row["current_policy_digest"])
+            ),
+            current_budget_digest=(
+                None
+                if row["current_budget_digest"] is None
+                else RevisionDigest(row["current_budget_digest"])
+            ),
+            current_model_configuration_digest=(
+                None
+                if row["current_model_configuration_digest"] is None
+                else RevisionDigest(row["current_model_configuration_digest"])
+            ),
+        )
+
+    def run_record(self, run_id: RunId) -> RunRecord:
+        with self._read_transaction() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        return self._run_record_from_row(row)
+
+    def target_reservation(self, reservation_id: str) -> TargetReservation:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM target_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        return self._target_reservation_from_row(row)
+
+    def _target_reservation_for_run_for_update(
+        self, connection: sqlite3.Connection, run_id: RunId
+    ) -> TargetReservation:
+        if not connection.in_transaction:
+            raise StateConflict("TARGET_RESERVATION_WRITE_TRANSACTION_REQUIRED")
+        row = connection.execute(
+            "SELECT * FROM target_reservations WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        return self._target_reservation_from_row(row)
+
+    def _unsettled_effect_for_reservation(
+        self,
+        connection: sqlite3.Connection,
+        reservation: TargetReservation,
+    ) -> EffectIntent:
+        row = connection.execute(
+            "SELECT creation_intent_id FROM target_reservations "
+            "WHERE reservation_id = ? AND run_id = ? "
+            "AND phase = 'CREATION_INTENT_RECORDED'",
+            (reservation.reservation_id, reservation.run_id),
+        ).fetchone()
+        if row is None or row["creation_intent_id"] is None:
+            raise StateConflict("TARGET_RESERVATION_UNSETTLED_INTENT_REQUIRED")
+        return self._require_unsettled_effect_intent(
+            connection, reservation.run_id, IntentId(row["creation_intent_id"])
+        )
+
+    def _require_matching_unsettled_reservation_intent(
+        self,
+        connection: sqlite3.Connection,
+        reservation: TargetReservation,
+        intent: TargetReservationCreationIntent,
+    ) -> None:
+        try:
+            stored = TargetReservationCreationIntent.from_effect_intent(
+                self._unsettled_effect_for_reservation(connection, reservation)
+            )
+        except ValueError as error:
+            raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH") from error
+        if stored != intent or stored.reservation_id != reservation.reservation_id:
+            raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH")
+
+    def _new_target_reservation_creation_intent(
+        self,
+        connection: sqlite3.Connection,
+        reservation: TargetReservation,
+        expected_sequence: AuditSequence,
+    ) -> TargetReservationCreationIntent:
+        row = connection.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (reservation.run_id,)
+        ).fetchone()
+        if row is None or reservation.phase != "ALLOCATED":
+            raise StateConflict("TARGET_RESERVATION_CREATION_NOT_ALLOCATED")
+        run = self._run_record_from_row(row)
+        target_authority_digest = sha256_digest(
+            canonical_json(
+                {
+                    "pinned_target_oid": reservation.pinned_target_oid,
+                    "repository_id": run.repository_id,
+                    "repository_instance_digest": run.repository_instance_digest,
+                    "reservation_id": reservation.reservation_id,
+                    "reservation_path": str(reservation.path),
+                    "target_ref": reservation.target_ref,
+                }
+            )
+        )
+        return TargetReservationCreationIntent(
+            intent_id=IntentId(
+                f"target-reservation-intent:{run.run_id}:{reservation.reservation_id}:"
+                f"{expected_sequence + 1}"
+            ),
+            run_id=reservation.run_id,
+            reservation_id=reservation.reservation_id,
+            repository_id=run.repository_id,
+            target_ref=reservation.target_ref,
+            pinned_target_oid=reservation.pinned_target_oid,
+            reservation_path=str(reservation.path),
+            repository_instance_digest=run.repository_instance_digest,
+            applicable_revision_digests=ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            ),
+            target_authority_digest=target_authority_digest,
+            idempotency_key=(
+                f"target-reservation-create:{run.run_id}:{reservation.reservation_id}:"
+                f"{expected_sequence + 1}"
+            ),
+            recorded_sequence=AuditSequence(expected_sequence + 1),
+        )
+
+    def _record_or_load_target_reservation_creation_intent(
+        self, run_id: RunId, *, expected_sequence: AuditSequence
+    ) -> TargetReservationCreationIntent:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM target_reservations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+            reservation = self._target_reservation_from_row(row)
+            if reservation.phase == "CREATION_INTENT_RECORDED":
+                return TargetReservationCreationIntent.from_effect_intent(
+                    self._unsettled_effect_for_reservation(connection, reservation)
+                )
+            if reservation.phase != "ALLOCATED":
+                raise StateConflict("TARGET_RESERVATION_CREATION_NOT_ALLOCATED")
+
+        created: list[TargetReservationCreationIntent] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            current = self._target_reservation_for_run_for_update(connection, run_id)
+            if current.phase != "ALLOCATED":
+                raise StateConflict("TARGET_RESERVATION_CREATION_NOT_ALLOCATED")
+            intent = self._new_target_reservation_creation_intent(
+                connection, current, expected_sequence
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            self._validate_effect_intent(effect, expected_sequence)
+            self._insert_effect_intent(connection, effect)
+            if (
+                connection.execute(
+                    "UPDATE target_reservations SET phase = "
+                    "'CREATION_INTENT_RECORDED', creation_intent_id = ? "
+                    "WHERE reservation_id = ? AND phase = 'ALLOCATED'",
+                    (intent.intent_id, current.reservation_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("TARGET_RESERVATION_ALLOCATION_COMPARE_AND_SET_FAILED")
+            created.append(intent)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return created[0]
+
+    def unsettled_target_reservation_creation(
+        self, run_id: RunId
+    ) -> TargetReservationCreationIntent:
+        with self._read_transaction() as connection:
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            try:
+                return TargetReservationCreationIntent.from_effect_intent(
+                    self._unsettled_effect_for_reservation(connection, reservation)
+                )
+            except ValueError as error:
+                raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH") from error
+
+    def _settle_target_reservation_creation(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        _validate_reservation_outcome(intent, outcome)
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            reservation = self._target_reservation_for_run_for_update(connection, intent.run_id)
+            self._require_matching_unsettled_reservation_intent(connection, reservation, intent)
+            self._insert_effect_result(
+                connection,
+                intent.run_id,
+                intent.intent_id,
+                result,
+                intent.applicable_revision_digests,
+            )
+            if outcome.result_class == "REGISTERED_LOCKED":
+                next_phase, next_state = "REGISTERED_LOCKED", RunState.DRAFT
+                admin_entry_name = outcome.observed.admin_entry_name
+                admin_binding_digest = outcome.observed.admin_binding_digest
+            elif outcome.result_class == "CONFLICT":
+                next_phase, next_state = "ALLOCATED", RunState.DRAFT
+                admin_entry_name = admin_binding_digest = None
+            else:
+                next_phase, next_state = (
+                    "CREATION_INTENT_RECORDED",
+                    RunState.INDETERMINATE,
+                )
+                admin_entry_name = admin_binding_digest = None
+            connection.execute(
+                "UPDATE target_reservations SET phase = ?, admin_entry_name = ?, "
+                "admin_binding_digest = ? WHERE reservation_id = ?",
+                (
+                    next_phase,
+                    admin_entry_name,
+                    admin_binding_digest,
+                    reservation.reservation_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET state = ? WHERE run_id = ?",
+                (next_state, intent.run_id),
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_SETTLED"),
+            mutate=mutate,
+        )
 
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         with self._read_transaction() as connection:

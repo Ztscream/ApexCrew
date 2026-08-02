@@ -6,6 +6,10 @@ from copy import deepcopy
 from dataclasses import replace
 from threading import RLock
 
+from apexcrew.domain.admission import (
+    TargetReservationCreationIntent,
+    TargetReservationCreationOutcome,
+)
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     CommandEnvelope,
@@ -15,9 +19,12 @@ from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    RunRecord,
     StateCommitFault,
     StateConflict,
+    TargetReservation,
     canonical_json,
+    classify_reservation_creation,
     sha256_digest,
 )
 from apexcrew.domain.model import (
@@ -34,7 +41,109 @@ from apexcrew.domain.model import (
     ProviderAttemptResult,
     SettledModelAttempt,
 )
-from apexcrew.domain.types import AuditSequence, CommandStatus, IntentId, RunId
+from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.types import (
+    AuditSequence,
+    CommandStatus,
+    IntentId,
+    RepositoryId,
+    RunId,
+    RunState,
+)
+
+
+def _validate_draft_reservation(
+    run_id: RunId,
+    repository_id: RepositoryId,
+    repository_instance_digest: Sha256DigestText,
+    reservation: TargetReservation,
+) -> None:
+    oid = str(reservation.pinned_target_oid)
+    if (
+        reservation.run_id != run_id
+        or not str(repository_id)
+        or reservation.phase != "ALLOCATED"
+        or reservation.admin_entry_name is not None
+        or reservation.admin_binding_digest is not None
+        or not reservation.target_ref.startswith("refs/heads/")
+        or reservation.target_ref == "refs/heads/"
+        or any(character.isspace() or character == "\x00" for character in reservation.target_ref)
+        or len(oid) != 40
+        or any(character not in "0123456789abcdef" for character in oid)
+        or not reservation.path.is_absolute()
+        or reservation.path.name != reservation.reservation_id
+        or reservation.path.parent.name != "reservations"
+    ):
+        raise StateConflict("TARGET_RESERVATION_BINDING_INVALID")
+    if (
+        len(repository_instance_digest) != 71
+        or not repository_instance_digest.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in repository_instance_digest[7:])
+    ):
+        raise StateConflict("REPOSITORY_INSTANCE_DIGEST_INVALID")
+
+
+def _target_authority_digest(run: RunRecord, reservation: TargetReservation) -> Sha256DigestText:
+    return sha256_digest(
+        canonical_json(
+            {
+                "pinned_target_oid": reservation.pinned_target_oid,
+                "repository_id": run.repository_id,
+                "repository_instance_digest": run.repository_instance_digest,
+                "reservation_id": reservation.reservation_id,
+                "reservation_path": str(reservation.path),
+                "target_ref": reservation.target_ref,
+            }
+        )
+    )
+
+
+def _new_target_reservation_creation_intent(
+    run: RunRecord,
+    reservation: TargetReservation,
+    expected_sequence: AuditSequence,
+) -> TargetReservationCreationIntent:
+    return TargetReservationCreationIntent(
+        intent_id=IntentId(
+            f"target-reservation-intent:{run.run_id}:{reservation.reservation_id}:"
+            f"{expected_sequence + 1}"
+        ),
+        run_id=run.run_id,
+        reservation_id=reservation.reservation_id,
+        repository_id=run.repository_id,
+        target_ref=reservation.target_ref,
+        pinned_target_oid=reservation.pinned_target_oid,
+        reservation_path=str(reservation.path),
+        repository_instance_digest=run.repository_instance_digest,
+        applicable_revision_digests=ApplicableRevisionDigests(
+            plan_digest=run.current_plan_digest,
+            policy_digest=run.current_policy_digest,
+            budget_digest=run.current_budget_digest,
+            model_configuration_digest=run.current_model_configuration_digest,
+        ),
+        target_authority_digest=_target_authority_digest(run, reservation),
+        idempotency_key=(
+            f"target-reservation-create:{run.run_id}:{reservation.reservation_id}:"
+            f"{expected_sequence + 1}"
+        ),
+        recorded_sequence=AuditSequence(expected_sequence + 1),
+    )
+
+
+def _validate_reservation_outcome(
+    intent: TargetReservationCreationIntent,
+    outcome: TargetReservationCreationOutcome,
+) -> None:
+    if outcome.intent_id != intent.intent_id or outcome.run_id != intent.run_id:
+        raise StateConflict("TARGET_RESERVATION_OUTCOME_BINDING_MISMATCH")
+    if outcome.result_class == "REGISTERED_LOCKED":
+        if classify_reservation_creation(outcome.observed) != "SETTLE":
+            raise StateConflict("TARGET_RESERVATION_SUCCESS_NOT_EXACT")
+        if (
+            outcome.observed.admin_entry_name is None
+            or outcome.observed.admin_binding_digest is None
+        ):
+            raise StateConflict("TARGET_RESERVATION_ADMIN_BINDING_MISSING")
 
 
 def _command_run_id(command: CommandEnvelope, outcome: CommandOutcome) -> RunId:
@@ -79,6 +188,8 @@ class InMemoryStateStore:
         self._model_attempt_numbers: dict[tuple[RunId, LogicalTurnId, int], IntentId] = {}
         self._model_attempts: dict[IntentId, ModelRequestIntent | SettledModelAttempt] = {}
         self._model_counters: dict[RunId, ModelCounters] = {}
+        self._runs: dict[RunId, RunRecord] = {}
+        self._target_reservations: dict[str, TargetReservation] = {}
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
 
@@ -93,6 +204,8 @@ class InMemoryStateStore:
         copied._model_attempt_numbers = self._model_attempt_numbers.copy()
         copied._model_attempts = self._model_attempts.copy()
         copied._model_counters = self._model_counters.copy()
+        copied._runs = self._runs.copy()
+        copied._target_reservations = self._target_reservations.copy()
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
         return copied
@@ -107,6 +220,8 @@ class InMemoryStateStore:
         self._model_attempt_numbers = copied._model_attempt_numbers
         self._model_attempts = copied._model_attempts
         self._model_counters = copied._model_counters
+        self._runs = copied._runs
+        self._target_reservations = copied._target_reservations
 
     def _commit_state_and_event(
         self,
@@ -134,12 +249,15 @@ class InMemoryStateStore:
     def record_command(self, command: CommandEnvelope, outcome: CommandOutcome) -> CommandOutcome:
         with self._lock:
             run_id = _command_run_id(command, outcome)
+            run = self._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
             envelope_digest = _command_digest(command)
             existing = self._command_receipts.get(command.request_id)
             if existing is not None:
                 repository_id, stored_run_id, stored_digest, stored_outcome, _ = existing
                 if (
-                    repository_id == ""
+                    repository_id == run.repository_id
                     and stored_run_id == run_id
                     and stored_digest == envelope_digest
                 ):
@@ -162,7 +280,7 @@ class InMemoryStateStore:
 
             def mutate(copied: InMemoryStateStore) -> None:
                 copied._command_receipts[command.request_id] = (
-                    "",
+                    run.repository_id,
                     run_id,
                     envelope_digest,
                     _outcome_json(outcome),
@@ -180,6 +298,177 @@ class InMemoryStateStore:
                 mutate=mutate,
             )
             return outcome
+
+    def create_draft_with_reservation(
+        self,
+        run_id: RunId,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        reservation: TargetReservation,
+    ) -> AuditSequence:
+        _validate_draft_reservation(run_id, repository_id, repository_instance_digest, reservation)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if run_id in copied._runs or reservation.reservation_id in copied._target_reservations:
+                raise StateConflict("RUN_OR_TARGET_RESERVATION_DUPLICATE")
+            if any(
+                existing.path == reservation.path
+                for existing in copied._target_reservations.values()
+            ):
+                raise StateConflict("TARGET_RESERVATION_PATH_DUPLICATE")
+            copied._runs[run_id] = RunRecord(
+                run_id=run_id,
+                repository_id=repository_id,
+                repository_instance_digest=repository_instance_digest,
+                state=RunState.DRAFT,
+                target_ref=reservation.target_ref,
+                pinned_target_oid=reservation.pinned_target_oid,
+            )
+            copied._target_reservations[reservation.reservation_id] = reservation
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=AuditSequence(0),
+            event=AuditEvent.kind("RUN_DRAFT_AND_TARGET_RESERVATION_ALLOCATED"),
+            mutate=mutate,
+        )
+
+    def run_record(self, run_id: RunId) -> RunRecord:
+        with self._lock:
+            try:
+                return self._runs[run_id]
+            except KeyError as error:
+                raise StateConflict("RUN_NOT_FOUND") from error
+
+    def target_reservation(self, reservation_id: str) -> TargetReservation:
+        with self._lock:
+            try:
+                return self._target_reservations[reservation_id]
+            except KeyError as error:
+                raise StateConflict("TARGET_RESERVATION_NOT_FOUND") from error
+
+    def _record_or_load_target_reservation_creation_intent(
+        self, run_id: RunId, *, expected_sequence: AuditSequence
+    ) -> TargetReservationCreationIntent:
+        reservation = next(
+            (current for current in self._target_reservations.values() if current.run_id == run_id),
+            None,
+        )
+        if reservation is None:
+            raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
+        if reservation.phase == "CREATION_INTENT_RECORDED":
+            effect_intent = next(
+                (
+                    current
+                    for current in self._effect_intents.values()
+                    if current.run_id == run_id
+                    and current.kind == "target_reservation_creation"
+                    and current.intent_id not in self._effect_results
+                ),
+                None,
+            )
+            if effect_intent is None:
+                raise StateConflict("TARGET_RESERVATION_UNSETTLED_INTENT_REQUIRED")
+            return TargetReservationCreationIntent.from_effect_intent(effect_intent)
+        if reservation.phase != "ALLOCATED":
+            raise StateConflict("TARGET_RESERVATION_CREATION_NOT_ALLOCATED")
+        run = self.run_record(run_id)
+        creation_intent = _new_target_reservation_creation_intent(
+            run, reservation, expected_sequence
+        )
+        effect = creation_intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if effect.intent_id in copied._effect_intents or any(
+                existing.idempotency_key == effect.idempotency_key
+                for existing in copied._effect_intents.values()
+            ):
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._target_reservations[reservation.reservation_id] = replace(
+                reservation, phase="CREATION_INTENT_RECORDED"
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return creation_intent
+
+    def unsettled_target_reservation_creation(
+        self, run_id: RunId
+    ) -> TargetReservationCreationIntent:
+        reservation = next(
+            (current for current in self._target_reservations.values() if current.run_id == run_id),
+            None,
+        )
+        if reservation is None or reservation.phase != "CREATION_INTENT_RECORDED":
+            raise StateConflict("TARGET_RESERVATION_UNSETTLED_INTENT_REQUIRED")
+        effect = next(
+            (
+                current
+                for current in self._effect_intents.values()
+                if current.run_id == run_id
+                and current.kind == "target_reservation_creation"
+                and current.intent_id not in self._effect_results
+            ),
+            None,
+        )
+        if effect is None:
+            raise StateConflict("TARGET_RESERVATION_UNSETTLED_INTENT_REQUIRED")
+        return TargetReservationCreationIntent.from_effect_intent(effect)
+
+    def _settle_target_reservation_creation(
+        self,
+        intent: TargetReservationCreationIntent,
+        outcome: TargetReservationCreationOutcome,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        effect_result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+        _validate_reservation_outcome(intent, outcome)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            reservation = copied.target_reservation(intent.reservation_id)
+            stored_effect = copied._effect_intents.get(intent.intent_id)
+            if (
+                reservation.run_id != intent.run_id
+                or reservation.phase != "CREATION_INTENT_RECORDED"
+                or stored_effect is None
+                or stored_effect != intent.to_effect_intent(stored_effect.recorded_sequence)
+                or intent.intent_id in copied._effect_results
+            ):
+                raise StateConflict("TARGET_RESERVATION_INTENT_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = effect_result
+            if outcome.result_class == "REGISTERED_LOCKED":
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="REGISTERED_LOCKED",
+                    admin_entry_name=outcome.observed.admin_entry_name,
+                    admin_binding_digest=outcome.observed.admin_binding_digest,
+                )
+                next_state = RunState.DRAFT
+            elif outcome.result_class == "CONFLICT":
+                copied._target_reservations[intent.reservation_id] = replace(
+                    reservation,
+                    phase="ALLOCATED",
+                    admin_entry_name=None,
+                    admin_binding_digest=None,
+                )
+                next_state = RunState.DRAFT
+            else:
+                next_state = RunState.INDETERMINATE
+            copied._runs[intent.run_id] = replace(copied._runs[intent.run_id], state=next_state)
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CREATION_SETTLED"),
+            mutate=mutate,
+        )
 
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         with self._lock:
