@@ -25,6 +25,7 @@ from apexcrew.domain.effects import (
     RecoveryService,
     StateCommitFault,
     StateConflict,
+    TargetReservation,
 )
 from apexcrew.domain.model import (
     LogicalModelTurn,
@@ -36,7 +37,9 @@ from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CommandStatus,
+    GitOid,
     IntentId,
+    RepositoryId,
     RevisionDigest,
     RunId,
     TaskId,
@@ -243,55 +246,99 @@ def accepted_outcome(*, sequence: int, run_id: str = "run-command") -> CommandOu
     )
 
 
+def seed_command_run(
+    store: InMemoryStateStore | SqliteStateStore,
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    store.create_draft_with_reservation(
+        RunId(run_id),
+        RepositoryId(f"repository-{run_id}"),
+        "sha256:" + "a" * 64,
+        TargetReservation(
+            reservation_id=f"reservation-{run_id}",
+            run_id=RunId(run_id),
+            target_ref="refs/heads/main",
+            pinned_target_oid=GitOid("1" * 40),
+            path=tmp_path / "data" / "reservations" / f"reservation-{run_id}",
+            phase="ALLOCATED",
+        ),
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_record_command_requires_existing_run_and_uses_real_repository_binding(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    command = make_pause_command(request_id="cmd-bound", expected_sequence=0)
+    with pytest.raises(StateConflict, match="^RUN_NOT_FOUND$"):
+        store.record_command(command, accepted_outcome(sequence=1))
+    assert store.audit_sequence(RunId("run-command")) == 0
+
+    seed_command_run(store, tmp_path, "run-command")
+    bound_command = make_pause_command(request_id="cmd-bound", expected_sequence=1)
+    outcome = store.record_command(bound_command, accepted_outcome(sequence=2))
+    assert outcome.resulting_sequence == 2
+    assert store.audit_sequence(RunId("run-command")) == 2
+
+
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
 def test_identical_command_replay_returns_committed_outcome(
-    tmp_path: Path, store_factory: Callable[[Path], EffectJournal]
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
     run_id = RunId("run-command")
-    for expected_sequence in range(3):
+    seed_command_run(store, tmp_path, str(run_id))
+    for expected_sequence in range(1, 4):
         store.append_event(
             run_id,
-            AuditEvent.kind(f"PRIOR_EVENT_{expected_sequence + 1}"),
+            AuditEvent.kind(f"PRIOR_EVENT_{expected_sequence}"),
             AuditSequence(expected_sequence),
         )
-    envelope = make_pause_command(request_id="cmd-7", expected_sequence=3)
-    first = store.record_command(envelope, accepted_outcome(sequence=4))
+    envelope = make_pause_command(request_id="cmd-7", expected_sequence=4)
+    first = store.record_command(envelope, accepted_outcome(sequence=5))
     replay = store.record_command(envelope, accepted_outcome(sequence=99))
-    assert first.resulting_sequence == 4
+    assert first.resulting_sequence == 5
     assert replay == first
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
 def test_request_id_reuse_conflicts_without_appending_audit(
-    tmp_path: Path, store_factory: Callable[[Path], EffectJournal]
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    original = make_pause_command(request_id="cmd-reused", expected_sequence=0)
-    store.record_command(original, accepted_outcome(sequence=1))
+    seed_command_run(store, tmp_path, "run-command")
+    seed_command_run(store, tmp_path, "run-other")
+    original = make_pause_command(request_id="cmd-reused", expected_sequence=1)
+    store.record_command(original, accepted_outcome(sequence=2))
     changed = make_pause_command(
         request_id="cmd-reused",
-        expected_sequence=0,
+        expected_sequence=1,
         run_id="run-other",
         reason="different payload",
     )
-    conflict = store.record_command(changed, accepted_outcome(sequence=1, run_id="run-other"))
+    conflict = store.record_command(changed, accepted_outcome(sequence=2, run_id="run-other"))
     assert conflict.status == CommandStatus.CONFLICT
     assert conflict.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
-    assert conflict.resulting_sequence == 0
-    assert store.audit_sequence(RunId("run-command")) == 1
-    assert store.audit_sequence(RunId("run-other")) == 0
+    assert conflict.resulting_sequence == 1
+    assert store.audit_sequence(RunId("run-command")) == 2
+    assert store.audit_sequence(RunId("run-other")) == 1
 
 
 def test_sqlite_command_replay_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.db"
-    command = make_pause_command(request_id="cmd-restart", expected_sequence=0)
     first_store = SqliteStateStore(database)
-    first = first_store.record_command(command, accepted_outcome(sequence=1))
+    seed_command_run(first_store, tmp_path, "run-command")
+    command = make_pause_command(request_id="cmd-restart", expected_sequence=1)
+    first = first_store.record_command(command, accepted_outcome(sequence=2))
     first_store.close()
     reopened = SqliteStateStore(database)
     assert reopened.record_command(command, accepted_outcome(sequence=99)) == first
-    assert reopened.audit_sequence(RunId("run-command")) == 1
+    assert reopened.audit_sequence(RunId("run-command")) == 2
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])

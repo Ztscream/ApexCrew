@@ -18,8 +18,18 @@ from apexcrew.adapters.repository.no_follow import (
 from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError as _RepositoryUnsafeError
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
+from apexcrew.domain.admission import (
+    RepositoryEffectError,
+    ReservationAdminObservation,
+    TargetReservationGitPort,
+    TargetReservationOperation,
+    TargetReservationOperationResult,
+    TargetReservationWorktreeGuard,
+)
+from apexcrew.domain.effects import TargetReservation, canonical_json, sha256_digest
 from apexcrew.domain.plan import CanonicalPath, PathValidationError
-from apexcrew.domain.types import GitOid
+from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.types import GitOid, RepositoryId
 
 RepositoryUnsafeError = _RepositoryUnsafeError
 
@@ -31,6 +41,12 @@ MAX_GIT_INDEX_BYTES = 67_108_864
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_GIT_ADMIN_ENTRIES = 4_096
 MAX_WORKTREE_ADMIN_ENTRIES = 2
+MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES = 4_096
+MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 16
+_TARGET_RESERVATION_REQUIRED_ADMIN_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
+_TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES = frozenset(
+    {"index", "locked", "logs", "ORIG_HEAD", "refs"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +600,11 @@ class GitWorktreeListPorcelain:
 
 
 @dataclass(frozen=True, slots=True)
+class GitShowRefVerify:
+    direct_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class GitWorktreeAddNoCheckout:
     reservation_path: Path
     target_ref: str
@@ -619,6 +640,7 @@ class GitCatFileSize:
 type GitOperation = (
     GitStatusPorcelain
     | GitWorktreeListPorcelain
+    | GitShowRefVerify
     | GitWorktreeAddNoCheckout
     | GitWorktreeLock
     | GitLsTreeRecursive
@@ -697,6 +719,7 @@ class GitCommandRunner:
             (
                 GitStatusPorcelain,
                 GitWorktreeListPorcelain,
+                GitShowRefVerify,
                 GitWorktreeAddNoCheckout,
                 GitWorktreeLock,
                 GitLsTreeRecursive,
@@ -734,10 +757,14 @@ class GitCommandRunner:
                 return ("status", "--porcelain=v1", "--untracked-files=no")
             case GitWorktreeListPorcelain():
                 return ("worktree", "list", "--porcelain", "-z")
+            case GitShowRefVerify(direct_ref=target):
+                self._require_direct_ref(target)
+                return ("show-ref", "--verify", "--hash", "--", target)
             case GitWorktreeAddNoCheckout(reservation_path=path, target_ref=target):
                 self._require_direct_ref(target)
                 self._require_operand_path(path)
-                return ("worktree", "add", "--no-checkout", "--", str(path), target)
+                short_branch = target.removeprefix("refs/heads/")
+                return ("worktree", "add", "--no-checkout", "--", str(path), short_branch)
             case GitWorktreeLock(reservation_path=path, reason=reason):
                 self._require_operand_path(path)
                 self._require_reason(reason)
@@ -778,3 +805,299 @@ class GitCommandRunner:
     def _require_reason(value: str) -> None:
         if not value or "\x00" in value or "\n" in value or "\r" in value:
             raise RepositoryUnsafeError("GIT_LOCK_REASON_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class TargetReservationAdminRecord:
+    entry_name: str
+    gitdir: bytes
+    commondir: bytes
+    head: bytes
+    locked: bytes | None
+    binding_digest: Sha256DigestText
+
+
+def _target_reservation_component(value: str) -> str:
+    if (
+        not value
+        or len(value) > 128
+        or value in {".", ".."}
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in value)
+    ):
+        raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ENTRY_INVALID")
+    return value
+
+
+def _exact_admin_line(raw: bytes, *, label: str) -> bytes:
+    if (
+        not raw
+        or len(raw) > MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES
+        or not raw.endswith(b"\n")
+        or raw.count(b"\n") != 1
+        or b"\x00" in raw
+        or b"\r" in raw
+    ):
+        raise RepositoryEffectError("TARGET_RESERVATION_" + label + "_INVALID")
+    return raw
+
+
+def reservation_for_operation(
+    operation: TargetReservationOperation,
+) -> TargetReservation:
+    return TargetReservation(
+        reservation_id=operation.reservation_id,
+        run_id=operation.run_id,
+        target_ref=operation.target_ref,
+        pinned_target_oid=operation.pinned_target_oid,
+        path=Path(operation.reservation_path),
+        phase="CREATION_INTENT_RECORDED",
+    )
+
+
+class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
+    """Validates only preallocated admin/data-root paths before a Git subprocess."""
+
+    def __init__(
+        self,
+        repository: RepositoryInstance,
+        data_root: Path,
+        data_handles: StableHandleTree,
+        expected_main_worktree: Path,
+    ) -> None:
+        self._repository = repository
+        self._data_root = data_root
+        self._data_handles = data_handles
+        self._expected_main_worktree = expected_main_worktree
+
+    def require_safe_before_list(self, reservation: TargetReservation) -> None:
+        self._repository.assert_stable()
+        self._data_handles.assert_name_bindings()
+        if self._repository.root != self._expected_main_worktree:
+            raise RepositoryEffectError("TARGET_RESERVATION_MAIN_WORKTREE_CHANGED")
+        self._require_reservation_path(reservation)
+        self._worktree_admin_names()
+
+    def require_compatible_observation(
+        self, reservation: TargetReservation
+    ) -> ReservationAdminObservation:
+        self.require_safe_before_list(reservation)
+        names = self._worktree_admin_names()
+        if not names:
+            return ReservationAdminObservation(admin_entry_name=None, admin_binding_digest=None)
+        expected = _target_reservation_component(reservation.reservation_id)
+        if names != (expected,):
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_INVENTORY_INVALID")
+        record = self._read_exact_admin_record(reservation)
+        return ReservationAdminObservation(
+            admin_entry_name=record.entry_name,
+            admin_binding_digest=record.binding_digest,
+        )
+
+    def require_absent_before_add(self, operation: TargetReservationOperation) -> None:
+        reservation = reservation_for_operation(operation)
+        self.require_safe_before_list(reservation)
+        if self._worktree_admin_names() or self._reservation_path_state(reservation)[0]:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADD_PRESTATE_NOT_ABSENT")
+
+    def require_exact_registered_unlocked(self, operation: TargetReservationOperation) -> None:
+        reservation = reservation_for_operation(operation)
+        self.require_safe_before_list(reservation)
+        record = self._read_exact_admin_record(reservation)
+        path_present, gitfile_exact = self._reservation_path_state(reservation)
+        if (
+            not path_present
+            or not gitfile_exact
+            or record.locked is not None
+            or record.entry_name != _target_reservation_component(operation.reservation_id)
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_LOCK_PRESTATE_NOT_EXACT")
+
+    def require_exact_post_operation(self, operation: TargetReservationOperation) -> None:
+        reservation = reservation_for_operation(operation)
+        self._repository.handles.assert_name_bindings()
+        self._data_handles.assert_name_bindings()
+        if self._repository.root != self._expected_main_worktree:
+            raise RepositoryEffectError("TARGET_RESERVATION_MAIN_WORKTREE_CHANGED")
+        self._require_reservation_path(reservation)
+        record = self._read_exact_admin_record(reservation)
+        path_present, gitfile_exact = self._reservation_path_state(reservation)
+        expected_locked = (
+            None
+            if operation.kind == "ADD_NO_CHECKOUT"
+            else operation.lock_reason.encode("utf-8") + b"\n"
+        )
+        if (
+            not path_present
+            or not gitfile_exact
+            or record.entry_name != _target_reservation_component(operation.reservation_id)
+            or record.locked != expected_locked
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_POSTSTATE_NOT_EXACT")
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+
+    def _worktree_admin_names(self) -> tuple[str, ...]:
+        directory = self._repository.handles.try_open(".git/worktrees", "directory")
+        if directory is None:
+            return ()
+        names = self._repository.handles.list_names(directory, MAX_TARGET_RESERVATION_ADMIN_ENTRIES)
+        for name in names:
+            _target_reservation_component(name)
+        return names
+
+    def _require_reservation_path(self, reservation: TargetReservation) -> None:
+        expected = (
+            self._data_root
+            / "reservations"
+            / _target_reservation_component(reservation.reservation_id)
+        )
+        if not reservation.path.is_absolute() or reservation.path != expected:
+            raise RepositoryEffectError("TARGET_RESERVATION_PATH_BINDING_INVALID")
+
+    def _read_exact_admin_record(
+        self, reservation: TargetReservation
+    ) -> TargetReservationAdminRecord:
+        name = _target_reservation_component(reservation.reservation_id)
+        if self._worktree_admin_names() != (name,):
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_INVENTORY_INVALID")
+        prefix = ".git/worktrees/" + name
+        entry = self._repository.handles.open(prefix, "directory")
+        names = self._repository.handles.list_names(entry, MAX_TARGET_RESERVATION_ADMIN_ENTRIES)
+        allowed = (
+            _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES | _TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES
+        )
+        observed = set(names)
+        if (
+            not _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES.issubset(observed)
+            or not observed.issubset(allowed)
+            or not (len(_TARGET_RESERVATION_REQUIRED_ADMIN_NAMES) <= len(observed) <= len(allowed))
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+        gitdir = _exact_admin_line(
+            self._repository.handles.read_bytes(
+                self._repository.handles.open(prefix + "/gitdir", "file"),
+                MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+            ),
+            label="GITDIR",
+        )
+        commondir = _exact_admin_line(
+            self._repository.handles.read_bytes(
+                self._repository.handles.open(prefix + "/commondir", "file"),
+                MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+            ),
+            label="COMMONDIR",
+        )
+        head = _exact_admin_line(
+            self._repository.handles.read_bytes(
+                self._repository.handles.open(prefix + "/HEAD", "file"),
+                MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+            ),
+            label="HEAD",
+        )
+        locked_node = self._repository.handles.try_open(prefix + "/locked", "file")
+        locked = (
+            None
+            if locked_node is None
+            else _exact_admin_line(
+                self._repository.handles.read_bytes(
+                    locked_node, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES
+                ),
+                label="LOCK",
+            )
+        )
+        if gitdir != os.fsencode((reservation.path / ".git").as_posix()) + b"\n":
+            raise RepositoryEffectError("TARGET_RESERVATION_GITDIR_MISMATCH")
+        if commondir != b"../..\n":
+            raise RepositoryEffectError("TARGET_RESERVATION_COMMONDIR_MISMATCH")
+        if (
+            self._repository.handles.open(".git", "directory").identity
+            != self._repository.git_dir_identity
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_COMMONDIR_IDENTITY_CHANGED")
+        expected_head = b"ref: " + os.fsencode(reservation.target_ref) + b"\n"
+        if head != expected_head:
+            raise RepositoryEffectError("TARGET_RESERVATION_HEAD_MISMATCH")
+        digest = sha256_digest(
+            canonical_json(
+                {
+                    "entry_name": name,
+                    "gitdir_hex": gitdir.hex(),
+                    "commondir_hex": commondir.hex(),
+                    "head_hex": head.hex(),
+                    "locked_hex": None if locked is None else locked.hex(),
+                }
+            )
+        )
+        return TargetReservationAdminRecord(name, gitdir, commondir, head, locked, digest)
+
+    def _reservation_path_state(self, reservation: TargetReservation) -> tuple[bool, bool]:
+        relative = "reservations/" + _target_reservation_component(reservation.reservation_id)
+        directory = self._data_handles.try_open(relative, "directory")
+        if directory is None:
+            return False, False
+        if self._data_handles.list_names(directory, 2) != (".git",):
+            return True, False
+        gitfile = self._data_handles.try_open(relative + "/.git", "file")
+        if gitfile is None:
+            return True, False
+        expected = (
+            b"gitdir: "
+            + os.fsencode(
+                (
+                    self._repository.root / ".git" / "worktrees" / reservation.reservation_id
+                ).as_posix()
+            )
+            + b"\n"
+        )
+        actual = self._data_handles.read_bytes(gitfile, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES)
+        return True, actual == expected
+
+
+class GitTargetReservationRepository(TargetReservationGitPort):
+    def __init__(
+        self,
+        repository: RepositoryInstance,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        runner: GitCommandRunner,
+        worktree_guard: TargetReservationWorktreeGuard,
+        data_root: Path,
+        target_authority_digest: Sha256DigestText,
+    ) -> None:
+        self._repository = repository
+        self._repository_id = repository_id
+        self._repository_instance_digest = repository_instance_digest
+        self._runner = runner
+        self._worktree_guard = worktree_guard
+        self._data_root = data_root
+        self._target_authority_digest = target_authority_digest
+
+    def apply(self, operation: TargetReservationOperation) -> TargetReservationOperationResult:
+        expected = self._data_root / "reservations" / operation.reservation_id
+        if (
+            Path(operation.reservation_path) != expected
+            or operation.repository_id != self._repository_id
+            or operation.repository_instance_digest != self._repository_instance_digest
+            or operation.target_authority_digest != self._target_authority_digest
+            or not operation.target_ref.startswith("refs/heads/")
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_OPERATION_BINDING_INVALID")
+        self._require_pinned_target(operation)
+        git_operation: GitWorktreeAddNoCheckout | GitWorktreeLock
+        if operation.kind == "ADD_NO_CHECKOUT":
+            self._worktree_guard.require_absent_before_add(operation)
+            git_operation = GitWorktreeAddNoCheckout(expected, operation.target_ref)
+        else:
+            self._worktree_guard.require_exact_registered_unlocked(operation)
+            git_operation = GitWorktreeLock(expected, operation.lock_reason)
+        result = self._runner.run(self._repository, git_operation)
+        if result.returncode != 0:
+            raise RepositoryEffectError("TARGET_RESERVATION_" + operation.kind + "_FAILED")
+        self._worktree_guard.require_exact_post_operation(operation)
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+        self._require_pinned_target(operation)
+        return TargetReservationOperationResult(intent_id=operation.intent_id, kind=operation.kind)
+
+    def _require_pinned_target(self, operation: TargetReservationOperation) -> None:
+        result = self._runner.run(self._repository, GitShowRefVerify(operation.target_ref))
+        if result.returncode != 0 or result.stdout != f"{operation.pinned_target_oid}\n":
+            raise RepositoryEffectError("TARGET_RESERVATION_PINNED_TARGET_MISMATCH")
