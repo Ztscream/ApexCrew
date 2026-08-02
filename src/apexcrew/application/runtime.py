@@ -7,7 +7,16 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
 
-from apexcrew.domain.admission import TargetReservationBootstrapAdmissionService
+from apexcrew.domain.admission import (
+    PrivateRefAdmissionPort,
+    PrivateRefCasOutcome,
+    RefCasIntent,
+    RepositoryEffectUncertain,
+    RuntimeStartBinding,
+    StartGuard,
+    TargetReservationBootstrapAdmissionService,
+    private_ref,
+)
 from apexcrew.domain.authority import ActiveRunTimeBoundaryDecision
 from apexcrew.domain.commands import RunStop, RuntimeDecision, RuntimePermit, RuntimeState
 from apexcrew.domain.effects import EffectIntent, RecoveryOutcome, StateConflict, canonical_json
@@ -128,6 +137,112 @@ TargetReservationDriverService = TargetReservationDriver
 class PrivateRefDriver(Protocol):
     def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         raise NotImplementedError
+
+
+class PrivateRefState(Protocol):
+    def runtime_start_binding(self, run_id: RunId) -> RuntimeStartBinding: ...
+
+    def record_private_ref_init_intent(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+    def settle_private_ref_init(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+    def mark_private_ref_init_indeterminate(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        failure_class: str,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
+
+
+class PrivateRefInitializer:
+    def __init__(
+        self,
+        store: PrivateRefState,
+        start_guard: StartGuard,
+        admission: PrivateRefAdmissionPort,
+    ) -> None:
+        self._store = store
+        self._start_guard = start_guard
+        self._admission = admission
+
+    def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        current = self._store.runtime_start_binding(run_id)
+        guard = self._start_guard.validate_consumed(
+            binding=current,
+            permit=permit,
+            expected_sequence=current.sequence,
+        )
+        if not guard.ok or guard.binding is None:
+            return RuntimeDecision.pause(guard.reason or "START_GUARD_DENIED")
+        identity = canonical_json({"permit_generation": permit.generation, "run_id": run_id})
+        digest = sha256(identity.encode("utf-8")).hexdigest()
+        intent = RefCasIntent(
+            intent_id=IntentId("private-ref-init-" + digest),
+            run_id=run_id,
+            kind="private_ref_init",
+            repository_id=guard.binding.repository_id,
+            ref_name=private_ref(run_id),
+            expected_old_oid=None,
+            prepared_oid=guard.binding.pinned_target_oid,
+            target_safety_digest=guard.binding.target_safety_digest,
+            ref_effect_binding=guard.binding.ref_effect_binding,
+            target_reservation_id=guard.binding.target_reservation_id,
+            permit_generation=permit.generation,
+            applicable_revision_digests=guard.binding.applicable_revision_digests,
+            idempotency_key=f"private-ref-init:{run_id}:{permit.generation}",
+        )
+        self._store.record_private_ref_init_intent(
+            binding=current,
+            intent=intent,
+            expected_sequence=current.sequence,
+        )
+        try:
+            outcome = self._admission.initialize_private_ref(intent)
+        except RepositoryEffectUncertain:
+            sequence = self._store.mark_private_ref_init_indeterminate(
+                binding=current,
+                intent=intent,
+                failure_class="PRIVATE_REF_INIT_UNOBSERVABLE",
+                expected_sequence=self._store.audit_sequence(run_id),
+            )
+            return RuntimeDecision.pause("INDETERMINATE", sequence)
+        sequence = self._store.settle_private_ref_init(
+            binding=current,
+            intent=intent,
+            outcome=outcome,
+            expected_sequence=self._store.audit_sequence(run_id),
+        )
+        if outcome.result_class == "PRIVATE_REF_INITIALIZED":
+            return RuntimeDecision(
+                code="CONTINUE",
+                resulting_sequence=sequence,
+                phase_transition="PRIVATE_REF_INITIALIZED",
+            )
+        if outcome.result_class == "PRIVATE_REF_UNOBSERVABLE":
+            return RuntimeDecision.pause("INDETERMINATE", sequence)
+        return RuntimeDecision.pause(
+            "PRIVATE_REF_CONFLICT"
+            if outcome.result_class == "PRIVATE_REF_CONFLICT"
+            else "PRIVATE_REF_INIT_FAILED",
+            sequence,
+        )
 
 
 class ResolutionDriver(Protocol):

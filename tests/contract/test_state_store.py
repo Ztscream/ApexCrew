@@ -42,9 +42,11 @@ from apexcrew.domain.effects import (
     EffectIntent,
     EffectJournal,
     EffectResult,
+    PlanApproval,
     RecoveryOutcome,
     RecoveryService,
     ReservationObservation,
+    RunRefRecord,
     StateCommitFault,
     StateConflict,
     TargetReservation,
@@ -489,6 +491,75 @@ def seed_command_run(
             phase="ALLOCATED",
         ),
     )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_plan_approval_and_private_ref_prestate_roll_back_together(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-start-rollback")
+    seed_command_run(store, tmp_path, str(run_id))
+    before = store.audit_sequence(run_id)
+    approval = PlanApproval(
+        run_id,
+        RevisionDigest("sha256:" + "1" * 64),
+        "approve-start-rollback",
+        AuditSequence(before + 1),
+        "sha256:" + "2" * 64,
+    )
+    ref = RunRefRecord(
+        run_id,
+        "PRIVATE",
+        f"refs/apexcrew/runs/{run_id}",
+        None,
+        None,
+        "ABSENT_EXPECTED",
+        None,
+    )
+    store.fail_next_commit_after_state_write_for_test()
+
+    if isinstance(store, InMemoryStateStore):
+
+        def mutate_memory(copied: InMemoryStateStore) -> None:
+            copied._plan_approvals[run_id] = approval
+            copied._run_refs[(run_id, "PRIVATE")] = ref
+
+        mutation = mutate_memory
+    else:
+
+        def mutate_sqlite(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "INSERT INTO plan_approvals VALUES (?, ?, ?, ?, ?)",
+                (
+                    approval.run_id,
+                    approval.plan_digest,
+                    approval.approval_request_id,
+                    approval.approval_sequence,
+                    approval.binding_digest,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO run_refs(run_id, ref_kind, ref_name, state) "
+                "VALUES (?, 'PRIVATE', ?, 'ABSENT_EXPECTED')",
+                (run_id, ref.ref_name),
+            )
+
+        mutation = mutate_sqlite
+
+    with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):
+        store._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=before,
+            event=AuditEvent.kind("PLAN_APPROVAL_TEST"),
+            mutate=mutation,
+        )
+    assert store.audit_sequence(run_id) == before
+    with pytest.raises(StateConflict, match="PLAN_APPROVAL_NOT_FOUND"):
+        store.plan_approval(run_id)
+    with pytest.raises(StateConflict, match="RUN_REF_NOT_FOUND"):
+        store.run_ref(run_id, "PRIVATE")
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])

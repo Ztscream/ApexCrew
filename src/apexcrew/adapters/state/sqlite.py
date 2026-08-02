@@ -22,6 +22,11 @@ from apexcrew.application.control import (
     TargetAuthorityDigestService,
 )
 from apexcrew.domain.admission import (
+    PrivateRefCasOutcome,
+    RefCasIntent,
+    RuntimeStartBinding,
+    StartGuard,
+    StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
 )
@@ -100,6 +105,7 @@ from apexcrew.domain.commands import (
     RuntimeDecision,
     RuntimePermit,
     RuntimeState,
+    StartPayload,
     applicable_revision_digests_from_json,
     applicable_revision_digests_to_json,
 )
@@ -124,8 +130,10 @@ from apexcrew.domain.effects import (
     AuditEvent,
     EffectIntent,
     EffectResult,
+    PlanApproval,
     ReservationObservation,
     RunRecord,
+    RunRefRecord,
     StateCommitFault,
     StateConflict,
     TargetReservation,
@@ -758,6 +766,31 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         14,
         ("ALTER TABLE runs ADD COLUMN planning_returned_bytes INTEGER NOT NULL DEFAULT 0",),
+    ),
+    (
+        15,
+        (
+            """CREATE TABLE plan_approvals (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                plan_digest TEXT NOT NULL,
+                approval_request_id TEXT NOT NULL UNIQUE,
+                approval_sequence INTEGER NOT NULL,
+                binding_digest TEXT NOT NULL
+            )""",
+            """CREATE TABLE run_refs (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                ref_kind TEXT NOT NULL CHECK(ref_kind IN ('PRIVATE','TARGET')),
+                ref_name TEXT NOT NULL,
+                expected_old_oid TEXT,
+                current_oid TEXT,
+                state TEXT NOT NULL CHECK(state IN (
+                    'ABSENT_EXPECTED','INIT_INTENT_RECORDED','PRESENT','CONFLICT'
+                )),
+                last_intent_id TEXT REFERENCES effect_intents(intent_id),
+                guard_binding_json TEXT,
+                PRIMARY KEY(run_id, ref_kind)
+            )""",
+        ),
     ),
 )
 
@@ -6796,11 +6829,225 @@ class SqliteStateStore:
             mutate,
         )
 
+    def _approve_plan(
+        self, command: CommandEnvelope, run_id: RunId, state: RunState
+    ) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, ApprovePlanPayload):
+            raise TypeError("Plan approval required")
+        expected = command.expected_sequence
+        if expected is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        if state != RunState.AWAITING_PLAN_APPROVAL:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "PLAN_APPROVAL_REQUIRES_PROPOSAL",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        expected_code = _approval_confirmation_code(
+            payload.kind, run_id, "PLAN", payload.plan_digest
+        )
+        if not compare_digest(payload.confirmation_code, expected_code):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "REVISION_CONFIRMATION_CODE_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        try:
+            proposal = self.plan_proposal(run_id, payload.plan_digest)
+        except StateConflict:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "PLAN_PROPOSAL_NOT_CURRENT",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        current = self.current_revision_digests(run_id)
+        if (
+            command.applicable_revision_digests != current
+            or current.plan_digest is not None
+            or proposal.applicable_revision_digests != current
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "PLAN_REVISION_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        binding_payload = canonical_json(
+            {
+                "plan_digest": proposal.plan_digest,
+                "proposal_json": proposal.canonical_plan_json,
+                "revision_digests": current.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+        binding_digest = sha256_digest(binding_payload)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT state, current_plan_digest FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT state, policy_digest, budget_digest, model_configuration_digest "
+                "FROM plans WHERE run_id = ? AND plan_digest = ?",
+                (run_id, proposal.plan_digest),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != RunState.AWAITING_PLAN_APPROVAL
+                or row["current_plan_digest"] is not None
+                or plan is None
+                or plan["state"] != "PROPOSED"
+                or (
+                    plan["policy_digest"],
+                    plan["budget_digest"],
+                    plan["model_configuration_digest"],
+                )
+                != (
+                    current.policy_digest,
+                    current.budget_digest,
+                    current.model_configuration_digest,
+                )
+            ):
+                raise StateConflict("PLAN_APPROVAL_BINDING_CHANGED")
+            connection.execute(
+                "INSERT INTO plan_approvals(run_id, plan_digest, approval_request_id, "
+                "approval_sequence, binding_digest) VALUES (?, ?, ?, ?, ?)",
+                (run_id, proposal.plan_digest, command.request_id, expected + 1, binding_digest),
+            )
+            connection.execute(
+                "UPDATE plans SET state = 'APPROVED' WHERE run_id = ? AND plan_digest = ?",
+                (run_id, proposal.plan_digest),
+            )
+            connection.execute(
+                "UPDATE runs SET state = 'READY_TO_START', current_plan_digest = ? "
+                "WHERE run_id = ?",
+                (proposal.plan_digest, run_id),
+            )
+            connection.execute(
+                "INSERT INTO run_refs(run_id, ref_kind, ref_name, expected_old_oid, "
+                "current_oid, state) VALUES (?, 'PRIVATE', ?, NULL, NULL, 'ABSENT_EXPECTED')",
+                (run_id, f"refs/apexcrew/runs/{run_id}"),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "PLAN_APPROVED",
+            mutate,
+        )
+
+    def _apply_start(
+        self,
+        command: CommandEnvelope,
+        run_id: RunId,
+        target_authority: TargetAuthorityDigestService,
+        start_guard: StartGuard | None,
+    ) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, StartPayload):
+            raise TypeError("start command required")
+        expected = command.expected_sequence
+        if expected is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        approval = self.plan_approval(run_id)
+        if (
+            payload.plan_digest != current.plan_digest
+            or approval.plan_digest != payload.plan_digest
+            or command.applicable_revision_digests != current
+        ):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.STALE,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected),
+                failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
+            )
+        target_digest = self.target_authority_digest(run_id)
+        if target_authority.current_for(run_id) != target_digest or start_guard is None:
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.CONFLICT,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected),
+                failed_invariant="START_GUARD_UNAVAILABLE",
+            )
+        decision = start_guard.inspect(
+            run_id=run_id,
+            applicable_revision_digests=current,
+            expected_sequence=AuditSequence(expected),
+        )
+        if not decision.ok or decision.binding is None:
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.CONFLICT,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected),
+                failed_invariant=decision.reason or "START_GUARD_DENIED",
+            )
+        guard = decision.binding
+        run = self.run_record(run_id)
+        reservation = self.target_reservation_for_run(run_id)
+        if (
+            guard.run_id != run_id
+            or guard.repository_id != run.repository_id
+            or guard.target_reservation_id != reservation.reservation_id
+            or guard.pinned_target_oid != run.pinned_target_oid
+            or guard.target_safety_digest != target_digest
+            or guard.applicable_revision_digests != current
+        ):
+            return CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.STALE,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected),
+                failed_invariant="START_GUARD_BINDING_MISMATCH",
+            )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            if (
+                connection.execute(
+                    "UPDATE run_refs SET guard_binding_json = ? WHERE run_id = ? "
+                    "AND ref_kind = 'PRIVATE' AND state = 'ABSENT_EXPECTED'",
+                    (guard.model_dump_json(), run_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("PRIVATE_REF_PRESTATE_MISMATCH")
+            self._issue_runtime_permit_in_transaction(
+                connection,
+                command,
+                "READY_TO_START",
+                current,
+                target_digest,
+                AuditSequence(expected + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_PERMIT_ISSUED",
+            mutate,
+        )
+
     def apply_control_command(
         self,
         command: CommandEnvelope,
         target_authority: TargetAuthorityDigestService,
         repository_authority: RepositoryBootstrapAuthorityService,
+        start_guard: StartGuard | None = None,
     ) -> CommandOutcome:
         existing = self._existing_control_outcome(command)
         if existing is not None:
@@ -6828,6 +7075,8 @@ class SqliteStateStore:
                 resulting_sequence=sequence,
                 failed_invariant="STALE_SEQUENCE",
             )
+        if isinstance(command.payload, ApprovePlanPayload):
+            return self._approve_plan(command, run_id, state)
         if isinstance(
             command.payload,
             (ProposePolicyPayload, ProposeBudgetPayload, ProposeModelConfigurationPayload),
@@ -6839,7 +7088,6 @@ class SqliteStateStore:
                 ApprovePolicyPayload,
                 ApproveBudgetPayload,
                 ApproveModelConfigurationPayload,
-                ApprovePlanPayload,
             ),
         ):
             return self.approve_revision(command, run_id, state)
@@ -6853,6 +7101,16 @@ class SqliteStateStore:
                     "CONTROL_COMMAND_REJECTED",
                 )
             return self._apply_begin_planning(command, run_id, target_authority)
+        if isinstance(command.payload, StartPayload):
+            if state != RunState.READY_TO_START:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "START_REQUIRES_READY_TO_START",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            return self._apply_start(command, run_id, target_authority, start_guard)
         if isinstance(command.payload, ResumePayload):
             if state != RunState.PAUSED:
                 return self._record_control_outcome(
@@ -7554,6 +7812,229 @@ class SqliteStateStore:
             None,
             "RUNTIME_OWNER_ORPHANED_AND_PERMIT_ISSUED",
             mutate,
+        )
+
+    def plan_approval(self, run_id: RunId) -> PlanApproval:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM plan_approvals WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise StateConflict("PLAN_APPROVAL_NOT_FOUND")
+        return PlanApproval(
+            run_id,
+            RevisionDigest(row["plan_digest"]),
+            str(row["approval_request_id"]),
+            AuditSequence(row["approval_sequence"]),
+            Sha256DigestText(row["binding_digest"]),
+        )
+
+    def run_ref(self, run_id: RunId, ref_kind: Literal["PRIVATE", "TARGET"]) -> RunRefRecord:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_refs WHERE run_id = ? AND ref_kind = ?",
+                (run_id, ref_kind),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_REF_NOT_FOUND")
+        return RunRefRecord(
+            run_id=run_id,
+            ref_kind=ref_kind,
+            ref_name=str(row["ref_name"]),
+            expected_old_oid=(
+                None if row["expected_old_oid"] is None else GitOid(row["expected_old_oid"])
+            ),
+            current_oid=None if row["current_oid"] is None else GitOid(row["current_oid"]),
+            state=row["state"],
+            last_intent_id=(
+                None if row["last_intent_id"] is None else IntentId(row["last_intent_id"])
+            ),
+            guard_binding_json=row["guard_binding_json"],
+        )
+
+    def runtime_start_binding(self, run_id: RunId) -> RuntimeStartBinding:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT runs.state, run_sequences.current_sequence, run_refs.guard_binding_json, "
+                "runtime_permits.generation, runtime_permits.consumed_owner_id, "
+                "runtime_permits.consumed_sequence FROM runs JOIN run_sequences USING(run_id) "
+                "JOIN run_refs ON run_refs.run_id = runs.run_id AND run_refs.ref_kind = 'PRIVATE' "
+                "JOIN runtime_permits ON runtime_permits.run_id = runs.run_id "
+                "AND runtime_permits.state = 'CONSUMED' WHERE runs.run_id = ? "
+                "ORDER BY runtime_permits.generation DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if (
+            row is None
+            or row["state"] != RunState.READY_TO_START
+            or row["guard_binding_json"] is None
+            or row["consumed_owner_id"] is None
+            or row["consumed_sequence"] is None
+        ):
+            raise StateConflict("RUNTIME_START_BINDING_NOT_CURRENT")
+        return RuntimeStartBinding(
+            run_id=run_id,
+            sequence=AuditSequence(row["current_sequence"]),
+            state=RunState.READY_TO_START,
+            permit_generation=int(row["generation"]),
+            consumed_owner_id=RuntimeOwnerId(row["consumed_owner_id"]),
+            consumed_sequence=AuditSequence(row["consumed_sequence"]),
+            guard=StartGuardBinding.model_validate_json(row["guard_binding_json"]),
+        )
+
+    def record_private_ref_init_intent(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            current = connection.execute(
+                "SELECT runs.state, run_sequences.current_sequence, run_refs.guard_binding_json, "
+                "runtime_permits.generation, runtime_permits.consumed_owner_id, "
+                "runtime_permits.consumed_sequence FROM runs JOIN run_sequences USING(run_id) "
+                "JOIN run_refs ON run_refs.run_id = runs.run_id AND run_refs.ref_kind = 'PRIVATE' "
+                "JOIN runtime_permits ON runtime_permits.run_id = runs.run_id "
+                "AND runtime_permits.state = 'CONSUMED' WHERE runs.run_id = ? "
+                "ORDER BY runtime_permits.generation DESC LIMIT 1",
+                (binding.run_id,),
+            ).fetchone()
+            if (
+                current is None
+                or current["state"] != RunState.READY_TO_START
+                or AuditSequence(current["current_sequence"]) != binding.sequence
+                or int(current["generation"]) != binding.permit_generation
+                or current["consumed_owner_id"] != binding.consumed_owner_id
+                or AuditSequence(current["consumed_sequence"]) != binding.consumed_sequence
+                or StartGuardBinding.model_validate_json(current["guard_binding_json"])
+                != binding.guard
+                or intent.permit_generation != binding.permit_generation
+            ):
+                raise StateConflict("RUNTIME_START_BINDING_CHANGED")
+            self._insert_effect_intent(connection, effect)
+            if (
+                connection.execute(
+                    "UPDATE run_refs SET state = 'INIT_INTENT_RECORDED', last_intent_id = ? "
+                    "WHERE run_id = ? AND ref_kind = 'PRIVATE' AND state = 'ABSENT_EXPECTED'",
+                    (intent.intent_id, intent.run_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("PRIVATE_REF_PRESTATE_MISMATCH")
+            connection.execute(
+                "UPDATE runs SET state = 'ACTIVE' WHERE run_id = ? AND state = 'READY_TO_START'",
+                (intent.run_id,),
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PRIVATE_REF_INIT_INTENT_RECORDED",
+                applicable_revision_digests=intent.applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+
+    def settle_private_ref_init(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        del binding
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT state, last_intent_id FROM run_refs WHERE run_id = ? "
+                "AND ref_kind = 'PRIVATE'",
+                (intent.run_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] != "INIT_INTENT_RECORDED"
+                or row["last_intent_id"] != intent.intent_id
+            ):
+                raise StateConflict("PRIVATE_REF_INTENT_NOT_CURRENT")
+            self._insert_effect_result(
+                connection,
+                intent.run_id,
+                intent.intent_id,
+                result,
+                intent.applicable_revision_digests,
+            )
+            if outcome.result_class == "PRIVATE_REF_INITIALIZED":
+                if outcome.observed_oid != intent.prepared_oid:
+                    raise StateConflict("PRIVATE_REF_OUTCOME_OID_MISMATCH")
+                connection.execute(
+                    "UPDATE run_refs SET state = 'PRESENT', current_oid = ? "
+                    "WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (intent.prepared_oid, intent.run_id),
+                )
+                connection.execute(
+                    "UPDATE runs SET run_head_oid = ? WHERE run_id = ? AND state = 'ACTIVE'",
+                    (intent.prepared_oid, intent.run_id),
+                )
+            else:
+                state = (
+                    "INDETERMINATE"
+                    if outcome.result_class == "PRIVATE_REF_UNOBSERVABLE"
+                    else "PAUSED"
+                )
+                ref_state = (
+                    "CONFLICT"
+                    if outcome.result_class == "PRIVATE_REF_CONFLICT"
+                    else (
+                        "INIT_INTENT_RECORDED"
+                        if outcome.result_class == "PRIVATE_REF_UNOBSERVABLE"
+                        else "ABSENT_EXPECTED"
+                    )
+                )
+                connection.execute(
+                    "UPDATE run_refs SET state = ? WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (ref_state, intent.run_id),
+                )
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ? AND state = 'ACTIVE'",
+                    (state, intent.run_id),
+                )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "PRIVATE_REF_INIT_SETTLED",
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=outcome.result_class,
+            ),
+            mutate=mutate,
+        )
+
+    def mark_private_ref_init_indeterminate(
+        self,
+        *,
+        binding: RuntimeStartBinding,
+        intent: RefCasIntent,
+        failure_class: str,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        del failure_class
+        return self.settle_private_ref_init(
+            binding=binding,
+            intent=intent,
+            outcome=PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class="PRIVATE_REF_UNOBSERVABLE",
+                observed_oid=None,
+            ),
+            expected_sequence=expected_sequence,
         )
 
     def fail_next_commit_after_state_write_for_test(self) -> None:

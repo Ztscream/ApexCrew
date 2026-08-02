@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from apexcrew.domain.admission import StartGuard
 from apexcrew.domain.commands import CommandEnvelope, CommandOutcome
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import GitOid, RepositoryId, RunId
@@ -38,6 +39,7 @@ class ControlState(Protocol):
         command: CommandEnvelope,
         target_authority: TargetAuthorityDigestService,
         repository_authority: RepositoryBootstrapAuthorityService,
+        start_guard: StartGuard | None = None,
     ) -> CommandOutcome:
         raise NotImplementedError
 
@@ -48,16 +50,19 @@ class ControlCommandService(CommandHandler):
         state: ControlState,
         target_authority: TargetAuthorityDigestService,
         repository_authority: RepositoryBootstrapAuthorityService,
+        start_guard: StartGuard | None = None,
     ) -> None:
         self._state = state
         self._target_authority = target_authority
         self._repository_authority = repository_authority
+        self._start_guard = start_guard
 
     def apply(self, command: CommandEnvelope) -> CommandOutcome:
         return self._state.apply_control_command(
             command,
             self._target_authority,
             self._repository_authority,
+            self._start_guard,
         )
 
 

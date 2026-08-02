@@ -71,6 +71,27 @@ class TargetReservation:
     admin_binding_digest: Sha256DigestText | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class PlanApproval:
+    run_id: RunId
+    plan_digest: RevisionDigest
+    approval_request_id: str
+    approval_sequence: AuditSequence
+    binding_digest: Sha256DigestText
+
+
+@dataclass(frozen=True, slots=True)
+class RunRefRecord:
+    run_id: RunId
+    ref_kind: Literal["PRIVATE", "TARGET"]
+    ref_name: str
+    expected_old_oid: GitOid | None
+    current_oid: GitOid | None
+    state: Literal["ABSENT_EXPECTED", "INIT_INTENT_RECORDED", "PRESENT", "CONFLICT"]
+    last_intent_id: IntentId | None
+    guard_binding_json: str | None = None
+
+
 class ReservationObservation(FrozenDocument):
     registration_present: bool
     path_present: bool
