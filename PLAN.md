@@ -187,11 +187,11 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 7A | `TASK-007A` | M1-04 | DONE | `bf9638ec725cd93cecf22c42d7daa603492b6bb0` |
 | Task 7B | `TASK-007B` | M1-04 | DONE | `98b08f2545e5dc09576f88dff531ec7c10c2c46d` |
 | Task 8 | `TASK-008` | M1-04 | DONE | `73fac5dfc548cb8e2b216b139ae476198ba326c0` |
-| Task 9 | `TASK-009` | M1-05 | NOT STARTED | Not created |
-| Task 9A | `TASK-009A` | M1-05 | NOT STARTED | Not created |
-| Task 9B | `TASK-009B` | M1-05 | NOT STARTED | Not created |
-| Task 9C | `TASK-009C` | M1-05 | NOT STARTED | Not created |
-| Task 9D | `TASK-009D` | M1-05 | NOT STARTED | Not created |
+| Task 9 | `TASK-009` | M1-05 | DONE | `a24c10b009d5b9e773cc5be565246014173b3f22` |
+| Task 9A | `TASK-009A` | M1-05 | DONE | `efd54d59cdb16d94856d88fb027f02ddc1cd1995` |
+| Task 9B | `TASK-009B` | M1-05 | DONE | `75fb5765c7290faf96dfa1cf21cb90794084ca67` |
+| Task 9C | `TASK-009C` | M1-05 | DONE | `0e6bc7800fad1059c47aceccff95121bc3703742` |
+| Task 9D | `TASK-009D` | M1-05 | DONE | `3dd8dcc0fcf8fbfdcb823cb339a8a2fd8bb7377b` |
 | Task 10 | `TASK-010` | M1-06 | NOT STARTED | Not created |
 | Task 11A | `TASK-011A` | M1-06 | NOT STARTED | Not created |
 | Task 11B | `TASK-011B` | M1-06 | NOT STARTED | Not created |
