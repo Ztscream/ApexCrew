@@ -4,7 +4,7 @@ import struct
 import subprocess
 import sys
 from collections.abc import Mapping
-from ctypes import POINTER, c_long, cast, memmove, string_at, wintypes
+from ctypes import POINTER, addressof, c_long, c_void_p, cast, memmove, string_at, wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +32,7 @@ from apexcrew.adapters.repository.no_follow_windows import (
     STATUS_NOT_A_DIRECTORY,
     STATUS_OBJECT_NAME_NOT_FOUND,
     STATUS_OBJECT_PATH_NOT_FOUND,
+    UNICODE_STRING,
     WindowsNoFollowBackend,
 )
 
@@ -60,7 +61,7 @@ class _RecordingBackend:
         self.absolute_root = Path("C:/repo") if platform == "windows" else Path("/repo")
         self.opens: list[_RecordedOpen] = []
         self.followed_link_count = 0
-        self.git_executable = Path("C:/git.exe")
+        self.git_executable = Path("C:/git.exe").resolve()
         self.empty_dir = Path("C:/empty")
         self._replacement_ids: dict[tuple[str, ...], int] = {}
 
@@ -303,7 +304,11 @@ class _SuccessfulNtCreate:
         self.calls += 1
         attributes = cast(arguments[2], POINTER(OBJECT_ATTRIBUTES)).contents
         unicode_name = attributes.ObjectName.contents
-        encoded = string_at(unicode_name.Buffer, unicode_name.Length)
+        buffer_pointer = c_void_p.from_address(
+            addressof(unicode_name) + UNICODE_STRING.Buffer.offset
+        ).value
+        assert buffer_pointer is not None
+        encoded = string_at(buffer_pointer, unicode_name.Length)
         self.names.append(
             (
                 unicode_name.Length,

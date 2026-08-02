@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 import sys
 from ctypes import (
+    CDLL,
     POINTER,
     Structure,
     byref,
@@ -17,6 +18,7 @@ from ctypes import (
     wintypes,
 )
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
 
 from apexcrew.adapters.repository.no_follow import (
     HandleIdentity,
@@ -25,7 +27,12 @@ from apexcrew.adapters.repository.no_follow import (
     RepositoryUnsafeError,
 )
 
-if sys.platform == "win32":
+if TYPE_CHECKING:
+    if sys.platform == "win32":
+        from ctypes import WinDLL
+    else:
+        WinDLL: type[CDLL] | None = None
+elif sys.platform == "win32":
     from ctypes import WinDLL
 else:
     WinDLL = None  # type: ignore[assignment,misc]
@@ -102,8 +109,8 @@ class WindowsNoFollowBackend:
     def __init__(self) -> None:
         if WinDLL is None:
             raise RepositoryUnsafeError("WINDOWS_NT_REQUIRED")
-        self._kernel32 = WinDLL("kernel32", use_last_error=True)
-        self._ntdll = WinDLL("ntdll")
+        self._kernel32: CDLL = WinDLL("kernel32", use_last_error=True)
+        self._ntdll: CDLL = WinDLL("ntdll")
         self._last_ntstatus: int | None = None
         self._declare_native_signatures()
 
