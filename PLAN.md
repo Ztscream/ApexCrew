@@ -185,8 +185,8 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 5 | `TASK-005` | M1-03 | DONE | `a1663fa0d6a60ccd3ee7a2e3577a7055db90ce11` |
 | Task 6 | `TASK-006` | M1-03 | DONE | `336a8ed63b9e89eb93ad7847b224249ce7fbe59f` |
 | Task 7A | `TASK-007A` | M1-04 | DONE | `bf9638ec725cd93cecf22c42d7daa603492b6bb0` |
-| Task 7B | `TASK-007B` | M1-04 | NOT STARTED | Not created |
-| Task 8 | `TASK-008` | M1-04 | NOT STARTED | Not created |
+| Task 7B | `TASK-007B` | M1-04 | DONE | `98b08f2545e5dc09576f88dff531ec7c10c2c46d` |
+| Task 8 | `TASK-008` | M1-04 | DONE | `73fac5dfc548cb8e2b216b139ae476198ba326c0` |
 | Task 9 | `TASK-009` | M1-05 | NOT STARTED | Not created |
 | Task 9A | `TASK-009A` | M1-05 | NOT STARTED | Not created |
 | Task 9B | `TASK-009B` | M1-05 | NOT STARTED | Not created |
