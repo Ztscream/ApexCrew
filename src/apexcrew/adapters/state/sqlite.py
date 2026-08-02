@@ -4,14 +4,36 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
+from typing import Literal
 
 from apexcrew.domain.admission import (
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
+)
+from apexcrew.domain.authority import (
+    ActiveRunTimeState,
+    AuthorizationReason,
+    AuthorizationRequest,
+    LeaseDenial,
+    ModelReservation,
+    ModelReservationReason,
+    ModelReservationRequest,
+    MonotonicClock,
+    MonotonicInstant,
+    ProgressEvidence,
+    RuntimeAuditStamp,
+    TaskAuthority,
+    TaskBudgetState,
+    TrancheDecision,
+    TrancheReason,
+    WorkspaceLease,
+    model_reservation_amounts,
+    progress_from_checks,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -51,7 +73,12 @@ from apexcrew.domain.model import (
     model_request_from_json,
     model_request_to_json,
 )
-from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.plan import GlobPattern, may_overlap
+from apexcrew.domain.revisions import (
+    BudgetRevisionDocument,
+    Sha256DigestText,
+    revision_digest,
+)
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -221,6 +248,92 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        6,
+        (
+            "ALTER TABLE model_attempts ADD COLUMN owner_kind TEXT NOT NULL DEFAULT 'PLANNING'",
+            "ALTER TABLE model_attempts ADD COLUMN task_id TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN attempt_id TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN tranche_id TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN dispatch_deadline_at_utc TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN target_safety_digest TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN budget_digest TEXT",
+            "ALTER TABLE model_attempts ADD COLUMN model_configuration_digest TEXT",
+            "ALTER TABLE runs ADD COLUMN active_runtime_nanoseconds INTEGER NOT NULL DEFAULT 0 CHECK(active_runtime_nanoseconds >= 0)",
+            "ALTER TABLE runs ADD COLUMN runtime_interval_opened_nanoseconds INTEGER",
+            "ALTER TABLE runs ADD COLUMN runtime_interval_owner_generation INTEGER",
+            "ALTER TABLE runs ADD COLUMN new_dispatch_open INTEGER NOT NULL DEFAULT 1 CHECK(new_dispatch_open IN (0, 1))",
+            "ALTER TABLE runs ADD COLUMN dispatch_close_causes_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE audit_events ADD COLUMN runtime_owner_generation INTEGER",
+            "ALTER TABLE audit_events ADD COLUMN runtime_monotonic_nanoseconds INTEGER",
+            """CREATE TABLE run_authority_counters (
+                run_id TEXT PRIMARY KEY,
+                planning_requests INTEGER NOT NULL CHECK(planning_requests >= 0)
+            )""",
+            """CREATE TABLE task_budget_counters (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                counters_json TEXT NOT NULL,
+                counters_digest TEXT NOT NULL,
+                PRIMARY KEY(run_id, task_id)
+            )""",
+            """CREATE TABLE task_tranches (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                tranche_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                tranche_number INTEGER NOT NULL,
+                tranche_kind TEXT NOT NULL CHECK(tranche_kind IN ('BOOTSTRAP', 'RENEWAL')),
+                allocated_calls INTEGER NOT NULL CHECK(allocated_calls BETWEEN 1 AND 8),
+                consumed_calls INTEGER NOT NULL CHECK(consumed_calls BETWEEN 0 AND allocated_calls),
+                progress_evidence_json TEXT NOT NULL,
+                progress_digest TEXT NOT NULL,
+                allocated_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, task_id, tranche_id),
+                UNIQUE(run_id, task_id, tranche_number)
+            )""",
+            """CREATE TABLE workspace_leases (
+                lease_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                base_head TEXT NOT NULL,
+                admissible_head TEXT NOT NULL,
+                task_contract_digest TEXT NOT NULL,
+                write_globs_json TEXT NOT NULL,
+                sensitivity_globs_json TEXT NOT NULL,
+                issued_at_utc TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                state TEXT NOT NULL,
+                issued_sequence INTEGER NOT NULL,
+                renewed_sequence INTEGER,
+                terminal_sequence INTEGER,
+                UNIQUE(run_id, attempt_id, generation)
+            )""",
+            """CREATE TABLE authorization_denials (
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                action_digest TEXT NOT NULL,
+                binding_digest TEXT NOT NULL,
+                plan_digest TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                budget_digest TEXT NOT NULL,
+                model_configuration_digest TEXT NOT NULL,
+                occurred_at_utc TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                denied_sequence INTEGER NOT NULL,
+                PRIMARY KEY(run_id, action_id)
+            )""",
+            """CREATE TABLE approved_budgets_for_test (
+                run_id TEXT PRIMARY KEY,
+                budget_digest TEXT NOT NULL,
+                budget_json TEXT NOT NULL
+            )""",
+        ),
+    ),
 )
 
 
@@ -387,13 +500,106 @@ def effect_result_from_storage_json(value: str) -> EffectResult:
     return result
 
 
+def _task_budget_json(state: TaskBudgetState) -> str:
+    return canonical_json(
+        {
+            "active_tranche_id": state.active_tranche_id,
+            "active_tranche_remaining_calls": state.active_tranche_remaining_calls,
+            "allocated_calls": state.allocated_calls,
+            "attempts": state.attempts,
+            "bootstrap_tranches": state.bootstrap_tranches,
+            "consecutive_no_progress_tranches": state.consecutive_no_progress_tranches,
+            "consumed_calls": state.consumed_calls,
+            "cost_usd": str(state.cost_usd),
+            "input_tokens": state.input_tokens,
+            "manual_resumes": state.manual_resumes,
+            "output_tokens": state.output_tokens,
+            "run_id": state.run_id,
+            "stale_refreshes": state.stale_refreshes,
+            "task_id": state.task_id,
+            "tranche_count": state.tranche_count,
+        }
+    )
+
+
+def _task_budget_from_json(value: str) -> TaskBudgetState:
+    data = _json_object(value, "TASK_BUDGET_STORAGE_INVALID")
+    try:
+        state = TaskBudgetState(
+            run_id=RunId(str(data["run_id"])),
+            task_id=TaskId(str(data["task_id"])),
+            allocated_calls=int(str(data["allocated_calls"])),
+            consumed_calls=int(str(data["consumed_calls"])),
+            input_tokens=int(str(data["input_tokens"])),
+            output_tokens=int(str(data["output_tokens"])),
+            cost_usd=Decimal(str(data["cost_usd"])),
+            tranche_count=int(str(data["tranche_count"])),
+            bootstrap_tranches=int(str(data["bootstrap_tranches"])),
+            consecutive_no_progress_tranches=int(str(data["consecutive_no_progress_tranches"])),
+            attempts=int(str(data["attempts"])),
+            stale_refreshes=int(str(data["stale_refreshes"])),
+            manual_resumes=int(str(data["manual_resumes"])),
+            active_tranche_id=(
+                None if data["active_tranche_id"] is None else str(data["active_tranche_id"])
+            ),
+            active_tranche_remaining_calls=int(str(data["active_tranche_remaining_calls"])),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise StateConflict("TASK_BUDGET_STORAGE_INVALID") from error
+    if _task_budget_json(state) != value:
+        raise StateConflict("TASK_BUDGET_STORAGE_INVALID")
+    return state
+
+
+def _workspace_lease_from_row(row: sqlite3.Row) -> WorkspaceLease:
+    try:
+        return WorkspaceLease(
+            lease_id=str(row["lease_id"]),
+            run_id=RunId(str(row["run_id"])),
+            task_id=TaskId(str(row["task_id"])),
+            attempt_id=AttemptId(str(row["attempt_id"])),
+            generation=int(row["generation"]),
+            base_head=str(row["base_head"]),
+            admissible_head=str(row["admissible_head"]),
+            task_contract_digest=str(row["task_contract_digest"]),
+            write_globs=tuple(
+                GlobPattern.parse(value) for value in json.loads(row["write_globs_json"])
+            ),
+            sensitivity_globs=tuple(
+                GlobPattern.parse(value) for value in json.loads(row["sensitivity_globs_json"])
+            ),
+            issued_at=datetime.fromisoformat(str(row["issued_at_utc"])),
+            expires_at=datetime.fromisoformat(str(row["expires_at_utc"])),
+            state=str(row["state"]),  # type: ignore[arg-type]
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StateConflict("WORKSPACE_LEASE_STORAGE_INVALID") from error
+
+
+class _LeaseDenied(RuntimeError):
+    def __init__(self, denial: LeaseDenial) -> None:
+        super().__init__(denial.reason)
+        self.denial = denial
+
+
+@dataclass(frozen=True, slots=True)
+class _ReservationEvaluation:
+    reason: ModelReservationReason | None
+    budget: BudgetRevisionDocument
+    amounts: ModelBudgetAmounts
+    run_counters: ModelCounters
+    task_counters: TaskBudgetState | None
+    planning_requests: int
+
+
 class SqliteStateStore:
-    def __init__(self, database: Path) -> None:
+    def __init__(self, database: Path, monotonic_clock: MonotonicClock | None = None) -> None:
         self._connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
+        self._monotonic_clock = monotonic_clock
         self._apply_migrations()
 
     def _apply_migrations(self) -> None:
@@ -418,6 +624,23 @@ class SqliteStateStore:
             raise
         else:
             connection.commit()
+
+    @contextmanager
+    def _transaction(
+        self, mode: Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
+    ) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            connection = self._connection
+            if connection.in_transaction:
+                raise StateConflict("NESTED_STATE_TRANSACTION")
+            connection.execute(f"BEGIN {mode}")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
 
     @contextmanager
     def _read_transaction(self) -> Iterator[sqlite3.Connection]:
@@ -465,6 +688,36 @@ class SqliteStateStore:
         expected_sequence: AuditSequence,
     ) -> AuditSequence:
         next_sequence = AuditSequence(expected_sequence + 1)
+        runtime_owner_generation: int | None = None
+        runtime_monotonic_nanoseconds: int | None = None
+        run = connection.execute(
+            "SELECT runtime_interval_owner_generation, "
+            "runtime_interval_opened_nanoseconds FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if run is None or run["runtime_interval_owner_generation"] is None:
+            if (
+                event.runtime_owner_generation is not None
+                or event.runtime_monotonic_nanoseconds is not None
+            ):
+                raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+        else:
+            if self._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            runtime_owner_generation = int(run["runtime_interval_owner_generation"])
+            opened = run["runtime_interval_opened_nanoseconds"]
+            if opened is None:
+                raise StateConflict("ACTIVE_RUN_TIME_OPEN_BINDING_INCOMPLETE")
+            now = self._monotonic_clock.now()
+            latest = connection.execute(
+                "SELECT runtime_monotonic_nanoseconds FROM audit_events WHERE run_id = ? "
+                "AND runtime_owner_generation = ? ORDER BY sequence DESC LIMIT 1",
+                (run_id, runtime_owner_generation),
+            ).fetchone()
+            latest_nanoseconds = int(opened) if latest is None else int(latest[0])
+            if now.nanoseconds < int(opened) or now.nanoseconds < latest_nanoseconds:
+                raise StateConflict("MONOTONIC_CLOCK_REGRESSED")
+            runtime_monotonic_nanoseconds = now.nanoseconds
         correlation_json = canonical_json(
             {
                 "action_id": event.action_id,
@@ -487,7 +740,8 @@ class SqliteStateStore:
         )
         connection.execute(
             "INSERT INTO audit_events(run_id, sequence, event_kind, correlation_json, "
-            "payload_json, created_at_utc) VALUES (?, ?, ?, ?, ?, ?)",
+            "payload_json, created_at_utc, runtime_owner_generation, "
+            "runtime_monotonic_nanoseconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 next_sequence,
@@ -495,6 +749,8 @@ class SqliteStateStore:
                 correlation_json,
                 payload_json,
                 datetime.now(UTC).isoformat(),
+                runtime_owner_generation,
+                runtime_monotonic_nanoseconds,
             ),
         )
         if (
@@ -932,6 +1188,829 @@ class SqliteStateStore:
                 "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
             ).fetchone()
         return AuditSequence(0 if row is None else row["current_sequence"])
+
+    def install_approved_budget_for_test(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        budget: BudgetRevisionDocument,
+    ) -> None:
+        if revision_digest(budget) != budget_digest:
+            raise StateConflict("APPROVED_BUDGET_DIGEST_MISMATCH")
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO approved_budgets_for_test(run_id, budget_digest, budget_json) "
+                "VALUES (?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                "budget_digest = excluded.budget_digest, budget_json = excluded.budget_json",
+                (run_id, budget_digest, budget.model_dump_json()),
+            )
+
+    def current_approved_budget(
+        self, run_id: RunId
+    ) -> tuple[RevisionDigest, BudgetRevisionDocument]:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT budget_digest, budget_json FROM approved_budgets_for_test WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+        budget = BudgetRevisionDocument.model_validate_json(str(row["budget_json"]))
+        digest = RevisionDigest(str(row["budget_digest"]))
+        if revision_digest(budget) != digest:
+            raise StateConflict("APPROVED_BUDGET_STORAGE_INVALID")
+        return digest, budget
+
+    def _evaluate_model_reservation(
+        self, connection: sqlite3.Connection, request: ModelReservationRequest
+    ) -> _ReservationEvaluation:
+        sequence_row = connection.execute(
+            "SELECT current_sequence FROM run_sequences WHERE run_id = ?",
+            (request.run_id,),
+        ).fetchone()
+        current_sequence = AuditSequence(
+            0 if sequence_row is None else sequence_row["current_sequence"]
+        )
+        budget_row = connection.execute(
+            "SELECT budget_digest, budget_json FROM approved_budgets_for_test WHERE run_id = ?",
+            (request.run_id,),
+        ).fetchone()
+        if budget_row is None:
+            raise StateConflict("APPROVED_BUDGET_NOT_FOUND")
+        budget = BudgetRevisionDocument.model_validate_json(str(budget_row["budget_json"]))
+        budget_digest = RevisionDigest(str(budget_row["budget_digest"]))
+        if revision_digest(budget) != budget_digest:
+            raise StateConflict("APPROVED_BUDGET_STORAGE_INVALID")
+        run_counters = self._model_counters(connection, request.run_id)
+        task_counters = (
+            None
+            if request.task_id is None
+            else self._task_budget_state(connection, request.run_id, request.task_id)
+        )
+        planning_row = connection.execute(
+            "SELECT planning_requests FROM run_authority_counters WHERE run_id = ?",
+            (request.run_id,),
+        ).fetchone()
+        planning_requests = 0 if planning_row is None else int(planning_row[0])
+        try:
+            amounts = model_reservation_amounts(request.model_request, budget)
+        except ValueError:
+            amounts = ModelBudgetAmounts.zero()
+            pricing_missing = True
+        else:
+            pricing_missing = False
+        reason: ModelReservationReason | None = None
+        if current_sequence != request.expected_sequence:
+            reason = "STALE_SEQUENCE"
+        elif request.model_request.budget_digest != budget_digest:
+            reason = "REVISION_BINDING_MISMATCH"
+        elif request.credential_profile is None:
+            reason = "CREDENTIAL_UNAVAILABLE"
+        elif (
+            request.expected_run_counters != run_counters
+            or request.expected_task_counters != task_counters
+        ):
+            reason = "COUNTER_SNAPSHOT_MISMATCH"
+        elif pricing_missing:
+            reason = "PRICING_MISSING"
+        else:
+            run = connection.execute(
+                "SELECT state, current_plan_digest, current_policy_digest, "
+                "current_budget_digest, current_model_configuration_digest, "
+                "new_dispatch_open FROM runs WHERE run_id = ?",
+                (request.run_id,),
+            ).fetchone()
+            if run is not None:
+                expected_revisions = (
+                    request.model_request.plan_digest,
+                    request.model_request.policy_digest,
+                    request.model_request.budget_digest,
+                    request.model_request.model_configuration_digest,
+                )
+                current_revisions = (
+                    run["current_plan_digest"],
+                    run["current_policy_digest"],
+                    run["current_budget_digest"],
+                    run["current_model_configuration_digest"],
+                )
+                target = connection.execute(
+                    "SELECT admin_binding_digest FROM target_reservations WHERE run_id = ?",
+                    (request.run_id,),
+                ).fetchone()
+                if current_revisions != expected_revisions:
+                    reason = "REVISION_BINDING_MISMATCH"
+                elif target is None or target[0] != request.target_safety_digest:
+                    reason = "TARGET_BINDING_MISMATCH"
+                elif run["new_dispatch_open"] != 1 or run["state"] not in {
+                    "PLANNING",
+                    "ACTIVE",
+                }:
+                    reason = "RUN_NOT_DISPATCHABLE"
+            after = run_counters.reserve(amounts)
+            if (
+                reason is None
+                and request.owner_kind == "PLANNING"
+                and (planning_requests >= budget.planning_request_ceiling)
+            ):
+                reason = "PLANNING_REQUEST_CEILING"
+            elif (
+                reason is None
+                and request.owner_kind == "WORKER"
+                and (
+                    task_counters is None
+                    or task_counters.active_tranche_id != request.tranche_id
+                    or task_counters.active_tranche_remaining_calls < 1
+                )
+            ):
+                reason = "TASK_TRANCHE_EXHAUSTED"
+            elif reason is None and after.calls > budget.model_call_ceiling:
+                reason = "MODEL_CALL_CEILING"
+            elif reason is None and after.input_tokens > budget.input_token_ceiling:
+                reason = "INPUT_TOKEN_CEILING"
+            elif reason is None and after.output_tokens > budget.output_token_ceiling:
+                reason = "OUTPUT_TOKEN_CEILING"
+            elif reason is None and after.cost_usd > budget.cost_reserve_usd:
+                reason = "COST_RESERVE_CEILING"
+        return _ReservationEvaluation(
+            reason,
+            budget,
+            amounts,
+            run_counters,
+            task_counters,
+            planning_requests,
+        )
+
+    def _model_reservation_result(
+        self,
+        request: ModelReservationRequest,
+        evaluation: _ReservationEvaluation,
+        *,
+        decision: Literal["DENY", "PAUSE"],
+        resulting_sequence: AuditSequence,
+    ) -> ModelReservation:
+        if evaluation.reason is None:
+            raise AssertionError("denial result requires a reason")
+        return ModelReservation(
+            decision=decision,
+            reason=evaluation.reason,
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt_id=request.attempt_id,
+            tranche_id=request.tranche_id,
+            turn=request.turn,
+            intent=None,
+            reserved_amounts=ModelBudgetAmounts.zero(),
+            run_counters_before=evaluation.run_counters,
+            run_counters_after=evaluation.run_counters,
+            task_counters_before=evaluation.task_counters,
+            task_counters_after=evaluation.task_counters,
+            deadline_at_utc=request.deadline_at_utc,
+            pause_after_barrier=decision == "PAUSE",
+            resulting_sequence=resulting_sequence,
+        )
+
+    def reserve_authorized_model_attempt(
+        self, request: ModelReservationRequest
+    ) -> ModelReservation:
+        with self._read_transaction() as connection:
+            evaluation = self._evaluate_model_reservation(connection, request)
+        ceiling_reasons: set[ModelReservationReason] = {
+            "PLANNING_REQUEST_CEILING",
+            "TASK_TRANCHE_EXHAUSTED",
+            "MODEL_CALL_CEILING",
+            "INPUT_TOKEN_CEILING",
+            "OUTPUT_TOKEN_CEILING",
+            "COST_RESERVE_CEILING",
+        }
+        if evaluation.reason is not None and evaluation.reason not in ceiling_reasons:
+            return self._model_reservation_result(
+                request,
+                evaluation,
+                decision="DENY",
+                resulting_sequence=self.audit_sequence(request.run_id),
+            )
+        if evaluation.reason is not None:
+
+            def pause(connection: sqlite3.Connection) -> None:
+                current = self._evaluate_model_reservation(connection, request)
+                if current.reason != evaluation.reason:
+                    raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+                connection.execute(
+                    "UPDATE runs SET new_dispatch_open = 0, state = 'PAUSED', "
+                    "dispatch_close_causes_json = ? WHERE run_id = ?",
+                    (json.dumps([evaluation.reason]), request.run_id),
+                )
+
+            sequence = self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind("MODEL_RESERVATION_PAUSED", result_class=evaluation.reason),
+                mutate=pause,
+            )
+            return self._model_reservation_result(
+                request,
+                evaluation,
+                decision="PAUSE",
+                resulting_sequence=sequence,
+            )
+
+        turn: LogicalModelTurn | None = None
+        intent: ModelRequestIntent | None = None
+        run_after: ModelCounters | None = None
+        task_after: TaskBudgetState | None = None
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            nonlocal turn, intent, run_after, task_after
+            current = self._evaluate_model_reservation(connection, request)
+            if current.reason is not None or current != evaluation:
+                raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+            if request.turn is None:
+                turn = LogicalModelTurn.new(request.model_request)
+                connection.execute(
+                    "INSERT INTO model_turns(logical_turn_id, run_id, request_digest, "
+                    "created_sequence, state, owner_kind, task_id, attempt_id, tranche_id) "
+                    "VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)",
+                    (
+                        turn.logical_turn_id,
+                        request.run_id,
+                        request.model_request.request_digest,
+                        request.expected_sequence + 1,
+                        request.owner_kind,
+                        request.task_id,
+                        request.attempt_id,
+                        request.tranche_id,
+                    ),
+                )
+            else:
+                turn = request.turn
+                bound = connection.execute(
+                    "SELECT 1 FROM model_turns WHERE run_id = ? AND logical_turn_id = ? "
+                    "AND request_digest = ? AND state = 'OPEN'",
+                    (request.run_id, turn.logical_turn_id, turn.request_digest),
+                ).fetchone()
+                if bound is None:
+                    raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
+            intent = replace(
+                ModelRequestIntent.reserve(
+                    turn, request.model_request, request.provider_attempt_number
+                ),
+                reserved_amounts=evaluation.amounts,
+            )
+            connection.execute(
+                "INSERT INTO model_attempts(intent_id, run_id, logical_turn_id, "
+                "provider_attempt_number, request_json, request_digest, idempotency_key, "
+                "reserved_json, allowed_model_ids_json, reserved_sequence, state, "
+                "owner_kind, task_id, attempt_id, tranche_id, dispatch_deadline_at_utc, "
+                "target_safety_digest, budget_digest, model_configuration_digest) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    intent.intent_id,
+                    request.run_id,
+                    turn.logical_turn_id,
+                    request.provider_attempt_number,
+                    model_request_to_json(request.model_request),
+                    request.model_request.request_digest,
+                    request.model_request.idempotency_key,
+                    evaluation.amounts.to_json(),
+                    json.dumps(
+                        sorted(request.model_request.allowed_model_ids), separators=(",", ":")
+                    ),
+                    request.expected_sequence + 1,
+                    request.owner_kind,
+                    request.task_id,
+                    request.attempt_id,
+                    request.tranche_id,
+                    request.deadline_at_utc.isoformat(),
+                    request.target_safety_digest,
+                    request.model_request.budget_digest,
+                    request.model_request.model_configuration_digest,
+                ),
+            )
+            run_after = evaluation.run_counters.reserve(evaluation.amounts)
+            self._write_model_counters(connection, request.run_id, run_after)
+            if request.owner_kind == "PLANNING":
+                connection.execute(
+                    "INSERT INTO run_authority_counters(run_id, planning_requests) "
+                    "VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                    "planning_requests = excluded.planning_requests",
+                    (request.run_id, evaluation.planning_requests + 1),
+                )
+            else:
+                if evaluation.task_counters is None:
+                    raise StateConflict("TASK_COUNTERS_REQUIRED")
+                remaining = evaluation.task_counters.active_tranche_remaining_calls - 1
+                task_after = replace(
+                    evaluation.task_counters,
+                    consumed_calls=evaluation.task_counters.consumed_calls + 1,
+                    input_tokens=evaluation.task_counters.input_tokens
+                    + evaluation.amounts.input_tokens,
+                    output_tokens=evaluation.task_counters.output_tokens
+                    + evaluation.amounts.output_tokens,
+                    cost_usd=evaluation.task_counters.cost_usd + evaluation.amounts.cost_usd,
+                    active_tranche_id=(
+                        None if remaining == 0 else evaluation.task_counters.active_tranche_id
+                    ),
+                    active_tranche_remaining_calls=remaining,
+                )
+                self._write_task_budget_state(connection, task_after)
+                connection.execute(
+                    "UPDATE task_tranches SET consumed_calls = consumed_calls + 1 "
+                    "WHERE run_id = ? AND task_id = ? AND tranche_id = ?",
+                    (request.run_id, request.task_id, request.tranche_id),
+                )
+
+        sequence = self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=request.expected_sequence,
+            event=AuditEvent.kind(
+                "MODEL_ATTEMPT_RESERVED",
+                task_id=request.task_id,
+                attempt_id=request.attempt_id,
+                budget_delta_json=evaluation.amounts.to_json(),
+            ),
+            mutate=mutate,
+        )
+        if turn is None or intent is None or run_after is None:
+            raise AssertionError("model reservation state missing after commit")
+        return ModelReservation(
+            decision="RESERVED",
+            reason="AUTHORIZED",
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt_id=request.attempt_id,
+            tranche_id=request.tranche_id,
+            turn=turn,
+            intent=intent,
+            reserved_amounts=evaluation.amounts,
+            run_counters_before=evaluation.run_counters,
+            run_counters_after=run_after,
+            task_counters_before=evaluation.task_counters,
+            task_counters_after=task_after,
+            deadline_at_utc=request.deadline_at_utc,
+            pause_after_barrier=False,
+            resulting_sequence=sequence,
+        )
+
+    def issue_workspace_lease(
+        self,
+        lease: WorkspaceLease,
+        worker_ceiling: int,
+        expected_sequence: AuditSequence,
+    ) -> WorkspaceLease | LeaseDenial:
+        def mutate(connection: sqlite3.Connection) -> None:
+            active = tuple(
+                _workspace_lease_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE' "
+                    "AND expires_at_utc > ?",
+                    (lease.run_id, lease.issued_at.isoformat()),
+                )
+            )
+            if len(active) >= worker_ceiling:
+                raise _LeaseDenied(LeaseDenial(reason="WORKER_CEILING"))
+            if any(
+                may_overlap(left, right)
+                for existing in active
+                for left in existing.write_globs
+                for right in lease.write_globs
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            connection.execute(
+                "INSERT INTO workspace_leases(lease_id, run_id, task_id, attempt_id, "
+                "generation, base_head, admissible_head, task_contract_digest, "
+                "write_globs_json, sensitivity_globs_json, issued_at_utc, expires_at_utc, "
+                "state, issued_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    lease.lease_id,
+                    lease.run_id,
+                    lease.task_id,
+                    lease.attempt_id,
+                    lease.generation,
+                    lease.base_head,
+                    lease.admissible_head,
+                    lease.task_contract_digest,
+                    json.dumps([item.value for item in lease.write_globs], separators=(",", ":")),
+                    json.dumps(
+                        [item.value for item in lease.sensitivity_globs], separators=(",", ":")
+                    ),
+                    lease.issued_at.isoformat(),
+                    lease.expires_at.isoformat(),
+                    lease.state,
+                    expected_sequence + 1,
+                ),
+            )
+
+        try:
+            self._commit_state_and_event(
+                run_id=lease.run_id,
+                expected_sequence=expected_sequence,
+                event=AuditEvent.kind(
+                    "WORKSPACE_LEASE_ISSUED",
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                ),
+                mutate=mutate,
+            )
+        except _LeaseDenied as denial:
+            return denial.denial
+        return lease
+
+    def workspace_lease(self, run_id: RunId, lease_id: str) -> WorkspaceLease | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM workspace_leases WHERE run_id = ? AND lease_id = ?",
+                (run_id, lease_id),
+            ).fetchone()
+        return None if row is None else _workspace_lease_from_row(row)
+
+    def expire_workspace_lease(
+        self,
+        run_id: RunId,
+        lease_id: str,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            if (
+                connection.execute(
+                    "UPDATE workspace_leases SET state = 'EXPIRED', terminal_sequence = ? "
+                    "WHERE run_id = ? AND lease_id = ? AND state = 'ACTIVE'",
+                    (expected_sequence + 1, run_id, lease_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("WORKSPACE_LEASE_NOT_ACTIVE")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("WORKSPACE_LEASE_EXPIRED"),
+            mutate=mutate,
+        )
+
+    def renew_workspace_lease(
+        self,
+        run_id: RunId,
+        lease_id: str,
+        generation: int,
+        latest_admissible_head: str,
+        renewed_at: datetime,
+        expires_at: datetime,
+        expected_sequence: AuditSequence,
+    ) -> WorkspaceLease | LeaseDenial:
+        renewed: WorkspaceLease | None = None
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            nonlocal renewed
+            row = connection.execute(
+                "SELECT * FROM workspace_leases WHERE run_id = ? AND lease_id = ?",
+                (run_id, lease_id),
+            ).fetchone()
+            if row is None:
+                raise _LeaseDenied(LeaseDenial())
+            current = _workspace_lease_from_row(row)
+            if (
+                current.state != "ACTIVE"
+                or current.expires_at <= renewed_at
+                or current.generation != generation
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            others = tuple(
+                _workspace_lease_from_row(item)
+                for item in connection.execute(
+                    "SELECT * FROM workspace_leases WHERE run_id = ? AND lease_id <> ? "
+                    "AND state = 'ACTIVE' AND expires_at_utc > ?",
+                    (run_id, lease_id, renewed_at.isoformat()),
+                )
+            )
+            if any(
+                may_overlap(left, right)
+                for other in others
+                for left in current.write_globs
+                for right in other.write_globs
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            renewed = replace(
+                current,
+                admissible_head=latest_admissible_head,
+                expires_at=expires_at,
+            )
+            connection.execute(
+                "UPDATE workspace_leases SET admissible_head = ?, expires_at_utc = ?, "
+                "renewed_sequence = ? WHERE run_id = ? AND lease_id = ?",
+                (
+                    latest_admissible_head,
+                    expires_at.isoformat(),
+                    expected_sequence + 1,
+                    run_id,
+                    lease_id,
+                ),
+            )
+
+        try:
+            self._commit_state_and_event(
+                run_id=run_id,
+                expected_sequence=expected_sequence,
+                event=AuditEvent.kind("WORKSPACE_LEASE_RENEWED"),
+                mutate=mutate,
+            )
+        except _LeaseDenied as denial:
+            return denial.denial
+        if renewed is None:
+            raise AssertionError("renewed lease missing after committed mutation")
+        return renewed
+
+    def _require_current_revisions(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        expected: ApplicableRevisionDigests,
+    ) -> None:
+        row = connection.execute(
+            "SELECT current_plan_digest, current_policy_digest, current_budget_digest, "
+            "current_model_configuration_digest FROM runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        current = ApplicableRevisionDigests(
+            plan_digest=row["current_plan_digest"],
+            policy_digest=row["current_policy_digest"],
+            budget_digest=row["current_budget_digest"],
+            model_configuration_digest=row["current_model_configuration_digest"],
+        )
+        if current != expected:
+            raise StateConflict("CURRENT_REVISION_BINDING_MISMATCH")
+
+    def _require_current_budget(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+    ) -> None:
+        row = connection.execute(
+            "SELECT current_budget_digest FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None or row["current_budget_digest"] != budget_digest:
+            raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+
+    def authorization_binding_failure(
+        self, request: AuthorizationRequest
+    ) -> AuthorizationReason | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT state, current_plan_digest, current_policy_digest, "
+                "current_budget_digest, current_model_configuration_digest, "
+                "new_dispatch_open FROM runs WHERE run_id = ?",
+                (request.run_id,),
+            ).fetchone()
+            target = connection.execute(
+                "SELECT admin_binding_digest FROM target_reservations WHERE run_id = ?",
+                (request.run_id,),
+            ).fetchone()
+        if row is None or row["state"] != "ACTIVE" or row["new_dispatch_open"] != 1:
+            return "RUN_NOT_DISPATCHABLE"
+        if (
+            row["current_plan_digest"] != request.plan_digest
+            or row["current_policy_digest"] != request.policy_digest
+            or row["current_budget_digest"] != request.budget_digest
+            or row["current_model_configuration_digest"] != request.model_configuration_digest
+        ):
+            return "REVISION_BINDING_MISMATCH"
+        if target is None or target["admin_binding_digest"] != request.target_safety_digest:
+            return "TARGET_BINDING_MISMATCH"
+        return None
+
+    def record_authorization_denial(
+        self,
+        request: AuthorizationRequest,
+        binding_digest: str,
+        reason: AuthorizationReason,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "INSERT INTO authorization_denials(run_id, task_id, attempt_id, action_id, "
+                "action_digest, binding_digest, plan_digest, policy_digest, budget_digest, "
+                "model_configuration_digest, occurred_at_utc, reason, denied_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    request.run_id,
+                    request.task_id,
+                    request.attempt_id,
+                    request.action_id,
+                    request.action_digest,
+                    binding_digest,
+                    request.plan_digest,
+                    request.policy_digest,
+                    request.budget_digest,
+                    request.model_configuration_digest,
+                    request.started_at_utc.isoformat(),
+                    reason,
+                    expected_sequence + 1,
+                ),
+            )
+
+        return self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_AUTHORIZATION_DENIED",
+                task_id=request.task_id,
+                attempt_id=request.attempt_id,
+                action_id=request.action_id,
+                result_class=reason,
+                subject_digests=(request.action_digest, binding_digest),
+            ),
+            mutate=mutate,
+        )
+
+    def _task_budget_state(
+        self, connection: sqlite3.Connection, run_id: RunId, task_id: TaskId
+    ) -> TaskBudgetState:
+        row = connection.execute(
+            "SELECT counters_json, counters_digest FROM task_budget_counters "
+            "WHERE run_id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if row is None:
+            return TaskBudgetState(run_id=run_id, task_id=task_id)
+        counters_json = str(row["counters_json"])
+        if sha256_digest(counters_json) != row["counters_digest"]:
+            raise StateConflict("TASK_BUDGET_STORAGE_INVALID")
+        state = _task_budget_from_json(counters_json)
+        if state.run_id != run_id or state.task_id != task_id:
+            raise StateConflict("TASK_BUDGET_STORAGE_INVALID")
+        return state
+
+    def _write_task_budget_state(
+        self, connection: sqlite3.Connection, state: TaskBudgetState
+    ) -> None:
+        counters_json = _task_budget_json(state)
+        connection.execute(
+            "INSERT INTO task_budget_counters(run_id, task_id, counters_json, counters_digest) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(run_id, task_id) DO UPDATE SET "
+            "counters_json = excluded.counters_json, counters_digest = excluded.counters_digest",
+            (state.run_id, state.task_id, counters_json, sha256_digest(counters_json)),
+        )
+
+    def task_budget_state(self, run_id: RunId, task_id: TaskId) -> TaskBudgetState:
+        with self._read_transaction() as connection:
+            return self._task_budget_state(connection, run_id, task_id)
+
+    def allocate_task_tranche(
+        self,
+        task: TaskAuthority,
+        expected: TaskBudgetState,
+        calls: int,
+        reason: TrancheReason,
+        progress: ProgressEvidence,
+        expected_sequence: AuditSequence,
+    ) -> TrancheDecision:
+        progressed = progress_from_checks(
+            progress.previous,
+            progress.current,
+            progress.previous_lifecycle,
+            progress.current_lifecycle,
+        )
+        tranche_number = expected.tranche_count + 1
+        tranche_id = (
+            None if calls == 0 else f"tranche-{task.run_id}-{task.task_id}-{tranche_number}"
+        )
+        decision: Literal["ALLOCATE", "PAUSE"]
+        if calls == 0:
+            after = replace(
+                expected,
+                consecutive_no_progress_tranches=(
+                    expected.consecutive_no_progress_tranches + 1
+                    if reason == "NO_PROGRESS"
+                    else expected.consecutive_no_progress_tranches
+                ),
+            )
+            event_kind = "TASK_PAUSED_NO_PROGRESS"
+            decision = "PAUSE"
+        else:
+            after = replace(
+                expected,
+                allocated_calls=expected.allocated_calls + calls,
+                tranche_count=tranche_number,
+                bootstrap_tranches=expected.bootstrap_tranches
+                + (1 if reason == "BOOTSTRAP" else 0),
+                consecutive_no_progress_tranches=(
+                    0
+                    if reason == "OBJECTIVE_PROGRESS"
+                    else expected.consecutive_no_progress_tranches
+                ),
+                active_tranche_id=tranche_id,
+                active_tranche_remaining_calls=calls,
+            )
+            event_kind = "TASK_TRANCHE_ALLOCATED"
+            decision = "ALLOCATE"
+        progress_json = canonical_json(
+            {
+                "current_failures": sorted(progress.current.failures),
+                "current_fresh_passes": sorted(progress.current.fresh_passes),
+                "current_lifecycle": progress.current_lifecycle,
+                "previous_failures": sorted(progress.previous.failures),
+                "previous_fresh_passes": sorted(progress.previous.fresh_passes),
+                "previous_lifecycle": progress.previous_lifecycle,
+                "progressed": progressed,
+            }
+        )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            current = self._task_budget_state(connection, task.run_id, task.task_id)
+            if current != expected:
+                raise StateConflict("TASK_COUNTER_SNAPSHOT_MISMATCH")
+            if current.active_tranche_remaining_calls:
+                raise StateConflict("TASK_TRANCHE_STILL_ACTIVE")
+            if calls == 0:
+                if reason not in {"NO_PROGRESS", "TASK_CALL_CEILING"}:
+                    raise StateConflict("TASK_TRANCHE_PAUSE_REASON_INVALID")
+            elif not 1 <= calls <= 8 or reason not in {"BOOTSTRAP", "OBJECTIVE_PROGRESS"}:
+                raise StateConflict("TASK_TRANCHE_ALLOCATION_INVALID")
+            self._write_task_budget_state(connection, after)
+            if tranche_id is not None:
+                connection.execute(
+                    "INSERT INTO task_tranches(run_id, task_id, tranche_id, attempt_id, "
+                    "tranche_number, tranche_kind, allocated_calls, consumed_calls, "
+                    "progress_evidence_json, progress_digest, allocated_sequence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                    (
+                        task.run_id,
+                        task.task_id,
+                        tranche_id,
+                        task.attempt_id,
+                        tranche_number,
+                        "BOOTSTRAP" if reason == "BOOTSTRAP" else "RENEWAL",
+                        calls,
+                        progress_json,
+                        sha256_digest(progress_json),
+                        expected_sequence + 1,
+                    ),
+                )
+
+        resulting_sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(event_kind, task_id=task.task_id, attempt_id=task.attempt_id),
+            mutate=mutate,
+        )
+        return TrancheDecision(
+            decision=decision,
+            reason=reason,
+            run_id=task.run_id,
+            task_id=task.task_id,
+            attempt_id=task.attempt_id,
+            tranche_id=tranche_id,
+            tranche_number=tranche_number,
+            calls=calls,
+            counters_before=expected,
+            counters_after=after,
+            resulting_sequence=resulting_sequence,
+        )
+
+    def last_runtime_audit_event(
+        self, run_id: RunId, owner_generation: int
+    ) -> RuntimeAuditStamp | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT sequence, runtime_owner_generation, runtime_monotonic_nanoseconds "
+                "FROM audit_events WHERE run_id = ? AND runtime_owner_generation = ? "
+                "ORDER BY sequence DESC LIMIT 1",
+                (run_id, owner_generation),
+            ).fetchone()
+        if row is None or row["runtime_monotonic_nanoseconds"] is None:
+            return None
+        return RuntimeAuditStamp(
+            sequence=AuditSequence(row["sequence"]),
+            owner_generation=int(row["runtime_owner_generation"]),
+            monotonic_instant=MonotonicInstant(row["runtime_monotonic_nanoseconds"]),
+        )
+
+    def active_run_time_state(self, run_id: RunId) -> ActiveRunTimeState:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT active_runtime_nanoseconds, runtime_interval_owner_generation, "
+                "runtime_interval_opened_nanoseconds FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return ActiveRunTimeState(run_id, 0, None, None, None)
+        generation = row["runtime_interval_owner_generation"]
+        stamp = (
+            None if generation is None else self.last_runtime_audit_event(run_id, int(generation))
+        )
+        return ActiveRunTimeState(
+            run_id=run_id,
+            cumulative_nanoseconds=int(row["active_runtime_nanoseconds"]),
+            open_owner_generation=None if generation is None else int(generation),
+            opened_at=(
+                None
+                if row["runtime_interval_opened_nanoseconds"] is None
+                else MonotonicInstant(int(row["runtime_interval_opened_nanoseconds"]))
+            ),
+            latest_committed_at=None if stamp is None else stamp.monotonic_instant,
+        )
 
     def append_event(
         self,

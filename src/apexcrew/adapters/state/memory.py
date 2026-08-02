@@ -3,12 +3,34 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime
 from threading import RLock
+from typing import Literal
 
 from apexcrew.domain.admission import (
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
+)
+from apexcrew.domain.authority import (
+    ActiveRunTimeState,
+    AuthorizationReason,
+    AuthorizationRequest,
+    LeaseDenial,
+    ModelReservation,
+    ModelReservationReason,
+    ModelReservationRequest,
+    MonotonicClock,
+    MonotonicInstant,
+    ProgressEvidence,
+    RuntimeAuditStamp,
+    TaskAuthority,
+    TaskBudgetState,
+    TrancheDecision,
+    TrancheReason,
+    WorkspaceLease,
+    model_reservation_amounts,
+    progress_from_checks,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -31,6 +53,7 @@ from apexcrew.domain.model import (
     CommittedModelTurn,
     LogicalModelTurn,
     LogicalTurnId,
+    ModelBudgetAmounts,
     ModelCompletion,
     ModelCounters,
     ModelDispatchResult,
@@ -41,14 +64,18 @@ from apexcrew.domain.model import (
     ProviderAttemptResult,
     SettledModelAttempt,
 )
-from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.plan import may_overlap
+from apexcrew.domain.revisions import BudgetRevisionDocument, Sha256DigestText, revision_digest
 from apexcrew.domain.types import (
+    AttemptId,
     AuditSequence,
     CommandStatus,
     IntentId,
     RepositoryId,
+    RevisionDigest,
     RunId,
     RunState,
+    TaskId,
 )
 
 
@@ -177,8 +204,24 @@ def _require_canonical_json_object(value: str, error_code: str) -> None:
         raise StateConflict(error_code)
 
 
+@dataclass(frozen=True, slots=True)
+class _ReservationEvaluation:
+    reason: ModelReservationReason | None
+    budget: BudgetRevisionDocument
+    amounts: ModelBudgetAmounts
+    run_counters: ModelCounters
+    task_counters: TaskBudgetState | None
+    planning_requests: int
+
+
+class _LeaseDenied(RuntimeError):
+    def __init__(self, denial: LeaseDenial) -> None:
+        super().__init__(denial.reason)
+        self.denial = denial
+
+
 class InMemoryStateStore:
-    def __init__(self) -> None:
+    def __init__(self, monotonic_clock: MonotonicClock | None = None) -> None:
         self._command_receipts: dict[str, tuple[str, RunId, str, str, AuditSequence]] = {}
         self._audit_events: dict[RunId, list[tuple[AuditSequence, AuditEvent]]] = {}
         self._sequences: dict[RunId, AuditSequence] = {}
@@ -190,6 +233,17 @@ class InMemoryStateStore:
         self._model_counters: dict[RunId, ModelCounters] = {}
         self._runs: dict[RunId, RunRecord] = {}
         self._target_reservations: dict[str, TargetReservation] = {}
+        self._approved_budgets: dict[RunId, tuple[RevisionDigest, BudgetRevisionDocument]] = {}
+        self._workspace_leases: dict[tuple[RunId, str], WorkspaceLease] = {}
+        self._authorization_denials: dict[tuple[RunId, str], tuple[str, AuthorizationReason]] = {}
+        self._task_budget_counters: dict[tuple[RunId, TaskId], TaskBudgetState] = {}
+        self._planning_request_counts: dict[RunId, int] = {}
+        self._dispatch_close_causes: dict[RunId, tuple[str, ...]] = {}
+        self._active_run_times: dict[RunId, ActiveRunTimeState] = {}
+        self._task_tranches: dict[
+            tuple[RunId, TaskId, str], tuple[AttemptId, int, int, str, str]
+        ] = {}
+        self._monotonic_clock = monotonic_clock
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
 
@@ -206,6 +260,15 @@ class InMemoryStateStore:
         copied._model_counters = self._model_counters.copy()
         copied._runs = self._runs.copy()
         copied._target_reservations = self._target_reservations.copy()
+        copied._approved_budgets = self._approved_budgets.copy()
+        copied._workspace_leases = self._workspace_leases.copy()
+        copied._authorization_denials = self._authorization_denials.copy()
+        copied._task_budget_counters = self._task_budget_counters.copy()
+        copied._planning_request_counts = self._planning_request_counts.copy()
+        copied._dispatch_close_causes = self._dispatch_close_causes.copy()
+        copied._active_run_times = self._active_run_times.copy()
+        copied._task_tranches = self._task_tranches.copy()
+        copied._monotonic_clock = self._monotonic_clock
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
         return copied
@@ -222,6 +285,14 @@ class InMemoryStateStore:
         self._model_counters = copied._model_counters
         self._runs = copied._runs
         self._target_reservations = copied._target_reservations
+        self._approved_budgets = copied._approved_budgets
+        self._workspace_leases = copied._workspace_leases
+        self._authorization_denials = copied._authorization_denials
+        self._task_budget_counters = copied._task_budget_counters
+        self._planning_request_counts = copied._planning_request_counts
+        self._dispatch_close_causes = copied._dispatch_close_causes
+        self._active_run_times = copied._active_run_times
+        self._task_tranches = copied._task_tranches
 
     def _commit_state_and_event(
         self,
@@ -241,7 +312,28 @@ class InMemoryStateStore:
                 self._fail_next_commit_after_state_write = False
                 raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
             next_sequence = AuditSequence(expected_sequence + 1)
-            copied._audit_events.setdefault(run_id, []).append((next_sequence, event))
+            runtime_state = copied._active_run_times.get(
+                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            )
+            committed_event = event
+            if runtime_state.open_owner_generation is None:
+                if (
+                    event.runtime_owner_generation is not None
+                    or event.runtime_monotonic_nanoseconds is not None
+                ):
+                    raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+            else:
+                if copied._monotonic_clock is None:
+                    raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+                now = copied._monotonic_clock.now()
+                runtime_state.observed_nanoseconds(now)
+                committed_event = replace(
+                    event,
+                    runtime_owner_generation=runtime_state.open_owner_generation,
+                    runtime_monotonic_nanoseconds=now.nanoseconds,
+                )
+                copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
+            copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
             copied._sequences[run_id] = next_sequence
             self._publish(copied)
             return next_sequence
@@ -473,6 +565,612 @@ class InMemoryStateStore:
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         with self._lock:
             return self._sequences.get(run_id, AuditSequence(0))
+
+    def install_approved_budget_for_test(
+        self,
+        run_id: RunId,
+        budget_digest: RevisionDigest,
+        budget: BudgetRevisionDocument,
+    ) -> None:
+        if revision_digest(budget) != budget_digest:
+            raise StateConflict("APPROVED_BUDGET_DIGEST_MISMATCH")
+        with self._lock:
+            self._approved_budgets[run_id] = (budget_digest, budget)
+
+    def current_approved_budget(
+        self, run_id: RunId
+    ) -> tuple[RevisionDigest, BudgetRevisionDocument]:
+        with self._lock:
+            try:
+                return self._approved_budgets[run_id]
+            except KeyError as error:
+                raise StateConflict("APPROVED_BUDGET_NOT_FOUND") from error
+
+    def _evaluate_model_reservation(
+        self, request: ModelReservationRequest
+    ) -> _ReservationEvaluation:
+        try:
+            budget_digest, budget = self._approved_budgets[request.run_id]
+        except KeyError as error:
+            raise StateConflict("APPROVED_BUDGET_NOT_FOUND") from error
+        run_counters = self._model_counters.get(request.run_id, ModelCounters())
+        task_counters = (
+            None
+            if request.task_id is None
+            else self._task_budget_counters.get(
+                (request.run_id, request.task_id),
+                TaskBudgetState(request.run_id, request.task_id),
+            )
+        )
+        planning_requests = self._planning_request_counts.get(request.run_id, 0)
+        try:
+            amounts = model_reservation_amounts(request.model_request, budget)
+        except ValueError:
+            amounts = ModelBudgetAmounts.zero()
+            pricing_missing = True
+        else:
+            pricing_missing = False
+        reason: ModelReservationReason | None = None
+        if self._sequences.get(request.run_id, AuditSequence(0)) != request.expected_sequence:
+            reason = "STALE_SEQUENCE"
+        elif request.model_request.budget_digest != budget_digest:
+            reason = "REVISION_BINDING_MISMATCH"
+        elif request.credential_profile is None:
+            reason = "CREDENTIAL_UNAVAILABLE"
+        elif (
+            request.expected_run_counters != run_counters
+            or request.expected_task_counters != task_counters
+        ):
+            reason = "COUNTER_SNAPSHOT_MISMATCH"
+        elif pricing_missing:
+            reason = "PRICING_MISSING"
+        else:
+            run = self._runs.get(request.run_id)
+            if run is not None:
+                if (
+                    run.current_plan_digest != request.model_request.plan_digest
+                    or run.current_policy_digest != request.model_request.policy_digest
+                    or run.current_budget_digest != request.model_request.budget_digest
+                    or run.current_model_configuration_digest
+                    != request.model_request.model_configuration_digest
+                ):
+                    reason = "REVISION_BINDING_MISMATCH"
+                else:
+                    reservation = next(
+                        (
+                            item
+                            for item in self._target_reservations.values()
+                            if item.run_id == request.run_id
+                        ),
+                        None,
+                    )
+                    if (
+                        reservation is None
+                        or reservation.admin_binding_digest != request.target_safety_digest
+                    ):
+                        reason = "TARGET_BINDING_MISMATCH"
+                    elif run.state not in {RunState.PLANNING, RunState.ACTIVE} or (
+                        request.run_id in self._dispatch_close_causes
+                    ):
+                        reason = "RUN_NOT_DISPATCHABLE"
+            after = run_counters.reserve(amounts)
+            if (
+                reason is None
+                and request.owner_kind == "PLANNING"
+                and (planning_requests >= budget.planning_request_ceiling)
+            ):
+                reason = "PLANNING_REQUEST_CEILING"
+            elif (
+                reason is None
+                and request.owner_kind == "WORKER"
+                and (
+                    task_counters is None
+                    or task_counters.active_tranche_id != request.tranche_id
+                    or task_counters.active_tranche_remaining_calls < 1
+                )
+            ):
+                reason = "TASK_TRANCHE_EXHAUSTED"
+            elif reason is None and after.calls > budget.model_call_ceiling:
+                reason = "MODEL_CALL_CEILING"
+            elif reason is None and after.input_tokens > budget.input_token_ceiling:
+                reason = "INPUT_TOKEN_CEILING"
+            elif reason is None and after.output_tokens > budget.output_token_ceiling:
+                reason = "OUTPUT_TOKEN_CEILING"
+            elif reason is None and after.cost_usd > budget.cost_reserve_usd:
+                reason = "COST_RESERVE_CEILING"
+        return _ReservationEvaluation(
+            reason,
+            budget,
+            amounts,
+            run_counters,
+            task_counters,
+            planning_requests,
+        )
+
+    def _model_reservation_result(
+        self,
+        request: ModelReservationRequest,
+        evaluation: _ReservationEvaluation,
+        *,
+        decision: Literal["DENY", "PAUSE"],
+        resulting_sequence: AuditSequence,
+    ) -> ModelReservation:
+        if evaluation.reason is None:
+            raise AssertionError("denial result requires a reason")
+        return ModelReservation(
+            decision=decision,
+            reason=evaluation.reason,
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt_id=request.attempt_id,
+            tranche_id=request.tranche_id,
+            turn=request.turn,
+            intent=None,
+            reserved_amounts=ModelBudgetAmounts.zero(),
+            run_counters_before=evaluation.run_counters,
+            run_counters_after=evaluation.run_counters,
+            task_counters_before=evaluation.task_counters,
+            task_counters_after=evaluation.task_counters,
+            deadline_at_utc=request.deadline_at_utc,
+            pause_after_barrier=decision == "PAUSE",
+            resulting_sequence=resulting_sequence,
+        )
+
+    def reserve_authorized_model_attempt(
+        self, request: ModelReservationRequest
+    ) -> ModelReservation:
+        with self._lock:
+            evaluation = self._evaluate_model_reservation(request)
+            ceiling_reasons: set[ModelReservationReason] = {
+                "PLANNING_REQUEST_CEILING",
+                "TASK_TRANCHE_EXHAUSTED",
+                "MODEL_CALL_CEILING",
+                "INPUT_TOKEN_CEILING",
+                "OUTPUT_TOKEN_CEILING",
+                "COST_RESERVE_CEILING",
+            }
+            if evaluation.reason is not None and evaluation.reason not in ceiling_reasons:
+                return self._model_reservation_result(
+                    request,
+                    evaluation,
+                    decision="DENY",
+                    resulting_sequence=self.audit_sequence(request.run_id),
+                )
+            pause_reason = evaluation.reason
+            if pause_reason is not None:
+
+                def pause(copied: InMemoryStateStore) -> None:
+                    current = copied._evaluate_model_reservation(request)
+                    if current.reason != pause_reason:
+                        raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+                    copied._dispatch_close_causes[request.run_id] = (pause_reason,)
+                    if request.run_id in copied._runs:
+                        copied._runs[request.run_id] = replace(
+                            copied._runs[request.run_id], state=RunState.PAUSED
+                        )
+
+                sequence = self._commit_state_and_event(
+                    run_id=request.run_id,
+                    expected_sequence=request.expected_sequence,
+                    event=AuditEvent.kind("MODEL_RESERVATION_PAUSED", result_class=pause_reason),
+                    mutate=pause,
+                )
+                return self._model_reservation_result(
+                    request,
+                    evaluation,
+                    decision="PAUSE",
+                    resulting_sequence=sequence,
+                )
+
+            turn: LogicalModelTurn | None = None
+            intent: ModelRequestIntent | None = None
+            run_after: ModelCounters | None = None
+            task_after: TaskBudgetState | None = None
+
+            def mutate(copied: InMemoryStateStore) -> None:
+                nonlocal turn, intent, run_after, task_after
+                current = copied._evaluate_model_reservation(request)
+                if current.reason is not None or current != evaluation:
+                    raise StateConflict("MODEL_RESERVATION_REVALIDATION_MISMATCH")
+                if request.turn is None:
+                    turn = LogicalModelTurn.new(request.model_request)
+                    copied._model_turns[turn.logical_turn_id] = turn
+                else:
+                    turn = request.turn
+                    stored = copied._model_turns.get(turn.logical_turn_id)
+                    if stored != turn:
+                        raise StateConflict("MODEL_TURN_BINDING_MISMATCH")
+                intent = replace(
+                    ModelRequestIntent.reserve(
+                        turn, request.model_request, request.provider_attempt_number
+                    ),
+                    reserved_amounts=evaluation.amounts,
+                )
+                attempt_key = (
+                    request.run_id,
+                    turn.logical_turn_id,
+                    request.provider_attempt_number,
+                )
+                if attempt_key in copied._model_attempt_numbers:
+                    raise StateConflict("MODEL_ATTEMPT_DUPLICATE")
+                copied._model_attempt_numbers[attempt_key] = intent.intent_id
+                copied._model_attempts[intent.intent_id] = intent
+                run_after = evaluation.run_counters.reserve(evaluation.amounts)
+                copied._model_counters[request.run_id] = run_after
+                if request.owner_kind == "PLANNING":
+                    copied._planning_request_counts[request.run_id] = (
+                        evaluation.planning_requests + 1
+                    )
+                else:
+                    if evaluation.task_counters is None:
+                        raise StateConflict("TASK_COUNTERS_REQUIRED")
+                    if request.task_id is None:
+                        raise StateConflict("TASK_ID_REQUIRED")
+                    remaining = evaluation.task_counters.active_tranche_remaining_calls - 1
+                    task_after = replace(
+                        evaluation.task_counters,
+                        consumed_calls=evaluation.task_counters.consumed_calls + 1,
+                        input_tokens=evaluation.task_counters.input_tokens
+                        + evaluation.amounts.input_tokens,
+                        output_tokens=evaluation.task_counters.output_tokens
+                        + evaluation.amounts.output_tokens,
+                        cost_usd=evaluation.task_counters.cost_usd + evaluation.amounts.cost_usd,
+                        active_tranche_id=(
+                            None if remaining == 0 else evaluation.task_counters.active_tranche_id
+                        ),
+                        active_tranche_remaining_calls=remaining,
+                    )
+                    copied._task_budget_counters[(request.run_id, request.task_id)] = task_after
+
+            sequence = self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "MODEL_ATTEMPT_RESERVED",
+                    task_id=request.task_id,
+                    attempt_id=request.attempt_id,
+                    budget_delta_json=evaluation.amounts.to_json(),
+                ),
+                mutate=mutate,
+            )
+            if turn is None or intent is None or run_after is None:
+                raise AssertionError("model reservation state missing after commit")
+            return ModelReservation(
+                decision="RESERVED",
+                reason="AUTHORIZED",
+                run_id=request.run_id,
+                task_id=request.task_id,
+                attempt_id=request.attempt_id,
+                tranche_id=request.tranche_id,
+                turn=turn,
+                intent=intent,
+                reserved_amounts=evaluation.amounts,
+                run_counters_before=evaluation.run_counters,
+                run_counters_after=run_after,
+                task_counters_before=evaluation.task_counters,
+                task_counters_after=task_after,
+                deadline_at_utc=request.deadline_at_utc,
+                pause_after_barrier=False,
+                resulting_sequence=sequence,
+            )
+
+    def issue_workspace_lease(
+        self,
+        lease: WorkspaceLease,
+        worker_ceiling: int,
+        expected_sequence: AuditSequence,
+    ) -> WorkspaceLease | LeaseDenial:
+        def mutate(copied: InMemoryStateStore) -> None:
+            active = tuple(
+                existing
+                for (run_id, _), existing in copied._workspace_leases.items()
+                if run_id == lease.run_id
+                and existing.state == "ACTIVE"
+                and existing.expires_at > lease.issued_at
+            )
+            if len(active) >= worker_ceiling:
+                raise _LeaseDenied(LeaseDenial(reason="WORKER_CEILING"))
+            if any(
+                may_overlap(left, right)
+                for existing in active
+                for left in existing.write_globs
+                for right in lease.write_globs
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            key = (lease.run_id, lease.lease_id)
+            if key in copied._workspace_leases:
+                raise StateConflict("WORKSPACE_LEASE_DUPLICATE")
+            copied._workspace_leases[key] = lease
+
+        try:
+            self._commit_state_and_event(
+                run_id=lease.run_id,
+                expected_sequence=expected_sequence,
+                event=AuditEvent.kind(
+                    "WORKSPACE_LEASE_ISSUED",
+                    task_id=lease.task_id,
+                    attempt_id=lease.attempt_id,
+                ),
+                mutate=mutate,
+            )
+        except _LeaseDenied as denial:
+            return denial.denial
+        return lease
+
+    def workspace_lease(self, run_id: RunId, lease_id: str) -> WorkspaceLease | None:
+        with self._lock:
+            return self._workspace_leases.get((run_id, lease_id))
+
+    def expire_workspace_lease(
+        self,
+        run_id: RunId,
+        lease_id: str,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            key = (run_id, lease_id)
+            lease = copied._workspace_leases.get(key)
+            if lease is None or lease.state != "ACTIVE":
+                raise StateConflict("WORKSPACE_LEASE_NOT_ACTIVE")
+            copied._workspace_leases[key] = replace(lease, state="EXPIRED")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("WORKSPACE_LEASE_EXPIRED"),
+            mutate=mutate,
+        )
+
+    def renew_workspace_lease(
+        self,
+        run_id: RunId,
+        lease_id: str,
+        generation: int,
+        latest_admissible_head: str,
+        renewed_at: datetime,
+        expires_at: datetime,
+        expected_sequence: AuditSequence,
+    ) -> WorkspaceLease | LeaseDenial:
+        renewed: WorkspaceLease | None = None
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            nonlocal renewed
+            key = (run_id, lease_id)
+            current = copied._workspace_leases.get(key)
+            if (
+                current is None
+                or current.state != "ACTIVE"
+                or current.expires_at <= renewed_at
+                or current.generation != generation
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            others = tuple(
+                lease
+                for other_key, lease in copied._workspace_leases.items()
+                if other_key != key
+                and lease.run_id == run_id
+                and lease.state == "ACTIVE"
+                and lease.expires_at > renewed_at
+            )
+            if any(
+                may_overlap(left, right)
+                for other in others
+                for left in current.write_globs
+                for right in other.write_globs
+            ):
+                raise _LeaseDenied(LeaseDenial())
+            renewed = replace(
+                current,
+                admissible_head=latest_admissible_head,
+                expires_at=expires_at,
+            )
+            copied._workspace_leases[key] = renewed
+
+        try:
+            self._commit_state_and_event(
+                run_id=run_id,
+                expected_sequence=expected_sequence,
+                event=AuditEvent.kind("WORKSPACE_LEASE_RENEWED"),
+                mutate=mutate,
+            )
+        except _LeaseDenied as denial:
+            return denial.denial
+        if renewed is None:
+            raise AssertionError("renewed lease missing after committed mutation")
+        return renewed
+
+    def authorization_binding_failure(
+        self, request: AuthorizationRequest
+    ) -> AuthorizationReason | None:
+        with self._lock:
+            run = self._runs.get(request.run_id)
+            if run is None:
+                return "RUN_NOT_DISPATCHABLE"
+            if (
+                run.current_plan_digest != request.plan_digest
+                or run.current_policy_digest != request.policy_digest
+                or run.current_budget_digest != request.budget_digest
+                or run.current_model_configuration_digest != request.model_configuration_digest
+            ):
+                return "REVISION_BINDING_MISMATCH"
+            reservation = next(
+                (
+                    item
+                    for item in self._target_reservations.values()
+                    if item.run_id == request.run_id
+                ),
+                None,
+            )
+            if (
+                reservation is None
+                or reservation.admin_binding_digest != request.target_safety_digest
+            ):
+                return "TARGET_BINDING_MISMATCH"
+            if run.state is not RunState.ACTIVE:
+                return "RUN_NOT_DISPATCHABLE"
+            return None
+
+    def record_authorization_denial(
+        self,
+        request: AuthorizationRequest,
+        binding_digest: str,
+        reason: AuthorizationReason,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            key = (request.run_id, request.action_id)
+            if key in copied._authorization_denials:
+                raise StateConflict("ACTION_AUTHORIZATION_DENIAL_DUPLICATE")
+            copied._authorization_denials[key] = (binding_digest, reason)
+
+        return self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "ACTION_AUTHORIZATION_DENIED",
+                task_id=request.task_id,
+                attempt_id=request.attempt_id,
+                action_id=request.action_id,
+                result_class=reason,
+                subject_digests=(request.action_digest, binding_digest),
+            ),
+            mutate=mutate,
+        )
+
+    def task_budget_state(self, run_id: RunId, task_id: TaskId) -> TaskBudgetState:
+        with self._lock:
+            return self._task_budget_counters.get(
+                (run_id, task_id), TaskBudgetState(run_id=run_id, task_id=task_id)
+            )
+
+    def active_run_time_state(self, run_id: RunId) -> ActiveRunTimeState:
+        with self._lock:
+            return self._active_run_times.get(
+                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            )
+
+    def last_runtime_audit_event(
+        self, run_id: RunId, owner_generation: int
+    ) -> RuntimeAuditStamp | None:
+        with self._lock:
+            for sequence, event in reversed(self._audit_events.get(run_id, [])):
+                if (
+                    event.runtime_owner_generation == owner_generation
+                    and event.runtime_monotonic_nanoseconds is not None
+                ):
+                    return RuntimeAuditStamp(
+                        sequence,
+                        owner_generation,
+                        MonotonicInstant(event.runtime_monotonic_nanoseconds),
+                    )
+            return None
+
+    def allocate_task_tranche(
+        self,
+        task: TaskAuthority,
+        expected: TaskBudgetState,
+        calls: int,
+        reason: TrancheReason,
+        progress: ProgressEvidence,
+        expected_sequence: AuditSequence,
+    ) -> TrancheDecision:
+        progressed = progress_from_checks(
+            progress.previous,
+            progress.current,
+            progress.previous_lifecycle,
+            progress.current_lifecycle,
+        )
+        progress_json = canonical_json(
+            {
+                "current_failures": sorted(progress.current.failures),
+                "current_fresh_passes": sorted(progress.current.fresh_passes),
+                "current_lifecycle": progress.current_lifecycle,
+                "previous_failures": sorted(progress.previous.failures),
+                "previous_fresh_passes": sorted(progress.previous.fresh_passes),
+                "previous_lifecycle": progress.previous_lifecycle,
+                "progressed": progressed,
+            }
+        )
+        key = (task.run_id, task.task_id)
+        current = self.task_budget_state(*key)
+        if current != expected:
+            raise StateConflict("TASK_COUNTER_SNAPSHOT_MISMATCH")
+        tranche_number = current.tranche_count + 1
+        tranche_id = (
+            None if calls == 0 else f"tranche-{task.run_id}-{task.task_id}-{tranche_number}"
+        )
+        decision: Literal["ALLOCATE", "PAUSE"]
+        if calls == 0:
+            after = replace(
+                current,
+                consecutive_no_progress_tranches=(
+                    current.consecutive_no_progress_tranches + 1
+                    if reason == "NO_PROGRESS"
+                    else current.consecutive_no_progress_tranches
+                ),
+            )
+            event_kind = "TASK_PAUSED_NO_PROGRESS"
+            decision = "PAUSE"
+        else:
+            after = replace(
+                current,
+                allocated_calls=current.allocated_calls + calls,
+                tranche_count=tranche_number,
+                bootstrap_tranches=current.bootstrap_tranches + (1 if reason == "BOOTSTRAP" else 0),
+                consecutive_no_progress_tranches=(
+                    0
+                    if reason == "OBJECTIVE_PROGRESS"
+                    else current.consecutive_no_progress_tranches
+                ),
+                active_tranche_id=tranche_id,
+                active_tranche_remaining_calls=calls,
+            )
+            event_kind = "TASK_TRANCHE_ALLOCATED"
+            decision = "ALLOCATE"
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            current_copy = copied.task_budget_state(*key)
+            if current_copy != expected:
+                raise StateConflict("TASK_COUNTER_SNAPSHOT_MISMATCH")
+            if current_copy.active_tranche_remaining_calls:
+                raise StateConflict("TASK_TRANCHE_STILL_ACTIVE")
+            if calls == 0:
+                if reason not in {"NO_PROGRESS", "TASK_CALL_CEILING"}:
+                    raise StateConflict("TASK_TRANCHE_PAUSE_REASON_INVALID")
+            elif not 1 <= calls <= 8 or reason not in {"BOOTSTRAP", "OBJECTIVE_PROGRESS"}:
+                raise StateConflict("TASK_TRANCHE_ALLOCATION_INVALID")
+            copied._task_budget_counters[key] = after
+            if tranche_id is not None:
+                tranche_key = (task.run_id, task.task_id, tranche_id)
+                if tranche_key in copied._task_tranches:
+                    raise StateConflict("TASK_TRANCHE_DUPLICATE")
+                copied._task_tranches[tranche_key] = (
+                    task.attempt_id,
+                    tranche_number,
+                    calls,
+                    progress_json,
+                    sha256_digest(progress_json),
+                )
+
+        resulting_sequence = self._commit_state_and_event(
+            run_id=task.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(event_kind, task_id=task.task_id, attempt_id=task.attempt_id),
+            mutate=mutate,
+        )
+        return TrancheDecision(
+            decision=decision,
+            reason=reason,
+            run_id=task.run_id,
+            task_id=task.task_id,
+            attempt_id=task.attempt_id,
+            tranche_id=tranche_id,
+            tranche_number=tranche_number,
+            calls=calls,
+            counters_before=current,
+            counters_after=after,
+            resulting_sequence=resulting_sequence,
+        )
 
     def append_event(
         self,

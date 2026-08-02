@@ -165,6 +165,8 @@ class AuditEvent:
     subject_digests: tuple[str, ...] = ()
     timing_ms: int | None = None
     budget_delta_json: str | None = None
+    runtime_owner_generation: int | None = None
+    runtime_monotonic_nanoseconds: int | None = None
 
     @classmethod
     def kind(cls, event_kind: str, **fields: Any) -> AuditEvent:

@@ -1,7 +1,8 @@
 import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -10,6 +11,11 @@ import pytest
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.domain.authority import (
+    AuthorityService,
+    ModelReservationRequest,
+    MonotonicInstant,
+)
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     CommandEnvelope,
@@ -29,9 +35,15 @@ from apexcrew.domain.effects import (
 )
 from apexcrew.domain.model import (
     LogicalModelTurn,
+    ModelBudgetAmounts,
     ModelRequest,
     ModelRequestIntent,
     ProviderAttemptResult,
+)
+from apexcrew.domain.revisions import (
+    BudgetRevisionDocument,
+    ModelPricingEntryDocument,
+    revision_digest,
 )
 from apexcrew.domain.types import (
     AttemptId,
@@ -63,6 +75,133 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
         max_output_tokens=200,
         reserved_cost_usd=Decimal("0.01"),
     )
+
+
+def make_authority(store: SqliteStateStore, run_id: str) -> AuthorityService:
+    budget = BudgetRevisionDocument(
+        schema_version="budget-revision-v1",
+        active_run_seconds_ceiling=28_800,
+        task_ceiling=12,
+        planning_request_ceiling=8,
+        model_call_ceiling=240,
+        input_token_ceiling=2_000_000,
+        output_token_ceiling=200_000,
+        cost_reserve_usd=Decimal(10),
+        concurrent_worker_ceiling=3,
+        pricing_observed_on=datetime(2026, 7, 26, tzinfo=UTC).date(),
+        pricing_entries=(
+            ModelPricingEntryDocument(
+                returned_model_id="gpt-5.6-terra",
+                input_usd_per_million=Decimal("2.50"),
+                output_usd_per_million=Decimal("15.00"),
+            ),
+        ),
+    )
+    digest = revision_digest(budget)
+    store.install_approved_budget_for_test(run_id, digest, budget)
+    return AuthorityService(store)
+
+
+def planning_reservation_request(
+    store: SqliteStateStore, run_id: str, expected_sequence: int
+) -> ModelReservationRequest:
+    budget_digest, _ = store.current_approved_budget(run_id)
+    request = replace(
+        make_model_request({"gpt-5.6-terra"}),
+        run_id=run_id,
+        budget_digest=budget_digest,
+        request_digest="sha256:" + ("a" if run_id == "run-a" else "b") * 64,
+        idempotency_key=f"request-{run_id}",
+    )
+    started = datetime(2026, 7, 27, tzinfo=UTC)
+    return ModelReservationRequest(
+        run_id=run_id,
+        owner_kind="PLANNING",
+        task_id=None,
+        attempt_id=None,
+        tranche_id=None,
+        turn=None,
+        model_request=request,
+        provider_attempt_number=1,
+        target_safety_digest="sha256:" + "c" * 64,
+        credential_profile="default",
+        expected_run_counters=store.model_counters(run_id),
+        expected_task_counters=None,
+        started_at_utc=started,
+        deadline_at_utc=started + timedelta(minutes=2),
+        expected_sequence=expected_sequence,
+    )
+
+
+def test_sqlite_authority_model_reservation_is_run_bound_and_stale_safe(
+    tmp_path: Path,
+) -> None:
+    store = SqliteStateStore(tmp_path / "state.db")
+    authority = make_authority(store, run_id="run-a")
+    make_authority(store, run_id="run-b")
+    first = authority.reserve_model_attempt(planning_reservation_request(store, "run-a", 0))
+    stale = authority.reserve_model_attempt(planning_reservation_request(store, "run-b", 1))
+    assert first.decision == "RESERVED"
+    assert first.reserved_amounts == ModelBudgetAmounts(
+        calls=1,
+        input_tokens=1_000,
+        output_tokens=200,
+        cost_usd=Decimal("0.0055"),
+    )
+    assert stale.decision == "DENY"
+    assert stale.reason == "STALE_SEQUENCE"
+    assert store.model_counters("run-a").calls == 1
+    assert store.model_counters("run-b").calls == 0
+    assert store.audit_sequence("run-a") == 1
+    assert store.audit_sequence("run-b") == 0
+
+
+def seeded_authority_store(database: Path, run_id: str) -> SqliteStateStore:
+    store = SqliteStateStore(database)
+    seed_command_run(store, database.parent, run_id)
+    return store
+
+
+@dataclass
+class FixedMonotonicClock:
+    instant: MonotonicInstant
+
+    def now(self) -> MonotonicInstant:
+        return self.instant
+
+
+def test_active_runtime_account_survives_restart_and_rejects_clock_regression(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.db"
+    first = seeded_authority_store(database, run_id="run-time")
+    with first._transaction("IMMEDIATE") as connection:
+        connection.execute(
+            "UPDATE runs SET active_runtime_nanoseconds = ?, "
+            "runtime_interval_owner_generation = ?, "
+            "runtime_interval_opened_nanoseconds = ? WHERE run_id = ?",
+            (7_000_000_000, 4, 100_000_000_000, "run-time"),
+        )
+        connection.execute(
+            "UPDATE audit_events SET runtime_owner_generation = ?, "
+            "runtime_monotonic_nanoseconds = ? WHERE run_id = ? AND sequence = "
+            "(SELECT MAX(sequence) FROM audit_events WHERE run_id = ?)",
+            (4, 103_000_000_000, "run-time", "run-time"),
+        )
+    first.close()
+    clock = FixedMonotonicClock(MonotonicInstant(105_000_000_000))
+    reopened = SqliteStateStore(database, monotonic_clock=clock)
+    state = reopened.active_run_time_state(RunId("run-time"))
+    assert state.cumulative_nanoseconds == 7_000_000_000
+    assert state.open_owner_generation == 4
+    assert state.latest_committed_at == MonotonicInstant(103_000_000_000)
+    assert state.observed_nanoseconds(clock.now()) == 12_000_000_000
+    with pytest.raises(ValueError, match="MONOTONIC_CLOCK_REGRESSED"):
+        state.observed_nanoseconds(MonotonicInstant(99_999_999_999))
+    event = reopened.last_runtime_audit_event(RunId("run-time"), owner_generation=4)
+    assert event is not None
+    assert event.owner_generation == 4
+    assert event.monotonic_instant == MonotonicInstant(103_000_000_000)
 
 
 def memory_store_factory(tmp_path: Path) -> InMemoryStateStore:
