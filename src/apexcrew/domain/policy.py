@@ -13,7 +13,14 @@ if TYPE_CHECKING:
     from apexcrew.domain.coordination import PlanningTurnBinding
 
 from apexcrew.domain.actions import ActionEnvelope
-from apexcrew.domain.plan import CanonicalPath, GlobPattern, PathValidationError
+from apexcrew.domain.plan import (
+    CanonicalPath,
+    GlobPattern,
+    GlobProof,
+    GlobValidationError,
+    PathValidationError,
+    prove_included,
+)
 from apexcrew.domain.revisions import PlanningReadAuthorizationDocument
 
 DEFAULT_SECRET_GLOBS = (
@@ -96,9 +103,23 @@ class SecretPathPolicy:
 
     def inspect(self, path: CanonicalPath) -> SecretInspection:
         folded = CanonicalPath.parse(unicodedata.normalize("NFC", path).casefold())
-        denied = any(rule.matches(path) for rule in self._rules) or any(
-            rule.matches(folded) for rule in self._folded_rules
+        denied = False
+        for rule in self._rules:
+            denied |= rule.matches(path)
+        for rule in self._folded_rules:
+            denied |= rule.matches(folded)
+        return SecretInspection(
+            "SECRET_PATH_DENIED" if denied else "ALLOW",
+            "effective secret path" if denied else "allowed path",
         )
+
+    def inspect_selector(self, selector: GlobPattern) -> SecretInspection:
+        folded = GlobPattern.parse(unicodedata.normalize("NFC", selector.value).casefold())
+        denied = False
+        for rule in self._rules:
+            denied |= prove_included(selector, rule) is GlobProof.PROVEN
+        for rule in self._folded_rules:
+            denied |= prove_included(folded, rule) is GlobProof.PROVEN
         return SecretInspection(
             "SECRET_PATH_DENIED" if denied else "ALLOW",
             "effective secret path" if denied else "allowed path",
@@ -147,9 +168,47 @@ ActionDecision = Literal["ALLOW", "REQUIRE_APPROVAL", "DENY"]
 
 @dataclass(frozen=True, slots=True)
 class ActionPolicy:
+    secret_paths: SecretPathPolicy | None = None
+
     @classmethod
-    def default(cls) -> ActionPolicy:
-        return cls()
+    def default(cls, secret_paths: SecretPathPolicy | None = None) -> ActionPolicy:
+        return cls(secret_paths)
+
+    @staticmethod
+    def _path_selectors(action: ActionEnvelope) -> tuple[str, ...]:
+        selectors: list[str] = []
+        if action.path is not None:
+            selectors.append(action.path)
+        paths = getattr(action, "paths", ())
+        if isinstance(paths, tuple) and all(isinstance(path, str) for path in paths):
+            selectors.extend(paths)
+        destination = getattr(action, "destination", None)
+        if isinstance(destination, str):
+            selectors.append(destination)
+        return tuple(selectors)
+
+    def _classify_paths(self, action: ActionEnvelope) -> ActionDecision | None:
+        selectors = self._path_selectors(action)
+        if not selectors:
+            return None
+        if self.secret_paths is None:
+            return "DENY"
+        for selector in selectors:
+            try:
+                path = CanonicalPath.parse(selector)
+            except PathValidationError:
+                try:
+                    pattern = GlobPattern.parse(selector)
+                except GlobValidationError:
+                    return "DENY"
+                if self.secret_paths.inspect_selector(pattern).code != "ALLOW":
+                    return "DENY"
+                continue
+            if self.secret_paths.inspect(path).code != "ALLOW":
+                return "DENY"
+            if str(path) == ".gitlab-ci.yml" or str(path).startswith(".github/workflows/"):
+                return "REQUIRE_APPROVAL"
+        return "ALLOW"
 
     def classify(self, action: ActionEnvelope) -> ActionDecision:
         if action.kind in {
@@ -165,14 +224,12 @@ class ActionPolicy:
             return "DENY"
         if action.kind == "target_cas":
             return "REQUIRE_APPROVAL" if action.issued_by_admission else "DENY"
-        if action.path is not None:
-            try:
-                path = CanonicalPath.parse(action.path)
-            except PathValidationError:
-                return "DENY"
-            if str(path) == ".gitlab-ci.yml" or str(path).startswith(".github/workflows/"):
-                return "REQUIRE_APPROVAL"
+        path_decision = self._classify_paths(action)
+        if path_decision in {"DENY", "REQUIRE_APPROVAL"}:
+            return path_decision
         if action.kind in {"delete", "rename", "chmod_executable"}:
+            return "REQUIRE_APPROVAL"
+        if action.kind == "risky_action":
             return "REQUIRE_APPROVAL"
         if action.kind in {"read", "search", "patch", "check", "finish", "fail"}:
             return "ALLOW"
