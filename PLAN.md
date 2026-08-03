@@ -1,23 +1,224 @@
 # ApexCrew M1 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Execute only after the M1-R3 gate below passes. Use the repository's TDD and review workflow task-by-task; checkbox (`- [ ]`) state is evidence, not authority by itself.
 
-**Goal:** Retain the deterministic ApexCrew safety core by re-executing Task 1 and Task 2A, then completing Task 2B through Task 17 as 27 independently reviewed TDD slices without authorizing M2-M4.
+**Goal:** Close M1 honestly by correcting the merged M1-02/M1-06 defects, closing the remaining M1 security evidence, replaying the unmerged M1-08 tasks from a corrected base, and independently reviewing the complete M1 result without authorizing M2-M4.
 
 **Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 builds immutable contracts, durable state/model effects, bounded Git and Authority adapters, the owned Coordinator/WorkerLoop core, typed tools, Runtime Permits, and exact Grants; provider, recovery, fixture, WebUI, and release work remains roadmap-only until a later reviewed plan revision.
 
 **Tech Stack:** Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI, Jinja2, keyring, OpenAI Responses API, Docker, Git, Python and TypeScript fixture repositories, GitHub Actions, GitLab CI, and GitHub Pages.
 
-**Revision:** M1-R2 candidate, prepared 2026-07-31. It replaces the independently rejected M1-R1 candidate only after the independent M1-R2 document review below reports zero blockers and the owner records an explicit `M1 GO` against the reviewed file digest.
+**Revision:** M1-R3 closeout candidate, prepared 2026-08-03 from `main` at `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`. It supersedes M1-R2 as execution authority only after the owner-dispatched independent review and explicit owner decision below.
 
-**Current status:** **DOCUMENT REVIEW REQUIRED - NO RETAINED IMPLEMENTATION AUTHORITY.** Creating this document and the byte-identical M1-R1 archive is documentation work only. No numbered or lettered M1 task may start from this candidate, and M2-M4 remain route-map entries rather than execution authority.
+**Current status:** **M1 HOLD - DOCUMENT REVIEW AND HISTORICAL-DEVIATION DECISION REQUIRED.** This revision is documentation only. Do not modify source, fixtures, tests, dependency locks, or CI; do not merge PR #8; and do not start an R3 implementation worktree until every gate row below passes.
 
-**Authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`, archived byte-for-byte at `docs/architecture/PLAN-M1-R1-2026-07-31.md`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`, archived byte-for-byte at `docs/architecture/PLAN-M0-R3-2026-07-31.md`.
+**Authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
+
+## M1-R3 Closeout Amendment (Binding)
+
+This section and the M1-R3 gate supersede the old M1-R2 status, gate, completion claim, module sequence, and M1-08 ledger meaning below. The lower task bodies remain detailed requirement references. The lower per-task TDD/review protocol remains binding where it does not conflict with this amendment. No R2 checkbox or historical green run authorizes a new write.
+
+### Observed Baseline and M1 Verdict
+
+Evidence was observed on 2026-08-03 without modifying implementation files:
+
+| Evidence | Observed result | M1 meaning |
+| --- | --- | --- |
+| `main` | `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`, merge of PR #7 | M1-01 through M1-07 code is merged; M1-08 is absent. |
+| PR #8 | `OPEN`, head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`, mergeable, zero GitHub reviews | Green CI is useful evidence but is not review or merge completion. |
+| PR #8 checks | `quality`, `unit-ubuntu`, and `unit-windows` all reported success for both workflow events | Cross-platform checks do not waive the critical findings below. |
+| Local M1-08 suite | `401 passed, 4 skipped`; Ruff format/check and mypy green | Baseline regression evidence only; it is not M1 acceptance evidence. |
+| Granted writes | Preflight is no-follow, but delete/rename/chmod/replace dispatches by pathname | Violates SPEC line 164 under an ancestor-swap race. |
+| Model provenance | `ModelCompletion.requested_model_id` exists but settlement neither compares it to the request nor explicitly persists the response field | Does not meet SPEC line 198's requested/returned-ID settlement record. |
+| Runtime ownership | Only the lock protocol and in-memory ownership exist; `FileRunOwnership.acquire()` creates `runtime-locks` before Permit validation | Does not meet SPEC line 118's process mutex, concrete OS lock, pre-created path, random durable owner, and zero-change invalid-Permit boundary. |
+| Process evidence | Task 14 was self-reviewed; Tasks 15-17 deferred task reviews; M1-08 used the primary checkout instead of its required worktree | The implementation evidence does not satisfy the course workflow even where behavior is green. |
+
+**Verdict:** M1 is **not complete**. The current feature branch must not be merged as-is, and no M2 implementation may start.
+
+### Historical-Deviation Decision
+
+M1-R3 does not rewrite Git history or relabel a self-review/deferred review as independent. The selected recovery route is the least destructive compliant-forward route:
+
+1. Commit this documentation-only candidate and obtain an owner-dispatched independent review of its exact digest.
+2. Obtain written owner/course acceptance that the immutable history of merged Tasks 1-13 may remain despite the recorded workflow deviations, while all currently known behavioral gaps are corrected under R3.
+3. Record the review/decision, merge the byte-identical reviewed PLAN to `main`, then close PR #8 without merge. Its four task SHAs remain historical diagnostic evidence only.
+4. Merge the four corrective module PRs below sequentially into `main`.
+5. Re-execute Tasks 14-17 from the corrected `main` base in a replacement M1-08 worktree, with fresh red evidence and ordered independent reviews for each task.
+6. Run a whole-M1 spec review followed by a whole-M1 quality review and close M1 only after both return zero critical findings.
+
+If written acceptance for merged Tasks 1-13 is not obtained, this revision stays `HOLD`; prepare and independently review M1-R4 for a full compliant replay of Tasks 1-17. R3 does not silently choose that larger rewrite and does not claim to repair past process evidence.
+
+### M1-R3 Execution Gate
+
+Every row is mandatory and sequential. A reviewer finding causes a PLAN edit and a new exact-digest review; it is not resolved by an implementation experiment.
+
+| Gate | Required evidence |
+| --- | --- |
+| Frozen input | `Get-FileHash SPEC.md` is exactly `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; any mismatch stops. |
+| Candidate commit | This candidate is committed documentation-only on its dedicated worktree/branch. Record its full commit SHA and PLAN SHA-256; it is not yet merged and grants no implementation authority. |
+| Independent dispatch | The repository owner, not the plan writer or an assisting agent, directly opens a fresh reviewer session and supplies frozen `SPEC.md`, this exact `PLAN.md`, the course workflow, the two review findings, PR #8 metadata, and read-only access to `main`/the rejected branch. |
+| Review scope | The reviewer checks the five-module order, no-follow mutation design on POSIX/Windows, requested-model persistence/validation, random durable identities, HMAC/non-disclosure evidence, recursive reservation inventory, production runtime locking, full M1-08 replay, exact red/green selectors, worktree/PR boundaries, and closeout reviews. |
+| Verdict | Zero blockers and zero unresolved critical findings against one exact PLAN SHA-256. Any change invalidates the verdict and requires another owner-dispatched review. |
+| Historical disposition | The owner records the written owner/course acceptance described above, including that it does not excuse new deviations. Without it, the only result is `HOLD` and an M1-R4 replay plan. |
+| Owner decision | The owner records the reviewed PLAN digest and explicit `M1 GO` in `AGENT_LOG.md`, then separately authorizes the first implementation worktree. This PLAN cannot contain its own stable digest. |
+| Reviewed base | The byte-identical reviewed PLAN plus review/decision records are merged documentation-only to `main`; record the observed merge SHA. No source/test/CI content may hitchhike in that merge. |
+| PR #8 disposition | The owner closes PR #8 without merge and records its final head/state. Do not delete or force-rewrite the branch; its evidence remains auditable. |
+| Sequential base | Each module worktree is created only after its predecessor PR merge is observed on `main`. No stacked corrective PR, direct-to-main implementation, or source edit in this documentation worktree is allowed. |
+
+### Corrective Worktrees and PR Order
+
+| Order | Module | Branch | Worktree | Required PR title | Forecast |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `R3-01` model provenance and deterministic test seams | `codex/m1-r3-model-provenance` | `.worktrees/m1-r3-model-provenance` | `fix(model): bind requested model provenance` | 4-7 h |
+| 2 | `R3-02` Secret Path HMAC and non-disclosure proof | `codex/m1-r3-secret-contract` | `.worktrees/m1-r3-secret-contract` | `fix(security): bind the secret policy key` | 1-2 h |
+| 3 | `R3-03` random reservation identity and recursive Git inventory | `codex/m1-r3-reservation-guard` | `.worktrees/m1-r3-reservation-guard` | `fix(admission): bind reservation identity and inventory` | 4-8 h |
+| 4 | `R3-04` production runtime ownership | `codex/m1-r3-runtime-ownership` | `.worktrees/m1-r3-runtime-ownership` | `fix(runtime): enforce process and OS ownership` | 5-10 h |
+| 5 | `R3-05` replacement M1-08 tools, WorkerLoop, and Grants plus closeout | `codex/m1-08r-worker-tools` | `.worktrees/m1-08r-worker-tools` | `feat: execute typed worker actions under grants` | 15-30 h |
+
+The 29-57 hour total is a forecast including task/module reviews but excluding owner wait time; observed time replaces it after every PR. The sequence is intentionally linear. R3-01 and R3-03 touch shared state adapters, R3-04 touches runtime/state composition, and R3-05 consumes all four corrected contracts. A PR targets `main`, receives an ordered whole-module spec review then quality review plus CI, and merges before the next worktree is created. Push and PR creation still require explicit owner authorization.
+
+### R3 Task Protocol and Ledger
+
+Each task uses a fresh implementation subagent in the named worktree. The implementer records the base SHA and failing selector before production edits, writes the minimum implementation, and stops before commit. A fresh spec-compliance reviewer runs first; after it passes, a different fresh code-quality reviewer runs. Critical findings return to the implementer and both evidence and the affected review are repeated. Only then create one Conventional Commit carrying the exact `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers required below.
+
+| R3 task | Module | Status | Commit |
+| --- | --- | --- | --- |
+| `M1-FIX-001` requested-model validation/persistence | R3-01 | NOT STARTED | Not created |
+| `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 | NOT STARTED | Not created |
+| `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 | NOT STARTED | Not created |
+| `M1-FIX-004` random Target Reservation identity | R3-03 | NOT STARTED | Not created |
+| `M1-FIX-005` recursive reservation admin/data inventory | R3-03 | NOT STARTED | Not created |
+| `M1-FIX-006` process mutex and POSIX/Windows OS file locks | R3-04 | NOT STARTED | Not created |
+| `M1-FIX-007` pre-created lock path and invalid-Permit zero-change composition | R3-04 | NOT STARTED | Not created |
+| `TASK-014R` scoped reads/searches replay | R3-05 | NOT STARTED | Not created |
+| `TASK-015R` structured patch/check replay | R3-05 | NOT STARTED | Not created |
+| `TASK-016R` one-action WorkerLoop replay | R3-05 | NOT STARTED | Not created |
+| `TASK-017R` exact Grants and handle-relative writes replay | R3-05 | NOT STARTED | Not created |
+| `M1-CLOSE-001` whole-M1 regression and independent reviews | R3-05 | NOT STARTED | Evidence-only; no implementation commit |
+
+Immediately after each task commit, record its full SHA in this table and append its actual red/green/review evidence to `AGENT_LOG.md`. At module close, persist only accumulated `PLAN.md` ledger rows in `docs(plan): record <module> task commits`. The closeout row is evidence-only because a review cannot be truthfully embedded in the already reviewed implementation commit.
+
+### R3-01: Model Provenance and Deterministic Test Seams
+
+#### `M1-FIX-001` - bind requested model provenance
+
+- **Exact paths:** `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/state/memory.py`, `src/apexcrew/adapters/state/sqlite.py`, `tests/unit/domain/test_model_requests.py`, `tests/contract/test_state_store.py`, `tests/integration/test_model_restart.py`, and `AGENT_LOG.md`.
+- **Red:** add paired memory/SQLite and `DurableModelClient` tests where the completion's `requested_model_id` differs from the persisted request while the returned ID is allowlisted. Run `uv run --python 3.12 pytest tests/unit/domain/test_model_requests.py tests/contract/test_state_store.py tests/integration/test_model_restart.py -q`; it must fail because output is currently released or the response field is not round-tripped.
+- **Green contract:** compare the response requested ID with the exact persisted request before normalizing/releasing output; durably store both requested and returned response IDs plus outcome/usage. Classify inequality as the new closed `REQUESTED_MODEL_MISMATCH` outcome, release no action, and charge by the same conservative rule as `RETURNED_MODEL_MISMATCH`. It survives restart and cannot cause a tool call. Use an additive SQLite migration; never infer the response requested ID from request JSON during reads.
+- **Green:** rerun the red selector, then `uv run --python 3.12 mypy src` and the complete model/state contract suite.
+- **Commit:** `fix(model): bind requested model provenance`.
+
+#### `M1-FIX-002` - make model identities injectable and scripted responses request-sensitive
+
+- **Exact allowed paths:** `src/apexcrew/domain/model.py`; `tests/helpers/application.py`; every existing test that directly constructs `ScriptedMockLLM` (`tests/contract/test_scripted_model.py`, `tests/integration/test_global_budget_producers.py`, `test_model_restart.py`, `test_planning_authorization.py`, `test_runtime_permits.py`, `tests/unit/domain/test_model_requests.py`, and `test_model_retry.py`); and `AGENT_LOG.md`. Stage only files actually changed from this closed set.
+- **Red:** prove a scripted response bound to a different request digest/idempotency key is rejected and prove deterministic logical-turn/provider-attempt IDs through an injected finite source. Run `uv run --python 3.12 pytest tests/contract/test_scripted_model.py tests/unit/domain/test_model_retry.py tests/integration/test_model_restart.py -q`; the new tests must fail against unconditional deque consumption and direct `uuid4()` calls.
+- **Green contract:** production defaults remain random UUID-based, while tests inject finite ID sources. Every non-empty scripted step carries the expected request digest, idempotency key, and requested model ID beside its result; `ScriptedMockLLM` compares all three before consuming the step and fails closed without advancing on mismatch. An empty script remains a deterministic no-response fixture.
+- **Commit:** `fix(model): bind scripted responses to requests`.
+
+Module regression: run the focused selector, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+
+### R3-02: Secret Path Contract Evidence
+
+#### `M1-FIX-003` - prove keyed HMAC and deterministic non-disclosure
+
+- **Exact allowed paths:** `src/apexcrew/domain/policy.py`, `tests/contract/test_secret_policy_digest.py`, `tests/unit/domain/test_secret_policy.py`, and `AGENT_LOG.md`. Stage only files actually changed from this set.
+- **Red:** first prove an empty installation key is rejected before a Policy digest exists; current code accepts it. Then add a low-entropy rule dictionary test showing that exported `(rules_hmac, user_rule_count)` cannot be reproduced by unkeyed SHA-256 or a guessed different installation key. Also prove key rotation changes the HMAC, sorted/deduplicated rules are canonical, and no raw rule/key appears in the exported object or serialized evidence. Run `uv run --python 3.12 pytest tests/contract/test_secret_policy_digest.py tests/unit/domain/test_secret_policy.py -q` and record the failing key-validation selector.
+- **Green contract:** require a non-empty host-supplied installation key and retain HMAC-SHA-256 over canonical JSON with that key only in the host seam. Production key generation remains the future credential/bootstrap owner's responsibility and must use a random 256-bit value; R3 does not access the OS keyring. Use deterministic operation traces, not wall-clock thresholds, for any secret/nonexistent equivalence assertion.
+- **Commit:** `fix(security): bind the secret policy key`.
+
+Module regression: run the focused selector, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+
+### R3-03: Reservation Identity and Complete Inventory
+
+#### `M1-FIX-004` - allocate a random immutable Target Reservation ID
+
+- **Exact allowed paths:** `src/apexcrew/domain/admission.py`, `src/apexcrew/adapters/state/memory.py`, `src/apexcrew/adapters/state/sqlite.py`, `tests/contract/test_state_store.py`, `tests/integration/test_target_reservation.py`, and `AGENT_LOG.md`. Stage only files actually changed from this set.
+- **Red:** inject a finite reservation-ID source and prove two otherwise identical fresh Runs receive distinct IDs, a persisted ID survives restart/replay, and collision exhaustion returns a closed conflict with zero second Run/reservation mutation. The selector must fail against digest-derived `reservation-<binding>` IDs.
+- **Green contract:** the control/state composition allocates one random opaque ID internally during draft creation, persists it in the same state transaction, and accepts no caller-selected ID. Tests use a deterministic finite source; production uses a cryptographically strong random source. Replay returns the stored reservation rather than allocating another.
+- **Commit:** `fix(admission): allocate random reservation identities`.
+
+#### `M1-FIX-005` - inspect the complete bounded reservation inventory
+
+- **Exact allowed paths:** `src/apexcrew/adapters/repository/git.py`, `src/apexcrew/adapters/repository/no_follow.py`, `src/apexcrew/adapters/repository/no_follow_posix.py`, and `src/apexcrew/adapters/repository/no_follow_windows.py`; `tests/unit/adapters/repository/test_no_follow_handles.py`; `tests/integration/test_git_preflight.py` and `tests/integration/test_target_reservation.py`; and `AGENT_LOG.md`. Stage only files actually changed from this set.
+- **Red:** add POSIX and Windows-backend cases for an unexpected nested admin file/directory, `logs/HEAD` replacement/link, lock companion, duplicate/case-colliding entry, extra reservation data-root member, and ancestor swap immediately before Git invocation. Run the two integration files and observe denial before the recording Git runner is called.
+- **Green contract:** bounded no-follow enumeration verifies the sole direct `.git/worktrees/<reservation>` entry and every allowed required/optional nested regular file, log directory/file, and lock companion named by SPEC lines 519 and 525. It never opens a path learned from file content. Unknown, duplicate, unbounded, linked/reparsed, identity-changed, or extra inventory fails `TARGET_UNSAFE` before Git.
+- **Commit:** `fix(git): bind complete reservation inventory`.
+
+Module regression: run the focused selector, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+
+### R3-04: Production Runtime Ownership
+
+#### `M1-FIX-006` - combine the process mutex with concrete OS locks
+
+- **Exact allowed paths:** `src/apexcrew/application/runtime.py`; new `src/apexcrew/adapters/runtime/__init__.py`, `file_lock.py`, `file_lock_posix.py`, and `file_lock_windows.py`; new `tests/unit/adapters/runtime/test_file_lock.py`, `test_file_lock_posix.py`, and `test_file_lock_windows.py`; `tests/integration/test_runtime_permits.py`; and `AGENT_LOG.md`. Stage only files actually changed from this set.
+- **Red:** on the current host prove that a second thread and a second process cannot acquire the same Run while the first open handle is held, a different Run remains acquirable, release/process death restores acquisition, and an unsupported platform fails closed. Add recording backend tests for the other platform's exact flags/handle lifecycle.
+- **Green contract:** one deep ownership module acquires a nonblocking process-local per-Run mutex and then a concrete nonblocking OS-released exclusive file lock. POSIX uses a held descriptor plus `flock`; Windows uses a held file handle/range lock with explicit release. The owner ID comes from an injected source whose production implementation is cryptographically random. PID, heartbeat, timeout, and stale-file deletion confer no authority.
+- **Commit:** `fix(runtime): enforce process and OS ownership`.
+
+#### `M1-FIX-007` - make invalid-Permit acquisition mutation-free
+
+- **Exact allowed paths:** `src/apexcrew/application/control.py` and `runtime.py`; `src/apexcrew/adapters/runtime/__init__.py`, `file_lock.py`, `file_lock_posix.py`, and `file_lock_windows.py`; `src/apexcrew/adapters/state/memory.py` and `sqlite.py`; `tests/unit/adapters/runtime/test_file_lock.py`; new `tests/integration/test_runtime_lock_lifecycle.py`; `tests/integration/test_runtime_permits.py`; and `AGENT_LOG.md`. Stage only files actually changed from this set.
+- **Red:** prove an accepted Create Run provisions exactly one canonical empty regular lock file and an identical replay reuses it; inject a crash/failure after the durable Create Run receipt and prove exact replay repairs only that missing file without another Run/reservation. Then snapshot private-root inventory/content and durable owner/progress state before direct runtime calls with no Permit, wrong phase, stale generation, and later interrupt. Each runtime call must return its closed stop with byte-for-byte unchanged durable state and no created directory/file. Also prove only valid Permit consumption clears a stale owner, installs the random owner ID, and increments progress.
+- **Green contract:** a private `RunLockProvisioner` is called by `ControlCommandService` only after an accepted Create Run or its identical accepted replay, while the Run is still non-runnable `DRAFT`; it creates the private runtime-lock directory/file from the internally allocated typed Run ID and verifies an existing file by no-follow identity. The service does not return the already durable accepted outcome to delivery until provisioning succeeds; on a typed provisioning failure, no Permit exists and an identical Create Run replay retries only this idempotent post-commit provisioning step before returning the stored outcome. `acquire()` itself never calls `mkdir`, creates, truncates, deletes, or renames a lock path. It accepts only that canonical pre-provisioned regular file. Lock acquisition precedes mutation, Permit validation is read-only, and owner installation occurs only in the Permit-consumption CAS transaction.
+- **Commit:** `fix(runtime): require preprovisioned run locks`.
+
+Module regression: run the runtime-permit integration tests including host-native contention, then `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+
+### R3-05: Replacement M1-08 Replay
+
+Create this worktree from `main` only after R3-01 through R3-04 merge. Do not cherry-pick, merge, or apply the PR #8 commit diff. The old commits may be read as diagnostic history after a failing test exists, but none of their green runs or self/deferred reviews satisfies the replacement task.
+
+#### `TASK-014R` - replay typed scoped reads and searches
+
+- Reuse the lower Task 14 behavior contract, but write its tests first from the corrected base. Exact staged paths are `src/apexcrew/domain/actions.py`, `effects.py`, `policy.py`, and `tools.py`; `src/apexcrew/adapters/repository/snapshot.py`; `src/apexcrew/adapters/state/memory.py` and `sqlite.py`; `tests/unit/domain/test_action_policy.py` and `test_tool_validation.py`; `tests/integration/test_scoped_reads.py` and `test_no_follow_paths.py`; `tests/contract/test_state_store.py`; and `AGENT_LOG.md`. Do not import Task 15-17 implementation.
+- Preserve no-follow reads, real Secret Path composition, bounded output, identical safe denial payloads, and zero intent/content exposure on denial. Add a deterministic operation-trace equivalence test for secret versus nonexistent reads; do not use flaky elapsed-time thresholds.
+- Red/green selector: `uv run --python 3.12 pytest tests/unit/domain/test_tool_validation.py tests/unit/domain/test_action_policy.py tests/integration/test_scoped_reads.py tests/integration/test_no_follow_paths.py tests/contract/test_state_store.py -q`.
+- Commit: `feat(tools): execute scoped reads and searches` with `PLAN-Task: TASK-014R`.
+
+#### `TASK-015R` - replay structured patch and check execution
+
+- Reuse the lower Task 15 contract, but start from the new Task 14R commit and capture the missing executor/package red before implementation. Exact staged paths are `src/apexcrew/adapters/executor/__init__.py` and `fake.py`; `src/apexcrew/domain/tools.py`; `src/apexcrew/adapters/state/memory.py` and `sqlite.py`; `tests/contract/test_executor.py` and `test_state_store.py`; `tests/integration/test_patch_and_check.py`; and `AGENT_LOG.md`.
+- Preserve structured `argv`, fixed trusted deadlines, sanitized regular-file snapshots, bounded/redacted stdout+stderr, and durable uncertainty semantics. No real Docker adapter is introduced in M1.
+- Red/green selector: `uv run --python 3.12 pytest tests/contract/test_executor.py tests/integration/test_patch_and_check.py tests/unit/domain/test_action_deadlines.py tests/contract/test_state_store.py -q`.
+- Commit: `feat(executor): run scoped patches and checks` with `PLAN-Task: TASK-015R`.
+
+#### `TASK-016R` - replay the owned one-action WorkerLoop
+
+- Reuse the lower Task 16 contract. Exact staged paths are `src/apexcrew/domain/coordination.py` and `worker.py`; `src/apexcrew/adapters/state/memory.py` and `sqlite.py`; `tests/unit/domain/test_worker_loop.py`; `tests/integration/test_worker_feedback.py`; `tests/contract/test_state_store.py`; and `AGENT_LOG.md`. Prove one completion yields at most one typed action; malformed/batch output has zero Authority/tool call; durable feedback and lease/Attempt state survive restart; Coordinator and WorkerLoop remain ApexCrew-owned.
+- Red/green selector: `uv run --python 3.12 pytest tests/unit/domain/test_worker_loop.py tests/integration/test_worker_feedback.py tests/contract/test_state_store.py -q`.
+- Commit: `feat(worker): execute one typed action per turn` with `PLAN-Task: TASK-016R`.
+
+#### `TASK-017R` - replay exact Grants with handle-relative mutation
+
+- Reuse the lower Task 17 Grant/journal/recovery contract. Exact allowed paths are `src/apexcrew/domain/authority.py` and `tools.py`; `src/apexcrew/application/runtime.py`; `src/apexcrew/adapters/state/memory.py` and `sqlite.py`; `src/apexcrew/adapters/repository/__init__.py`, `granted_workspace.py`, and new `mutation.py`, `mutation_posix.py`, and `mutation_windows.py`; `tests/unit/domain/test_frozen_action.py`; new `tests/unit/adapters/repository/test_no_follow_mutations.py`; `tests/integration/test_grant_consumption.py`, `test_granted_action_recovery.py`, and `test_runtime_permits.py`; `tests/contract/test_state_store.py`; and `AGENT_LOG.md`. Stage only changed files from this set. Keep the public `GrantedActionToolPort`/`GrantedWorkspaceAdapter` seam unchanged.
+- First red proves each granted delete, rename, executable-bit change, and protected patch loses an ancestor-swap race safely. Preflight-only symlink tests are insufficient. The recording mutation backend must show dispatch addresses held parent/final handles, never a re-resolved workspace pathname.
+- POSIX operations use held directory/file descriptors and `*at`/descriptor operations; protected replacement creates/fsyncs/chmods/renames a no-follow temporary file relative to the held parent. Windows operations use held handles plus handle-relative create/rename/disposition APIs and explicit final-path/file-ID verification. Unsupported executable-bit mutation remains a bounded Windows result. Temporary cleanup is also handle-relative.
+- Before and after every mutation, repeat canonical path/scope/protected/secret checks and verify root/ancestor/final identities. Exact pre-state may dispatch once; exact post-state settles without dispatch; third/unavailable state becomes durable `INDETERMINATE`.
+- Add one production-composition restart test that enters through `CrewRuntime.run_until_blocked`, finds an unsettled Granted Action before ordinary scheduling, performs zero model call, settles exact post-state or one exact pre-state dispatch, crosses the post-action boundary, then requires a fresh `continue` for later work.
+- Red/green selector: `uv run --python 3.12 pytest tests/unit/adapters/repository/test_no_follow_mutations.py tests/unit/domain/test_frozen_action.py tests/integration/test_grant_consumption.py tests/integration/test_granted_action_recovery.py tests/integration/test_runtime_permits.py tests/contract/test_state_store.py -q`.
+- Forbidden API scan for the granted adapter and mutation modules must prove there is no pathname `Path.unlink`, `Path.rename`, `Path.replace`, `Path.chmod`, `os.replace`, or unscoped temporary-file cleanup in the mutation path.
+- Commit: `feat(authority): consume exact risky-action grants` with `PLAN-Task: TASK-017R`.
+
+### M1 Closeout and Stop Rule
+
+After every R3 task review and commit, run from the replacement M1-08 worktree:
+
+1. `uv sync --frozen --all-groups`
+2. `uv run --python 3.12 pytest -q`
+3. `uv run --python 3.12 ruff format --check .`
+4. `uv run --python 3.12 ruff check .`
+5. `uv run --python 3.12 mypy src`
+6. `git diff --check main...HEAD`
+7. the focused model, secret-policy, Git inventory, runtime-lock, WorkerLoop, Grant, and granted-mutation selectors above
+
+Record exact outputs, skips by platform, elapsed time, changed paths, commit map, agent/human attribution, and current `SPEC.md`/`PLAN.md` digests. The `make test`, `make lint`, and `make secret-scan` entry points do not exist in M1 and are not claimed; Task 35A/Task 34 remain their future owners. For each R3 PR, reviewers still inspect the exact changed-path diff for credential-like material without printing suspected values, and hosted CI must report the existing `quality`, `unit-ubuntu`, and `unit-windows` checks green. Then dispatch a fresh whole-M1 spec-compliance reviewer. Only after that passes, dispatch a different whole-M1 code-quality reviewer. A critical finding becomes a new TDD task and ledger row: fix it in the still-open owning module PR when possible, or in a new sequential corrective worktree/PR when that module already merged. Repeat the affected task/module review and both whole-M1 reviews; never add an unreviewed closeout fixup.
+
+M1 closes only when all corrective/replacement PRs are merged, PR #8 is closed unmerged, `main` contains the reviewed commit map, both whole-M1 reviews report zero critical findings, all required local/hosted checks are observed green, and the owner records `M1 COMPLETE` against the exact `main` SHA. Until then, M2-M4 remain unauthorized.
 
 ## Global Constraints
 
 - Treat root `SPEC.md` revision 2 as frozen at SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; do not edit, normalize, or regenerate it. Its embedded pre-approval status is intentionally unchanged. The owner-approved proposal 0001, revision-2 digest, and revision-1 supersession are recorded externally in `SPEC_PROCESS.md` and `AGENT_LOG.md` on 2026-07-31.
-- Stage 4 Attempt 3 completed Task 1 and Task 2A on 2026-07-31 with `ZERO BLOCKERS`; its disposable code was destroyed without merge. Treat that result as input, not unfinished work and not reusable green evidence: M1 must reproduce both red/green sequences in retained worktrees.
+- Stage 4 Attempt 3 completed disposable Task 1/2A evidence on 2026-07-31. Retained replacements later merged through PR #1. Preserve the Stage 4 record as history; R3 neither reuses its green output nor reruns merged Tasks 1/2A unless the historical-deviation gate chooses M1-R4.
 - Carry both Stage 4 qualifications without dilution. Attempt 3 was dispatched by the assisting agent rather than directly by the owner, so its process evidence is weaker than the owner-dispatched Codex Attempts 1 and 2. Its `uv lock` emitted zero warnings, so R3's exit-zero resolver-diagnostic allowance remains correct but unexercised and must not be described as empirically proven.
 - Preserve the approved A-Hybrid boundary: only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get` are Run-facing application interfaces. Delivery must not coordinate Coordinator, WorkerLoop, Admission, or recovery ordering.
 - ApexCrew owns Coordinator and WorkerLoop. `ModelPort` returns one low-level structured completion only; external Coding Agent CLIs and high-level agent frameworks are prohibited from the assessed runtime.
@@ -26,15 +227,15 @@
 - The offline core, tests, fixture demonstrations, and CI run deterministically with `ScriptedMockLLM` and no network. The executor is non-root, digest-pinned, networkless, has no Docker socket, no host credential, and only sanitized regular-file snapshots.
 - Hard-deny workspace escape, symlink/reparse traversal, `.git/**`, `.apexcrew/**`, effective secret paths, raw shell, host network, Docker socket, push, reset, clean, force, and target mutation outside Admission's final typed CAS.
 - Freeze Plan and Policy at `ACTIVE`; a risky effect needs an exact, one-use Grant. A command replay or direct runtime call never creates new mutation authority.
-- The deadline is fixed at 2026-08-10 23:59 Asia/Shanghai and nominal capacity remains 30-40 hours/week. The specification proposal/application, M1-R2 preparation, and required re-review round consume an estimated 6-10 hours, leaving only about 25 implementation hours in the owner's actual window. R3's 757 listed actions alone total 25.2-63.1 raw hours before red/green reruns, full regressions, two reviews per task, evidence, worktree/PR handling, and commit bookkeeping. The prior M1-M3 conditional forecast depended on no SPEC amendment and no critical redesign; both conditions are now false. Report schedule risk rather than claiming closure.
-- M1 authority, once the document gate passes, is exactly retained Task 1, Task 2A, Task 2B, Task 3, Task 4, Task 4A, Task 4B, Task 5, Task 6, Task 7A, Task 7B, Task 8, Task 9, Task 9A, Task 9B, Task 9C, Task 9D, Task 10, Task 11A, Task 11B, Task 12A, Task 12B, Task 13, Task 14, Task 15, Task 16, and Task 17. No parent Task 2, 7, 11, or 12 aggregate commit exists. M2-M4 need their own exact revision, independent document review, and owner `GO` before any of their files may be retained.
-- GitHub is the sole delivery remote. Do not configure an NJU or GitLab remote. M1 Task 1 creates the minimal `.github/workflows/ci.yml` with `push` and `pull_request` triggers before the first branch push; M3 Task 35A later expands that same workflow and still creates `.gitlab-ci.yml` with a job named exactly `unit-test`.
-- No task authorizes push, publication, credentials, GitHub Pages enablement, workflow-permission changes, or a Runtime Grant. Task 1 is authorized after `M1 GO` to add the reviewed minimal workflow file, but a reviewed local module branch still stops for explicit owner authorization before its first push. This host has no `gh` CLI, so PR creation is an owner action in the authenticated GitHub Web UI unless the owner separately authorizes another route.
-- Private `self._x(...)` calls are governed exhaustively in this revision: a helper whose semantics carry expected-sequence CAS, transaction/locking mode, current revision or Budget binding, settle-once/one-use authority, dispatch closure, or a legal state transition is defined in its owning task and the implementation must match that definition. An undefined helper is permitted only when owning-task prose already specifies its contract or its factoring is safety-neutral; a task is complete when its stated selectors pass regardless of that safety-neutral factoring. After the round-2 definitions below, the exhaustive undefined set is `_append_audit_event`, `_commit_state_and_event`, `_commit_state_and_events`, `_issue_runtime_permit_in_transaction`, `_last_status_is_not_a_directory`, `_last_status_is_object_name_not_found`, `_pending_action`, `_query_directory_handle_names`, `_read_oldest_unsettled_granted_action`, `_require_sequence_and_interrupt_gate`, `_settle_global_usage_in_transaction`, and `_transaction`, each constrained by its owning-task prose. `_expected_gitfile` is separately exhaustive as an injected callable attribute, not a helper method. No other undefined private call is implementer-chosen, and this convention is not authority to omit a safety-bearing definition.
+- The deadline remains 2026-08-10 23:59 Asia/Shanghai and nominal capacity remains 30-40 hours/week. On 2026-08-03, R3 correction/replay is forecast at 29-57 implementation/review hours before owner PR administration. Do not claim that this fits the remaining window without a new observed capacity decision; report `HOLD` when it does not.
+- After the M1-R3 gate passes, new implementation authority is exactly `M1-FIX-001` through `M1-FIX-007` and `TASK-014R` through `TASK-017R`. Existing Tasks 1-13 remain historical merged evidence subject to the explicit acceptance gate. Original Task 14-17 commits remain rejected PR #8 evidence. M2-M4 need their own exact revision, independent document review, and owner `GO` before any of their files may be retained.
+- GitHub is the sole delivery remote. Do not configure an NJU or GitLab remote. The minimal `.github/workflows/ci.yml` already exists on `main`; R3 does not remove either trigger or broaden workflow authority. M3 Task 35A remains future roadmap.
+- No task authorizes push, publication, credentials, GitHub Pages enablement, workflow-permission changes, or a Runtime Grant. Every reviewed local R3 module still stops for explicit owner authorization before its first push. This host has no `gh` CLI, so PR creation is an owner action in the authenticated GitHub Web UI unless the owner separately authorizes another route.
+- Safety-bearing private helpers must have an explicit owning-task contract for expected-sequence CAS, locking, revision/Budget binding, settle-once authority, dispatch closure, and state transitions. The R2 helper inventory below remains historical input; R3 may add only the platform lock/mutation and ID-source helpers explicitly authorized above, with tests at their public module seams.
 
-## Execution Gate
+## Superseded M1-R2 Execution Gate (Historical)
 
-Stage 4 is closed and M1-R1 was rejected with 10 blockers. The next gate is an **owner-dispatched independent M1-R2 document review**, budgeted within the 6-10 hour revision/re-review round above. Until every row below is satisfied, this file is review input only and none of its implementation checkboxes are executable authority.
+This section records the gate that M1-R2 intended to use. It is not current execution authority and cannot substitute for the binding M1-R3 gate above. Its unmet or weak evidence is part of the historical-deviation decision.
 
 | Gate | Required evidence |
 | --- | --- |
@@ -51,7 +252,7 @@ The review must explicitly preserve both COLDSTART-3 limitations: its dispatch p
 
 After the gate passes, Task 1 still applies the following exact lock rule: `uv lock` warnings about ignored legacy package artifacts or corrected third-party metadata specifiers are permitted diagnostics only when the command exits 0, writes a syntactically complete `uv.lock`, and contains every direct dependency. A nonzero exit, absent lockfile, unsupported Python constraint, or missing direct dependency is a mandatory task stop. This retained run must record what actually occurred; it must not cite COLDSTART-3 as its own green result.
 
-## Milestones, Scope Tiers, and Stop Rules (M1-R2)
+## Superseded Milestones, Scope Tiers, and Stop Rules (M1-R2 Historical)
 
 This revision does not alter approved `SPEC.md` revision 2 or waive any signed requirement. A deferred item is not optional; it is simply not executable until its predecessor milestone closes and a reviewed milestone plan authorizes it. The rejected M1-R1 and superseded M0-R3 archives are complete at the paths above. This root file becomes executable only for M1 after the gate above; all later detailed sections remain signed-scope roadmap/reference material.
 
@@ -65,7 +266,7 @@ This revision does not alter approved `SPEC.md` revision 2 or waive any signed r
 
 At the end of each milestone, record a table in `AGENT_LOG.md` with elapsed hours, conservative remaining-hours estimate, hours available before the deadline, completed evidence, and an explicit owner `GO` or `HOLD` decision for the next milestone. If the observed schedule no longer closes, the valid outcomes are an owner-approved scope revision or added capacity/time; no agent silently omits a signed item. Task 28 remains an M4 provider profile: before live behavior is planned, the owner must reconfirm the frozen model/pricing profile or approve a new SPEC revision, select the credential profile, and separately authorize a smoke.
 
-## Capacity and Deadline Forecast
+## Superseded M1-R2 Capacity and Deadline Forecast
 
 The owner decision of 2026-07-31 keeps nominal capacity at 30-40 hours/week and the deadline fixed at 2026-08-10 23:59 Asia/Shanghai. The specification proposal/application plus M1-R2 and its new review round consume an estimated 6-10 hours. Against the owner's actual commitments, the remaining implementation window is approximately 25 hours; the earlier 42.9-57.1 nominal projection is no longer an honest implementation budget.
 
@@ -121,9 +322,9 @@ No-owner states add zero time. Each Audit event committed while an owner generat
 
 Task 9B owns the mapping and the six producer paths already available in M1-05. Task 11B and Task 12A own the two later producers and their threshold tests; Task 9B does not claim all-eight production coverage before those tasks exist. The M1-07 module regression is the first command allowed to claim all eight real producer paths green.
 
-## Module Worktrees and Pull Requests
+## Historical M1-R2 Module Worktrees and Pull Requests
 
-All M1-predecessor repository commits are documentation/governance history on `main`; they are not retroactively rewritten. M1 implementation starts the mandatory PR workflow. Worktrees are created only after the M1 gate passes and each predecessor PR has merged with its task commits preserved. Every row is one local worktree, one branch, and one GitHub PR; no implementation commit is made directly on `main`.
+This table records the original M1-R2 route. Rows 1-7 are historical merged topology; row 8 is the rejected PR #8 route. New work uses only the binding R3 worktree table above.
 
 | Order | Module and exact task slices | Branch | Worktree | Required PR title |
 | --- | --- | --- | --- | --- |
@@ -169,9 +370,9 @@ Quality-Review: <reviewer identifier>; PASS
 
 When a human changed anything, replace `none` with exact paths and a one-line reason, for example `Human-Changes: src/apexcrew/domain/authority.py - corrected counter invariant`. The PR description repeats the mapping at module level with headings `PLAN tasks`, `SPEC coverage`, `Subagent changes`, `Human changes`, `Spec reviews`, `Quality reviews`, `Commit map`, `Red/green evidence`, `Security/credential scan`, and `External gates`. Empty human work is written as `Human changes: none`; it is never omitted.
 
-## M1 Task Commit Ledger
+## Historical M1-R2 Task Commit Ledger
 
-This is the course-required continuously updated ledger. `Not created` is the truthful pre-execution state, not a commit placeholder. Immediately after each implementation commit, change only that row to `DONE` and its observed full 40-character SHA; the module ledger commit persists those updates without rewriting task history.
+This table preserves the original task commit map. `DONE` for Tasks 1-13 means only that the implementation commit merged; their milestone acceptance remains gated above. `OBSERVED / NOT ACCEPTED` for Tasks 14-17 means that a commit exists only on rejected PR #8 and is not an M1 completion claim. R3 task hashes belong in the binding R3 ledger above.
 
 | Slice | `AGENT_LOG.md` label | Module PR | Status | Implementation commit |
 | --- | --- | --- | --- | --- |
@@ -198,16 +399,16 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 12A | `TASK-012A` | M1-07 | DONE | `08bda573114debf1de5728aec67afe76014c76e1` |
 | Task 12B | `TASK-012B` | M1-07 | DONE | `8eec9f9b1293ee4d9220966dba4271da9bbb97aa` |
 | Task 13 | `TASK-013` | M1-07 | DONE | `0046c4d03daeb4444135aaa904cc4cb6a273a278` |
-| Task 14 | `TASK-014` | M1-08 | NOT STARTED | Not created |
-| Task 15 | `TASK-015` | M1-08 | NOT STARTED | Not created |
-| Task 16 | `TASK-016` | M1-08 | NOT STARTED | Not created |
-| Task 17 | `TASK-017` | M1-08 | NOT STARTED | Not created |
+| Task 14 | `TASK-014` | M1-08 / PR #8 | OBSERVED / NOT ACCEPTED | `8e8a0be8aa361c0aaf305fe172bb086c819ddb99` |
+| Task 15 | `TASK-015` | M1-08 / PR #8 | OBSERVED / NOT ACCEPTED | `0a8298accd0f03a49271549d4ad4244d7c062718` |
+| Task 16 | `TASK-016` | M1-08 / PR #8 | OBSERVED / NOT ACCEPTED | `fbb671a3255f0525d756cf59dd85bcbeddc0c38f` |
+| Task 17 | `TASK-017` | M1-08 / PR #8 | OBSERVED / NOT ACCEPTED | `817d84572d574958d1cd8e26e2bf5da285314bb4` |
 
 ## Course Delivery Decisions
 
 | Requirement | Planned treatment and gate |
 | --- | --- |
-| GitHub-only channel | `origin` remains the only remote. No NJU/GitLab remote is configured. M1 uses the 8 GitHub PRs above. |
+| GitHub-only channel | `origin` remains the only remote. No NJU/GitLab remote is configured. Historical PRs #1-7 are merged, PR #8 must close unmerged under R3, and the five R3 module PRs above are the only new M1 delivery route. |
 | GitLab CI artifact | M3 Task 35A creates `.gitlab-ci.yml` with a top-level job named exactly `unit-test`, even though no GitLab remote or runner is configured. |
 | GitHub Actions on every push | M1 Task 1 creates `.github/workflows/ci.yml` before the first M1 push, with `push`/`pull_request`, read-only permissions, offline pytest on Ubuntu and Windows, and Ruff/mypy quality. M3 Task 35A expands that existing file to the full six-job delivery topology required by SPEC revision-2 line 571. |
 | Public URL / WebUI | The signed design's GitHub Pages sanitized static fixture replay is a publicly accessible, read-only WebUI and is the chosen literal response to deliverable 9. This remains a **grading risk** because a grader may expect a live hosted application. Before M3 approval, seek written course-owner/instructor confirmation. If rejected, hosted execution conflicts with SPEC v0.1 exclusions and requires a separately proposed, newly hashed and owner-approved SPEC revision. |
@@ -217,9 +418,9 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Host prerequisites | Git 2.47.1, CPython 3.12.12 through uv, uv 0.9.29, Docker server 29.6.1, Windows WinVault keyring, and Node 22.14 are verified PASS as of 2026-07-31. Keyring is first-time evidence for the Secret Path Set installation key. |
 | Owner-only pending state | GitHub Pages enablement and workflow write permissions are still in progress. They gate M3 publication/CI evidence, not local M1 implementation. |
 
-### Execution Slicing Amendment
+### Historical M1-R2 Execution Slicing Amendment
 
-The Task 2, 7, 11, and 12 rows below are binding M1 decomposition after the document gate passes. Each replacement slice has its own failing selector, focused green selector, exact staged paths, unique `AGENT_LOG.md` label, and one implementation commit. The old parent commit commands later in this file are historical source detail and **must not run**. Task 27 and Task 35 remain non-executable constraints for future reviewed revisions.
+The Task 2, 7, 11, and 12 rows below record the decomposition used by merged R2 work. They are not R3 execution commands. The old parent commands remain historical source detail and **must not run**. Task 27 and Task 35 remain non-executable constraints for future reviewed revisions.
 
 | Legacy group | Replacement execution slices | Exact step allocation and commit boundary |
 | --- | --- | --- |
@@ -29960,13 +30161,13 @@ Expected: PASS only for one completed workflow at exact HEAD with every required
 
 ## Delivery Sequencing and Cut Line
 
-After this candidate passes review, execute M1 only, in the 8 PRs and 27 slices defined above. Tasks 18 onward remain route-map detail until M2, M3, and M4 each receive a new exact root revision, independent zero-blocker review, and owner `GO`. M1-M3 are the committed priority under the capacity dependencies above; M4 remains a sprint target and is still required for the accepted complete v0.1 release. Do not spend contingency on optional weak-oracle/challenger experiments, provider breadth beyond Task 28, writable WebUI, hosted execution, macOS/ARM, Kubernetes, A2A, marketplace, or full Open Design runtime integration.
+For M1, execute only the five-module M1-R3 route at the top of this file. The historical eight-PR/27-slice sentence is superseded: PRs #1-7 are merged evidence, PR #8 is closed unmerged, and R3 adds four corrective PRs plus one replacement M1-08 PR. Tasks 18 onward remain route-map detail until M2, M3, and M4 each receive a new exact root revision, independent zero-blocker review, and owner `GO`. Do not spend contingency on optional weak-oracle/challenger experiments, provider breadth beyond Task 28, writable WebUI, hosted execution, macOS/ARM, Kubernetes, A2A, marketplace, or full Open Design runtime integration.
 
 The deadline remains 2026-08-10 23:59 Asia/Shanghai at 30-40 hours/week. Recompute actual remaining capacity after every module PR and milestone; do not infer full-scope completion from checkbox count. Reserve 3-5 owner hours for the student-authored `REFLECTION.md`; no agent task drafts or commits its prose on the student's behalf.
 
 ## TASK Ledger Convention
 
-Every committed execution slice owns exactly one dated `AGENT_LOG.md` heading in the form `## TASK-<label> - <short title>`. M1 labels are fixed by the 27-row ledger above; a split slice never appends to `TASK-002`, `TASK-007`, `TASK-011`, or `TASK-012`. The exact implementation commit, PLAN ledger row, agent/human attribution, and unique log label form one evidence association.
+Every committed execution slice owns exactly one dated `AGENT_LOG.md` heading in the form `## <exact PLAN label> - <short title>`. Historical M1 labels remain fixed by the old ledger and are never reused. New work uses only `M1-FIX-001` through `M1-FIX-007` and `TASK-014R` through `TASK-017R`. The exact implementation commit, R3 ledger row, agent/human attribution, and unique log label form one evidence association.
 
 ## Required Evidence Per Commit
 
