@@ -198,10 +198,10 @@ This is the course-required continuously updated ledger. `Not created` is the tr
 | Task 12A | `TASK-012A` | M1-07 | DONE | `08bda573114debf1de5728aec67afe76014c76e1` |
 | Task 12B | `TASK-012B` | M1-07 | DONE | `8eec9f9b1293ee4d9220966dba4271da9bbb97aa` |
 | Task 13 | `TASK-013` | M1-07 | DONE | `0046c4d03daeb4444135aaa904cc4cb6a273a278` |
-| Task 14 | `TASK-014` | M1-08 | NOT STARTED | Not created |
-| Task 15 | `TASK-015` | M1-08 | NOT STARTED | Not created |
-| Task 16 | `TASK-016` | M1-08 | NOT STARTED | Not created |
-| Task 17 | `TASK-017` | M1-08 | NOT STARTED | Not created |
+| Task 14 | `TASK-014` | M1-08 | DONE | `8e8a0be8aa361c0aaf305fe172bb086c819ddb99` |
+| Task 15 | `TASK-015` | M1-08 | DONE | `0a8298accd0f03a49271549d4ad4244d7c062718` |
+| Task 16 | `TASK-016` | M1-08 | DONE | `fbb671a3255f0525d756cf59dd85bcbeddc0c38f` |
+| Task 17 | `TASK-017` | M1-08 | DONE | `817d84572d574958d1cd8e26e2bf5da285314bb4` |
 
 ## Course Delivery Decisions
 
