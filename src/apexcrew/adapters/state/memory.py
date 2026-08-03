@@ -21,7 +21,7 @@ from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
     TargetAuthorityDigestService,
 )
-from apexcrew.domain.actions import FailAction, FinishAction
+from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, RiskyAction
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
@@ -36,6 +36,7 @@ from apexcrew.domain.authority import (
     ActionDeadline,
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    ApprovalGrant,
     AtomicAction,
     AttemptLifecycleState,
     AuthorityDenied,
@@ -47,14 +48,19 @@ from apexcrew.domain.authority import (
     CheckpointKey,
     DispatchAuthorization,
     DispatchCloseCause,
+    FrozenActionBindings,
     GlobalBudgetMetric,
     GlobalUsageSnapshot,
+    GrantCommandValidator,
+    GrantedActionIntent,
+    GrantValidationError,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
     ModelReservationRequest,
     MonotonicClock,
     MonotonicInstant,
+    PendingAction,
     ProgressEvidence,
     ResumeTaskRequest,
     RuntimeAuditStamp,
@@ -71,10 +77,18 @@ from apexcrew.domain.authority import (
     TrancheReason,
     WorkspaceLease,
     action_deadline_binding,
+    approval_grant_from_json,
+    approval_grant_id,
+    approval_grant_to_json,
+    canonical_action_json,
+    confirmation_code_for_pending_digest,
     crossed_threshold,
+    freeze_pending_action,
     global_ceiling_for,
+    granted_action_intent_id,
     model_reservation_amounts,
     normalize_global_budget_metric,
+    pending_action_subject_json,
     progress_from_checks,
     task_resume_ids,
 )
@@ -88,6 +102,7 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
     CreateRunPayload,
+    GrantPayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
@@ -148,6 +163,7 @@ from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
     ModelConfigurationRevisionDocument,
+    PolicyRevisionDocument,
     Sha256DigestText,
     revision_digest,
 )
@@ -156,7 +172,9 @@ from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CommandStatus,
+    GrantId,
     IntentId,
+    PendingActionId,
     RepositoryId,
     RequestId,
     RevisionDigest,
@@ -466,6 +484,9 @@ class InMemoryStateStore:
         self._worker_bindings: dict[AttemptId, WorkerTurnBinding] = {}
         self._worker_actions: dict[str, WorkerActionRecord] = {}
         self._worker_turn_actions: dict[tuple[AttemptId, LogicalTurnId], str] = {}
+        self._pending_actions: dict[PendingActionId, PendingAction] = {}
+        self._approval_grants: dict[GrantId, tuple[ApprovalGrant, RequestId]] = {}
+        self._granted_action_intents: dict[IntentId, GrantedActionIntent] = {}
         self._monotonic_clock = monotonic_clock
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
@@ -531,6 +552,9 @@ class InMemoryStateStore:
         copied._worker_bindings = self._worker_bindings.copy()
         copied._worker_actions = self._worker_actions.copy()
         copied._worker_turn_actions = self._worker_turn_actions.copy()
+        copied._pending_actions = self._pending_actions.copy()
+        copied._approval_grants = self._approval_grants.copy()
+        copied._granted_action_intents = self._granted_action_intents.copy()
         copied._monotonic_clock = self._monotonic_clock
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
@@ -596,6 +620,9 @@ class InMemoryStateStore:
         self._worker_bindings = copied._worker_bindings
         self._worker_actions = copied._worker_actions
         self._worker_turn_actions = copied._worker_turn_actions
+        self._pending_actions = copied._pending_actions
+        self._approval_grants = copied._approval_grants
+        self._granted_action_intents = copied._granted_action_intents
 
     def _commit_state_and_event(
         self,
@@ -2117,6 +2144,22 @@ class InMemoryStateStore:
             pending_id = pending_worker_action_id(binding, request, decision, expected_prestate)
         except ValueError as error:
             raise StateConflict(str(error)) from error
+        policy_entry = self._revision_documents.get(
+            (binding.run_id, "POLICY", binding.policy_digest)
+        )
+        if policy_entry is None or not isinstance(policy_entry[0], PolicyRevisionDocument):
+            raise StateConflict("CURRENT_POLICY_NOT_FOUND")
+        try:
+            pending = freeze_pending_action(
+                PendingActionId(pending_id),
+                request,
+                decision,
+                expected_prestate,
+                request.started_at_utc,
+                policy_entry[0].grant_ttl_seconds,
+            )
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
 
         def mutate(copied: InMemoryStateStore) -> None:
             if copied.current_worker_turn_binding(binding.attempt_id) != binding:
@@ -2125,6 +2168,7 @@ class InMemoryStateStore:
             if (
                 request.action_id in copied._worker_actions
                 or turn_key in copied._worker_turn_actions
+                or pending.pending_id in copied._pending_actions
             ):
                 raise StateConflict("WORKER_ACTION_DUPLICATE")
             copied._worker_actions[request.action_id] = WorkerActionRecord(
@@ -2142,6 +2186,7 @@ class InMemoryStateStore:
                 created_sequence=AuditSequence(expected_sequence + 1),
             )
             copied._worker_turn_actions[turn_key] = request.action_id
+            copied._pending_actions[pending.pending_id] = pending
             copied._worker_attempts[binding.attempt_id] = replace(
                 copied._worker_attempts[binding.attempt_id], state="WAITING_APPROVAL"
             )
@@ -2168,6 +2213,501 @@ class InMemoryStateStore:
             mutate=mutate,
         )
         return PendingActionFreeze(pending_id, sequence)
+
+    @staticmethod
+    def _validated_pending_action(pending: PendingAction) -> PendingAction:
+        try:
+            action = ACTION_ADAPTER.validate_json(pending.normalized_action_json)
+        except ValueError as error:
+            raise StateConflict("PENDING_ACTION_STORAGE_INVALID") from error
+        subject = pending_action_subject_json(
+            pending_id=pending.pending_id,
+            normalized_action_json=pending.normalized_action_json,
+            action_digest=pending.action_digest,
+            authorization_binding_digest=Sha256DigestText(pending.authorization_binding_digest),
+            expected_pre_state=pending.expected_pre_state,
+            bindings=pending.bindings,
+            expires_at=pending.expires_at,
+        )
+        if (
+            not isinstance(action, RiskyAction)
+            or action != pending.action
+            or canonical_action_json(action) != pending.normalized_action_json
+            or sha256_digest(pending.normalized_action_json) != pending.action_digest
+            or sha256_digest(subject) != pending.pending_action_digest
+            or sha256_digest(confirmation_code_for_pending_digest(pending.pending_action_digest))
+            != pending.confirmation_code_digest
+            or pending.authorization_binding_digest != pending.bindings.authorization_binding_digest
+        ):
+            raise StateConflict("PENDING_ACTION_STORAGE_INVALID")
+        return pending
+
+    def pending_action(self, key: RunId | PendingActionId) -> PendingAction:
+        direct = self._pending_actions.get(PendingActionId(str(key)))
+        if direct is not None:
+            return self._validated_pending_action(direct)
+        matches = tuple(
+            pending
+            for pending in self._pending_actions.values()
+            if pending.bindings.run_id == RunId(str(key))
+        )
+        if len(matches) != 1:
+            raise StateConflict("PENDING_ACTION_NOT_FOUND_OR_AMBIGUOUS")
+        return self._validated_pending_action(matches[0])
+
+    def pending_actions(self, run_id: RunId) -> tuple[PendingAction, ...]:
+        return tuple(
+            self._validated_pending_action(pending)
+            for pending in sorted(
+                (item for item in self._pending_actions.values() if item.bindings.run_id == run_id),
+                key=lambda item: item.pending_id,
+            )
+        )
+
+    @staticmethod
+    def _current_frozen_action_bindings(
+        store: InMemoryStateStore, pending: PendingAction
+    ) -> FrozenActionBindings:
+        run = store._runs.get(pending.bindings.run_id)
+        attempt = store._worker_attempts.get(pending.bindings.attempt_id)
+        binding = store._worker_bindings.get(pending.bindings.attempt_id)
+        action = store._worker_actions.get(pending.bindings.action_id)
+        lease = store._workspace_leases.get((pending.bindings.run_id, pending.bindings.lease_id))
+        ref = store._run_refs.get((pending.bindings.run_id, "PRIVATE"))
+        if run is None or attempt is None or binding is None or action is None or lease is None:
+            raise StateConflict("FROZEN_ACTION_BINDING_NOT_FOUND")
+        lease_generation = lease.generation
+        if lease.state != "ACTIVE" or attempt.state != "WAITING_APPROVAL":
+            lease_generation = -1
+        run_head = (
+            str(ref.current_oid)
+            if ref is not None and ref.current_oid is not None
+            else str(run.pinned_target_oid)
+        )
+        return FrozenActionBindings(
+            run_id=run.run_id,
+            task_id=attempt.task_id,
+            attempt_id=attempt.attempt_id,
+            logical_turn_id=action.logical_turn_id,
+            action_id=action.action_id,
+            lease_id=lease.lease_id,
+            lease_generation=lease_generation,
+            run_head_oid=run_head,
+            target_safety_digest=RevisionDigest(attempt.target_safety_digest),
+            plan_digest=RevisionDigest(str(run.current_plan_digest)),
+            policy_digest=RevisionDigest(str(run.current_policy_digest)),
+            budget_digest=RevisionDigest(str(run.current_budget_digest)),
+            model_configuration_digest=RevisionDigest(str(run.current_model_configuration_digest)),
+            tool_schema_digest=attempt.tool_schema_digest,
+            authorization_binding_digest=action.authorization_binding_digest,
+            deadline_at_utc=action.deadline_at_utc,
+        )
+
+    @staticmethod
+    def _invalidate_pending_action_on_copy(
+        copied: InMemoryStateStore, pending: PendingAction
+    ) -> None:
+        current = copied._pending_actions.get(pending.pending_id)
+        attempt = copied._worker_attempts.get(pending.bindings.attempt_id)
+        if (
+            current is None
+            or current.state != "WAITING_APPROVAL"
+            or attempt is None
+            or attempt.state != "WAITING_APPROVAL"
+        ):
+            raise StateConflict("PENDING_ACTION_INVALIDATION_COMPARE_AND_SET_FAILED")
+        copied._pending_actions[pending.pending_id] = replace(current, state="INVALIDATED")
+        copied._worker_attempts[attempt.attempt_id] = replace(attempt, state="STALE")
+
+    def accept_pending_action_grant(
+        self,
+        *,
+        command: CommandEnvelope,
+        now: datetime,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent | None:
+        if not isinstance(command.payload, GrantPayload):
+            raise TypeError("PENDING_ACTION_GRANT_PAYLOAD_REQUIRED")
+        payload = command.payload
+        accepted: list[GrantedActionIntent] = []
+        event_kinds: list[str] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(payload.run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            interrupt = copied._runtime_interrupts.get(payload.run_id)
+            if interrupt is not None and interrupt[3] == "PENDING":
+                raise StateConflict("RUNTIME_INTERRUPT_PENDING")
+            try:
+                pending = copied._validated_pending_action(
+                    copied._pending_actions[payload.pending_action_id]
+                )
+            except (KeyError, StateConflict):
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant="PENDING_ACTION_BINDING_INVALID",
+                    safe_next_action="USE_DISPLAYED_CONFIRMATION_CODE",
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            try:
+                if (
+                    command.applicable_revision_digests
+                    != pending.bindings.applicable_revision_digests
+                ):
+                    raise GrantValidationError("PENDING_ACTION_BINDING_INVALID")
+                GrantCommandValidator().validate_payload_before_grant_write(payload, pending, now)
+            except GrantValidationError as error:
+                expired = str(error) == "PENDING_ACTION_EXPIRED"
+                if expired:
+                    self._invalidate_pending_action_on_copy(copied, pending)
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE if expired else CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=str(error),
+                    safe_next_action=(
+                        "CREATE_FRESH_ATTEMPT" if expired else "USE_DISPLAYED_CONFIRMATION_CODE"
+                    ),
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            grant = ApprovalGrant(
+                grant_id=approval_grant_id(
+                    RequestId(command.request_id), pending.pending_action_digest
+                ),
+                pending_id=pending.pending_id,
+                pending_action_digest=pending.pending_action_digest,
+                confirmation_code_digest=pending.confirmation_code_digest,
+                bindings=pending.bindings,
+                expires_at=pending.expires_at,
+            )
+            if any(
+                stored_request == RequestId(command.request_id)
+                or stored_grant.pending_id == pending.pending_id
+                for stored_grant, stored_request in copied._approval_grants.values()
+            ):
+                raise StateConflict("APPROVAL_GRANT_DUPLICATE")
+            copied._approval_grants[grant.grant_id] = (
+                grant,
+                RequestId(command.request_id),
+            )
+            try:
+                current = self._current_frozen_action_bindings(copied, pending)
+                GrantCommandValidator().validate_current_binding(grant, pending, current, now)
+            except (GrantValidationError, StateConflict) as error:
+                self._invalidate_pending_action_on_copy(copied, pending)
+                copied._approval_grants[grant.grant_id] = (
+                    replace(grant, state="INVALIDATED"),
+                    RequestId(command.request_id),
+                )
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=(
+                        str(error)
+                        if isinstance(error, GrantValidationError)
+                        else "GRANT_BINDING_MISMATCH"
+                    ),
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                "ACTIVE",
+                pending.bindings.applicable_revision_digests,
+                copied.target_authority_digest(payload.run_id),
+                AuditSequence(expected_sequence + 1),
+            )
+            intent = GrantedActionIntent(
+                intent_id=granted_action_intent_id(grant),
+                pending_id=pending.pending_id,
+                grant_id=grant.grant_id,
+                action=pending.action,
+                normalized_action_json=pending.normalized_action_json,
+                action_digest=pending.action_digest,
+                expected_pre_state=pending.expected_pre_state,
+                bindings=pending.bindings,
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            if (
+                effect.intent_id in copied._effect_intents
+                or intent.intent_id in copied._granted_action_intents
+            ):
+                raise StateConflict("GRANTED_ACTION_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._granted_action_intents[intent.intent_id] = intent
+            consumed = replace(
+                grant,
+                state="CONSUMED",
+                consumed_intent_id=intent.intent_id,
+                consumed_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._approval_grants[grant.grant_id] = (
+                consumed,
+                RequestId(command.request_id),
+            )
+            copied._pending_actions[pending.pending_id] = replace(pending, state="GRANT_CONSUMED")
+            attempt = copied._worker_attempts[pending.bindings.attempt_id]
+            if attempt.state != "WAITING_APPROVAL":
+                raise StateConflict("ATTEMPT_WAITING_APPROVAL_TRANSITION_INVALID")
+            copied._worker_attempts[attempt.attempt_id] = replace(attempt, state="RUNNING")
+            outcome = CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.ACCEPTED,
+                run_id=payload.run_id,
+                resulting_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._command_receipts[command.request_id] = (
+                run.repository_id,
+                payload.run_id,
+                _command_digest(command),
+                _outcome_json(outcome),
+                AuditSequence(expected_sequence + 1),
+            )
+            accepted.append(intent)
+            event_kinds.append("GRANT_CONSUMED_AND_INTENT_RECORDED")
+
+        self._commit_state_and_events(
+            run_id=payload.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
+            mutate=mutate,
+        )
+        return accepted[0] if accepted else None
+
+    def approval_grant(self, grant_id: GrantId) -> ApprovalGrant:
+        try:
+            grant, _ = self._approval_grants[grant_id]
+        except KeyError as error:
+            raise StateConflict("APPROVAL_GRANT_NOT_FOUND") from error
+        try:
+            restored = approval_grant_from_json(approval_grant_to_json(grant))
+        except ValueError as error:
+            raise StateConflict("APPROVAL_GRANT_STORAGE_INVALID") from error
+        if restored != grant:
+            raise StateConflict("APPROVAL_GRANT_STORAGE_INVALID")
+        return grant
+
+    @staticmethod
+    def _validated_granted_action(
+        store: InMemoryStateStore, intent_id: IntentId
+    ) -> GrantedActionIntent:
+        intent = store._granted_action_intents.get(intent_id)
+        if intent is None or intent.state not in {"INTENT_RECORDED", "DISPATCHED"}:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        pending = store._validated_pending_action(store._pending_actions[intent.pending_id])
+        grant_entry = store._approval_grants.get(intent.grant_id)
+        effect = store._require_unsettled_effect_intent(intent.bindings.run_id, intent.intent_id)
+        if (
+            grant_entry is None
+            or pending.state != "GRANT_CONSUMED"
+            or pending.action != intent.action
+            or pending.normalized_action_json != intent.normalized_action_json
+            or pending.action_digest != intent.action_digest
+            or pending.expected_pre_state != intent.expected_pre_state
+            or pending.bindings != intent.bindings
+            or grant_entry[0].state != "CONSUMED"
+            or grant_entry[0].pending_id != intent.pending_id
+            or grant_entry[0].bindings != intent.bindings
+            or grant_entry[0].consumed_intent_id != intent.intent_id
+            or intent.to_effect_intent(effect.recorded_sequence) != effect
+        ):
+            raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+        return intent
+
+    def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._lock:
+            return self._validated_granted_action(self, intent_id)
+
+    def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
+        candidates = sorted(
+            (
+                intent
+                for intent in self._granted_action_intents.values()
+                if intent.bindings.run_id == run_id
+                and intent.state in {"INTENT_RECORDED", "DISPATCHED"}
+                and intent.intent_id not in self._effect_results
+                and intent.intent_id not in self._indeterminate_effect_intents
+            ),
+            key=lambda item: (
+                self._effect_intents[item.intent_id].recorded_sequence,
+                item.intent_id,
+            ),
+        )
+        return (
+            None
+            if not candidates
+            else self._validated_granted_action(self, candidates[0].intent_id)
+        )
+
+    def mark_granted_action_dispatched(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent:
+        result: list[GrantedActionIntent] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+                or intent.state != "INTENT_RECORDED"
+            ):
+                raise StateConflict("GRANTED_ACTION_DISPATCH_STATE_INVALID")
+            dispatched = replace(intent, state="DISPATCHED")
+            copied._granted_action_intents[intent_id] = dispatched
+            result.append(dispatched)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_DISPATCHED",
+                applicable_revision_digests=applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def settle_granted_action(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        result: ToolResult,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != run_id or result.intent_id != intent_id:
+            raise StateConflict("GRANTED_ACTION_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+        if effect_result.outcome == "INDETERMINATE":
+            raise StateConflict("GRANTED_ACTION_DETERMINATE_RESULT_REQUIRED")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            action = copied._worker_actions.get(intent.bindings.action_id)
+            attempt = copied._worker_attempts.get(intent.bindings.attempt_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+                or action is None
+                or action.intent_id is not None
+                or action.result_intent_id is not None
+                or action.authorization_binding_digest
+                != intent.bindings.authorization_binding_digest
+                or action.normalized_action_digest != intent.action_digest
+                or action.expected_prestate_digest
+                != sha256_digest(intent.expected_pre_state.canonical_json())
+                or attempt is None
+                or attempt.state != "RUNNING"
+            ):
+                raise StateConflict("GRANTED_WORKER_ACTION_SETTLEMENT_MISMATCH")
+            copied._effect_results[intent_id] = effect_result
+            copied._worker_actions[action.action_id] = replace(action, result_intent_id=intent_id)
+            copied._granted_action_intents[intent_id] = replace(intent, state="SETTLED")
+            copied._pending_actions[intent.pending_id] = replace(
+                copied._pending_actions[intent.pending_id], state="SETTLED"
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_SETTLED",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def mark_granted_action_indeterminate(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        observation_digest: Sha256DigestText,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        result = ToolResult.indeterminate(
+            "GRANTED_ACTION_POSTSTATE_UNCERTAIN", run_id=run_id, intent_id=intent_id
+        ).model_copy(update={"content_digest": observation_digest})
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            if intent.bindings.applicable_revision_digests != applicable_revision_digests:
+                raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+            copied._effect_results[intent_id] = effect_result
+            copied._indeterminate_effect_intents.add(intent_id)
+            copied._granted_action_intents[intent_id] = replace(intent, state="INDETERMINATE")
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_INDETERMINATE",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class="INDETERMINATE",
+                subject_digests=(observation_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def granted_intent_count(self, pending_id: PendingActionId) -> int:
+        return sum(
+            intent.pending_id == pending_id for intent in self._granted_action_intents.values()
+        )
+
+    def approval_grant_count(self, pending_id: PendingActionId) -> int:
+        return sum(grant.pending_id == pending_id for grant, _ in self._approval_grants.values())
+
+    def effect_for_pending(self, pending_id: PendingActionId) -> GrantedActionIntent:
+        matches = tuple(
+            intent
+            for intent in self._granted_action_intents.values()
+            if intent.pending_id == pending_id
+        )
+        if len(matches) != 1:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        return matches[0]
 
     def finish_attempt(
         self,
@@ -5573,6 +6113,16 @@ class InMemoryStateStore:
                 resulting_sequence=sequence,
                 failed_invariant="STALE_SEQUENCE",
             )
+        if isinstance(command.payload, GrantPayload):
+            self.accept_pending_action_grant(
+                command=command,
+                now=datetime.now(UTC),
+                expected_sequence=AuditSequence(sequence),
+            )
+            outcome = self._existing_control_outcome(command)
+            if outcome is None:
+                raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
+            return outcome
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, run.state)
         if isinstance(

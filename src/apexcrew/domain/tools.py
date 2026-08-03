@@ -13,10 +13,18 @@ from apexcrew.domain.actions import (
     CheckAction,
     PatchAction,
     ReadAction,
+    RiskyAction,
     SearchAction,
     ToolActionEnvelope,
 )
-from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision, WorkspaceLease
+from apexcrew.domain.authority import (
+    ActionClass,
+    ActionDeadline,
+    GrantedActionIntent,
+    TimeoutDecision,
+    WorkspaceLease,
+    canonical_action_json,
+)
 from apexcrew.domain.commands import ApplicableRevisionDigests
 from apexcrew.domain.effects import EffectIntent, EffectResult, canonical_json, sha256_digest
 from apexcrew.domain.plan import (
@@ -73,6 +81,10 @@ class ToolEffectResultError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class ToolAuthorizationError(ValueError):
+    pass
 
 
 class SnapshotUnavailable(RuntimeError):
@@ -380,6 +392,88 @@ class ActionPreState(FrozenDocument):
         return canonical_json(self.model_dump(mode="json", exclude_none=True))
 
 
+class GrantedActionObservation(FrozenDocument):
+    state: Literal["EXACT_PRE", "EXACT_POST", "THIRD", "UNAVAILABLE"]
+    digest: Sha256DigestText
+    post_result: ToolResult | None = None
+
+    @model_validator(mode="after")
+    def validate_post_result(self) -> Self:
+        if (self.state == "EXACT_POST") != (self.post_result is not None):
+            raise ValueError("GRANTED_ACTION_OBSERVATION_RESULT_INVALID")
+        return self
+
+    def result_for(self, intent: GrantedActionIntent) -> ToolResult:
+        if self.state != "EXACT_POST" or self.post_result is None:
+            raise ValueError("GRANTED_ACTION_POST_RESULT_REQUIRED")
+        if self.post_result.run_id not in {None, intent.bindings.run_id}:
+            raise ToolAuthorizationError("GRANTED_RESULT_RUN_MISMATCH")
+        if self.post_result.intent_id not in {None, intent.intent_id}:
+            raise ToolAuthorizationError("GRANTED_RESULT_INTENT_MISMATCH")
+        return self.post_result.model_copy(
+            update={"run_id": intent.bindings.run_id, "intent_id": intent.intent_id}
+        )
+
+
+class GrantedWorkspacePort(Protocol):
+    def observe(
+        self, action: RiskyAction, expected: ActionPreState
+    ) -> GrantedActionObservation: ...
+
+    def delete_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult: ...
+
+    def rename_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult: ...
+
+    def set_executable(self, action: RiskyAction, expected: ActionPreState) -> ToolResult: ...
+
+    def apply_protected_patch(
+        self, action: RiskyAction, expected: ActionPreState
+    ) -> ToolResult: ...
+
+
+class GrantedActionToolPort(Protocol):
+    def observe_granted_action(self, intent: GrantedActionIntent) -> GrantedActionObservation: ...
+
+    def execute_granted(self, intent: GrantedActionIntent) -> ToolResult: ...
+
+
+class GrantedActionJournal(Protocol):
+    def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None: ...
+
+    def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent: ...
+
+    def mark_granted_action_dispatched(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent: ...
+
+    def settle_granted_action(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        result: ToolResult,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+    def mark_granted_action_indeterminate(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        observation_digest: Sha256DigestText,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
+
+
 class ToolIntent(FrozenDocument):
     intent_id: IntentId
     run_id: RunId
@@ -562,6 +656,9 @@ class ToolResult(FrozenDocument):
         )
 
 
+GrantedActionObservation.model_rebuild()
+
+
 def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> None:
     if intent.kind not in {"patch", "check"}:
         return
@@ -633,6 +730,7 @@ class ScopedToolRuntime:
         deadline_journal: CheckDeadlineJournal | None = None,
         deadline_authority: CheckDeadlineAuthority | None = None,
         workspace_lease: WorkspaceLease | None = None,
+        granted_workspace: GrantedWorkspacePort | None = None,
     ) -> None:
         self._snapshot = snapshot
         self._read_globs = tuple(GlobPattern.parse(pattern) for pattern in read_globs)
@@ -653,6 +751,7 @@ class ScopedToolRuntime:
         self._deadline_journal = deadline_journal
         self._deadline_authority = deadline_authority
         self._workspace_lease = workspace_lease
+        self._granted_workspace = granted_workspace
         if (denial_journal is None) != (denial_expected_sequence is None):
             raise ValueError("TOOL_DENIAL_AUDIT_BINDING_INCOMPLETE")
         self._denial_journal = denial_journal
@@ -672,6 +771,34 @@ class ScopedToolRuntime:
         if self._policy.classify(intent.action) == "REQUIRE_APPROVAL":
             return ToolResult.approval_required(intent)
         return self._denied(intent, "LEASE_SCOPE_DENIED")
+
+    def execute_granted(self, intent: GrantedActionIntent) -> ToolResult:
+        if canonical_action_json(intent.action) != intent.normalized_action_json:
+            raise ToolAuthorizationError("GRANTED_INTENT_MISMATCH")
+        if self._granted_workspace is None:
+            raise ToolAuthorizationError("GRANTED_WORKSPACE_NOT_CONFIGURED")
+        handler = {
+            "delete": self._granted_workspace.delete_regular_file,
+            "rename": self._granted_workspace.rename_regular_file,
+            "set_executable": self._granted_workspace.set_executable,
+            "protected_patch": self._granted_workspace.apply_protected_patch,
+        }[intent.action.operation]
+        result = handler(intent.action, intent.expected_pre_state)
+        if result.run_id not in {None, intent.bindings.run_id} or result.intent_id not in {
+            None,
+            intent.intent_id,
+        }:
+            raise ToolAuthorizationError("GRANTED_RESULT_OWNERSHIP_MISMATCH")
+        return result.model_copy(
+            update={"run_id": intent.bindings.run_id, "intent_id": intent.intent_id}
+        )
+
+    def observe_granted_action(self, intent: GrantedActionIntent) -> GrantedActionObservation:
+        if canonical_action_json(intent.action) != intent.normalized_action_json:
+            raise ToolAuthorizationError("GRANTED_INTENT_MISMATCH")
+        if self._granted_workspace is None:
+            raise ToolAuthorizationError("GRANTED_WORKSPACE_NOT_CONFIGURED")
+        return self._granted_workspace.observe(intent.action, intent.expected_pre_state)
 
     def _current_authorization(self, intent: ToolIntent) -> bool:
         return (

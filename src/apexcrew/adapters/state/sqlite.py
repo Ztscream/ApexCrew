@@ -5,7 +5,7 @@ import sqlite3
 from base64 import b32encode
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -22,7 +22,7 @@ from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
     TargetAuthorityDigestService,
 )
-from apexcrew.domain.actions import FailAction, FinishAction
+from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, RiskyAction
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
@@ -37,6 +37,7 @@ from apexcrew.domain.authority import (
     ActionDeadline,
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    ApprovalGrant,
     AtomicAction,
     AttemptLifecycleState,
     AuthorityDenied,
@@ -49,14 +50,19 @@ from apexcrew.domain.authority import (
     CheckpointKey,
     DispatchAuthorization,
     DispatchCloseCause,
+    FrozenActionBindings,
     GlobalBudgetMetric,
     GlobalUsageSnapshot,
+    GrantCommandValidator,
+    GrantedActionIntent,
+    GrantValidationError,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
     ModelReservationRequest,
     MonotonicClock,
     MonotonicInstant,
+    PendingAction,
     ProgressEvidence,
     ResumeTaskRequest,
     RuntimeAuditStamp,
@@ -72,17 +78,26 @@ from apexcrew.domain.authority import (
     TrancheReason,
     WorkspaceLease,
     action_deadline_binding,
+    approval_grant_from_json,
+    approval_grant_id,
+    approval_grant_to_json,
     budget_ceiling_exhaustions_from_json,
     budget_ceiling_exhaustions_to_json,
     budget_warning_from_json,
     budget_warning_to_json,
+    canonical_action_json,
+    confirmation_code_for_pending_digest,
     crossed_threshold,
     dispatch_close_causes_from_json,
     dispatch_close_causes_to_json,
+    freeze_pending_action,
+    frozen_action_bindings_from_mapping,
     global_ceiling_for,
     global_numeric_from_text,
+    granted_action_intent_id,
     model_reservation_amounts,
     normalize_global_budget_metric,
+    pending_action_subject_json,
     progress_from_checks,
     task_resume_ids,
     timeout_decision_from_json,
@@ -98,6 +113,7 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
     CreateRunPayload,
+    GrantPayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
@@ -179,6 +195,7 @@ from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
     ModelConfigurationRevisionDocument,
+    PolicyRevisionDocument,
     Sha256DigestText,
     revision_digest,
 )
@@ -188,7 +205,9 @@ from apexcrew.domain.types import (
     AuditSequence,
     CommandStatus,
     GitOid,
+    GrantId,
     IntentId,
+    PendingActionId,
     RepositoryId,
     RequestId,
     RevisionDigest,
@@ -863,6 +882,63 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        17,
+        (
+            """CREATE TABLE pending_actions (
+                pending_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                attempt_id TEXT NOT NULL REFERENCES worker_attempts(attempt_id),
+                normalized_action_json TEXT NOT NULL,
+                action_digest TEXT NOT NULL,
+                pending_action_digest TEXT NOT NULL UNIQUE,
+                confirmation_code_digest TEXT NOT NULL,
+                logical_turn_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                authorization_binding_digest TEXT NOT NULL,
+                authorized_deadline_at_utc TEXT NOT NULL,
+                expected_pre_state_json TEXT NOT NULL,
+                bindings_json TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'WAITING_APPROVAL','GRANT_CONSUMED','SETTLED','INVALIDATED'
+                ))
+            )""",
+            """CREATE TABLE approval_grants (
+                grant_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                source_request_id TEXT NOT NULL UNIQUE,
+                grant_kind TEXT NOT NULL CHECK(grant_kind IN (
+                    'PENDING_ACTION','FINAL_CANDIDATE','PURGE'
+                )),
+                pending_id TEXT REFERENCES pending_actions(pending_id),
+                candidate_id TEXT,
+                purge_manifest_digest TEXT,
+                grant_json TEXT NOT NULL,
+                consumed_intent_id TEXT UNIQUE,
+                state TEXT NOT NULL CHECK(state IN (
+                    'ISSUED','CONSUMED','REJECTED','EXPIRED','INVALIDATED'
+                )),
+                CHECK(
+                    (pending_id IS NOT NULL) + (candidate_id IS NOT NULL) +
+                    (purge_manifest_digest IS NOT NULL) = 1
+                )
+            )""",
+            """CREATE TABLE granted_action_intents (
+                intent_id TEXT PRIMARY KEY REFERENCES effect_intents(intent_id),
+                pending_id TEXT NOT NULL UNIQUE REFERENCES pending_actions(pending_id),
+                grant_id TEXT NOT NULL UNIQUE REFERENCES approval_grants(grant_id),
+                normalized_action_json TEXT NOT NULL,
+                action_digest TEXT NOT NULL,
+                expected_pre_state_json TEXT NOT NULL,
+                bindings_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'INTENT_RECORDED','DISPATCHED','SETTLED','INDETERMINATE'
+                )),
+                result_json TEXT
+            )""",
+        ),
+    ),
 )
 
 
@@ -1142,6 +1218,60 @@ def _workspace_lease_from_row(row: sqlite3.Row) -> WorkspaceLease:
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise StateConflict("WORKSPACE_LEASE_STORAGE_INVALID") from error
+
+
+def _pending_action_from_row(row: sqlite3.Row) -> PendingAction:
+    try:
+        action = ACTION_ADAPTER.validate_json(str(row["normalized_action_json"]))
+        if not isinstance(action, RiskyAction):
+            raise TypeError("PENDING_ACTION_REQUIRES_RISKY_ACTION")
+        expected_pre_state = ActionPreState.model_validate_json(str(row["expected_pre_state_json"]))
+        bindings_data = json.loads(str(row["bindings_json"]))
+        if not isinstance(bindings_data, dict):
+            raise TypeError("PENDING_ACTION_BINDINGS_INVALID")
+        bindings = frozen_action_bindings_from_mapping(bindings_data)
+        pending = PendingAction(
+            pending_id=PendingActionId(str(row["pending_id"])),
+            action=action,
+            normalized_action_json=str(row["normalized_action_json"]),
+            action_digest=Sha256DigestText(str(row["action_digest"])),
+            pending_action_digest=Sha256DigestText(str(row["pending_action_digest"])),
+            confirmation_code_digest=Sha256DigestText(str(row["confirmation_code_digest"])),
+            authorization_binding_digest=str(row["authorization_binding_digest"]),
+            expected_pre_state=expected_pre_state,
+            bindings=bindings,
+            expires_at=datetime.fromisoformat(str(row["expires_at_utc"])),
+            state=str(row["state"]),  # type: ignore[arg-type]
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StateConflict("PENDING_ACTION_STORAGE_INVALID") from error
+    subject = pending_action_subject_json(
+        pending_id=pending.pending_id,
+        normalized_action_json=pending.normalized_action_json,
+        action_digest=pending.action_digest,
+        authorization_binding_digest=Sha256DigestText(pending.authorization_binding_digest),
+        expected_pre_state=pending.expected_pre_state,
+        bindings=pending.bindings,
+        expires_at=pending.expires_at,
+    )
+    if (
+        canonical_action_json(pending.action) != pending.normalized_action_json
+        or sha256_digest(pending.normalized_action_json) != pending.action_digest
+        or sha256_digest(subject) != pending.pending_action_digest
+        or sha256_digest(confirmation_code_for_pending_digest(pending.pending_action_digest))
+        != pending.confirmation_code_digest
+        or pending.authorization_binding_digest != pending.bindings.authorization_binding_digest
+        or pending.bindings.run_id != RunId(str(row["run_id"]))
+        or pending.bindings.attempt_id != AttemptId(str(row["attempt_id"]))
+        or pending.bindings.logical_turn_id != str(row["logical_turn_id"])
+        or pending.bindings.action_id != str(row["action_id"])
+        or pending.bindings.deadline_at_utc
+        != datetime.fromisoformat(str(row["authorized_deadline_at_utc"]))
+        or pending.expected_pre_state.canonical_json() != str(row["expected_pre_state_json"])
+        or canonical_json(asdict(pending.bindings)) != str(row["bindings_json"])
+    ):
+        raise StateConflict("PENDING_ACTION_STORAGE_INVALID")
+    return pending
 
 
 class _LeaseDenied(RuntimeError):
@@ -3514,8 +3644,25 @@ class SqliteStateStore:
             raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
         with self._read_transaction() as connection:
             binding = self._worker_turn_binding_in_transaction(connection, request.attempt_id)
+            policy_row = connection.execute(
+                "SELECT document_json FROM revision_documents WHERE run_id = ? "
+                "AND revision_class = 'POLICY' AND revision_digest = ? "
+                "AND state = 'CURRENT'",
+                (binding.run_id, binding.policy_digest),
+            ).fetchone()
+        if policy_row is None:
+            raise StateConflict("CURRENT_POLICY_NOT_FOUND")
         try:
             pending_id = pending_worker_action_id(binding, request, decision, expected_prestate)
+            policy = PolicyRevisionDocument.model_validate_json(str(policy_row["document_json"]))
+            pending = freeze_pending_action(
+                PendingActionId(pending_id),
+                request,
+                decision,
+                expected_prestate,
+                request.started_at_utc,
+                policy.grant_ttl_seconds,
+            )
         except ValueError as error:
             raise StateConflict(str(error)) from error
 
@@ -3529,6 +3676,33 @@ class SqliteStateStore:
             ).fetchone()
             if duplicate is not None:
                 raise StateConflict("WORKER_ACTION_DUPLICATE")
+            try:
+                connection.execute(
+                    "INSERT INTO pending_actions(pending_id, run_id, attempt_id, "
+                    "normalized_action_json, action_digest, pending_action_digest, "
+                    "confirmation_code_digest, logical_turn_id, action_id, "
+                    "authorization_binding_digest, authorized_deadline_at_utc, "
+                    "expected_pre_state_json, bindings_json, expires_at_utc, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WAITING_APPROVAL')",
+                    (
+                        pending.pending_id,
+                        binding.run_id,
+                        binding.attempt_id,
+                        pending.normalized_action_json,
+                        pending.action_digest,
+                        pending.pending_action_digest,
+                        pending.confirmation_code_digest,
+                        request.logical_turn_id,
+                        request.action_id,
+                        pending.authorization_binding_digest,
+                        pending.bindings.deadline_at_utc.isoformat(),
+                        pending.expected_pre_state.canonical_json(),
+                        canonical_json(asdict(pending.bindings)),
+                        pending.expires_at.isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("PENDING_ACTION_DUPLICATE") from error
             connection.execute(
                 "INSERT INTO worker_actions(action_id, run_id, task_id, attempt_id, "
                 "logical_turn_id, normalized_action_digest, expected_prestate_digest, "
@@ -3588,6 +3762,712 @@ class SqliteStateStore:
             mutate=mutate,
         )
         return PendingActionFreeze(pending_id, sequence)
+
+    def pending_action(self, key: RunId | PendingActionId) -> PendingAction:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM pending_actions WHERE pending_id = ?", (str(key),)
+            ).fetchone()
+            if row is None:
+                rows = tuple(
+                    connection.execute(
+                        "SELECT * FROM pending_actions WHERE run_id = ? ORDER BY pending_id",
+                        (str(key),),
+                    )
+                )
+                if len(rows) != 1:
+                    raise StateConflict("PENDING_ACTION_NOT_FOUND_OR_AMBIGUOUS")
+                row = rows[0]
+        return _pending_action_from_row(row)
+
+    def pending_actions(self, run_id: RunId) -> tuple[PendingAction, ...]:
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT * FROM pending_actions WHERE run_id = ? ORDER BY pending_id",
+                    (run_id,),
+                )
+            )
+        return tuple(_pending_action_from_row(row) for row in rows)
+
+    @staticmethod
+    def _pending_action_in_transaction(
+        connection: sqlite3.Connection, pending_id: PendingActionId
+    ) -> PendingAction:
+        row = connection.execute(
+            "SELECT * FROM pending_actions WHERE pending_id = ?", (pending_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflict("PENDING_ACTION_NOT_FOUND")
+        return _pending_action_from_row(row)
+
+    @staticmethod
+    def _current_frozen_action_bindings(
+        connection: sqlite3.Connection, pending: PendingAction
+    ) -> FrozenActionBindings:
+        row = connection.execute(
+            "SELECT runs.run_head_oid, runs.current_plan_digest, "
+            "runs.current_policy_digest, runs.current_budget_digest, "
+            "runs.current_model_configuration_digest, worker_attempts.run_id, "
+            "worker_attempts.task_id, worker_attempts.tool_schema_digest, "
+            "worker_attempts.target_safety_digest, worker_attempts.state AS attempt_state, "
+            "worker_actions.logical_turn_id, worker_actions.action_id, "
+            "worker_actions.authorization_binding_digest, worker_actions.deadline_at_utc, "
+            "workspace_leases.lease_id, workspace_leases.generation, "
+            "workspace_leases.state AS lease_state "
+            "FROM worker_attempts JOIN runs USING(run_id) "
+            "JOIN worker_actions USING(attempt_id) "
+            "JOIN workspace_leases ON workspace_leases.lease_id = worker_attempts.lease_id "
+            "WHERE worker_attempts.attempt_id = ? AND worker_actions.action_id = ? "
+            "AND workspace_leases.lease_id = ?",
+            (
+                pending.bindings.attempt_id,
+                pending.bindings.action_id,
+                pending.bindings.lease_id,
+            ),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("FROZEN_ACTION_BINDING_NOT_FOUND")
+        lease_generation = int(row["generation"])
+        if row["lease_state"] != "ACTIVE" or row["attempt_state"] != "WAITING_APPROVAL":
+            lease_generation = -1
+        return FrozenActionBindings(
+            run_id=RunId(str(row["run_id"])),
+            task_id=TaskId(str(row["task_id"])),
+            attempt_id=pending.bindings.attempt_id,
+            logical_turn_id=str(row["logical_turn_id"]),
+            action_id=str(row["action_id"]),
+            lease_id=str(row["lease_id"]),
+            lease_generation=lease_generation,
+            run_head_oid=str(row["run_head_oid"]),
+            target_safety_digest=RevisionDigest(str(row["target_safety_digest"])),
+            plan_digest=RevisionDigest(str(row["current_plan_digest"])),
+            policy_digest=RevisionDigest(str(row["current_policy_digest"])),
+            budget_digest=RevisionDigest(str(row["current_budget_digest"])),
+            model_configuration_digest=RevisionDigest(
+                str(row["current_model_configuration_digest"])
+            ),
+            tool_schema_digest=str(row["tool_schema_digest"]),
+            authorization_binding_digest=str(row["authorization_binding_digest"]),
+            deadline_at_utc=datetime.fromisoformat(str(row["deadline_at_utc"])),
+        )
+
+    @staticmethod
+    def _insert_approval_grant(
+        connection: sqlite3.Connection,
+        grant: ApprovalGrant,
+        request_id: RequestId,
+    ) -> None:
+        if grant.state != "ISSUED" or grant.consumed_intent_id is not None:
+            raise StateConflict("NEW_APPROVAL_GRANT_MUST_BE_ISSUED")
+        try:
+            connection.execute(
+                "INSERT INTO approval_grants(grant_id, run_id, source_request_id, "
+                "grant_kind, pending_id, candidate_id, purge_manifest_digest, grant_json, "
+                "consumed_intent_id, state) VALUES (?, ?, ?, 'PENDING_ACTION', ?, NULL, "
+                "NULL, ?, NULL, 'ISSUED')",
+                (
+                    grant.grant_id,
+                    grant.bindings.run_id,
+                    request_id,
+                    grant.pending_id,
+                    approval_grant_to_json(grant),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise StateConflict("APPROVAL_GRANT_DUPLICATE") from error
+
+    def _insert_granted_action_intent(
+        self, connection: sqlite3.Connection, intent: GrantedActionIntent
+    ) -> None:
+        effect = self._require_unsettled_effect_intent(
+            connection, intent.bindings.run_id, intent.intent_id
+        )
+        if effect.kind != "granted_risky_action" or intent.state != "INTENT_RECORDED":
+            raise StateConflict("GRANTED_ACTION_EFFECT_INTENT_REQUIRED")
+        try:
+            connection.execute(
+                "INSERT INTO granted_action_intents(intent_id, pending_id, grant_id, "
+                "normalized_action_json, action_digest, expected_pre_state_json, "
+                "bindings_json, state, result_json) VALUES (?, ?, ?, ?, ?, ?, ?, "
+                "'INTENT_RECORDED', NULL)",
+                (
+                    intent.intent_id,
+                    intent.pending_id,
+                    intent.grant_id,
+                    intent.normalized_action_json,
+                    intent.action_digest,
+                    intent.expected_pre_state.canonical_json(),
+                    canonical_json(asdict(intent.bindings)),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise StateConflict("GRANTED_ACTION_INTENT_DUPLICATE") from error
+
+    @staticmethod
+    def _consume_grant_once(
+        connection: sqlite3.Connection,
+        grant: ApprovalGrant,
+        intent_id: IntentId,
+        consumed_sequence: AuditSequence,
+    ) -> ApprovalGrant:
+        consumed = replace(
+            grant,
+            state="CONSUMED",
+            consumed_intent_id=intent_id,
+            consumed_sequence=consumed_sequence,
+        )
+        if (
+            connection.execute(
+                "UPDATE approval_grants SET state = 'CONSUMED', consumed_intent_id = ?, "
+                "grant_json = ? WHERE grant_id = ? AND state = 'ISSUED' "
+                "AND consumed_intent_id IS NULL",
+                (intent_id, approval_grant_to_json(consumed), grant.grant_id),
+            ).rowcount
+            != 1
+        ):
+            raise StateConflict("GRANT_ALREADY_CONSUMED")
+        return consumed
+
+    @staticmethod
+    def _set_pending_state(
+        connection: sqlite3.Connection,
+        pending_id: PendingActionId,
+        source: str,
+        target: str,
+    ) -> None:
+        if (
+            connection.execute(
+                "UPDATE pending_actions SET state = ? WHERE pending_id = ? AND state = ?",
+                (target, pending_id, source),
+            ).rowcount
+            != 1
+        ):
+            raise StateConflict("PENDING_ACTION_STATE_TRANSITION_INVALID")
+
+    @staticmethod
+    def _invalidate_pending_action(connection: sqlite3.Connection, pending: PendingAction) -> None:
+        if (
+            connection.execute(
+                "UPDATE pending_actions SET state = 'INVALIDATED' "
+                "WHERE pending_id = ? AND state = 'WAITING_APPROVAL'",
+                (pending.pending_id,),
+            ).rowcount
+            != 1
+            or connection.execute(
+                "UPDATE worker_attempts SET state = 'STALE' "
+                "WHERE attempt_id = ? AND state = 'WAITING_APPROVAL'",
+                (pending.bindings.attempt_id,),
+            ).rowcount
+            != 1
+        ):
+            raise StateConflict("PENDING_ACTION_INVALIDATION_COMPARE_AND_SET_FAILED")
+
+    def accept_pending_action_grant(
+        self,
+        *,
+        command: CommandEnvelope,
+        now: datetime,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent | None:
+        if not isinstance(command.payload, GrantPayload):
+            raise TypeError("PENDING_ACTION_GRANT_PAYLOAD_REQUIRED")
+        payload = command.payload
+        accepted: list[GrantedActionIntent] = []
+        event_kinds: list[str] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            repository = connection.execute(
+                "SELECT repository_id FROM runs WHERE run_id = ?", (payload.run_id,)
+            ).fetchone()
+            if repository is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            interrupt = connection.execute(
+                "SELECT 1 FROM runtime_interrupts WHERE run_id = ? AND state = 'PENDING'",
+                (payload.run_id,),
+            ).fetchone()
+            if interrupt is not None:
+                raise StateConflict("RUNTIME_INTERRUPT_PENDING")
+            try:
+                pending = self._pending_action_in_transaction(connection, payload.pending_action_id)
+            except StateConflict:
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant="PENDING_ACTION_BINDING_INVALID",
+                    safe_next_action="USE_DISPLAYED_CONFIRMATION_CODE",
+                )
+                self._insert_control_receipt(
+                    connection,
+                    command,
+                    payload.run_id,
+                    RepositoryId(str(repository["repository_id"])),
+                    outcome,
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            try:
+                if (
+                    command.applicable_revision_digests
+                    != pending.bindings.applicable_revision_digests
+                ):
+                    raise GrantValidationError("PENDING_ACTION_BINDING_INVALID")
+                GrantCommandValidator().validate_payload_before_grant_write(payload, pending, now)
+            except GrantValidationError as error:
+                expired = str(error) == "PENDING_ACTION_EXPIRED"
+                if expired:
+                    self._invalidate_pending_action(connection, pending)
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE if expired else CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=str(error),
+                    safe_next_action=(
+                        "CREATE_FRESH_ATTEMPT" if expired else "USE_DISPLAYED_CONFIRMATION_CODE"
+                    ),
+                )
+                self._insert_control_receipt(
+                    connection,
+                    command,
+                    payload.run_id,
+                    RepositoryId(str(repository["repository_id"])),
+                    outcome,
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            grant = ApprovalGrant(
+                grant_id=approval_grant_id(
+                    RequestId(command.request_id), pending.pending_action_digest
+                ),
+                pending_id=pending.pending_id,
+                pending_action_digest=pending.pending_action_digest,
+                confirmation_code_digest=pending.confirmation_code_digest,
+                bindings=pending.bindings,
+                expires_at=pending.expires_at,
+            )
+            self._insert_approval_grant(connection, grant, RequestId(command.request_id))
+            try:
+                current = self._current_frozen_action_bindings(connection, pending)
+                GrantCommandValidator().validate_current_binding(grant, pending, current, now)
+            except (GrantValidationError, StateConflict) as error:
+                self._invalidate_pending_action(connection, pending)
+                invalidated = replace(grant, state="INVALIDATED")
+                if (
+                    connection.execute(
+                        "UPDATE approval_grants SET state = 'INVALIDATED', grant_json = ? "
+                        "WHERE grant_id = ? AND state = 'ISSUED' "
+                        "AND consumed_intent_id IS NULL",
+                        (approval_grant_to_json(invalidated), grant.grant_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("PENDING_GRANT_INVALIDATION_COMPARE_AND_SET_FAILED")
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=(
+                        str(error)
+                        if isinstance(error, GrantValidationError)
+                        else "GRANT_BINDING_MISMATCH"
+                    ),
+                )
+                self._insert_control_receipt(
+                    connection,
+                    command,
+                    payload.run_id,
+                    RepositoryId(str(repository["repository_id"])),
+                    outcome,
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            self._issue_runtime_permit_in_transaction(
+                connection,
+                command,
+                "ACTIVE",
+                pending.bindings.applicable_revision_digests,
+                self._target_authority_digest_in_transaction(connection, payload.run_id),
+                AuditSequence(expected_sequence + 1),
+            )
+            intent = GrantedActionIntent(
+                intent_id=granted_action_intent_id(grant),
+                pending_id=pending.pending_id,
+                grant_id=grant.grant_id,
+                action=pending.action,
+                normalized_action_json=pending.normalized_action_json,
+                action_digest=pending.action_digest,
+                expected_pre_state=pending.expected_pre_state,
+                bindings=pending.bindings,
+            )
+            self._insert_effect_intent(
+                connection,
+                intent.to_effect_intent(AuditSequence(expected_sequence + 1)),
+            )
+            self._insert_granted_action_intent(connection, intent)
+            self._consume_grant_once(
+                connection,
+                grant,
+                intent.intent_id,
+                AuditSequence(expected_sequence + 1),
+            )
+            self._set_pending_state(
+                connection, pending.pending_id, "WAITING_APPROVAL", "GRANT_CONSUMED"
+            )
+            if (
+                connection.execute(
+                    "UPDATE worker_attempts SET state = 'RUNNING' "
+                    "WHERE attempt_id = ? AND state = 'WAITING_APPROVAL'",
+                    (pending.bindings.attempt_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("ATTEMPT_WAITING_APPROVAL_TRANSITION_INVALID")
+            outcome = CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.ACCEPTED,
+                run_id=payload.run_id,
+                resulting_sequence=AuditSequence(expected_sequence + 1),
+            )
+            self._insert_control_receipt(
+                connection,
+                command,
+                payload.run_id,
+                RepositoryId(str(repository["repository_id"])),
+                outcome,
+            )
+            accepted.append(intent)
+            event_kinds.append("GRANT_CONSUMED_AND_INTENT_RECORDED")
+
+        self._commit_state_and_events(
+            run_id=payload.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
+            mutate=mutate,
+        )
+        return accepted[0] if accepted else None
+
+    def approval_grant(self, grant_id: GrantId) -> ApprovalGrant:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT grant_json FROM approval_grants WHERE grant_id = ?", (grant_id,)
+            ).fetchone()
+        if row is None:
+            raise StateConflict("APPROVAL_GRANT_NOT_FOUND")
+        try:
+            return approval_grant_from_json(str(row["grant_json"]))
+        except ValueError as error:
+            raise StateConflict("APPROVAL_GRANT_STORAGE_INVALID") from error
+
+    def _granted_action_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        intent_id: IntentId,
+        *,
+        require_unsettled: bool = True,
+    ) -> GrantedActionIntent:
+        row = connection.execute(
+            "SELECT * FROM granted_action_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        pending = self._pending_action_in_transaction(
+            connection, PendingActionId(str(row["pending_id"]))
+        )
+        grant_row = connection.execute(
+            "SELECT grant_json, consumed_intent_id, state FROM approval_grants WHERE grant_id = ?",
+            (row["grant_id"],),
+        ).fetchone()
+        if grant_row is None:
+            raise StateConflict("GRANTED_ACTION_GRANT_NOT_FOUND")
+        try:
+            grant = approval_grant_from_json(str(grant_row["grant_json"]))
+            action = ACTION_ADAPTER.validate_json(str(row["normalized_action_json"]))
+            expected = ActionPreState.model_validate_json(str(row["expected_pre_state_json"]))
+            bindings_data = json.loads(str(row["bindings_json"]))
+            if not isinstance(action, RiskyAction) or not isinstance(bindings_data, dict):
+                raise TypeError("GRANTED_ACTION_STORAGE_INVALID")
+            bindings = frozen_action_bindings_from_mapping(bindings_data)
+            intent = GrantedActionIntent(
+                intent_id=IntentId(str(row["intent_id"])),
+                pending_id=PendingActionId(str(row["pending_id"])),
+                grant_id=GrantId(str(row["grant_id"])),
+                action=action,
+                normalized_action_json=str(row["normalized_action_json"]),
+                action_digest=Sha256DigestText(str(row["action_digest"])),
+                expected_pre_state=expected,
+                bindings=bindings,
+                state=str(row["state"]),  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StateConflict("GRANTED_ACTION_STORAGE_INVALID") from error
+        effect_row = connection.execute(
+            "SELECT * FROM effect_intents WHERE run_id = ? AND intent_id = ?",
+            (intent.bindings.run_id, intent.intent_id),
+        ).fetchone()
+        if effect_row is None:
+            raise StateConflict("GRANTED_ACTION_EFFECT_INTENT_NOT_FOUND")
+        effect = self._effect_intent_from_row(effect_row)
+        active_state = (
+            intent.state in {"INTENT_RECORDED", "DISPATCHED"}
+            and pending.state == "GRANT_CONSUMED"
+            and effect_row["state"] == "UNSETTLED"
+        )
+        terminal_state = (
+            intent.state == "SETTLED"
+            and pending.state == "SETTLED"
+            and effect_row["state"] == "SETTLED"
+        ) or (
+            intent.state == "INDETERMINATE"
+            and pending.state == "GRANT_CONSUMED"
+            and effect_row["state"] == "SETTLED"
+        )
+        if (
+            (not active_state if require_unsettled else not (active_state or terminal_state))
+            or pending.pending_id != intent.pending_id
+            or pending.action != intent.action
+            or pending.normalized_action_json != intent.normalized_action_json
+            or pending.action_digest != intent.action_digest
+            or pending.expected_pre_state != intent.expected_pre_state
+            or pending.bindings != intent.bindings
+            or grant.state != "CONSUMED"
+            or grant_row["state"] != "CONSUMED"
+            or grant.grant_id != intent.grant_id
+            or grant.pending_id != intent.pending_id
+            or grant.bindings != intent.bindings
+            or grant.consumed_intent_id != intent.intent_id
+            or grant_row["consumed_intent_id"] != intent.intent_id
+            or intent.to_effect_intent(effect.recorded_sequence) != effect
+            or canonical_json(asdict(intent.bindings)) != str(row["bindings_json"])
+        ):
+            raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+        return intent
+
+    def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._read_transaction() as connection:
+            return self._granted_action_in_transaction(connection, intent_id)
+
+    def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT granted_action_intents.intent_id FROM granted_action_intents "
+                "JOIN effect_intents USING(intent_id) WHERE effect_intents.run_id = ? "
+                "AND granted_action_intents.state IN ('INTENT_RECORDED','DISPATCHED') "
+                "AND effect_intents.state = 'UNSETTLED' "
+                "ORDER BY effect_intents.created_sequence, effect_intents.intent_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._granted_action_in_transaction(connection, IntentId(str(row["intent_id"])))
+
+    def mark_granted_action_dispatched(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent:
+        result: list[GrantedActionIntent] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            intent = self._granted_action_in_transaction(connection, intent_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+                or intent.state != "INTENT_RECORDED"
+                or connection.execute(
+                    "UPDATE granted_action_intents SET state = 'DISPATCHED' "
+                    "WHERE intent_id = ? AND state = 'INTENT_RECORDED'",
+                    (intent_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("GRANTED_ACTION_DISPATCH_STATE_INVALID")
+            result.append(replace(intent, state="DISPATCHED"))
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_DISPATCHED",
+                action_id=None,
+                applicable_revision_digests=applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def settle_granted_action(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        result: ToolResult,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != run_id or result.intent_id != intent_id:
+            raise StateConflict("GRANTED_ACTION_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+        if effect_result.outcome == "INDETERMINATE":
+            raise StateConflict("GRANTED_ACTION_DETERMINATE_RESULT_REQUIRED")
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            intent = self._granted_action_in_transaction(connection, intent_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+            ):
+                raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+            action = connection.execute(
+                "SELECT intent_id, result_intent_id, authorization_binding_digest, "
+                "normalized_action_digest, expected_prestate_digest FROM worker_actions "
+                "WHERE action_id = ? AND run_id = ? AND attempt_id = ?",
+                (intent.bindings.action_id, run_id, intent.bindings.attempt_id),
+            ).fetchone()
+            if (
+                action is None
+                or action["intent_id"] is not None
+                or action["result_intent_id"] is not None
+                or action["authorization_binding_digest"]
+                != intent.bindings.authorization_binding_digest
+                or action["normalized_action_digest"] != intent.action_digest
+                or action["expected_prestate_digest"]
+                != sha256_digest(intent.expected_pre_state.canonical_json())
+            ):
+                raise StateConflict("GRANTED_WORKER_ACTION_SETTLEMENT_MISMATCH")
+            self._insert_effect_result(
+                connection,
+                run_id,
+                intent_id,
+                effect_result,
+                applicable_revision_digests,
+            )
+            if (
+                connection.execute(
+                    "UPDATE worker_actions SET result_intent_id = ? WHERE action_id = ? "
+                    "AND intent_id IS NULL AND result_intent_id IS NULL",
+                    (intent_id, intent.bindings.action_id),
+                ).rowcount
+                != 1
+                or connection.execute(
+                    "UPDATE granted_action_intents SET state = 'SETTLED', result_json = ? "
+                    "WHERE intent_id = ? AND state IN ('INTENT_RECORDED','DISPATCHED')",
+                    (result.model_dump_json(), intent_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("GRANTED_ACTION_SETTLEMENT_COMPARE_AND_SET_FAILED")
+            self._set_pending_state(connection, intent.pending_id, "GRANT_CONSUMED", "SETTLED")
+            attempt = connection.execute(
+                "SELECT state FROM worker_attempts WHERE attempt_id = ?",
+                (intent.bindings.attempt_id,),
+            ).fetchone()
+            if attempt is None or attempt["state"] != "RUNNING":
+                raise StateConflict("GRANTED_ATTEMPT_NOT_RUNNABLE")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_SETTLED",
+                action_id=None,
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def mark_granted_action_indeterminate(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        observation_digest: Sha256DigestText,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        result = ToolResult.indeterminate(
+            "GRANTED_ACTION_POSTSTATE_UNCERTAIN", run_id=run_id, intent_id=intent_id
+        ).model_copy(update={"content_digest": observation_digest})
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            intent = self._granted_action_in_transaction(connection, intent_id)
+            if intent.bindings.applicable_revision_digests != applicable_revision_digests:
+                raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+            self._insert_effect_result(
+                connection,
+                run_id,
+                intent_id,
+                effect_result,
+                applicable_revision_digests,
+            )
+            if (
+                connection.execute(
+                    "UPDATE granted_action_intents SET state = 'INDETERMINATE', "
+                    "result_json = ? WHERE intent_id = ? "
+                    "AND state IN ('INTENT_RECORDED','DISPATCHED')",
+                    (result.model_dump_json(), intent_id),
+                ).rowcount
+                != 1
+                or connection.execute(
+                    "UPDATE runs SET state = 'INDETERMINATE' WHERE run_id = ? AND state = 'ACTIVE'",
+                    (run_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("GRANTED_ACTION_INDETERMINATE_COMPARE_AND_SET_FAILED")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_INDETERMINATE",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class="INDETERMINATE",
+                subject_digests=(observation_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def granted_intent_count(self, pending_id: PendingActionId) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM granted_action_intents WHERE pending_id = ?",
+                    (pending_id,),
+                ).fetchone()[0]
+            )
+
+    def approval_grant_count(self, pending_id: PendingActionId) -> int:
+        with self._read_transaction() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM approval_grants WHERE pending_id = ?",
+                    (pending_id,),
+                ).fetchone()[0]
+            )
+
+    def effect_for_pending(self, pending_id: PendingActionId) -> GrantedActionIntent:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT intent_id FROM granted_action_intents WHERE pending_id = ?",
+                (pending_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+            return self._granted_action_in_transaction(
+                connection,
+                IntentId(str(row["intent_id"])),
+                require_unsettled=False,
+            )
 
     def finish_attempt(
         self,
@@ -8322,6 +9202,16 @@ class SqliteStateStore:
                 resulting_sequence=sequence,
                 failed_invariant="STALE_SEQUENCE",
             )
+        if isinstance(command.payload, GrantPayload):
+            self.accept_pending_action_grant(
+                command=command,
+                now=datetime.now(UTC),
+                expected_sequence=AuditSequence(sequence),
+            )
+            outcome = self._existing_control_outcome(command)
+            if outcome is None:
+                raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
+            return outcome
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, state)
         if isinstance(
