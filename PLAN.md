@@ -315,7 +315,7 @@ Create this worktree from `main` only after R3-01 through R3-04 merge. Do not ch
 
 ### M1 Closeout and Stop Rule
 
-After every R3 task review and commit, run from the replacement M1-08 worktree:
+For R3-01 through R3-04, after every task review and implementation commit run from that task's current corrective-module worktree:
 
 1. `uv sync --frozen --all-groups`
 2. `uv run --python 3.12 pytest -q`
@@ -323,9 +323,11 @@ After every R3 task review and commit, run from the replacement M1-08 worktree:
 4. `uv run --python 3.12 ruff check .`
 5. `uv run --python 3.12 mypy src`
 6. `git diff --check main...HEAD`
-7. the focused model, secret-policy, Git inventory, runtime-lock, WorkerLoop, Grant, and granted-mutation selectors above
+7. the module's own focused selectors above (R3-01 model; R3-02 secret policy; R3-03 reservation/Git inventory; R3-04 runtime locks).
 
-Record exact outputs, skips by platform, elapsed time, changed paths, commit map, agent/human attribution, and current `SPEC.md`/`PLAN.md` digests. The `make test`, `make lint`, and `make secret-scan` entry points do not exist in M1 and are not claimed; Task 35A/Task 34 remain their future owners. For each R3 PR, reviewers still inspect the exact changed-path diff for credential-like material without printing suspected values, and hosted CI must report the existing `quality`, `unit-ubuntu`, and `unit-windows` checks green. Then dispatch a fresh whole-M1 spec-compliance reviewer. Only after that passes, dispatch a different whole-M1 code-quality reviewer. A critical finding that is within an existing task's contract returns to that task and restarts its complete red/green -> spec review -> quality review sequence, followed by both whole-M1 reviews. A finding requiring new scope stops implementation: revise the static contract, obtain a new independent digest review and owner `GO`, then create a new mapped task; never add an unreviewed ledger row or closeout fixup.
+R3-05 is created only after R3-01 through R3-04 merge. After every R3-05 task review and implementation commit, run the same commands from the replacement M1-08 worktree plus every focused model, secret-policy, Git inventory, runtime-lock, WorkerLoop, Grant, and granted-mutation selector above. After R3-05's final task and before its PR closeout review, run that complete all-selector sequence once more from its already corrected-`main` base; this is the whole-M1 closeout run.
+
+Record exact outputs, skips by platform, elapsed time, changed paths, commit map, agent/human attribution, and current `SPEC.md`/`PLAN.md` digests. The `make test`, `make lint`, and `make secret-scan` entry points do not exist in M1 and are not claimed; Task 35A/Task 34 remain their future owners. Each R3 PR reviewer inspects its exact changed-path diff for credential-like material without printing suspected values, receives its ordered module spec/quality reviews, and requires the existing `quality`, `unit-ubuntu`, and `unit-windows` checks green. Only after the R3-05 whole-M1 closeout run dispatch a fresh whole-M1 spec-compliance reviewer; only after it passes dispatch a different whole-M1 code-quality reviewer. A critical finding that is within an existing task's contract returns to that task and restarts its complete red/green -> spec review -> quality review sequence, followed by both whole-M1 reviews. A finding requiring new scope stops implementation: revise the static contract, obtain a new independent digest review and owner `GO`, then create a new mapped task; never add an unreviewed ledger row or closeout fixup.
 
 M1 closes only when all corrective/replacement PRs are merged, PR #8 is closed unmerged, `main` contains the reviewed commit map, both whole-M1 reviews report zero critical findings, all required local/hosted checks are observed green, and the owner records `M1 COMPLETE` against the exact `main` SHA. Until then, M2-M4 remain unauthorized.
 
@@ -469,7 +471,7 @@ Every M1 slice uses one fresh implementation subagent and two ordered fresh revi
 6. Record reviewer identities, findings/fixes, actual human changes, exact red/green commands and outputs, changed paths, and intended Conventional Commit subject in `AGENT_LOG.md`.
 7. Stage only the slice's exact path set and create exactly one implementation commit. Review fixes are included before that commit; no parent-task aggregate commit or post-review fixup commit is allowed.
 8. Run `git rev-parse HEAD`, immediately mark the task complete in the working `PLAN.md`, and record the full observed SHA. Do not amend the implementation commit: a commit cannot contain its own stable SHA.
-9. Keep those PLAN ledger edits outside subsequent slice stage sets. At module close, commit all accumulated task-hash rows in one documentation-only commit staging exactly `PLAN.md`, with subject `docs(plan): record <module> task commits`. This bookkeeping commit is not an implementation slice and does not replace any task commit.
+9. This is the historical M1-R2 ledger rule. For binding M1-R3 work, it is explicitly overridden by the R3 Mutable Commit Ledger rule above: at module close, the documentation-only `docs(plan): record <module> task commits` commit stages exactly `PLAN.md` and the one corresponding `AGENT_LOG.md` ledger-audit entry that names the pre/post PLAN hashes, allowed cells, and recorded implementation SHAs. No other path, task evidence, review evidence, code, or test is staged. This bookkeeping commit is not an implementation slice and does not replace any task commit.
 10. Run the module's accumulated focused tests plus `make test`/`make lint` once those entry points exist. No next module starts until the PR is merged and the owner records the result.
 
 Each implementation commit uses a Conventional Commit subject from the task plus this body/trailer grammar, populated with actual identities rather than generic `Co-Authored-By` alone:
