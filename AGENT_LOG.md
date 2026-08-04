@@ -1251,3 +1251,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL deterministic demo boundary; implementation commit follows.
 - **Human intervention**: none; the demo uses no provider, network, credential, or repository mutation.
 - **Lesson**: a small deterministic trace makes governance, feedback, and freshness behavior inspectable without claiming production orchestration.
+
+## 2026-08-04 / S16 - Sanitized replay and read-only WebUI seam
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `3d3894f`.
+- **Task/skill**: S16; karpathy-guidelines.
+- **Prompt/context**: export only the public projection and serve it through a read-only route.
+- **Observed red**: focused collection initially failed because replay and WebUI delivery modules did not exist.
+- **Implementation**: added `replay_frame` with an explicit four-field allowlist and a FastAPI app bound only to `RunQueries` and one RunId. No control/runtime/model/Git/executor dependency is accepted.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_replay_web.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed. FastAPI emitted only its existing httpx deprecation warning.
+- **Subagent output/commit**: Codex self-checked the SKELETON read-only boundary; implementation commit follows.
+- **Human intervention**: none; no credentials, commands, or Tier 2 data enter the replay.
+- **Lesson**: static and local views should consume a sanitized projection rather than reconstructing domain state.
