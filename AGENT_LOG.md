@@ -1370,3 +1370,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-reviewed the REAL demo correction; implementation commit follows.
 - **Human intervention**: none; no network, provider credential, or external model was used.
 - **Lesson**: a deterministic demo must exercise the same mock seam as the core tests, not only reproduce its expected labels.
+
+## 2026-08-05 / S16-S21 documentation correction
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `ee15003`.
+- **Task/skill**: S16/S21 correction; karpathy-guidelines.
+- **Prompt/context**: make the required read-only WebUI boundary explicit in the README.
+- **Observed red**: `uv run --python 3.12 pytest tests/contract/test_documentation_delivery.py -q` failed because `not an execution service` was absent.
+- **Implementation**: added the explicit README sentence that the WebUI is a read-only projection, not an execution service.
+- **Green evidence**: the documentation contract passed with `1 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-reviewed the documentation correction; implementation commit follows.
+- **Human intervention**: none; no runtime or deployment behavior changed.
+- **Lesson**: read-only boundaries should be stated in the user-facing delivery document, not left implicit in code.

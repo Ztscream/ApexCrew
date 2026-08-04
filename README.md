@@ -53,6 +53,8 @@ docs/                architecture, research, decisions, learning
 
 Commands and approvals are CLI-only. The WebUI and replay export consume only sanitized `RunQueries` projections. Raw shell, host access, network, Docker socket, push, destructive Git, secret paths, and untyped target mutation are denied. Credentials are never read by the offline demo or committed to the repository; see `SECURITY.md` for the full trust boundary.
 
+The WebUI is a read-only projection, not an execution service.
+
 ## Status
 
 The frozen specification, reviewed M1 plan amendment, and Stage 4 cold-start gate authorize this implementation slice. M1-M4 are delivered at the SPRINT depth levels recorded in `AGENT_LOG.md`; SKELETON and STUB items remain explicitly bounded.
