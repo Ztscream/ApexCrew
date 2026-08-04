@@ -1,11 +1,14 @@
 from decimal import Decimal
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.domain.model import (
     DurableModelClient,
+    LogicalModelTurn,
     ModelCompletion,
+    ModelIdentitySource,
     ModelRequest,
+    ModelRequestIntent,
     ModelUsage,
     ProviderAttemptResult,
 )
@@ -48,21 +51,59 @@ class RecordingBackoff:
         self.seconds.append(seconds)
 
 
+class FiniteModelIdentitySource(ModelIdentitySource):
+    def __init__(self) -> None:
+        self._logical_turn_ids = iter(("model-turn-fixed",))
+        self._provider_attempt_ids = iter(
+            ("model-intent-first", "model-intent-second", "model-intent-third")
+        )
+
+    def next_logical_turn_id(self) -> str:
+        return next(self._logical_turn_ids)
+
+    def next_provider_attempt_id(self) -> str:
+        return next(self._provider_attempt_ids)
+
+
+def test_model_identity_source_makes_logical_turn_and_attempt_ids_deterministic() -> None:
+    request = make_model_request()
+    ids = FiniteModelIdentitySource()
+
+    turn = LogicalModelTurn.new(request, ids=ids)
+    attempts = [
+        ModelRequestIntent.reserve(turn, request, provider_attempt_number, ids=ids)
+        for provider_attempt_number in (1, 2, 3)
+    ]
+
+    assert turn.logical_turn_id == "model-turn-fixed"
+    assert [attempt.intent_id for attempt in attempts] == [
+        "model-intent-first",
+        "model-intent-second",
+        "model-intent-third",
+    ]
+
+
 def test_known_closed_rejection_retries_with_new_reserved_attempts() -> None:
     journal = InMemoryStateStore()
+    request = make_model_request()
     model = ScriptedMockLLM(
         [
-            ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION"),
-            ProviderAttemptResult.known_closed("reject-2", "TRANSIENT_REJECTION"),
-            ProviderAttemptResult.completed(
-                completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+            ScriptedModelStep.for_request(
+                request, ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION")
+            ),
+            ScriptedModelStep.for_request(
+                request, ProviderAttemptResult.known_closed("reject-2", "TRANSIENT_REJECTION")
+            ),
+            ScriptedModelStep.for_request(
+                request,
+                ProviderAttemptResult.completed(
+                    completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+                ),
             ),
         ]
     )
     backoff = RecordingBackoff()
-    result = DurableModelClient(model=model, journal=journal, backoff=backoff).complete(
-        make_model_request()
-    )
+    result = DurableModelClient(model=model, journal=journal, backoff=backoff).complete(request)
     attempts = journal.model_attempts(result.run_id, result.logical_turn_id)
     assert result.outcome == "COMPLETED"
     assert [attempt.provider_attempt_number for attempt in attempts] == [1, 2, 3]
@@ -75,11 +116,16 @@ def test_known_closed_rejection_retries_with_new_reserved_attempts() -> None:
 
 def test_timeout_after_possible_dispatch_is_fully_charged_without_retry() -> None:
     journal = InMemoryStateStore()
-    model = ScriptedMockLLM([ProviderAttemptResult.unknown("TIMEOUT_AFTER_POSSIBLE_DISPATCH")])
-    backoff = RecordingBackoff()
-    result = DurableModelClient(model=model, journal=journal, backoff=backoff).complete(
-        make_model_request()
+    request = make_model_request()
+    model = ScriptedMockLLM(
+        [
+            ScriptedModelStep.for_request(
+                request, ProviderAttemptResult.unknown("TIMEOUT_AFTER_POSSIBLE_DISPATCH")
+            )
+        ]
     )
+    backoff = RecordingBackoff()
+    result = DurableModelClient(model=model, journal=journal, backoff=backoff).complete(request)
     attempts = journal.model_attempts(result.run_id, result.logical_turn_id)
     assert result.outcome == "INDETERMINATE"
     assert len(attempts) == 1

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.commands import ApplicableRevisionDigests
 from apexcrew.domain.effects import EffectIntent, StateConflict
@@ -81,7 +81,14 @@ def committed_model_turn(
     request = make_model_request()
     result = DurableModelClient(
         model=ScriptedMockLLM(
-            [ProviderAttemptResult.completed(completion("gpt-5.6-terra", {"kind": "finish"}))]
+            [
+                ScriptedModelStep.for_request(
+                    request,
+                    ProviderAttemptResult.completed(
+                        completion("gpt-5.6-terra", {"kind": "finish"})
+                    ),
+                )
+            ]
         ),
         journal=store,
     ).complete(request)
@@ -119,8 +126,11 @@ def test_restart_releases_committed_completion_without_provider_redispatch(
     request = make_model_request()
     first_model = ScriptedMockLLM(
         [
-            ProviderAttemptResult.completed(
-                completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+            ScriptedModelStep.for_request(
+                request,
+                ProviderAttemptResult.completed(
+                    completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+                ),
             )
         ]
     )
@@ -231,12 +241,15 @@ def test_restart_preserves_requested_model_mismatch_without_releasing_action(
     result = DurableModelClient(
         model=ScriptedMockLLM(
             [
-                ProviderAttemptResult.completed(
-                    completion(
-                        model_id="gpt-5.6-terra",
-                        action={"kind": "finish"},
-                        requested_model_id="gpt-5.6-mini",
-                    )
+                ScriptedModelStep.for_request(
+                    request,
+                    ProviderAttemptResult.completed(
+                        completion(
+                            model_id="gpt-5.6-terra",
+                            action={"kind": "finish"},
+                            requested_model_id="gpt-5.6-mini",
+                        )
+                    ),
                 )
             ]
         ),

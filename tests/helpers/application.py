@@ -12,7 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.adapters.system import SystemMonotonicClock
 from apexcrew.application.control import (
@@ -1101,7 +1101,9 @@ def seed_unreleased_committed_completion(
         normalized_action=normalized_action,
     )
     result = DurableModelClient(
-        model=ScriptedMockLLM([ProviderAttemptResult.completed(completion)]),
+        model=ScriptedMockLLM(
+            [ScriptedModelStep.for_request(request, ProviderAttemptResult.completed(completion))]
+        ),
         journal=store,
     ).complete(request)
     committed = store.committed_model_turn(run_id, result.logical_turn_id)

@@ -15,9 +15,9 @@ from helpers.application import (
     make_create_run_command,
 )
 
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
@@ -384,7 +384,9 @@ def test_requested_model_mismatch_round_trips_for_each_state_store(
     )
 
     result = DurableModelClient(
-        model=ScriptedMockLLM([ProviderAttemptResult.completed(completion)]),
+        model=ScriptedMockLLM(
+            [ScriptedModelStep.for_request(request, ProviderAttemptResult.completed(completion))]
+        ),
         journal=store,
     ).complete(request)
     attempts = store.model_attempts(request.run_id, result.logical_turn_id)

@@ -26,6 +26,22 @@ from apexcrew.domain.types import (
 LogicalTurnId = str
 
 
+class ModelIdentitySource(Protocol):
+    def next_logical_turn_id(self) -> LogicalTurnId:
+        raise NotImplementedError
+
+    def next_provider_attempt_id(self) -> IntentId:
+        raise NotImplementedError
+
+
+class RandomModelIdentitySource:
+    def next_logical_turn_id(self) -> LogicalTurnId:
+        return f"model-turn-{uuid4().hex}"
+
+    def next_provider_attempt_id(self) -> IntentId:
+        return IntentId(f"model-intent-{uuid4().hex}")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     input_tokens: int
@@ -234,8 +250,11 @@ class LogicalModelTurn:
     state: Literal["OPEN"] = "OPEN"
 
     @classmethod
-    def new(cls, request: ModelRequest) -> LogicalModelTurn:
-        return cls(request.run_id, f"model-turn-{uuid4().hex}", request.request_digest)
+    def new(
+        cls, request: ModelRequest, *, ids: ModelIdentitySource | None = None
+    ) -> LogicalModelTurn:
+        source = RandomModelIdentitySource() if ids is None else ids
+        return cls(request.run_id, source.next_logical_turn_id(), request.request_digest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,12 +273,15 @@ class ModelRequestIntent:
         turn: LogicalModelTurn,
         request: ModelRequest,
         provider_attempt_number: int = 1,
+        *,
+        ids: ModelIdentitySource | None = None,
     ) -> ModelRequestIntent:
         if turn.run_id != request.run_id or turn.request_digest != request.request_digest:
             raise ValueError("MODEL_TURN_REQUEST_BINDING_MISMATCH")
+        source = RandomModelIdentitySource() if ids is None else ids
         return cls(
             run_id=request.run_id,
-            intent_id=IntentId(f"model-intent-{uuid4().hex}"),
+            intent_id=source.next_provider_attempt_id(),
             logical_turn_id=turn.logical_turn_id,
             request=request,
             reserved_amounts=ModelBudgetAmounts(

@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.domain.model import (
     DurableModelClient,
@@ -46,9 +46,15 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
 
 
 def test_unapproved_returned_model_is_charged_but_not_released() -> None:
-    model = ScriptedMockLLM([completion(model_id="unexpected-model", action={"kind": "finish"})])
-    client = DurableModelClient(model=model, journal=InMemoryStateStore())
     request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    model = ScriptedMockLLM(
+        [
+            ScriptedModelStep.for_request(
+                request, completion(model_id="unexpected-model", action={"kind": "finish"})
+            )
+        ]
+    )
+    client = DurableModelClient(model=model, journal=InMemoryStateStore())
     result = client.complete(request)
     assert result.outcome == "RETURNED_MODEL_MISMATCH"
     assert result.normalized_action is None
@@ -65,10 +71,13 @@ def test_mismatched_response_requested_model_is_charged_but_not_released() -> No
     request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
     model = ScriptedMockLLM(
         [
-            completion(
-                model_id="gpt-5.6-terra",
-                action={"kind": "finish"},
-                requested_model_id="gpt-5.6-mini",
+            ScriptedModelStep.for_request(
+                request,
+                completion(
+                    model_id="gpt-5.6-terra",
+                    action={"kind": "finish"},
+                    requested_model_id="gpt-5.6-mini",
+                ),
             )
         ]
     )
