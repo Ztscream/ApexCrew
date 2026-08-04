@@ -824,3 +824,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - PLAN after SHA-256: 3215973D002AFAF8208278C7426E39645531AD6A15F6CC5F6498BEB985B3BB6E
 - Cells: Status, Implementation commit
 - Implementation commit: 1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a
+
+## 2026-08-04 / R3-01 - Post-M1-FIX-008 local module regression
+
+- **Regression revision**: `3e3f668083a6a769aace47e0b528b5528a86ec09`; implementation map `M1-FIX-001=65d545bc3734bd1703d5b0793b52401da6f3b9cd`, `M1-FIX-002=205bd422bbd84a995882ceac50d597e4ef9c0f92`, and `M1-FIX-008=1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a`.
+- **Frozen inputs**: `SPEC.md` SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; `PLAN.md` SHA-256 `3215973D002AFAF8208278C7426E39645531AD6A15F6CC5F6498BEB985B3BB6E`; normalized execution authorization `B578F4A16D8E47705DD264D175329D40E8F266386C795B75909795DBB838C77A`.
+- **1. Dependency sync**: `uv sync --frozen --all-groups` exited `0` in 2.4 s: `Audited 46 packages in 8ms`.
+- **2. R3-01 focused selector**: the exact eight-file model selector in `PLAN.md` exited `0` in 28.5 s at `[100%]`.
+- **3. Full offline suite**: `uv run --python 3.12 pytest -q` exited `0` in 54.5 s at `[100%]` with two expected skips on this Windows host; no other platform or hosted-CI result is claimed.
+- **4-6. Format, lint, typing**: Ruff format exited `0` in 18.7 s with `69 files already formatted`; Ruff check exited `0` in 1.8 s with `All checks passed!`; `mypy src` exited `0` in 2.6 s with `Success: no issues found in 33 source files`.
+- **7. Diff integrity**: `git diff --check main...HEAD` exited `0` in 1.5 s with no output. No credential-like material was printed or observed in the exact changed-path review.
+- **Boundary**: all local task reviews and the R3-01 regression are complete. Push, PR creation, hosted CI observation, module-PR reviews, merge, M2-M4, publication, credentials, and Runtime Grants remain unauthorized.
