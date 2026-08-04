@@ -1382,3 +1382,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-reviewed the documentation correction; implementation commit follows.
 - **Human intervention**: none; no runtime or deployment behavior changed.
 - **Lesson**: read-only boundaries should be stated in the user-facing delivery document, not left implicit in code.
+
+## 2026-08-05 / Final local acceptance rerun
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `faad682`.
+- **Task/skill**: final SPRINT acceptance rerun; karpathy-guidelines.
+- **Prompt/context**: verify the corrected demo and local completion checks against the current tree.
+- **Observed evidence**: `make test` exited `0`; `make lint` exited `0`; the documentation/demo focused selector exited `0` with `2 passed`; two consecutive `python -m apexcrew.demo` outputs matched exactly and emitted two bound mock-model calls plus stale freshness.
+- **Boundary**: Docker daemon and hosted CI remain external pending gates; no push, PR, Pages enablement, or credential action was performed.
+- **Subagent output/commit**: Codex completed the local rerun and updated the SPRINT/PLAN evidence association; documentation commit follows.
+- **Human intervention**: none; `SPEC.md` remains unchanged.
+- **Lesson**: completion evidence must be rerun after a corrective commit and the ledger must point to the corrected state.

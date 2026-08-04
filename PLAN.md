@@ -30325,7 +30325,7 @@ depth/known boundary used for the claim.
 | S12 CLI | REAL | COMPLETED | `eab0ea4d29358c8f1fc60189deb9a633c8c367b7` | help and CLI contract green |
 | S13 restricted executor | SKELETON | COMPLETED | `278c0077184107e819a96ffe3bf68b491a232103` | constrained argv green |
 | S14 unit-drift fixtures | SKELETON | COMPLETED | `4d1c30ab397891cfaa0c3715545ad03330e17c54` | fixture contract green |
-| S15 mechanism demo | REAL | COMPLETED | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` | deterministic trace observed |
+| S15 mechanism demo | REAL | COMPLETED | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` + correction `ee15003` | two bound ScriptedMockLLM calls and deterministic trace observed |
 | S16 replay / read-only WebUI | SKELETON | COMPLETED | `fafbd369019455087a529f54cdee1683d37f7389` | projection/read route green |
 | S17 secret scan | REAL | COMPLETED | `8793268462a3f47b1b244eabee6353690354b666` | tracked tree/history clean |
 | S18 packaging / CI | REAL | COMPLETED (Docker local blocked) | `ed22d3cd3a7d733a945567150ab9d0dd2402ba56` | wheel green; Docker daemon pipe absent |
