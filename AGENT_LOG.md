@@ -1323,3 +1323,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON deployment boundary; implementation commit follows.
 - **Human intervention**: none; GitHub Pages or other hosting was not enabled.
 - **Lesson**: deployment readiness can be prepared as a static artifact without expanding the WebUI into an execution surface.
+
+## 2026-08-04 / S22 - Design workbench stub
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `5feb82f`.
+- **Task/skill**: S22; karpathy-guidelines.
+- **Prompt/context**: record the minimum design-workbench boundary without implementing another execution surface.
+- **Observed red**: focused collection initially failed because `docs/design-workbench.md` did not exist.
+- **Implementation**: added a STUB document describing candidate/freshness/review questions and explicitly forbidding Permit, Grant, CAS, model, Git, Docker, credential, and repository effects.
+- **Green evidence**: `uv run --python 3.12 pytest tests/contract/test_design_workbench.py -q` passed with `1 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the required STUB boundary; implementation commit follows.
+- **Human intervention**: none; no design tool or external model was invoked.
+- **Lesson**: a documented non-executing stub is safer than an ambiguous second command surface.
