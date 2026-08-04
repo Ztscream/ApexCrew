@@ -866,3 +866,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - PLAN after SHA-256: EDC3E664BC9E307A56B09C6B9C7D288A4876BC14B62900DFBC2849C7C5B99E31
 - Cells: Status, Implementation commit
 - Implementation commit: 567ab10ec5601aedddca4e149a1a68f54e50e25e
+
+## 2026-08-04 / R3-01 - Post-remediation module regression
+
+- **Regression revision**: `ead4f3b01f89f57cd696759346805135313423d2`; M1-FIX-001 repair `567ab10ec5601aedddca4e149a1a68f54e50e25e`; unchanged companion task commits `M1-FIX-002=205bd422bbd84a995882ceac50d597e4ef9c0f92` and `M1-FIX-008=1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a`.
+- **Supersession**: the earlier R3-01 regression at `1a92d8e` predates the M1-FIX-001 review remediation and is not final module evidence.
+- **Frozen inputs**: `SPEC.md` SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; `PLAN.md` SHA-256 `EDC3E664BC9E307A56B09C6B9C7D288A4876BC14B62900DFBC2849C7C5B99E31`; normalized execution authorization `B578F4A16D8E47705DD264D175329D40E8F266386C795B75909795DBB838C77A`.
+- **1. Dependency sync**: `uv sync --frozen --all-groups` exited `0` in 0.8 s: `Audited 46 packages in 7ms`.
+- **2. R3-01 focused selector**: the exact eight-file model selector in `PLAN.md` exited `0` in 11.1 s.
+- **3. Full offline suite**: `uv run --python 3.12 pytest -q` exited `0` in 27.5 s with two expected skips on this Windows host.
+- **4-6. Format, lint, typing**: Ruff format exited `0` with `69 files already formatted`; Ruff check exited `0` with `All checks passed!`; `mypy src` exited `0` with `Success: no issues found in 33 source files`.
+- **7. Diff integrity**: `git diff --check main...HEAD` exited `0` with no output. The reviewed R3-01 change set contains no credential-like material; this records only an inspection result and no suspected value.
+- **Boundary**: local module regression is green. Module spec review, module quality review, same-revision hosted CI, PR merge, and every later R3 module remain pending.
