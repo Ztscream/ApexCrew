@@ -1131,3 +1131,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-reviewed the narrow contract; implementation commit follows.
 - **Human intervention**: none; admission logic remains outside this skeleton and no credentials/`SPEC.md`/push/PR changed.
 - **Lesson**: bind evidence to both its content and revision before adding admission decisions.
+
+## 2026-08-04 / S6 - Freshness assessment and candidate promotion
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `815fe75`.
+- **Task/skill**: S6; karpathy-guidelines.
+- **Prompt/context**: compare receipt revision/dependencies with current inputs and reject stale candidate promotion.
+- **Observed red**: focused freshness collection initially failed because `apexcrew.domain.freshness` did not exist.
+- **Implementation**: added immutable `FreshnessAssessment` and `PromotedCandidate`; revision or dependency changes produce `STALE`, and non-fresh assessments raise `STALE_EVIDENCE` before promotion. Evidence receipts now persist dependencies for comparison.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_freshness.py tests/unit/domain/test_evidence.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
+- **Human intervention**: none; complex freshness hazards remain deferred and no credentials/`SPEC.md`/push/PR changed.
+- **Lesson**: stale evidence must be rejected before it can become a runnable candidate or model context.

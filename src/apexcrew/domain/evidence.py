@@ -83,6 +83,7 @@ class EvidenceReceipt(FrozenDocument):
     schema_version: Literal["evidence-receipt-v1"] = "evidence-receipt-v1"
     capsule_binding_digest: Sha256DigestText
     revision_digest: Sha256DigestText
+    dependencies: tuple[Sha256DigestText, ...]
     result_class: str
     result_digest: Sha256DigestText
     result: str
@@ -94,6 +95,7 @@ class EvidenceReceipt(FrozenDocument):
         return cls(
             capsule_binding_digest=valid_capsule.binding_digest,
             revision_digest=valid_capsule.revision_digest,
+            dependencies=valid_capsule.dependencies,
             result_class=result_class,
             result_digest=result_digest,
             result=result,
