@@ -1215,3 +1215,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL delivery boundary; implementation commit follows.
 - **Human intervention**: none; CLI never receives or prints credentials and never directly calls a model, Git mutator, or executor.
 - **Lesson**: delivery can expose workflows while authority remains in the three application interfaces.
+
+## 2026-08-04 / S13 - Restricted Docker invocation seam
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `eab0ea4`.
+- **Task/skill**: S13; karpathy-guidelines.
+- **Prompt/context**: encode the restricted executor profile as a digest-pinned, non-root, networkless Docker argv.
+- **Observed red**: focused collection initially failed because the restricted executor adapter did not exist; profile construction then exposed the existing non-empty environment allowlist invariant.
+- **Implementation**: added `RestrictedDockerExecutor.command_for`, enforcing allowlisted executables and emitting `--network=none`, non-root UID/GID, read-only root, dropped capabilities, no-new-privileges, limits, and the fixed image digest. Process execution remains a marked `DEBT-M2-005` fail-closed seam.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/adapters/executor/test_restricted.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON containment boundary; implementation commit follows.
+- **Human intervention**: none; no Docker daemon, socket, network, or credentials were accessed.
+- **Lesson**: security properties belong in the constructed command boundary before a process runner is connected.
