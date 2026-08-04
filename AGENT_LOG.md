@@ -1299,3 +1299,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL documentation boundary; implementation commit follows.
 - **Human intervention**: none; `SPEC.md` and frozen course documents were not changed.
 - **Lesson**: explicit limitation accounting is part of the security contract, not release polish.
+
+## 2026-08-04 / S20 - OpenAI Responses adapter seam
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `9434715`.
+- **Task/skill**: S20; karpathy-guidelines.
+- **Prompt/context**: add the thin external model seam without making a provider call or accessing credentials.
+- **Observed red**: focused collection initially failed because the OpenAI Responses adapter module did not exist.
+- **Implementation**: added `OpenAIResponsesAdapter` matching `ModelPort`; offline invocation raises `OPENAI_RESPONSES_DISABLED_OFFLINE` and records `DEBT-M4-001`. README and SECURITY disclose the new debt.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/adapters/model/test_openai_responses.py -q` passed with `1 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON provider boundary; implementation commit follows.
+- **Human intervention**: none; no OpenAI SDK call, keyring read, environment read, or API key was used.
+- **Lesson**: provider integration should be a replaceable seam, and an offline default must fail closed rather than silently degrade.
