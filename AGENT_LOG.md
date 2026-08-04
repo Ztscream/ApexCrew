@@ -1275,3 +1275,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL scanning boundary; implementation commit follows.
 - **Human intervention**: none; no credential source or API key was read.
 - **Lesson**: a useful scanner must distinguish fixture marker text from actual credential-shaped material while still checking all reachable history.
+
+## 2026-08-04 / S18 - Packaging and CI artifacts
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `8793268`.
+- **Task/skill**: S18; karpathy-guidelines.
+- **Prompt/context**: add wheel, restricted executor image, Make targets, GitLab unit-test job, and GitHub build coverage.
+- **Observed red**: release artifact contract initially failed because `Dockerfile` and `Makefile` were absent.
+- **Implementation**: added `Makefile`, digest-pinned Dockerfile with numeric non-root user and closed runtime labels, `.gitlab-ci.yml` with exact `unit-test`, and a GitHub Actions `build` job for `uv build` and Docker build.
+- **Green evidence**: `uv run --python 3.12 pytest tests/contract/test_release_artifacts.py -q` passed with `1 passed`; `make -n build` printed wheel and Docker build commands; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the REAL release artifact boundary; implementation commit follows.
+- **Human intervention**: none; no CI credential or workflow permission was added.
+- **Lesson**: packaging constraints should be visible in both local commands and CI artifacts before release claims are made.
