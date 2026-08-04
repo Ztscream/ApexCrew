@@ -798,3 +798,10 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - PLAN after SHA-256: 9FD18C973C664B8A9ABB1F553FFFA2F038FD13637000E8A498601127FB229D65
 - Cells: Status, Implementation commit
 - Implementation commit: 205bd422bbd84a995882ceac50d597e4ef9c0f92
+
+## 2026-08-04 / M1-R3B - M1-FIX-008 format-remediation review and owner GO
+
+- **Reviewed candidate**: `7d8a2615d9a394026cc329e19733b97f2f49329e` on `codex/m1-r3-fix008-format-plan`; `PLAN.md` SHA-256 `27F48E06AE0F40C95CA5C1C0E875333CCFEFF6EA74348AADF27941FA329D058E`; normalized execution-authorization SHA-256 `B578F4A16D8E47705DD264D175329D40E8F266386C795B75909795DBB838C77A`; frozen `SPEC.md` SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`.
+- **Independent review**: fresh reviewer `/root/r3_fix008_plan_review` returned APPROVED with zero blockers. It verified the candidate-only `PLAN.md` change, authorization-marker and 15-row EOF-ledger invariants, the exact three-line Ruff remediation scope, the narrow R3-01 regression exception, and the explicit seven-command post-`M1-FIX-008` module regression.
+- **Owner decision**: the repository owner explicitly renews `M1 GO` for the reviewed M1-R3B format-remediation correction and authorizes resuming only `M1-FIX-008` in the existing R3-01 worktree.
+- **Scope boundary**: this decision does not mark M1 complete, authorize M2-M4, authorize PR #8 merge, or authorize push, publication, credential access, or a Runtime Grant.
