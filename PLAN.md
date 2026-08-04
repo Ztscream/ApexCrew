@@ -30302,3 +30302,34 @@ This is the continuously updated task ledger required by course brief section 4.
 | `TASK-017R-B` POSIX no-follow granted mutations | R3-05 | NOT STARTED | Not created |
 | `TASK-017R-C` Windows no-follow granted mutations | R3-05 | NOT STARTED | Not created |
 | `TASK-017R-D` granted-action recovery composition | R3-05 | NOT STARTED | Not created |
+
+## M1-M4 Sprint Commit Ledger (2026-08-04)
+
+This mutable ledger records the SPRINT execution requested by the owner. It does
+not relabel the historical R3 ledger above. Each row has its task commit and the
+depth/known boundary used for the claim.
+
+| SPRINT task | Depth | Status | Implementation commit | Verification boundary |
+| --- | --- | --- | --- | --- |
+| S1 reservation inventory | REAL | COMPLETED | `3ab39aa750f256a7abd735984cae055968fcde23` | focused integration green |
+| S2 Worker/tools integration | REAL | COMPLETED | `e72bfea48abb3c23075587f3f0a98eddcb2795c8` | full offline regression green |
+| S3 granted mutation handles | REAL | COMPLETED | `8b5d7f4b68a8865e28c37637587fc27fd8efb28b` | TOCTOU recovery coverage |
+| S4 runtime lock debt | STUB | COMPLETED | `82513d489583779ab1436043598ea1eba5fe97f6` | invalid Permit zero-change green |
+| S5 Context Capsule / Receipt | SKELETON | COMPLETED | `815fe75b21757e413a90be1cd788019d8c284594` | focused evidence green |
+| S6 Freshness / candidate promotion | SKELETON | COMPLETED | `509def8b80c57f93c2e10600ca0a8a8c03ff09dc` | stale evidence rejected |
+| S7 frozen candidate / Grant / CAS | SKELETON | COMPLETED | `6edfea409180c70e4bd5545440ba16d1b3afb534` | binding/replay checks green |
+| S8 crash recovery paths | SKELETON | COMPLETED | `0c79762e9b22b091cc1374a5ab69f9c02887ec18` | observable-state matrix green |
+| S9 multi-intent resolution | STUB | COMPLETED | `e284c2e6a1cb9abc288e4dc7dd2f4fd98b02a2d9` | `INDETERMINATE` fail closed |
+| S10 reservation cleanup / tombstone | SKELETON | COMPLETED | `cb3ec0d67da5408e53ae0d27a1eb5de409b81f2b` | idempotence green |
+| S11 retention / redaction | STUB | COMPLETED | `e32927c82ed12cd775e326708311d06763a65659` | export/eviction denied |
+| S12 CLI | REAL | COMPLETED | `eab0ea4d29358c8f1fc60189deb9a633c8c367b7` | help and CLI contract green |
+| S13 restricted executor | SKELETON | COMPLETED | `278c0077184107e819a96ffe3bf68b491a232103` | constrained argv green |
+| S14 unit-drift fixtures | SKELETON | COMPLETED | `4d1c30ab397891cfaa0c3715545ad03330e17c54` | fixture contract green |
+| S15 mechanism demo | REAL | COMPLETED | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` | deterministic trace observed |
+| S16 replay / read-only WebUI | SKELETON | COMPLETED | `fafbd369019455087a529f54cdee1683d37f7389` | projection/read route green |
+| S17 secret scan | REAL | COMPLETED | `8793268462a3f47b1b244eabee6353690354b666` | tracked tree/history clean |
+| S18 packaging / CI | REAL | COMPLETED (Docker local blocked) | `ed22d3cd3a7d733a945567150ab9d0dd2402ba56` | wheel green; Docker daemon pipe absent |
+| S19 README / SECURITY / debt | REAL | COMPLETED | `9434715cd86fd42657fa3f11580faa7eb71b987e` | documentation contract green |
+| S20 OpenAI adapter | SKELETON | COMPLETED | `2b71a8cbfee82814cb49b664b6452d55e4cb9ece` | offline call denied |
+| S21 static WebUI deployment | SKELETON | COMPLETED | `5feb82f8c21ef40331b4336e65dce7b307239bb4` | bundle generated |
+| S22 design workbench | STUB | COMPLETED | `aef591522bac228d0c9b2511b665f7b441de5282` | non-executing document green |
