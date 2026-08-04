@@ -800,7 +800,59 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             "ALTER TABLE model_turns ADD COLUMN response_requested_model_id TEXT",
         ),
     ),
+    (
+        17,
+        (
+            (
+                "ALTER TABLE model_attempts ADD COLUMN response_requested_model_binding TEXT "
+                "NOT NULL DEFAULT 'LEGACY' "
+                "CHECK(response_requested_model_binding IN ('LEGACY', 'BOUND'))"
+            ),
+            (
+                "ALTER TABLE model_turns ADD COLUMN response_requested_model_binding TEXT "
+                "NOT NULL DEFAULT 'LEGACY' "
+                "CHECK(response_requested_model_binding IN ('LEGACY', 'BOUND'))"
+            ),
+            (
+                "UPDATE model_attempts SET response_requested_model_binding = 'BOUND' "
+                "WHERE response_requested_model_id IS NOT NULL "
+                "OR json_type(result_json, '$.response_requested_model_id') IS NOT NULL"
+            ),
+            (
+                "UPDATE model_turns SET response_requested_model_binding = 'BOUND' "
+                "WHERE response_requested_model_id IS NOT NULL "
+                "OR json_type(dispatch_result_json, '$.response_requested_model_id') IS NOT NULL"
+            ),
+        ),
+    ),
 )
+
+
+def _legacy_model_attempt_result_digest(
+    *,
+    kind: str,
+    charged: ModelBudgetAmounts,
+    provider_response_id: str | None,
+    reason_code: str | None,
+    normalized_payload_digest: str | None,
+) -> str:
+    payload = json.dumps(
+        {
+            "charged": {
+                "calls": charged.calls,
+                "cost_usd": str(charged.cost_usd),
+                "input_tokens": charged.input_tokens,
+                "output_tokens": charged.output_tokens,
+            },
+            "kind": kind,
+            "normalized_payload_digest": normalized_payload_digest,
+            "provider_response_id": provider_response_id,
+            "reason_code": reason_code,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + sha256(payload).hexdigest()
 
 
 def _command_run_id(command: CommandEnvelope, outcome: CommandOutcome) -> RunId:
@@ -4983,7 +5035,8 @@ class SqliteStateStore:
             changed = connection.execute(
                 "UPDATE model_attempts SET state = 'CLOSED', outcome = ?, "
                 "provider_response_id = ?, reason_code = ?, reported_usage_json = ?, "
-                "response_requested_model_id = ?, returned_model_id = ?, result_digest = ?, "
+                "response_requested_model_id = ?, response_requested_model_binding = 'BOUND', "
+                "returned_model_id = ?, result_digest = ?, "
                 "charged_json = ?, "
                 "result_json = ?, settled_sequence = ? WHERE run_id = ? AND intent_id = ? "
                 "AND state = 'RESERVED'",
@@ -5046,7 +5099,8 @@ class SqliteStateStore:
                     committed = connection.execute(
                         "UPDATE model_turns SET owner_kind = ?, task_id = ?, attempt_id = ?, "
                         "tranche_id = ?, recovery_binding_json = ?, "
-                        "response_requested_model_id = ?, returned_model_id = ?, "
+                        "response_requested_model_id = ?, response_requested_model_binding = 'BOUND', "
+                        "returned_model_id = ?, "
                         "normalized_output_digest = ?, normalized_payload_json = ?, "
                         "dispatch_result_json = ?, committed_sequence = ?, "
                         "state = 'COMPLETION_COMMITTED' WHERE run_id = ? "
@@ -5148,8 +5202,9 @@ class SqliteStateStore:
         rows = self._connection.execute(
             "SELECT run_id, intent_id, provider_attempt_number, request_json, "
             "reserved_json, outcome, provider_response_id, reason_code, result_digest, "
-            "charged_json, result_json, response_requested_model_id, reported_usage_json, "
-            "backoff_seconds FROM model_attempts "
+            "charged_json, result_json, response_requested_model_id, "
+            "response_requested_model_binding, reported_usage_json, backoff_seconds "
+            "FROM model_attempts "
             "WHERE run_id = ? AND logical_turn_id = ? AND state = 'CLOSED' "
             "ORDER BY provider_attempt_number",
             (run_id, logical_turn_id),
@@ -5168,15 +5223,34 @@ class SqliteStateStore:
                 normalized_payload_digest=dispatch_data["normalized_payload_digest"],
                 charged_amounts=charged,
             )
-            if dispatch.response_requested_model_id != row[11]:
+            response_requested_model_id_present = "response_requested_model_id" in dispatch_data
+            if row[12] == "LEGACY":
+                if (
+                    row[11] is not None
+                    or response_requested_model_id_present
+                    or _legacy_model_attempt_result_digest(
+                        kind=row[5],
+                        charged=charged,
+                        provider_response_id=row[6],
+                        reason_code=row[7],
+                        normalized_payload_digest=dispatch.normalized_payload_digest,
+                    )
+                    != row[8]
+                ):
+                    raise StateConflict("MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH")
+            elif row[12] != "BOUND" or (
+                not response_requested_model_id_present
+                or (row[5] == "COMPLETED" and row[11] is None)
+                or dispatch.response_requested_model_id != row[11]
+            ):
                 raise StateConflict("MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH")
             reported_usage = (
                 None
-                if row[12] is None
+                if row[13] is None
                 else ModelUsage(
-                    input_tokens=int(json.loads(row[12])["input_tokens"]),
-                    output_tokens=int(json.loads(row[12])["output_tokens"]),
-                    cost_usd=Decimal(str(json.loads(row[12])["cost_usd"])),
+                    input_tokens=int(json.loads(row[13])["input_tokens"]),
+                    output_tokens=int(json.loads(row[13])["output_tokens"]),
+                    cost_usd=Decimal(str(json.loads(row[13])["cost_usd"])),
                 )
             )
             attempts.append(
@@ -5194,7 +5268,7 @@ class SqliteStateStore:
                     result_digest=row[8],
                     dispatch_result=dispatch,
                     reported_usage=reported_usage,
-                    backoff_seconds=row[13],
+                    backoff_seconds=row[14],
                 )
             )
         return tuple(attempts)
@@ -5204,43 +5278,59 @@ class SqliteStateStore:
     ) -> CommittedModelTurn | None:
         row = self._connection.execute(
             "SELECT logical_turn_id, owner_kind, task_id, attempt_id, tranche_id, "
-            "recovery_binding_json, response_requested_model_id, returned_model_id, "
+            "recovery_binding_json, response_requested_model_id, "
+            "response_requested_model_binding, returned_model_id, "
             "normalized_output_digest, normalized_payload_json, dispatch_result_json, "
             "committed_sequence, state, "
             "downstream_intent_id, downstream_sequence FROM model_turns "
             "WHERE run_id = ? AND logical_turn_id = ?",
             (run_id, logical_turn_id),
         ).fetchone()
-        if row is None or row[12] not in {
+        if row is None or row[13] not in {
             "COMPLETION_COMMITTED",
             "DOWNSTREAM_INTENT_RECORDED",
         }:
             return None
-        if any(row[index] is None for index in (1, 5, 7, 8, 9, 10, 11)):
+        if any(row[index] is None for index in (1, 5, 8, 9, 10, 11, 12)):
             raise StateConflict("COMMITTED_MODEL_TURN_INCOMPLETE")
         if row[1] == "PLANNING" and any(row[index] is not None for index in (2, 3, 4)):
             raise StateConflict("COMMITTED_MODEL_OWNER_BINDING_MISMATCH")
         if row[1] == "WORKER" and any(row[index] is None for index in (2, 3, 4)):
             raise StateConflict("COMMITTED_MODEL_OWNER_BINDING_MISMATCH")
-        dispatch_data = json.loads(row[10])
+        dispatch_data = json.loads(row[11])
         response_requested_model_id_present = "response_requested_model_id" in dispatch_data
-        dispatch = model_dispatch_result_from_json(row[10])
-        payload = json.loads(row[9])
-        if row[6] is None:
-            if response_requested_model_id_present:
+        dispatch = model_dispatch_result_from_json(row[11])
+        payload = json.loads(row[10])
+        if row[7] == "LEGACY":
+            if row[6] is not None or response_requested_model_id_present:
                 raise StateConflict(
                     "COMMITTED_MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH"
                 )
-        elif (
+            try:
+                attempts = self.model_attempts(run_id, logical_turn_id)
+            except StateConflict as error:
+                raise StateConflict(
+                    "COMMITTED_MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH"
+                ) from error
+            if not any(
+                attempt.kind is ProviderAttemptKind.COMPLETED
+                and attempt.dispatch_result == dispatch
+                for attempt in attempts
+            ):
+                raise StateConflict(
+                    "COMMITTED_MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH"
+                )
+        elif row[7] != "BOUND" or (
             not response_requested_model_id_present
+            or row[6] is None
             or dispatch.response_requested_model_id != row[6]
         ):
             raise StateConflict("COMMITTED_MODEL_RESPONSE_REQUESTED_ID_STORAGE_BINDING_MISMATCH")
         if (
             dispatch.run_id != run_id
             or dispatch.logical_turn_id != row[0]
-            or dispatch.returned_model_id != row[7]
-            or dispatch.normalized_payload_digest != row[8]
+            or dispatch.returned_model_id != row[8]
+            or dispatch.normalized_payload_digest != row[9]
             or dispatch.normalized_action != payload
         ):
             raise StateConflict("COMMITTED_MODEL_TURN_BINDING_MISMATCH")
@@ -5253,14 +5343,14 @@ class SqliteStateStore:
             tranche_id=row[4],
             recovery_binding=model_recovery_binding_from_json(row[5]),
             response_requested_model_id=row[6],
-            returned_model_id=row[7],
-            normalized_output_digest=row[8],
+            returned_model_id=row[8],
+            normalized_output_digest=row[9],
             normalized_payload=payload,
             dispatch_result=dispatch,
-            committed_sequence=AuditSequence(row[11]),
-            state=row[12],
-            downstream_intent_id=(None if row[13] is None else IntentId(row[13])),
-            downstream_sequence=(None if row[14] is None else AuditSequence(row[14])),
+            committed_sequence=AuditSequence(row[12]),
+            state=row[13],
+            downstream_intent_id=(None if row[14] is None else IntentId(row[14])),
+            downstream_sequence=(None if row[15] is None else AuditSequence(row[15])),
         )
 
     def reserved_call_count(self, run_id: RunId) -> int:
