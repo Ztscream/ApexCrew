@@ -1,4 +1,4 @@
-.PHONY: test lint demo secret-scan build
+.PHONY: test lint demo secret-scan web-build build
 
 UV_RUN := uv run --python 3.12
 
@@ -15,6 +15,9 @@ demo:
 
 secret-scan:
 	$(UV_RUN) python scripts/secret_scan.py .
+
+web-build:
+	$(UV_RUN) python scripts/build_webui.py dist/webui
 
 build:
 	$(UV_RUN) build

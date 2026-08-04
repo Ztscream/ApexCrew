@@ -32,10 +32,12 @@ make test
 make lint
 make demo
 make secret-scan
+make web-build
 make build
 ```
 
 `make build` creates the wheel and the digest-pinned executor image. CI repeats quality, tests, wheel build, and image build.
+`make web-build` creates the static read-only bundle described in `docs/deployment.md`.
 
 ## 目录结构
 

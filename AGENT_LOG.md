@@ -1311,3 +1311,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON provider boundary; implementation commit follows.
 - **Human intervention**: none; no OpenAI SDK call, keyring read, environment read, or API key was used.
 - **Lesson**: provider integration should be a replaceable seam, and an offline default must fail closed rather than silently degrade.
+
+## 2026-08-04 / S21 - Static WebUI deployment artifact
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `2b71a8c`.
+- **Task/skill**: S21; karpathy-guidelines.
+- **Prompt/context**: produce a static read-only WebUI bundle and deployment instructions without enabling external hosting.
+- **Observed red**: focused collection initially failed because `scripts/build_webui.py` and the static source bundle did not exist.
+- **Implementation**: added `webui/index.html`, `app.js`, and `styles.css`, a deterministic copy builder, `docs/deployment.md`, and a `web-build` Make target. The client performs only `GET /api/run`.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_webui_build.py -q` passed with `1 passed`; the builder created `dist/webui/index.html`, `app.js`, and `styles.css`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON deployment boundary; implementation commit follows.
+- **Human intervention**: none; GitHub Pages or other hosting was not enabled.
+- **Lesson**: deployment readiness can be prepared as a static artifact without expanding the WebUI into an execution surface.
