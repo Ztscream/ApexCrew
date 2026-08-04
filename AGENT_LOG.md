@@ -1191,3 +1191,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
 - **Human intervention**: none; no Git deletion/force cleanup path was added.
 - **Lesson**: cleanup can be idempotent without making an unobserved external effect look successful.
+
+## 2026-08-04 / S11 - Retention and redaction fail-closed stub
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `cb3ec0d`.
+- **Task/skill**: S11; karpathy-guidelines.
+- **Prompt/context**: expose retention-tier diagnostic and eviction seams without exporting sensitive records before policy exists.
+- **Observed red**: focused collection initially failed because `apexcrew.domain.retention` did not exist.
+- **Implementation**: added `RetentionManager`; Tier 2 export and all eviction calls raise explicit `RetentionNotImplemented` errors with `DEBT-M2-002` through `DEBT-M2-004` markers.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_retention.py -q` passed with `1 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the required STUB fail-closed behavior; implementation commit follows.
+- **Human intervention**: none; no diagnostic record was exported or deleted.
+- **Lesson**: incomplete redaction policy must deny export rather than rely on callers to remember a boundary.
