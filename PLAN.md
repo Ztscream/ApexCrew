@@ -231,7 +231,7 @@ The immutable task/module mapping is:
 - **Green contract:** apply only Ruff's displayed line-layout replacements at those three conditions. Do not alter an operand, branch, type, persisted value, test, or any other path. Run `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 mypy src`, and `git diff --check`; every command must pass.
 - **Commit:** `style(model): normalize provenance bindings`.
 
-R3-01 module regression, only after `M1-FIX-008`: run the focused selectors, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+R3-01 module regression, only after the `M1-FIX-008` implementation commit: run all of the following from the R3-01 worktree: (1) `uv sync --frozen --all-groups`; (2) `uv run --python 3.12 pytest tests/unit/domain/test_model_requests.py tests/unit/domain/test_model_retry.py tests/contract/test_scripted_model.py tests/contract/test_state_store.py tests/integration/test_model_restart.py tests/integration/test_global_budget_producers.py tests/integration/test_planning_authorization.py tests/integration/test_runtime_permits.py -q`; (3) `uv run --python 3.12 pytest -q`; (4) `uv run --python 3.12 ruff format --check .`; (5) `uv run --python 3.12 ruff check .`; (6) `uv run --python 3.12 mypy src`; and (7) `git diff --check main...HEAD`.
 
 ### R3-02: Secret Path Contract Evidence
 
@@ -358,7 +358,9 @@ Create this worktree from `main` only after R3-01 through R3-04 merge. Do not ch
 
 ### M1 Closeout and Stop Rule
 
-For R3-01 through R3-04, after every task review and implementation commit run from that task's current corrective-module worktree:
+R3-01 has one narrow ordering exception. `M1-FIX-001` and `M1-FIX-002` run their listed task-local red/green, type, diff, and ordered-review checks before their commits. Because `M1-FIX-001` introduced the three exact format failures assigned to `M1-FIX-008`, neither earlier task is required to pass the complete seven-command module regression below. `M1-FIX-008` must pass its listed complete formatting, lint, suite, type, and diff checks before its ordered reviews; after its implementation commit, run the complete R3-01 seven-command module regression once. No other R3-01 exception exists.
+
+For R3-02 through R3-04, after every task review and implementation commit run from that task's current corrective-module worktree:
 
 1. `uv sync --frozen --all-groups`
 2. `uv run --python 3.12 pytest -q`
