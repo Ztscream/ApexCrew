@@ -208,9 +208,10 @@ def schema_v16_database(
     connection = sqlite3.connect(database)
     if remove_response_requested_model_id_value:
         remove_response_requested_model_id(connection, request, logical_turn_id)
+    connection.execute("ALTER TABLE model_attempts DROP COLUMN request_requested_model_id")
     connection.execute("ALTER TABLE model_attempts DROP COLUMN response_requested_model_binding")
     connection.execute("ALTER TABLE model_turns DROP COLUMN response_requested_model_binding")
-    connection.execute("DELETE FROM schema_migrations WHERE version = 17")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (17, 18)")
     connection.commit()
     connection.close()
     return database
@@ -225,6 +226,24 @@ def legacy_result_digest(row: tuple[object, ...]) -> str:
             "normalized_payload_digest": dispatch["normalized_payload_digest"],
             "provider_response_id": row[1],
             "reason_code": row[2],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + sha256(digest_payload).hexdigest()
+
+
+def bound_result_digest(row: tuple[object, ...]) -> str:
+    dispatch = json.loads(str(row[4]))
+    digest_payload = json.dumps(
+        {
+            "charged": json.loads(str(row[3])),
+            "kind": row[0],
+            "normalized_payload_digest": dispatch["normalized_payload_digest"],
+            "provider_response_id": row[1],
+            "reason_code": row[2],
+            "response_requested_model_id": dispatch["response_requested_model_id"],
+            "returned_model_id": dispatch["returned_model_id"],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -354,6 +373,97 @@ def test_new_attempt_with_explicit_null_requested_model_id_is_closed(
 
     with pytest.raises(StateConflict, match="MODEL_RESPONSE_REQUESTED_ID"):
         store.model_attempts(request.run_id, logical_turn_id)
+
+
+def test_bound_completion_with_coherent_requested_model_id_tamper_is_closed(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    dispatch["response_requested_model_id"] = "gpt-5.6-mini"
+    dispatch_json = json.dumps(dispatch, sort_keys=True, separators=(",", ":"))
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = ?, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+    store._connection.execute(
+        "UPDATE model_attempts SET response_requested_model_id = ?, result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+
+    with pytest.raises(StateConflict, match="MODEL_RESPONSE_REQUESTED_ID"):
+        store.model_attempts(request.run_id, logical_turn_id)
+    recovery_model = ScriptedMockLLM([])
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        DurableModelClient(model=recovery_model, journal=store).recover_committed(
+            request.run_id,
+            logical_turn_id,
+            ModelRecoveryBinding.from_request(request),
+        )
+    assert recovery_model.call_count == 0
+
+
+def test_bound_completion_with_rewritten_request_json_is_closed(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    dispatch["response_requested_model_id"] = "gpt-5.6-mini"
+    dispatch_json = json.dumps(dispatch, sort_keys=True, separators=(",", ":"))
+    request_row = store._connection.execute(
+        "SELECT request_json FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert request_row is not None
+    stored_request = json.loads(request_row[0])
+    stored_request["requested_model_id"] = "gpt-5.6-mini"
+    attempt_row = store._connection.execute(
+        "SELECT outcome, provider_response_id, reason_code, charged_json, result_json "
+        "FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert attempt_row is not None
+    tampered_attempt = (*attempt_row[:4], dispatch_json)
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = ?, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+    store._connection.execute(
+        "UPDATE model_attempts SET request_json = ?, response_requested_model_id = ?, "
+        "result_json = ?, result_digest = ? WHERE run_id = ? AND logical_turn_id = ?",
+        (
+            json.dumps(stored_request, sort_keys=True, separators=(",", ":")),
+            "gpt-5.6-mini",
+            dispatch_json,
+            bound_result_digest(tampered_attempt),
+            request.run_id,
+            logical_turn_id,
+        ),
+    )
+
+    with pytest.raises(StateConflict, match="MODEL_REQUEST"):
+        store.model_attempts(request.run_id, logical_turn_id)
+    recovery_model = ScriptedMockLLM([])
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        DurableModelClient(model=recovery_model, journal=store).recover_committed(
+            request.run_id,
+            logical_turn_id,
+            ModelRecoveryBinding.from_request(request),
+        )
+    assert recovery_model.call_count == 0
 
 
 def test_restart_preserves_requested_model_mismatch_without_releasing_action(
