@@ -1335,3 +1335,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the required STUB boundary; implementation commit follows.
 - **Human intervention**: none; no design tool or external model was invoked.
 - **Lesson**: a documented non-executing stub is safer than an ambiguous second command surface.
+
+## 2026-08-04 / Final M1-M4 acceptance evidence
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `b3c06b4`.
+- **Task/skill**: final SPRINT acceptance; karpathy-guidelines.
+- **Prompt/context**: verify the complete local M1-M4 delivery, preserve the frozen specification, and record external build limits honestly.
+- **Observed evidence**: `make test` exited `0` with the full suite green and 8 Windows capability skips; `make lint` exited `0` with Ruff format/check and mypy green; `make demo` emitted the three deterministic events; `make secret-scan` emitted `secret-scan: clean`; `make web-build` generated all three static assets; `uv build` generated the wheel and source distribution.
+- **External boundary**: `docker build --tag apexcrew-executor:local .` was attempted and failed before build execution because `//./pipe/dockerDesktopLinuxEngine` was absent. The Dockerfile remains digest-pinned and its artifact contract is green; no image-build success is claimed locally.
+- **Ledger/scope evidence**: `SPRINT.md` has `22` rows and `22` `DONE` rows; `SPEC.md` is unchanged relative to `main...HEAD`; `git diff --check` is clean.
+- **Subagent output/commit**: Codex completed the local acceptance loop; this evidence commit follows.
+- **Human intervention**: none; no API key, keyring value, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
+- **Lesson**: M1-M4 can be delivered as a bounded offline harness with explicit SKELETON/STUB debts, but local Docker daemon availability remains a prerequisite for observing the image build.
