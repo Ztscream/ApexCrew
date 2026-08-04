@@ -1287,3 +1287,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL release artifact boundary; implementation commit follows.
 - **Human intervention**: none; no CI credential or workflow permission was added.
 - **Lesson**: packaging constraints should be visible in both local commands and CI artifacts before release claims are made.
+
+## 2026-08-04 / S19 - README, security boundary, and debt inventory
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `ed22d3c`.
+- **Task/skill**: S19; karpathy-guidelines.
+- **Prompt/context**: update delivery documentation and ensure every source DEBT marker is disclosed.
+- **Observed red**: documentation contract initially failed because the README still claimed documentation-only status and lacked the six required headings.
+- **Implementation**: added project, installation, run, distribution commands, structure, security boundary, and known-debt sections; updated `SECURITY.md` delivery status and all current M1/M2 debt descriptions.
+- **Green evidence**: `uv run --python 3.12 pytest tests/contract/test_documentation_delivery.py -q` passed with `1 passed`; `rg -n "DEBT-" src` inventory is covered by the contract; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the REAL documentation boundary; implementation commit follows.
+- **Human intervention**: none; `SPEC.md` and frozen course documents were not changed.
+- **Lesson**: explicit limitation accounting is part of the security contract, not release polish.

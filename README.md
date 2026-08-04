@@ -2,9 +2,58 @@
 
 ApexCrew is a local-first Coding Agent Harness for an **Evidence-Driven Durable Crew**. It coordinates bounded work in one Git repository, requires human approval for risky actions, and accepts changes only when objective evidence is fresh for the exact revision being integrated.
 
+## 项目简介
+
+This repository contains the M1-M4 offline harness core and delivery artifacts. The durable application surface is `CrewControl`, `CrewRuntime`, and read-only `RunQueries`; deterministic tests use `ScriptedMockLLM`.
+
+## 安装
+
+Requirements: Python 3.12 and `uv`.
+
+```text
+uv sync --frozen --all-groups
+```
+
+No provider credential is required for the offline suite.
+
+## 运行
+
+```text
+uv run --python 3.12 apexcrew --help
+uv run --python 3.12 python -m apexcrew.demo
+```
+
+The demo is deterministic and local-only. The CLI refuses runtime or approval actions when no composed authority/Permit exists.
+
+## 分发命令
+
+```text
+make test
+make lint
+make demo
+make secret-scan
+make build
+```
+
+`make build` creates the wheel and the digest-pinned executor image. CI repeats quality, tests, wheel build, and image build.
+
+## 目录结构
+
+```text
+src/apexcrew/       domain, application, adapters, delivery
+tests/              unit, contract, integration, acceptance coverage
+fixtures/           Python money and TypeScript timestamp repositories
+scripts/             release/security helpers
+docs/                architecture, research, decisions, learning
+```
+
+## 安全边界
+
+Commands and approvals are CLI-only. The WebUI and replay export consume only sanitized `RunQueries` projections. Raw shell, host access, network, Docker socket, push, destructive Git, secret paths, and untyped target mutation are denied. Credentials are never read by the offline demo or committed to the repository; see `SECURITY.md` for the full trust boundary.
+
 ## Status
 
-This repository is intentionally documentation-only. Discovery, all three specification-brainstorming rounds, the A-Hybrid implementation architecture, independent review, final written-spec sign-off, the R3 `PLAN.md`, and the Stage 4 implementation cold-start review are complete; that review returned zero blockers on 2026-07-31 and its disposable code was destroyed without merge. Do not add persistent implementation until a new M1 `PLAN.md` revision passes its own independent document review.
+The frozen specification, reviewed M1 plan amendment, and Stage 4 cold-start gate authorize this implementation slice. M1-M4 are delivered at the SPRINT depth levels recorded in `AGENT_LOG.md`; SKELETON and STUB items remain explicitly bounded.
 
 ## Accepted v0.1 Boundary
 
@@ -41,7 +90,7 @@ The target user is a developer who needs long-running agent collaboration to rem
 - `SPEC_PROCESS.md` and `AGENT_LOG.md`: required development-process evidence.
 - `LICENSE` and `NOTICE`: Apache-2.0 terms and the explicit scope exception for course-provided documents.
 
-There are no build, test, or run commands yet. Proposed commands in `AGENTS.md` are interface commitments, not current capabilities. The selected target is a Python 3.12 wheel/`uv` CLI plus a digest-pinned GHCR executor for Windows 11 and Ubuntu 24.04 x86_64. Every `SPEC.md` section 10.5 host prerequisite was re-verified on 2026-07-31: Git 2.47.1, CPython 3.12.12, uv 0.9.29, a responding Docker daemon, and OS keyring support.
+The selected target is a Python 3.12 wheel/`uv` CLI plus a digest-pinned executor for Windows 11 and Ubuntu 24.04 x86_64. Every `SPEC.md` section 10.5 host prerequisite was re-verified on 2026-07-31: Git 2.47.1, CPython 3.12.12, uv 0.9.29, a responding Docker daemon, and OS keyring support.
 
 ## Repository and License
 
@@ -49,4 +98,8 @@ The public GitHub remote is `https://github.com/Ztscream/ApexCrew.git` and is th
 
 The repository owner decided on 2026-07-31 that no NJU/GitLab remote will be configured and that delivery runs through GitHub. The course brief is internally inconsistent here: section 4.7 is titled "GitHub 仓库要求" and mandates a public GitHub repository with GitHub Actions CI, while section 5 describes submission through an NJU Git link. The owner resolved that inconsistency in favour of GitHub. A `.gitlab-ci.yml` carrying a job named exactly `unit-test` is still produced, because deliverable 6 names that file directly and because frozen `SPEC.md` section 10.5 requires the file's existence and job name, not a GitLab remote.
 
-The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The owner raised available capacity to 30-40 hours/week on 2026-07-31. Stages 2 and 3 are complete and the Stage 4 cold-start review returned zero blockers; the immediate next gate is a new M1 `PLAN.md` revision with its own independent document review. The Python money-unit and TypeScript timestamp-unit fixture problems are approved. No API credential value is needed until the offline `ScriptedMockLLM` core is green and the opt-in provider slice begins.
+The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python money-unit and TypeScript timestamp-unit fixture problems are included. No API credential value is needed for the offline core or delivery commands.
+
+## 已知债务
+
+The following markers are intentionally fail-closed and are not production claims: `DEBT-M1-006` (cross-process runtime/OS lock), `DEBT-M2-001` (multi-intent precedence), `DEBT-M2-002` (Tier 2 export), `DEBT-M2-003` (retention export), `DEBT-M2-004` (durable eviction), and `DEBT-M2-005` (Docker process runner). Their exact source locations are generated with `rg -n "DEBT-" src`.
