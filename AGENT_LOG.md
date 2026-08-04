@@ -1347,3 +1347,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex completed the local acceptance loop; this evidence commit follows.
 - **Human intervention**: none; no API key, keyring value, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
 - **Lesson**: M1-M4 can be delivered as a bounded offline harness with explicit SKELETON/STUB debts, but local Docker daemon availability remains a prerequisite for observing the image build.
+
+## 2026-08-04 / Docker build retry amendment
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `3c8b7ab`.
+- **Task/skill**: final acceptance retry; karpathy-guidelines.
+- **Prompt/context**: retry the only failed local release step after starting the available Docker Desktop executable.
+- **Observed evidence**: Docker Desktop executable was present and launch was attempted; `docker info` and `docker build --tag apexcrew-executor:local .` both returned `Docker Desktop is unable to start`. The default context produced the same server error.
+- **Boundary**: no Docker configuration, socket, image, credential, or repository state was modified; wheel, Dockerfile, CI job, and static artifacts remain verified.
+- **Subagent output/commit**: Codex exhausted the safe local daemon recovery attempt; this amendment commit follows.
+- **Human intervention**: none; no push, PR, Pages enablement, or credential access occurred.
+- **Lesson**: a failed external daemon is recorded as an environment blocker rather than converted into a false image-build pass.
