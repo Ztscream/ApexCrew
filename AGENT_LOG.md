@@ -1203,3 +1203,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the required STUB fail-closed behavior; implementation commit follows.
 - **Human intervention**: none; no diagnostic record was exported or deleted.
 - **Lesson**: incomplete redaction policy must deny export rather than rely on callers to remember a boundary.
+
+## 2026-08-04 / S12 - CLI delivery surface
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `e32927c`.
+- **Task/skill**: S12; karpathy-guidelines.
+- **Prompt/context**: expose the required CLI commands without allowing delivery code to mint runtime authority.
+- **Observed red**: focused collection initially failed because `apexcrew.delivery` and the console entry point did not exist.
+- **Implementation**: added Typer commands `init`, `run`, `status`, `approve`, and `doctor`; `init` writes only non-sensitive local configuration, read commands are side-effect-free, and uncomposed runtime/approval operations return explicit closed statuses. Added the `apexcrew` console script.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_cli.py -q` passed with `1 passed`; `uv run --python 3.12 apexcrew --help` showed all five commands; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the REAL delivery boundary; implementation commit follows.
+- **Human intervention**: none; CLI never receives or prints credentials and never directly calls a model, Git mutator, or executor.
+- **Lesson**: delivery can expose workflows while authority remains in the three application interfaces.
