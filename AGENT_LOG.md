@@ -1155,3 +1155,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
 - **Human intervention**: none; CAS remains a typed request seam and never pushes or mutates Git directly.
 - **Lesson**: final authority must bind to the exact frozen candidate and refuse replay or moved-target integration.
+
+## 2026-08-04 / S8 - Model, patch, and ref recovery
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `6edfea4`.
+- **Task/skill**: S8; karpathy-guidelines.
+- **Prompt/context**: reconcile common restart paths from durable observations without guessing an external outcome.
+- **Observed red**: focused recovery collection initially failed because `apexcrew.domain.recovery` did not exist.
+- **Implementation**: added deterministic model, patch, and ref reconciliation helpers. Committed completion is replayed as `COMPLETED`; an unobserved provider/patch state or moved ref is `INDETERMINATE`; a still-old ref is the only retry path.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_recovery.py -q` passed with `5 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
+- **Human intervention**: none; no provider, Git, Docker, credential, or `SPEC.md` effect was invoked.
+- **Lesson**: restart recovery may retry only from exact observable state and must stop on uncertainty.
