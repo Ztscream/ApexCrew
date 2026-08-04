@@ -1143,3 +1143,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
 - **Human intervention**: none; complex freshness hazards remain deferred and no credentials/`SPEC.md`/push/PR changed.
 - **Lesson**: stale evidence must be rejected before it can become a runnable candidate or model context.
+
+## 2026-08-04 / S7 - Frozen candidate, final Grant, and typed CAS
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `509def8`.
+- **Task/skill**: S7; karpathy-guidelines.
+- **Prompt/context**: bind final integration authority to a frozen, fresh candidate and one expected target OID.
+- **Observed red**: focused candidate collection initially failed because `apexcrew.domain.candidate` did not exist; a follow-up mutation test exposed that an unvalidated Pydantic copy could bypass the candidate binding check.
+- **Implementation**: added immutable `FrozenRunCandidate`, mutable one-use `FinalGrant`, typed `TargetCasRequest`, and fail-closed candidate revalidation plus expected-old-OID CAS classification.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_candidate.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
+- **Human intervention**: none; CAS remains a typed request seam and never pushes or mutates Git directly.
+- **Lesson**: final authority must bind to the exact frozen candidate and refuse replay or moved-target integration.
