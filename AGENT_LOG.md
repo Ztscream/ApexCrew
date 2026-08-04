@@ -1358,3 +1358,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex exhausted the safe local daemon recovery attempt; this amendment commit follows.
 - **Human intervention**: none; no push, PR, Pages enablement, or credential access occurred.
 - **Lesson**: a failed external daemon is recorded as an environment blocker rather than converted into a false image-build pass.
+
+## 2026-08-05 / S15 corrective mock-LLM trace
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `3d3894f`.
+- **Task/skill**: S15 correction; karpathy-guidelines.
+- **Prompt/context**: close the gap where the deterministic demo described feedback without driving `ScriptedMockLLM`.
+- **Observed red**: `uv run --python 3.12 pytest tests/unit/test_demo.py -q` failed with `KeyError: 'model_calls'` after the regression assertion was added.
+- **Implementation**: the demo now constructs two bound `ScriptedModelStep` completions, calls the existing `ScriptedMockLLM` twice, and sends `CHECK_FAILED` in the second request prompt before emitting the corrective patch action.
+- **Green evidence**: focused demo test and `python -m apexcrew.demo` passed; `mypy src`, Ruff check/format, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-reviewed the REAL demo correction; implementation commit follows.
+- **Human intervention**: none; no network, provider credential, or external model was used.
+- **Lesson**: a deterministic demo must exercise the same mock seam as the core tests, not only reproduce its expected labels.
