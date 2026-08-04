@@ -11,10 +11,15 @@ from apexcrew.domain.model import (
 )
 
 
-def completion(model_id: str, action: dict[str, str]) -> ModelCompletion:
+def completion(
+    model_id: str,
+    action: dict[str, str],
+    *,
+    requested_model_id: str = "gpt-5.6-terra",
+) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id=requested_model_id,
         returned_model_id=model_id,
         usage=ModelUsage(input_tokens=120, output_tokens=12, cost_usd=Decimal("0.00048")),
         normalized_action=action,
@@ -54,3 +59,28 @@ def test_unapproved_returned_model_is_charged_but_not_released() -> None:
         cost_usd=request.reserved_cost_usd,
     )
     assert client.journal.reserved_call_count(request.run_id) == 1
+
+
+def test_mismatched_response_requested_model_is_charged_but_not_released() -> None:
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    model = ScriptedMockLLM(
+        [
+            completion(
+                model_id="gpt-5.6-terra",
+                action={"kind": "finish"},
+                requested_model_id="gpt-5.6-mini",
+            )
+        ]
+    )
+    client = DurableModelClient(model=model, journal=InMemoryStateStore())
+
+    result = client.complete(request)
+
+    assert result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert result.normalized_action is None
+    assert result.charged_amounts == ModelBudgetAmounts(
+        calls=1,
+        input_tokens=120,
+        output_tokens=12,
+        cost_usd=request.reserved_cost_usd,
+    )

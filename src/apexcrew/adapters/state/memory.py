@@ -3318,7 +3318,9 @@ class InMemoryStateStore:
                 dispatch = settled.dispatch_result
                 if dispatch.outcome == "COMPLETED":
                     if (
-                        dispatch.returned_model_id is None
+                        dispatch.response_requested_model_id
+                        != intent.request.requested_model_id
+                        or dispatch.returned_model_id is None
                         or dispatch.normalized_payload_digest is None
                         or dispatch.normalized_action is None
                     ):
@@ -3334,6 +3336,7 @@ class InMemoryStateStore:
                         attempt_id=intent.request.attempt_id,
                         tranche_id=intent.request.tranche_id,
                         recovery_binding=ModelRecoveryBinding.from_request(intent.request),
+                        response_requested_model_id=dispatch.response_requested_model_id,
                         returned_model_id=dispatch.returned_model_id,
                         normalized_output_digest=dispatch.normalized_payload_digest,
                         normalized_payload=dispatch.normalized_action,

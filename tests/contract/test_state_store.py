@@ -17,6 +17,7 @@ from helpers.application import (
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.domain.admission import TargetReservationCreationOutcome
 from apexcrew.domain.authority import (
     AuthorityService,
@@ -53,10 +54,13 @@ from apexcrew.domain.effects import (
     canonical_json,
 )
 from apexcrew.domain.model import (
+    DurableModelClient,
     LogicalModelTurn,
     ModelBudgetAmounts,
+    ModelCompletion,
     ModelRequest,
     ModelRequestIntent,
+    ModelUsage,
     ProviderAttemptResult,
 )
 from apexcrew.domain.revisions import (
@@ -362,6 +366,37 @@ def test_sqlite_model_backoff_survives_restart(tmp_path: Path) -> None:
     assert attempts[0].outcome == "KNOWN_CLOSED_REJECTION"
     assert attempts[0].backoff_seconds == 1
     assert attempts[0].charged_amounts == attempts[0].reserved_amounts
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_requested_model_mismatch_round_trips_for_each_state_store(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    completion = ModelCompletion(
+        response_id="response-requested-model-mismatch",
+        requested_model_id="gpt-5.6-mini",
+        returned_model_id="gpt-5.6-terra",
+        usage=ModelUsage(120, 12, Decimal("0.00048")),
+        normalized_action={"kind": "finish"},
+    )
+
+    result = DurableModelClient(
+        model=ScriptedMockLLM([ProviderAttemptResult.completed(completion)]),
+        journal=store,
+    ).complete(request)
+    attempts = store.model_attempts(request.run_id, result.logical_turn_id)
+
+    assert result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert result.normalized_action is None
+    assert len(attempts) == 1
+    assert attempts[0].request.requested_model_id == request.requested_model_id
+    assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
+    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert attempts[0].reported_usage == completion.usage
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])

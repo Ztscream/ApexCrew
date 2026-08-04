@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -8,7 +9,7 @@ import pytest
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.commands import ApplicableRevisionDigests
-from apexcrew.domain.effects import EffectIntent
+from apexcrew.domain.effects import EffectIntent, StateConflict
 from apexcrew.domain.model import (
     DurableModelClient,
     LogicalTurnId,
@@ -23,10 +24,15 @@ from apexcrew.domain.model import (
 from apexcrew.domain.types import AuditSequence, IntentId, RunId
 
 
-def completion(model_id: str, action: dict[str, str]) -> ModelCompletion:
+def completion(
+    model_id: str,
+    action: dict[str, str],
+    *,
+    requested_model_id: str = "gpt-5.6-terra",
+) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id=requested_model_id,
         returned_model_id=model_id,
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action=action,
@@ -151,6 +157,113 @@ def test_recovery_binding_mismatch_releases_no_output(tmp_path: Path) -> None:
     assert recovered.outcome == "RECOVERY_BINDING_MISMATCH"
     assert recovered.normalized_action is None
     assert model.call_count == 0
+
+
+def test_legacy_committed_completion_without_response_requested_id_recovers(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    legacy_dispatch = json.loads(row[0])
+    del legacy_dispatch["response_requested_model_id"]
+    legacy_dispatch_json = json.dumps(legacy_dispatch, sort_keys=True, separators=(",", ":"))
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = NULL, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (legacy_dispatch_json, request.run_id, logical_turn_id),
+    )
+    store._connection.execute(
+        "UPDATE model_attempts SET response_requested_model_id = NULL, result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (legacy_dispatch_json, request.run_id, logical_turn_id),
+    )
+    store.close()
+
+    reopened = SqliteStateStore(tmp_path / "state.db")
+    committed = reopened.committed_model_turn(request.run_id, logical_turn_id)
+    recovered = DurableModelClient(model=ScriptedMockLLM([]), journal=reopened).recover_committed(
+        request.run_id,
+        logical_turn_id,
+        ModelRecoveryBinding.from_request(request),
+    )
+
+    assert committed is not None
+    assert committed.response_requested_model_id is None
+    assert recovered.outcome == "COMPLETED"
+    assert recovered.normalized_action == {"kind": "finish"}
+
+
+def test_new_committed_completion_cannot_be_reclassified_as_legacy(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    tampered_dispatch = json.loads(row[0])
+    tampered_dispatch["response_requested_model_id"] = None
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = NULL, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (
+            json.dumps(tampered_dispatch, sort_keys=True, separators=(",", ":")),
+            request.run_id,
+            logical_turn_id,
+        ),
+    )
+
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        store.committed_model_turn(request.run_id, logical_turn_id)
+
+
+def test_restart_preserves_requested_model_mismatch_without_releasing_action(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database)
+    request = make_model_request()
+    result = DurableModelClient(
+        model=ScriptedMockLLM(
+            [
+                ProviderAttemptResult.completed(
+                    completion(
+                        model_id="gpt-5.6-terra",
+                        action={"kind": "finish"},
+                        requested_model_id="gpt-5.6-mini",
+                    )
+                )
+            ]
+        ),
+        journal=store,
+    ).complete(request)
+    store.close()
+
+    reopened = SqliteStateStore(database)
+    attempts = reopened.model_attempts(request.run_id, result.logical_turn_id)
+    empty_model = ScriptedMockLLM([])
+    recovered = DurableModelClient(model=empty_model, journal=reopened).recover_committed(
+        request.run_id,
+        result.logical_turn_id,
+        ModelRecoveryBinding.from_request(request),
+    )
+
+    assert result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert result.normalized_action is None
+    assert len(attempts) == 1
+    assert attempts[0].request.requested_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
+    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert attempts[0].reported_usage == ModelUsage(120, 12, Decimal("0.00048"))
+    assert recovered.outcome == "MODEL_COMPLETION_NOT_COMMITTED"
+    assert recovered.normalized_action is None
+    assert empty_model.call_count == 0
 
 
 def test_committed_completion_with_downstream_intent_is_not_released_twice(
