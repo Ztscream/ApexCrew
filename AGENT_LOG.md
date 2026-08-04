@@ -939,3 +939,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - PLAN after SHA-256: 0DFA0D07E21DDC336D313018B55FE788A58E72DAEDFF18F2E433672AB88C3B7D
 - Cells: Status, Implementation commit
 - Implementation commit: 4a3e3235e7eb53b3427935cfdeef33860183edb5
+
+## 2026-08-04 / R3-02 - Module regression
+
+- **Regression revision**: `7b8994135e5815219d6b1e50b61f7cbb8231dc26`; implementation commit `M1-FIX-003=4a3e3235e7eb53b3427935cfdeef33860183edb5` and its ledger documentation commit are included.
+- **Frozen inputs**: `SPEC.md` SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; `PLAN.md` SHA-256 `0DFA0D07E21DDC336D313018B55FE788A58E72DAEDFF18F2E433672AB88C3B7D`.
+- **1. Focused selector**: `uv run --python 3.12 pytest tests/contract/test_secret_policy_digest.py tests/unit/domain/test_secret_policy.py -q` exited `0` with `6 passed` in 2.1 s.
+- **2. Full offline suite**: `uv run --python 3.12 pytest -q` exited `0` in 28.4 s; two existing Windows-host skips were observed.
+- **3-5. Format, lint, typing**: Ruff format exited `0` with `69 files already formatted`; Ruff check exited `0` with `All checks passed!`; `mypy src` exited `0` with `Success: no issues found in 33 source files`.
+- **6. Diff integrity**: `git diff --check main...HEAD` exited `0` with no output; the module diff was inspected without recording suspected credential-like values.
+- **Boundary**: final local module regression is green. Fresh module spec-compliance review, then a different fresh module code-quality review, same-revision hosted CI, and PR merge remain pending. Human changes: none.
