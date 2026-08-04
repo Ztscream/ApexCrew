@@ -367,8 +367,7 @@ class RecoveredModelAction:
         if (
             turn.state != "COMPLETION_COMMITTED"
             or turn.downstream_intent_id is not None
-            or turn.dispatch_result.response_requested_model_id
-            != turn.response_requested_model_id
+            or turn.dispatch_result.response_requested_model_id != turn.response_requested_model_id
             or turn.dispatch_result.normalized_action != turn.normalized_payload
             or turn.dispatch_result.normalized_payload_digest != turn.normalized_output_digest
         ):

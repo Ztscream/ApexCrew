@@ -777,6 +777,20 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Owner decision**: the repository owner explicitly renews `M1 GO` for the reviewed M1-R3A scope correction and authorizes resuming only M1-FIX-002 in the existing R3-01 worktree.
 - **Scope boundary**: this decision does not mark M1 complete, authorize M2-M4, authorize PR #8 merge, or authorize push, publication, credential access, or a Runtime Grant.
 
+## 2026-08-04 / M1-FIX-008 - Close the model provenance format regression
+
+- **Pre-task record**: fresh implementation subagent OpenAI Codex (GPT-5), session `/root/r3_01_fix008_impl`, starts from base `8631c52200c84d466a6de4709f0dbee12e01baff` on `codex/m1-r3-model-provenance`.
+- **Exact red command**: `uv run --python 3.12 ruff format --check .`.
+- **Intended closed path set**: `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/state/memory.py`, `src/apexcrew/adapters/state/sqlite.py`, and `AGENT_LOG.md` only.
+- **Observed red**: the exact command exited `1` and reported only `src/apexcrew/adapters/state/memory.py:3321`, `src/apexcrew/adapters/state/sqlite.py:5040`, and `src/apexcrew/domain/model.py:370`; each report was the intended single condition-layout replacement. It reported `3 files would be reformatted, 66 files already formatted`.
+- **Mechanical implementation**: applied only Ruff's displayed one-line layout at those three conditions. No operand, branch, type, persisted value, test, or other production path changed.
+- **Green evidence**: `uv run --python 3.12 ruff format --check .` exited `0` with `69 files already formatted`; `uv run --python 3.12 ruff check .` exited `0` with `All checks passed!`; `uv run --python 3.12 pytest -q` exited `0` with the full suite completing and two expected skips; `uv run --python 3.12 mypy src` exited `0` with `Success: no issues found in 33 source files`; `git diff --check` exited `0` with no output.
+- **Changed paths and human boundary**: `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/state/memory.py`, `src/apexcrew/adapters/state/sqlite.py`, and `AGENT_LOG.md` only. Human changes: none.
+- **Commit subject**: `style(model): normalize provenance bindings`.
+- **Process correction**: preliminary local commit `93e1a0759ccf64962e1c1dab2d027b90616abfca` was created before the mandatory ordered review evidence and therefore was not ledger-recorded or accepted. The branch was returned with `git reset --soft` to its verified parent `8631c52200c84d466a6de4709f0dbee12e01baff`, preserving this exact staged diff without a code or test edit. All preliminary review results are discarded; the fresh staged-diff reviews recorded below are the only final task review evidence.
+- **Spec-compliance review**: fresh reviewer OpenAI Codex (GPT-5), session `/root/r3_01_fix008_spec_rebuild`, returned PASS. It verified the authorized base, exact four-path staged scope, three Ruff-only condition-layout hunks, frozen SPEC preservation, red/green evidence, and clean Ruff-format plus cached/working-tree diff checks. No finding or code/test fix was required.
+- **Code-quality review**: fresh reviewer OpenAI Codex (GPT-5), session `/root/r3_01_fix008_quality_rebuild`, returned PASS. It verified the final staged four-path scope, no unstaged or untracked change, behavior-preserving Ruff-only source layout, task evidence quality, and passing Ruff format/check, full pytest, mypy, and cached/working-tree diff checks. No finding or code/test fix was required.
+
 ## 2026-08-04 / M1-FIX-002 - Injectable model identities and request-sensitive scripted responses
 
 - **Pre-task record**: fresh implementation subagent OpenAI Codex (GPT-5), session `/root/r3_01_fix002_impl`, starts from base `c62298400c80dc525ed0f53de7f679f4055995ab` on `codex/m1-r3-model-provenance`.

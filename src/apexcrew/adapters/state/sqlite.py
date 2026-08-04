@@ -5037,8 +5037,7 @@ class SqliteStateStore:
                 if dispatch.outcome == "COMPLETED":
                     if (
                         dispatch.response_requested_model_id is None
-                        or dispatch.response_requested_model_id
-                        != intent.request.requested_model_id
+                        or dispatch.response_requested_model_id != intent.request.requested_model_id
                         or dispatch.returned_model_id is None
                         or dispatch.normalized_payload_digest is None
                         or dispatch.normalized_action is None
