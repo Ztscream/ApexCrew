@@ -819,3 +819,8 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Independent review**: fresh reviewer `/root/r3_fix008_plan_review` returned APPROVED with zero blockers. It verified the candidate-only `PLAN.md` change, authorization-marker and 15-row EOF-ledger invariants, the exact three-line Ruff remediation scope, the narrow R3-01 regression exception, and the explicit seven-command post-`M1-FIX-008` module regression.
 - **Owner decision**: the repository owner explicitly renews `M1 GO` for the reviewed M1-R3B format-remediation correction and authorizes resuming only `M1-FIX-008` in the existing R3-01 worktree.
 - **Scope boundary**: this decision does not mark M1 complete, authorize M2-M4, authorize PR #8 merge, or authorize push, publication, credential access, or a Runtime Grant.
+## M1-R3 ledger-audit M1-FIX-008
+- PLAN before SHA-256: 27F48E06AE0F40C95CA5C1C0E875333CCFEFF6EA74348AADF27941FA329D058E
+- PLAN after SHA-256: 3215973D002AFAF8208278C7426E39645531AD6A15F6CC5F6498BEB985B3BB6E
+- Cells: Status, Implementation commit
+- Implementation commit: 1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a
