@@ -29,6 +29,9 @@ from apexcrew.domain.admission import (
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
+    TargetReservationIdAllocationError,
+    allocate_target_reservation_id,
+    random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
     ActionClass,
@@ -835,6 +838,32 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             ),
         ),
     ),
+    (
+        19,
+        (
+            """CREATE TABLE bootstrap_command_receipts (
+                request_id TEXT PRIMARY KEY,
+                envelope_digest TEXT NOT NULL,
+                outcome_json TEXT NOT NULL
+            )""",
+        ),
+    ),
+    (
+        20,
+        (
+            """CREATE TABLE control_request_claims (
+                request_id TEXT PRIMARY KEY,
+                envelope_digest TEXT NOT NULL,
+                outcome_json TEXT NOT NULL
+            )""",
+            """INSERT OR IGNORE INTO control_request_claims(
+                request_id, envelope_digest, outcome_json
+            ) SELECT request_id, envelope_digest, outcome_json FROM command_receipts""",
+            """INSERT OR IGNORE INTO control_request_claims(
+                request_id, envelope_digest, outcome_json
+            ) SELECT request_id, envelope_digest, outcome_json FROM bootstrap_command_receipts""",
+        ),
+    ),
 )
 
 
@@ -937,6 +966,19 @@ def _json_object(value: str, error_code: str = "STORED_JSON_OBJECT_REQUIRED") ->
     if not isinstance(parsed, dict):
         raise StateConflict(error_code)
     return parsed
+
+
+def _stored_command_outcome_identity(value: str) -> tuple[RunId | None, AuditSequence | None]:
+    try:
+        outcome = CommandOutcome.model_validate(
+            {
+                **_json_object(value, "CONTROL_REQUEST_CLAIM_STORAGE_INVALID"),
+                "result": None,
+            }
+        )
+    except ValueError as error:
+        raise StateConflict("CONTROL_REQUEST_CLAIM_STORAGE_INVALID") from error
+    return outcome.run_id, outcome.resulting_sequence
 
 
 def _require_canonical_json_object(value: str, error_code: str) -> None:
@@ -1186,6 +1228,12 @@ class _ResumeStale(RuntimeError):
         self.decision = decision
 
 
+class _ControlRequestClaimed(RuntimeError):
+    def __init__(self, outcome: CommandOutcome) -> None:
+        super().__init__("CONTROL_REQUEST_ALREADY_CLAIMED")
+        self.outcome = outcome
+
+
 @dataclass(frozen=True, slots=True)
 class _ReservationEvaluation:
     reason: ModelReservationReason | None
@@ -1197,7 +1245,13 @@ class _ReservationEvaluation:
 
 
 class SqliteStateStore:
-    def __init__(self, database: Path, monotonic_clock: MonotonicClock | None = None) -> None:
+    def __init__(
+        self,
+        database: Path,
+        monotonic_clock: MonotonicClock | None = None,
+        *,
+        target_reservation_id_source: Callable[[], object] | None = None,
+    ) -> None:
         self._database = database
         self._data_root = database.parent / "data"
         self._connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
@@ -1206,6 +1260,11 @@ class SqliteStateStore:
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
         self._monotonic_clock = monotonic_clock
+        self._target_reservation_id_source = (
+            random_target_reservation_id
+            if target_reservation_id_source is None
+            else target_reservation_id_source
+        )
         self._apply_migrations()
 
     def _apply_migrations(self) -> None:
@@ -1436,29 +1495,24 @@ class SqliteStateStore:
     def record_command(self, command: CommandEnvelope, outcome: CommandOutcome) -> CommandOutcome:
         with self._lock:
             run_id = _command_run_id(command, outcome)
-            envelope_digest = _command_digest(command)
             with self._read_transaction() as connection:
                 run = connection.execute(
                     "SELECT repository_id FROM runs WHERE run_id = ?", (run_id,)
                 ).fetchone()
                 if run is None:
                     raise StateConflict("RUN_NOT_FOUND")
-                existing = connection.execute(
-                    "SELECT repository_id, run_id, envelope_digest, outcome_json, "
-                    "resulting_sequence FROM command_receipts WHERE request_id = ?",
+                claim = connection.execute(
+                    "SELECT envelope_digest, outcome_json FROM control_request_claims "
+                    "WHERE request_id = ?",
                     (command.request_id,),
                 ).fetchone()
                 sequence_row = connection.execute(
                     "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
                 ).fetchone()
-            if existing is not None:
-                if (
-                    existing["repository_id"] == run["repository_id"]
-                    and existing["run_id"] == run_id
-                    and existing["envelope_digest"] == envelope_digest
-                ):
+            if claim is not None:
+                if claim["envelope_digest"] == _command_digest(command):
                     return CommandOutcome.validate_for_payload(
-                        command.payload, _json_object(existing["outcome_json"])
+                        command.payload, _json_object(claim["outcome_json"])
                     )
                 return CommandOutcome.for_payload(
                     command.payload,
@@ -1475,33 +1529,29 @@ class SqliteStateStore:
             committed_sequence = outcome.resulting_sequence
             if committed_sequence is None or committed_sequence != AuditSequence(expected + 1):
                 raise StateConflict("COMMAND_OUTCOME_SEQUENCE_MISMATCH")
-            outcome_json = canonical_json(outcome.model_dump(mode="json"))
 
             def mutate(connection: sqlite3.Connection) -> None:
-                connection.execute(
-                    "INSERT INTO command_receipts(request_id, repository_id, run_id, "
-                    "envelope_digest, outcome_json, resulting_sequence) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        command.request_id,
-                        run["repository_id"],
-                        run_id,
-                        envelope_digest,
-                        outcome_json,
-                        committed_sequence,
-                    ),
+                self._insert_control_receipt(
+                    connection,
+                    command,
+                    run_id,
+                    RepositoryId(run["repository_id"]),
+                    outcome,
                 )
 
-            self._commit_state_and_event(
-                run_id=run_id,
-                expected_sequence=expected,
-                event=AuditEvent.kind(
-                    "COMMAND_RECORDED",
-                    applicable_revision_digests=command.applicable_revision_digests,
-                    result_class=outcome.status,
-                ),
-                mutate=mutate,
-            )
+            try:
+                self._commit_state_and_event(
+                    run_id=run_id,
+                    expected_sequence=expected,
+                    event=AuditEvent.kind(
+                        "COMMAND_RECORDED",
+                        applicable_revision_digests=command.applicable_revision_digests,
+                        result_class=outcome.status,
+                    ),
+                    mutate=mutate,
+                )
+            except _ControlRequestClaimed as error:
+                return error.outcome
             return outcome
 
     def create_draft_with_reservation(
@@ -6277,34 +6327,89 @@ class SqliteStateStore:
 
     def _existing_control_outcome(self, command: CommandEnvelope) -> CommandOutcome | None:
         with self._read_transaction() as connection:
-            row = connection.execute(
-                "SELECT envelope_digest, outcome_json FROM command_receipts WHERE request_id = ?",
-                (command.request_id,),
-            ).fetchone()
+            return self._existing_control_outcome_in_transaction(connection, command)
+
+    def _existing_control_outcome_in_transaction(
+        self, connection: sqlite3.Connection, command: CommandEnvelope
+    ) -> CommandOutcome | None:
+        row = connection.execute(
+            "SELECT envelope_digest, outcome_json FROM control_request_claims WHERE request_id = ?",
+            (command.request_id,),
+        ).fetchone()
         if row is None:
             return None
-        stored = CommandOutcome.validate_for_payload(
-            command.payload, _json_object(row["outcome_json"])
-        )
         if row["envelope_digest"] == _command_digest(command):
-            return stored
+            return CommandOutcome.validate_for_payload(
+                command.payload, _json_object(row["outcome_json"])
+            )
+        stored_run_id, stored_sequence = _stored_command_outcome_identity(row["outcome_json"])
         return CommandOutcome.for_payload(
             command.payload,
             status=CommandStatus.CONFLICT,
-            run_id=stored.run_id,
-            resulting_sequence=stored.resulting_sequence,
+            run_id=stored_run_id,
+            resulting_sequence=stored_sequence,
             failed_invariant="IDEMPOTENCY_KEY_REUSE",
         )
 
-    @staticmethod
+    def _claim_control_request_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        command: CommandEnvelope,
+        outcome: CommandOutcome,
+    ) -> None:
+        existing = self._existing_control_outcome_in_transaction(connection, command)
+        if existing is not None:
+            raise _ControlRequestClaimed(existing)
+        connection.execute(
+            "INSERT INTO control_request_claims(request_id, envelope_digest, outcome_json) "
+            "VALUES (?, ?, ?)",
+            (
+                command.request_id,
+                _command_digest(command),
+                canonical_json(outcome.model_dump(mode="json")),
+            ),
+        )
+
+    def _record_unsequenced_control_outcome(
+        self,
+        connection: sqlite3.Connection,
+        command: CommandEnvelope,
+        outcome: CommandOutcome,
+    ) -> CommandOutcome:
+        existing = self._existing_control_outcome_in_transaction(connection, command)
+        if existing is not None:
+            return existing
+        self._claim_control_request_in_transaction(connection, command, outcome)
+        return outcome
+
+    def _record_bootstrap_conflict_receipt(
+        self,
+        connection: sqlite3.Connection,
+        command: CommandEnvelope,
+        failed_invariant: str,
+    ) -> CommandOutcome:
+        outcome = CommandOutcome.for_payload(
+            command.payload,
+            status=CommandStatus.CONFLICT,
+            run_id=None,
+            resulting_sequence=None,
+            failed_invariant=failed_invariant,
+        )
+        return self._record_unsequenced_control_outcome(connection, command, outcome)
+
     def _insert_control_receipt(
+        self,
         connection: sqlite3.Connection,
         command: CommandEnvelope,
         run_id: RunId,
         repository_id: RepositoryId,
         outcome: CommandOutcome,
+        *,
+        claim: bool = True,
     ) -> None:
         assert outcome.resulting_sequence is not None
+        if claim:
+            self._claim_control_request_in_transaction(connection, command, outcome)
         connection.execute(
             "INSERT INTO command_receipts(request_id, repository_id, run_id, "
             "envelope_digest, outcome_json, resulting_sequence) VALUES (?, ?, ?, ?, ?, ?)",
@@ -6330,20 +6435,45 @@ class SqliteStateStore:
         if command.expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
         expected = AuditSequence(command.expected_sequence)
-        outcome = CommandOutcome.for_payload(
-            command.payload,
-            status=status,
-            run_id=run_id,
-            resulting_sequence=AuditSequence(expected + 1),
-            failed_invariant=failed_invariant,
-        )
-
-        def mutate(connection: sqlite3.Connection) -> None:
+        with self._transaction("IMMEDIATE") as connection:
+            existing = self._existing_control_outcome_in_transaction(connection, command)
+            if existing is not None:
+                return existing
             run = connection.execute(
                 "SELECT repository_id FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
             if run is None:
-                raise StateConflict("RUN_NOT_FOUND")
+                missing = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.INVALID,
+                    run_id=run_id,
+                    resulting_sequence=None,
+                    failed_invariant="RUN_NOT_FOUND",
+                )
+                self._claim_control_request_in_transaction(connection, command, missing)
+                return missing
+            sequence_row = connection.execute(
+                "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            current = AuditSequence(0 if sequence_row is None else sequence_row["current_sequence"])
+            if current != expected:
+                stale = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=current,
+                    failed_invariant="STALE_SEQUENCE",
+                )
+                self._claim_control_request_in_transaction(connection, command, stale)
+                return stale
+            outcome = CommandOutcome.for_payload(
+                command.payload,
+                status=status,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected + 1),
+                failed_invariant=failed_invariant,
+            )
+            self._claim_control_request_in_transaction(connection, command, outcome)
             if mutate_domain is not None:
                 mutate_domain(connection)
             self._insert_control_receipt(
@@ -6352,21 +6482,38 @@ class SqliteStateStore:
                 run_id,
                 RepositoryId(run["repository_id"]),
                 outcome,
+                claim=False,
             )
-
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=expected,
-            event=AuditEvent.kind(
-                event_kind,
-                applicable_revision_digests=command.applicable_revision_digests,
-                result_class=status,
-            ),
-            mutate=mutate,
-        )
-        return outcome
+            if self._fail_next_commit_after_state_write:
+                self._fail_next_commit_after_state_write = False
+                raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
+            self._append_audit_event(
+                connection,
+                run_id,
+                AuditEvent.kind(
+                    event_kind,
+                    applicable_revision_digests=command.applicable_revision_digests,
+                    result_class=status,
+                ),
+                expected,
+            )
+            return outcome
 
     def create_bootstrap_run(
+        self,
+        command: CommandEnvelope,
+        repository_authority: RepositoryBootstrapAuthorityService,
+    ) -> CommandOutcome:
+        existing = self._existing_control_outcome(command)
+        if existing is not None:
+            return existing
+        outcome = self._create_bootstrap_run_unchecked(command, repository_authority)
+        if outcome.status == CommandStatus.ACCEPTED:
+            return outcome
+        with self._transaction("IMMEDIATE") as connection:
+            return self._record_unsequenced_control_outcome(connection, command, outcome)
+
+    def _create_bootstrap_run_unchecked(
         self,
         command: CommandEnvelope,
         repository_authority: RepositoryBootstrapAuthorityService,
@@ -6426,8 +6573,6 @@ class SqliteStateStore:
         run_id = RunId(f"run-{binding[:32]}")
         repository_id = authority.repository_id
         repository_instance_digest = authority.repository_instance_digest
-        reservation_id = f"reservation-{binding[32:64]}"
-        reservation_path = self._data_root / "reservations" / reservation_id
         revisions = {
             "POLICY": payload.policy_revision,
             "BUDGET": payload.budget_revision,
@@ -6444,7 +6589,8 @@ class SqliteStateStore:
             resulting_sequence=AuditSequence(1),
         )
 
-        def mutate(connection: sqlite3.Connection) -> None:
+        def mutate(connection: sqlite3.Connection, reservation_id: str) -> None:
+            reservation_path = self._data_root / "reservations" / reservation_id
             connection.execute(
                 "INSERT INTO runs(run_id, repository_id, repository_instance_digest, state, "
                 "target_ref, pinned_target_oid, current_policy_digest, current_budget_digest, "
@@ -6492,14 +6638,46 @@ class SqliteStateStore:
                         _revision_json(document),
                     ),
                 )
-            self._insert_control_receipt(connection, command, run_id, repository_id, outcome)
+            self._insert_control_receipt(
+                connection,
+                command,
+                run_id,
+                repository_id,
+                outcome,
+                claim=False,
+            )
 
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=AuditSequence(0),
-            event=AuditEvent.kind("RUN_CREATED"),
-            mutate=mutate,
-        )
+        with self._transaction("IMMEDIATE") as connection:
+            existing = self._existing_control_outcome_in_transaction(connection, command)
+            if existing is not None:
+                return existing
+            try:
+                reservation_id = allocate_target_reservation_id(
+                    self._target_reservation_id_source,
+                    lambda candidate: (
+                        connection.execute(
+                            "SELECT 1 FROM target_reservations WHERE reservation_id = ?",
+                            (candidate,),
+                        ).fetchone()
+                        is not None
+                    ),
+                )
+            except TargetReservationIdAllocationError as error:
+                return self._record_bootstrap_conflict_receipt(
+                    connection, command, error.failed_invariant
+                )
+            self._claim_control_request_in_transaction(connection, command, outcome)
+            self._require_expected_sequence(connection, run_id, AuditSequence(0))
+            mutate(connection, reservation_id)
+            if self._fail_next_commit_after_state_write:
+                self._fail_next_commit_after_state_write = False
+                raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
+            self._append_audit_event(
+                connection,
+                run_id,
+                AuditEvent.kind("RUN_CREATED"),
+                AuditSequence(0),
+            )
         return outcome
 
     def _run_state_and_sequence(self, run_id: RunId) -> tuple[RunState, AuditSequence]:
@@ -7166,35 +7344,41 @@ class SqliteStateStore:
             or approval.plan_digest != payload.plan_digest
             or command.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 payload,
                 status=CommandStatus.STALE,
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected),
                 failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
         target_digest = self.target_authority_digest(run_id)
         if target_authority.current_for(run_id) != target_digest or start_guard is None:
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 payload,
                 status=CommandStatus.CONFLICT,
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected),
                 failed_invariant="START_GUARD_UNAVAILABLE",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
         decision = start_guard.inspect(
             run_id=run_id,
             applicable_revision_digests=current,
             expected_sequence=AuditSequence(expected),
         )
         if not decision.ok or decision.binding is None:
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 payload,
                 status=CommandStatus.CONFLICT,
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected),
                 failed_invariant=decision.reason or "START_GUARD_DENIED",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
         guard = decision.binding
         run = self.run_record(run_id)
         reservation = self.target_reservation_for_run(run_id)
@@ -7206,13 +7390,15 @@ class SqliteStateStore:
             or guard.target_safety_digest != target_digest
             or guard.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 payload,
                 status=CommandStatus.STALE,
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected),
                 failed_invariant="START_GUARD_BINDING_MISMATCH",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
 
         def mutate(connection: sqlite3.Connection) -> None:
             if (
@@ -7249,32 +7435,36 @@ class SqliteStateStore:
         repository_authority: RepositoryBootstrapAuthorityService,
         start_guard: StartGuard | None = None,
     ) -> CommandOutcome:
+        if isinstance(command.payload, CreateRunPayload):
+            return self.create_bootstrap_run(command, repository_authority)
         existing = self._existing_control_outcome(command)
         if existing is not None:
             return existing
-        if isinstance(command.payload, CreateRunPayload):
-            return self.create_bootstrap_run(command, repository_authority)
         run_id = RunId(command.payload.run_id)
         try:
             state, sequence = self._run_state_and_sequence(run_id)
         except StateConflict as error:
             if str(error) != "RUN_NOT_FOUND":
                 raise
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 command.payload,
                 status=CommandStatus.INVALID,
                 run_id=run_id,
                 resulting_sequence=None,
                 failed_invariant="RUN_NOT_FOUND",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
         if command.expected_sequence != sequence:
-            return CommandOutcome.for_payload(
+            outcome = CommandOutcome.for_payload(
                 command.payload,
                 status=CommandStatus.STALE,
                 run_id=run_id,
                 resulting_sequence=sequence,
                 failed_invariant="STALE_SEQUENCE",
             )
+            with self._transaction("IMMEDIATE") as connection:
+                return self._record_unsequenced_control_outcome(connection, command, outcome)
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, state)
         if isinstance(

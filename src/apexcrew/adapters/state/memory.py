@@ -28,6 +28,9 @@ from apexcrew.domain.admission import (
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
+    TargetReservationIdAllocationError,
+    allocate_target_reservation_id,
+    random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
     ActionClass,
@@ -341,6 +344,19 @@ def _json_object(value: str, error_code: str = "STORED_JSON_OBJECT_REQUIRED") ->
     return parsed
 
 
+def _stored_command_outcome_identity(value: str) -> tuple[RunId | None, AuditSequence | None]:
+    try:
+        outcome = CommandOutcome.model_validate(
+            {
+                **_json_object(value, "CONTROL_REQUEST_CLAIM_STORAGE_INVALID"),
+                "result": None,
+            }
+        )
+    except ValueError as error:
+        raise StateConflict("CONTROL_REQUEST_CLAIM_STORAGE_INVALID") from error
+    return outcome.run_id, outcome.resulting_sequence
+
+
 def _require_canonical_json_object(value: str, error_code: str) -> None:
     if canonical_json(_json_object(value, error_code)) != value:
         raise StateConflict(error_code)
@@ -368,9 +384,21 @@ class _ResumeStale(RuntimeError):
         self.decision = decision
 
 
+class _ControlRequestClaimed(RuntimeError):
+    def __init__(self, outcome: CommandOutcome) -> None:
+        super().__init__("CONTROL_REQUEST_ALREADY_CLAIMED")
+        self.outcome = outcome
+
+
 class InMemoryStateStore:
-    def __init__(self, monotonic_clock: MonotonicClock | None = None) -> None:
+    def __init__(
+        self,
+        monotonic_clock: MonotonicClock | None = None,
+        *,
+        target_reservation_id_source: Callable[[], object] | None = None,
+    ) -> None:
         self._command_receipts: dict[str, tuple[str, RunId, str, str, AuditSequence]] = {}
+        self._control_request_claims: dict[str, tuple[str, str]] = {}
         self._audit_events: dict[RunId, list[tuple[AuditSequence, AuditEvent]]] = {}
         self._sequences: dict[RunId, AuditSequence] = {}
         self._effect_intents: dict[IntentId, EffectIntent] = {}
@@ -444,12 +472,18 @@ class InMemoryStateStore:
         self._trusted_task_repairs: dict[tuple[RunId, TaskId, int, str], str] = {}
         self._task_resume_allocations: dict[str, TaskResumeAllocation] = {}
         self._monotonic_clock = monotonic_clock
+        self._target_reservation_id_source = (
+            random_target_reservation_id
+            if target_reservation_id_source is None
+            else target_reservation_id_source
+        )
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
 
     def _copied(self) -> InMemoryStateStore:
         copied = object.__new__(InMemoryStateStore)
         copied._command_receipts = deepcopy(self._command_receipts)
+        copied._control_request_claims = self._control_request_claims.copy()
         copied._audit_events = deepcopy(self._audit_events)
         copied._sequences = self._sequences.copy()
         copied._effect_intents = self._effect_intents.copy()
@@ -505,12 +539,14 @@ class InMemoryStateStore:
         copied._trusted_task_repairs = self._trusted_task_repairs.copy()
         copied._task_resume_allocations = self._task_resume_allocations.copy()
         copied._monotonic_clock = self._monotonic_clock
+        copied._target_reservation_id_source = self._target_reservation_id_source
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
         return copied
 
     def _publish(self, copied: InMemoryStateStore) -> None:
         self._command_receipts = copied._command_receipts
+        self._control_request_claims = copied._control_request_claims
         self._audit_events = copied._audit_events
         self._sequences = copied._sequences
         self._effect_intents = copied._effect_intents
@@ -604,46 +640,70 @@ class InMemoryStateStore:
                 self._fail_next_commit_after_state_write = False
                 raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
             events = event_factory()
-            if not events:
-                raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
-            runtime_state = copied._active_run_times.get(
-                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            return self._publish_copied_events(
+                copied=copied,
+                run_id=run_id,
+                expected_sequence=expected_sequence,
+                events=events,
+                runtime_now=runtime_now,
+                runtime_now_factory=runtime_now_factory,
+                finalize=finalize,
             )
-            committed_events = events
-            if runtime_state.open_owner_generation is None:
-                if any(
-                    event.runtime_owner_generation is not None
-                    or event.runtime_monotonic_nanoseconds is not None
-                    for event in events
-                ):
-                    raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
-                copied._active_run_times[run_id] = runtime_state
-            else:
-                if copied._monotonic_clock is None:
-                    raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
-                if runtime_now_factory is not None:
-                    now = runtime_now_factory()
-                else:
-                    now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
-                runtime_state.observed_nanoseconds(now)
-                committed_events = tuple(
-                    replace(
-                        event,
-                        runtime_owner_generation=runtime_state.open_owner_generation,
-                        runtime_monotonic_nanoseconds=now.nanoseconds,
-                    )
-                    for event in events
+
+    def _publish_copied_events(
+        self,
+        *,
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        events: tuple[AuditEvent, ...],
+        runtime_now: MonotonicInstant | None,
+        runtime_now_factory: Callable[[], MonotonicInstant] | None = None,
+        finalize: Callable[[InMemoryStateStore], None] | None = None,
+    ) -> AuditSequence:
+        if not events:
+            raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
+        runtime_state = copied._active_run_times.get(
+            run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+        )
+        committed_events = events
+        if runtime_state.open_owner_generation is None:
+            if any(
+                event.runtime_owner_generation is not None
+                or event.runtime_monotonic_nanoseconds is not None
+                for event in events
+            ):
+                raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+            copied._active_run_times[run_id] = runtime_state
+        else:
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            now = (
+                runtime_now_factory()
+                if runtime_now_factory is not None
+                else copied._monotonic_clock.now()
+                if runtime_now is None
+                else runtime_now
+            )
+            runtime_state.observed_nanoseconds(now)
+            committed_events = tuple(
+                replace(
+                    event,
+                    runtime_owner_generation=runtime_state.open_owner_generation,
+                    runtime_monotonic_nanoseconds=now.nanoseconds,
                 )
-                copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
-            for offset, committed_event in enumerate(committed_events, start=1):
-                next_sequence = AuditSequence(expected_sequence + offset)
-                copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
-            if finalize is not None:
-                finalize(copied)
-            next_sequence = AuditSequence(expected_sequence + len(committed_events))
-            copied._sequences[run_id] = next_sequence
-            self._publish(copied)
-            return next_sequence
+                for event in events
+            )
+            copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
+        for offset, committed_event in enumerate(committed_events, start=1):
+            next_sequence = AuditSequence(expected_sequence + offset)
+            copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+        if finalize is not None:
+            finalize(copied)
+        next_sequence = AuditSequence(expected_sequence + len(committed_events))
+        copied._sequences[run_id] = next_sequence
+        self._publish(copied)
+        return next_sequence
 
     def record_command(self, command: CommandEnvelope, outcome: CommandOutcome) -> CommandOutcome:
         with self._lock:
@@ -651,15 +711,10 @@ class InMemoryStateStore:
             run = self._runs.get(run_id)
             if run is None:
                 raise StateConflict("RUN_NOT_FOUND")
-            envelope_digest = _command_digest(command)
-            existing = self._command_receipts.get(command.request_id)
-            if existing is not None:
-                repository_id, stored_run_id, stored_digest, stored_outcome, _ = existing
-                if (
-                    repository_id == run.repository_id
-                    and stored_run_id == run_id
-                    and stored_digest == envelope_digest
-                ):
+            claim = self._control_request_claims.get(command.request_id)
+            if claim is not None:
+                stored_digest, stored_outcome = claim
+                if stored_digest == _command_digest(command):
                     return CommandOutcome.validate_for_payload(
                         command.payload, _json_object(stored_outcome)
                     )
@@ -678,24 +733,28 @@ class InMemoryStateStore:
                 raise StateConflict("COMMAND_OUTCOME_SEQUENCE_MISMATCH")
 
             def mutate(copied: InMemoryStateStore) -> None:
+                self._claim_control_request(copied, command, outcome)
                 copied._command_receipts[command.request_id] = (
                     run.repository_id,
                     run_id,
-                    envelope_digest,
+                    _command_digest(command),
                     _outcome_json(outcome),
                     committed_sequence,
                 )
 
-            self._commit_state_and_event(
-                run_id=run_id,
-                expected_sequence=expected,
-                event=AuditEvent.kind(
-                    "COMMAND_RECORDED",
-                    applicable_revision_digests=command.applicable_revision_digests,
-                    result_class=outcome.status,
-                ),
-                mutate=mutate,
-            )
+            try:
+                self._commit_state_and_event(
+                    run_id=run_id,
+                    expected_sequence=expected,
+                    event=AuditEvent.kind(
+                        "COMMAND_RECORDED",
+                        applicable_revision_digests=command.applicable_revision_digests,
+                        result_class=outcome.status,
+                    ),
+                    mutate=mutate,
+                )
+            except _ControlRequestClaimed as error:
+                return error.outcome
             return outcome
 
     def create_draft_with_reservation(
@@ -3750,22 +3809,65 @@ class InMemoryStateStore:
 
     def _existing_control_outcome(self, command: CommandEnvelope) -> CommandOutcome | None:
         with self._lock:
-            receipt = self._command_receipts.get(command.request_id)
-            if receipt is None:
-                return None
-            _, _, stored_digest, outcome_json, _ = receipt
-            stored = CommandOutcome.validate_for_payload(
-                command.payload, _json_object(outcome_json)
+            return self._control_request_claim_outcome(command, self._control_request_claims)
+
+    @staticmethod
+    def _control_request_claim_outcome(
+        command: CommandEnvelope, claims: dict[str, tuple[str, str]]
+    ) -> CommandOutcome | None:
+        claim = claims.get(command.request_id)
+        if claim is None:
+            return None
+        stored_digest, outcome_json = claim
+        if stored_digest == _command_digest(command):
+            return CommandOutcome.validate_for_payload(command.payload, _json_object(outcome_json))
+        stored_run_id, stored_sequence = _stored_command_outcome_identity(outcome_json)
+        return CommandOutcome.for_payload(
+            command.payload,
+            status=CommandStatus.CONFLICT,
+            run_id=stored_run_id,
+            resulting_sequence=stored_sequence,
+            failed_invariant="IDEMPOTENCY_KEY_REUSE",
+        )
+
+    def _claim_control_request(
+        self,
+        copied: InMemoryStateStore,
+        command: CommandEnvelope,
+        outcome: CommandOutcome,
+    ) -> None:
+        existing = self._control_request_claim_outcome(command, copied._control_request_claims)
+        if existing is not None:
+            raise _ControlRequestClaimed(existing)
+        copied._control_request_claims[command.request_id] = (
+            _command_digest(command),
+            _outcome_json(outcome),
+        )
+
+    def _record_unsequenced_control_outcome(
+        self, command: CommandEnvelope, outcome: CommandOutcome
+    ) -> CommandOutcome:
+        with self._lock:
+            existing = self._control_request_claim_outcome(command, self._control_request_claims)
+            if existing is not None:
+                return existing
+            self._control_request_claims[command.request_id] = (
+                _command_digest(command),
+                _outcome_json(outcome),
             )
-            if stored_digest == _command_digest(command):
-                return stored
-            return CommandOutcome.for_payload(
-                command.payload,
-                status=CommandStatus.CONFLICT,
-                run_id=stored.run_id,
-                resulting_sequence=stored.resulting_sequence,
-                failed_invariant="IDEMPOTENCY_KEY_REUSE",
-            )
+        return outcome
+
+    def _record_bootstrap_conflict_receipt(
+        self, command: CommandEnvelope, failed_invariant: str
+    ) -> CommandOutcome:
+        outcome = CommandOutcome.for_payload(
+            command.payload,
+            status=CommandStatus.CONFLICT,
+            run_id=None,
+            resulting_sequence=None,
+            failed_invariant=failed_invariant,
+        )
+        return self._record_unsequenced_control_outcome(command, outcome)
 
     def _record_control_outcome(
         self,
@@ -3779,18 +3881,43 @@ class InMemoryStateStore:
         if command.expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
         expected = AuditSequence(command.expected_sequence)
-        outcome = CommandOutcome.for_payload(
-            command.payload,
-            status=status,
-            run_id=run_id,
-            resulting_sequence=AuditSequence(expected + 1),
-            failed_invariant=failed_invariant,
-        )
-
-        def mutate(copied: InMemoryStateStore) -> None:
+        with self._lock:
+            existing = self._control_request_claim_outcome(command, self._control_request_claims)
+            if existing is not None:
+                return existing
+            copied = self._copied()
             run = copied._runs.get(run_id)
             if run is None:
-                raise StateConflict("RUN_NOT_FOUND")
+                missing = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.INVALID,
+                    run_id=run_id,
+                    resulting_sequence=None,
+                    failed_invariant="RUN_NOT_FOUND",
+                )
+                self._claim_control_request(copied, command, missing)
+                self._publish(copied)
+                return missing
+            current = copied._sequences.get(run_id, AuditSequence(0))
+            if current != expected:
+                stale = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=current,
+                    failed_invariant="STALE_SEQUENCE",
+                )
+                self._claim_control_request(copied, command, stale)
+                self._publish(copied)
+                return stale
+            outcome = CommandOutcome.for_payload(
+                command.payload,
+                status=status,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected + 1),
+                failed_invariant=failed_invariant,
+            )
+            self._claim_control_request(copied, command, outcome)
             if mutate_domain is not None:
                 mutate_domain(copied)
             copied._command_receipts[command.request_id] = (
@@ -3800,20 +3927,39 @@ class InMemoryStateStore:
                 _outcome_json(outcome),
                 AuditSequence(expected + 1),
             )
-
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=expected,
-            event=AuditEvent.kind(
-                event_kind,
-                applicable_revision_digests=command.applicable_revision_digests,
-                result_class=status,
-            ),
-            mutate=mutate,
-        )
-        return outcome
+            if self._fail_next_commit_after_state_write:
+                self._fail_next_commit_after_state_write = False
+                raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
+            self._publish_copied_events(
+                copied=copied,
+                run_id=run_id,
+                expected_sequence=expected,
+                events=(
+                    AuditEvent.kind(
+                        event_kind,
+                        applicable_revision_digests=command.applicable_revision_digests,
+                        result_class=status,
+                    ),
+                ),
+                runtime_now=None,
+            )
+            return outcome
 
     def create_bootstrap_run(
+        self,
+        command: CommandEnvelope,
+        repository_authority: RepositoryBootstrapAuthorityService,
+    ) -> CommandOutcome:
+        with self._lock:
+            existing = self._existing_control_outcome(command)
+            if existing is not None:
+                return existing
+            outcome = self._create_bootstrap_run_unchecked(command, repository_authority)
+            if outcome.status == CommandStatus.ACCEPTED:
+                return outcome
+            return self._record_unsequenced_control_outcome(command, outcome)
+
+    def _create_bootstrap_run_unchecked(
         self,
         command: CommandEnvelope,
         repository_authority: RepositoryBootstrapAuthorityService,
@@ -3873,7 +4019,6 @@ class InMemoryStateStore:
         run_id = RunId(f"run-{binding[:32]}")
         repository_id = authority.repository_id
         repository_instance_digest = authority.repository_instance_digest
-        reservation_id = f"reservation-{binding[32:64]}"
         revisions: dict[str, FrozenDocument] = {
             "POLICY": payload.policy_revision,
             "BUDGET": payload.budget_revision,
@@ -3891,6 +4036,11 @@ class InMemoryStateStore:
         )
 
         def mutate(copied: InMemoryStateStore) -> None:
+            reservation_id = allocate_target_reservation_id(
+                copied._target_reservation_id_source,
+                lambda candidate: candidate in copied._target_reservations,
+            )
+            self._claim_control_request(copied, command, outcome)
             copied._runs[run_id] = RunRecord(
                 run_id=run_id,
                 repository_id=repository_id,
@@ -3933,12 +4083,15 @@ class InMemoryStateStore:
                 AuditSequence(1),
             )
 
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=AuditSequence(0),
-            event=AuditEvent.kind("RUN_CREATED"),
-            mutate=mutate,
-        )
+        try:
+            self._commit_state_and_event(
+                run_id=run_id,
+                expected_sequence=AuditSequence(0),
+                event=AuditEvent.kind("RUN_CREATED"),
+                mutate=mutate,
+            )
+        except TargetReservationIdAllocationError as error:
+            return self._record_bootstrap_conflict_receipt(command, error.failed_invariant)
         return outcome
 
     def propose_revision(
@@ -4485,21 +4638,27 @@ class InMemoryStateStore:
             or approval.plan_digest != payload.plan_digest
             or command.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
+                ),
             )
         target_digest = self.target_authority_digest(run_id)
         if target_authority.current_for(run_id) != target_digest or start_guard is None:
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.CONFLICT,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="START_GUARD_UNAVAILABLE",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.CONFLICT,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="START_GUARD_UNAVAILABLE",
+                ),
             )
         decision = start_guard.inspect(
             run_id=run_id,
@@ -4507,12 +4666,15 @@ class InMemoryStateStore:
             expected_sequence=AuditSequence(expected),
         )
         if not decision.ok or decision.binding is None:
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.CONFLICT,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant=decision.reason or "START_GUARD_DENIED",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.CONFLICT,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant=decision.reason or "START_GUARD_DENIED",
+                ),
             )
         guard = decision.binding
         run = self.run_record(run_id)
@@ -4525,12 +4687,15 @@ class InMemoryStateStore:
             or guard.target_safety_digest != target_digest
             or guard.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="START_GUARD_BINDING_MISMATCH",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="START_GUARD_BINDING_MISMATCH",
+                ),
             )
 
         def mutate(copied: InMemoryStateStore) -> None:
@@ -4565,30 +4730,36 @@ class InMemoryStateStore:
         repository_authority: RepositoryBootstrapAuthorityService,
         start_guard: StartGuard | None = None,
     ) -> CommandOutcome:
+        if isinstance(command.payload, CreateRunPayload):
+            return self.create_bootstrap_run(command, repository_authority)
         existing = self._existing_control_outcome(command)
         if existing is not None:
             return existing
-        if isinstance(command.payload, CreateRunPayload):
-            return self.create_bootstrap_run(command, repository_authority)
         run_id = RunId(command.payload.run_id)
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
-                return CommandOutcome.for_payload(
-                    command.payload,
-                    status=CommandStatus.INVALID,
-                    run_id=run_id,
-                    resulting_sequence=None,
-                    failed_invariant="RUN_NOT_FOUND",
+                return self._record_unsequenced_control_outcome(
+                    command,
+                    CommandOutcome.for_payload(
+                        command.payload,
+                        status=CommandStatus.INVALID,
+                        run_id=run_id,
+                        resulting_sequence=None,
+                        failed_invariant="RUN_NOT_FOUND",
+                    ),
                 )
             sequence = self._sequences.get(run_id, AuditSequence(0))
         if command.expected_sequence != sequence:
-            return CommandOutcome.for_payload(
-                command.payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=sequence,
-                failed_invariant="STALE_SEQUENCE",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=sequence,
+                    failed_invariant="STALE_SEQUENCE",
+                ),
             )
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, run.state)

@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from helpers.application import make_permitted_draft_runtime
+from helpers.application import (
+    FixtureRepositoryBootstrapAuthorityService,
+    make_create_run_command,
+    make_permitted_draft_runtime,
+)
 
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
@@ -34,7 +38,15 @@ from apexcrew.domain.admission import (
 from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import ReservationObservation, TargetReservation
 from apexcrew.domain.model import RecoveredModelAction
-from apexcrew.domain.types import GitOid, IntentId, RepositoryId, RunId, RunState, RunStopReason
+from apexcrew.domain.types import (
+    CommandStatus,
+    GitOid,
+    IntentId,
+    RepositoryId,
+    RunId,
+    RunState,
+    RunStopReason,
+)
 
 
 @dataclass
@@ -60,6 +72,12 @@ class ScriptedReservationObserver:
 
 class InjectedCrash(RuntimeError):
     pass
+
+
+class TargetAuthorityMustNotBeUsed:
+    def current_for(self, run_id: RunId) -> str:
+        del run_id
+        raise AssertionError("bootstrap creation does not consult target authority")
 
 
 def reservation(tmp_path: Path) -> TargetReservation:
@@ -112,6 +130,39 @@ def seeded_reservation_store(database: Path, allocated: TargetReservation) -> Sq
         allocated,
     )
     return store
+
+
+def test_target_reservation_id_persists_across_sqlite_restart_and_identical_replay(
+    tmp_path: Path,
+) -> None:
+    reservation_id = "reservation-" + "a" * 32
+    candidates = iter((reservation_id,))
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database, target_reservation_id_source=lambda: next(candidates))
+    command = make_create_run_command(request_id="reservation-restart")
+    accepted = store.apply_control_command(
+        command,
+        TargetAuthorityMustNotBeUsed(),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert accepted.status == CommandStatus.ACCEPTED
+    assert accepted.run_id is not None
+    assert store.target_reservation_for_run(accepted.run_id).reservation_id == reservation_id
+    store.close()
+
+    def replay_source() -> str:
+        raise AssertionError("identical replay must not consult the reservation ID source")
+
+    reopened = SqliteStateStore(database, target_reservation_id_source=replay_source)
+    replay = reopened.apply_control_command(
+        command,
+        TargetAuthorityMustNotBeUsed(),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert replay == accepted
+    assert accepted.run_id is not None
+    assert reopened.target_reservation_for_run(accepted.run_id).reservation_id == reservation_id
+    reopened.close()
 
 
 def real_git_reservation_adapter(
