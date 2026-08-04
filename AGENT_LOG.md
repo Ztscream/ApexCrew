@@ -769,3 +769,10 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - PLAN after SHA-256: 13BB0887AAEDA4365C4F49C783E0E0A76F85354EC938A664DD723C3B8FD70E47
 - Cells: Status, Implementation commit
 - Implementation commit: 65d545bc3734bd1703d5b0793b52401da6f3b9cd
+
+## 2026-08-04 / M1-R3A - M1-FIX-002 scope-correction review and owner GO
+
+- **Reviewed candidate**: `aaeeef46068884fc939078bfb87b1ce234cbc701` on `codex/m1-r3-fix002-scope-plan`; `PLAN.md` SHA-256 `45CAAA148B43EBF452A8C2F4A03362D2870263875C36198F6EBCEACFBDE3D9A6`; normalized execution-authorization SHA-256 `AC4D72F80F31BE8ED7739DB89C4256CA1ACE1466AEE589061F9494160EABF005`; frozen `SPEC.md` SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`.
+- **Independent review**: fresh reviewer `/root/r3_fix002_scope_plan_review` returned APPROVED with zero blockers. It verified that the candidate-parent diff is one `PLAN.md` line adding only `tests/contract/test_state_store.py` to the M1-FIX-002 closed set, the authorization markers and EOF ledger remain valid, all legacy nonempty `ScriptedMockLLM` inputs are within that set, and M1-FIX-001 remains completed with implementation SHA `65d545bc3734bd1703d5b0793b52401da6f3b9cd`.
+- **Owner decision**: the repository owner explicitly renews `M1 GO` for the reviewed M1-R3A scope correction and authorizes resuming only M1-FIX-002 in the existing R3-01 worktree.
+- **Scope boundary**: this decision does not mark M1 complete, authorize M2-M4, authorize PR #8 merge, or authorize push, publication, credential access, or a Runtime Grant.
