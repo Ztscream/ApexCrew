@@ -1119,3 +1119,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the fail-closed stub; implementation commit follows.
 - **Human intervention**: none; process/OS lock behavior remains explicitly unimplemented, with no credential/`SPEC.md`/push/PR change.
 - **Lesson**: a deferred concurrency control must reject unsupported acquisition rather than manufacture a lock path or imply exclusivity.
+
+## 2026-08-04 / S5 - Context Capsule and Evidence Receipt
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `82513d489583779ab1436043598ea1eba5fe97f6`.
+- **Task/skill**: S5; karpathy-guidelines.
+- **Prompt/context**: add immutable revision-bound context and evidence contracts with constructor and persistence serialization only.
+- **Observed red**: collection failed with `ModuleNotFoundError` before `apexcrew.domain.evidence` existed.
+- **Implementation**: added frozen `ContextCapsule` and `EvidenceReceipt` with content/result digests, revision binding, validation, and canonical JSON round-trip.
+- **Green evidence**: focused evidence test passed; Ruff check/format and `mypy src` passed (`40 source files`).
+- **Subagent output/commit**: Codex self-reviewed the narrow contract; implementation commit follows.
+- **Human intervention**: none; admission logic remains outside this skeleton and no credentials/`SPEC.md`/push/PR changed.
+- **Lesson**: bind evidence to both its content and revision before adding admission decisions.
