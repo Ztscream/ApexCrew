@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import json
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
-from apexcrew.domain.actions import ActionEnvelope
-from apexcrew.domain.commands import ApplicableRevisionDigests
-from apexcrew.domain.effects import EffectIntent, StateConflict
+from apexcrew.domain.actions import ActionEnvelope, RiskyAction
+from apexcrew.domain.commands import ApplicableRevisionDigests, ConfirmationCode, GrantPayload
+from apexcrew.domain.effects import EffectIntent, StateConflict, canonical_json, sha256_digest
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     LogicalModelTurn,
@@ -21,15 +24,21 @@ from apexcrew.domain.model import (
 )
 from apexcrew.domain.plan import CanonicalPath, GlobPattern, TaskContract
 from apexcrew.domain.policy import ActionPolicy
-from apexcrew.domain.revisions import BudgetRevisionDocument
+from apexcrew.domain.revisions import BudgetRevisionDocument, Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    GrantId,
     IntentId,
+    PendingActionId,
+    RequestId,
     RevisionDigest,
     RunId,
     TaskId,
 )
+
+if TYPE_CHECKING:
+    from apexcrew.domain.tools import ActionPreState
 
 
 class AuthorityDenied(ValueError):
@@ -731,6 +740,356 @@ class AuthorizationDecision:
     effect_intent_id: IntentId | None
     pending_action_id: str | None
     resulting_sequence: AuditSequence | None
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenActionBindings:
+    run_id: RunId
+    task_id: TaskId
+    attempt_id: AttemptId
+    logical_turn_id: str
+    action_id: str
+    lease_id: str
+    lease_generation: int
+    run_head_oid: str
+    target_safety_digest: RevisionDigest
+    plan_digest: RevisionDigest
+    policy_digest: RevisionDigest
+    budget_digest: RevisionDigest
+    model_configuration_digest: RevisionDigest
+    tool_schema_digest: str
+    authorization_binding_digest: str
+    deadline_at_utc: datetime
+
+    @property
+    def applicable_revision_digests(self) -> ApplicableRevisionDigests:
+        return ApplicableRevisionDigests(
+            plan_digest=self.plan_digest,
+            policy_digest=self.policy_digest,
+            budget_digest=self.budget_digest,
+            model_configuration_digest=self.model_configuration_digest,
+        )
+
+    @classmethod
+    def from_authorization(
+        cls, request: AuthorizationRequest, decision: AuthorizationDecision
+    ) -> FrozenActionBindings:
+        if (
+            decision.decision != "REQUIRE_APPROVAL"
+            or decision.persistence != "WITH_PENDING_ACTION"
+            or decision.run_id != request.run_id
+            or decision.task_id != request.task_id
+            or decision.attempt_id != request.attempt_id
+            or decision.action_id != request.action_id
+            or decision.action_digest != request.action_digest
+            or decision.deadline_at_utc != request.deadline_at_utc
+            or decision.resulting_sequence is not None
+        ):
+            raise ValueError("PENDING_ACTION_AUTHORIZATION_MISMATCH")
+        return cls(
+            run_id=request.run_id,
+            task_id=request.task_id,
+            attempt_id=request.attempt_id,
+            logical_turn_id=request.logical_turn_id,
+            action_id=request.action_id,
+            lease_id=request.lease_id,
+            lease_generation=request.lease_generation,
+            run_head_oid=request.admissible_head,
+            target_safety_digest=RevisionDigest(request.target_safety_digest),
+            plan_digest=request.plan_digest,
+            policy_digest=request.policy_digest,
+            budget_digest=request.budget_digest,
+            model_configuration_digest=request.model_configuration_digest,
+            tool_schema_digest=request.tool_schema_digest,
+            authorization_binding_digest=decision.binding_digest,
+            deadline_at_utc=decision.deadline_at_utc,
+        )
+
+
+PendingActionState = Literal["WAITING_APPROVAL", "GRANT_CONSUMED", "SETTLED", "INVALIDATED"]
+GrantState = Literal["ISSUED", "CONSUMED", "REJECTED", "EXPIRED", "INVALIDATED"]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAction:
+    pending_id: PendingActionId
+    action: RiskyAction
+    normalized_action_json: str
+    action_digest: Sha256DigestText
+    pending_action_digest: Sha256DigestText
+    confirmation_code_digest: Sha256DigestText
+    authorization_binding_digest: str
+    expected_pre_state: ActionPreState
+    bindings: FrozenActionBindings
+    expires_at: datetime
+    state: PendingActionState = "WAITING_APPROVAL"
+
+
+def canonical_action_json(action: RiskyAction) -> str:
+    return json.dumps(
+        action.model_dump(mode="json", exclude_none=True),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def pending_action_subject_json(
+    *,
+    pending_id: PendingActionId,
+    normalized_action_json: str,
+    action_digest: Sha256DigestText,
+    authorization_binding_digest: Sha256DigestText,
+    expected_pre_state: ActionPreState,
+    bindings: FrozenActionBindings,
+    expires_at: datetime,
+) -> str:
+    return canonical_json(
+        {
+            "action_digest": action_digest,
+            "authorization_binding_digest": authorization_binding_digest,
+            "bindings": asdict(bindings),
+            "expires_at_utc": expires_at.isoformat(),
+            "expected_pre_state": expected_pre_state.model_dump(mode="json", exclude_none=True),
+            "normalized_action_json": normalized_action_json,
+            "pending_id": pending_id,
+        }
+    )
+
+
+def pending_action_confirmation_material_digest(
+    pending_action_digest: Sha256DigestText,
+) -> Sha256DigestText:
+    return sha256_digest(
+        canonical_json({"kind": "grant", "pending_action_digest": pending_action_digest})
+    )
+
+
+def confirmation_code_for_pending_digest(
+    pending_action_digest: Sha256DigestText,
+) -> ConfirmationCode:
+    raw_digest = pending_action_confirmation_material_digest(pending_action_digest).removeprefix(
+        "sha256:"
+    )
+    return ConfirmationCode(base64.b32encode(bytes.fromhex(raw_digest)).decode("ascii")[:6])
+
+
+def freeze_pending_action(
+    pending_id: PendingActionId,
+    request: AuthorizationRequest,
+    decision: AuthorizationDecision,
+    expected_pre_state: ActionPreState,
+    now: datetime,
+    grant_ttl_seconds: int,
+) -> PendingAction:
+    if not 1 <= grant_ttl_seconds <= 1_800:
+        raise ValueError("PENDING_ACTION_GRANT_TTL_OUT_OF_RANGE")
+    if not isinstance(request.action, RiskyAction):
+        raise TypeError("PENDING_ACTION_REQUIRES_RISKY_ACTION")
+    action = request.action
+    bindings = FrozenActionBindings.from_authorization(request, decision)
+    normalized = canonical_action_json(action)
+    action_digest = sha256_digest(normalized)
+    if action_digest != request.action_digest:
+        raise ValueError("PENDING_ACTION_DIGEST_MISMATCH")
+    expires_at = now + timedelta(seconds=grant_ttl_seconds)
+    subject_json = pending_action_subject_json(
+        pending_id=pending_id,
+        normalized_action_json=normalized,
+        action_digest=action_digest,
+        authorization_binding_digest=Sha256DigestText(decision.binding_digest),
+        expected_pre_state=expected_pre_state,
+        bindings=bindings,
+        expires_at=expires_at,
+    )
+    pending_action_digest = sha256_digest(subject_json)
+    confirmation_code = confirmation_code_for_pending_digest(pending_action_digest)
+    return PendingAction(
+        pending_id=pending_id,
+        action=action,
+        normalized_action_json=normalized,
+        action_digest=action_digest,
+        pending_action_digest=pending_action_digest,
+        confirmation_code_digest=sha256_digest(confirmation_code),
+        authorization_binding_digest=decision.binding_digest,
+        expected_pre_state=expected_pre_state,
+        bindings=bindings,
+        expires_at=expires_at,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalGrant:
+    grant_id: GrantId
+    pending_id: PendingActionId
+    pending_action_digest: Sha256DigestText
+    confirmation_code_digest: Sha256DigestText
+    bindings: FrozenActionBindings
+    expires_at: datetime
+    state: GrantState = "ISSUED"
+    consumed_intent_id: IntentId | None = None
+    consumed_sequence: AuditSequence | None = None
+
+
+def approval_grant_id(
+    source_request_id: RequestId, pending_action_digest: Sha256DigestText
+) -> GrantId:
+    identity = canonical_json(
+        {
+            "pending_action_digest": pending_action_digest,
+            "source_request_id": source_request_id,
+        }
+    )
+    return GrantId("grant-" + sha256(identity.encode("utf-8")).hexdigest())
+
+
+def granted_action_intent_id(grant: ApprovalGrant) -> IntentId:
+    identity = canonical_json(
+        {
+            "grant_id": grant.grant_id,
+            "pending_action_digest": grant.pending_action_digest,
+            "pending_id": grant.pending_id,
+        }
+    )
+    return IntentId("granted-action-" + sha256(identity.encode("utf-8")).hexdigest())
+
+
+def frozen_action_bindings_from_mapping(
+    data: Mapping[str, object],
+) -> FrozenActionBindings:
+    return FrozenActionBindings(
+        run_id=RunId(str(data["run_id"])),
+        task_id=TaskId(str(data["task_id"])),
+        attempt_id=AttemptId(str(data["attempt_id"])),
+        logical_turn_id=str(data["logical_turn_id"]),
+        action_id=str(data["action_id"]),
+        lease_id=str(data["lease_id"]),
+        lease_generation=int(str(data["lease_generation"])),
+        run_head_oid=str(data["run_head_oid"]),
+        target_safety_digest=RevisionDigest(str(data["target_safety_digest"])),
+        plan_digest=RevisionDigest(str(data["plan_digest"])),
+        policy_digest=RevisionDigest(str(data["policy_digest"])),
+        budget_digest=RevisionDigest(str(data["budget_digest"])),
+        model_configuration_digest=RevisionDigest(str(data["model_configuration_digest"])),
+        tool_schema_digest=str(data["tool_schema_digest"]),
+        authorization_binding_digest=str(data["authorization_binding_digest"]),
+        deadline_at_utc=datetime.fromisoformat(str(data["deadline_at_utc"])),
+    )
+
+
+def approval_grant_to_json(grant: ApprovalGrant) -> str:
+    return canonical_json(asdict(grant))
+
+
+def approval_grant_from_json(value: str) -> ApprovalGrant:
+    data = json.loads(value)
+    grant = ApprovalGrant(
+        grant_id=GrantId(data["grant_id"]),
+        pending_id=PendingActionId(data["pending_id"]),
+        pending_action_digest=Sha256DigestText(data["pending_action_digest"]),
+        confirmation_code_digest=Sha256DigestText(data["confirmation_code_digest"]),
+        bindings=frozen_action_bindings_from_mapping(data["bindings"]),
+        expires_at=datetime.fromisoformat(data["expires_at"]),
+        state=data["state"],
+        consumed_intent_id=(
+            None if data["consumed_intent_id"] is None else IntentId(data["consumed_intent_id"])
+        ),
+        consumed_sequence=(
+            None if data["consumed_sequence"] is None else AuditSequence(data["consumed_sequence"])
+        ),
+    )
+    if approval_grant_to_json(grant) != value:
+        raise ValueError("APPROVAL_GRANT_CANONICAL_BINDING_MISMATCH")
+    return grant
+
+
+class GrantValidationError(ValueError):
+    pass
+
+
+class GrantCommandValidator:
+    def validate_payload_before_grant_write(
+        self,
+        payload: GrantPayload,
+        pending: PendingAction,
+        now: datetime,
+    ) -> None:
+        if (
+            payload.run_id != pending.bindings.run_id
+            or payload.pending_action_id != pending.pending_id
+            or not hmac.compare_digest(payload.pending_action_digest, pending.pending_action_digest)
+        ):
+            raise GrantValidationError("PENDING_ACTION_BINDING_INVALID")
+        expected_code = confirmation_code_for_pending_digest(pending.pending_action_digest)
+        if not hmac.compare_digest(
+            payload.confirmation_code, expected_code
+        ) or not hmac.compare_digest(
+            sha256_digest(payload.confirmation_code),
+            pending.confirmation_code_digest,
+        ):
+            raise GrantValidationError("GRANT_CONFIRMATION_CODE_INVALID")
+        if now >= pending.expires_at:
+            raise GrantValidationError("PENDING_ACTION_EXPIRED")
+
+    def validate_current_binding(
+        self,
+        grant: ApprovalGrant,
+        pending: PendingAction,
+        current: FrozenActionBindings,
+        now: datetime,
+    ) -> None:
+        if now >= grant.expires_at:
+            raise GrantValidationError("PENDING_ACTION_EXPIRED")
+        if grant.state != "ISSUED" or pending.state != "WAITING_APPROVAL":
+            raise GrantValidationError("GRANT_NOT_ISSUED_FOR_PENDING_ACTION")
+        if (
+            grant.pending_action_digest != pending.pending_action_digest
+            or grant.confirmation_code_digest != pending.confirmation_code_digest
+            or grant.bindings != pending.bindings
+            or grant.expires_at != pending.expires_at
+            or current != pending.bindings
+        ):
+            raise GrantValidationError("GRANT_BINDING_MISMATCH")
+
+
+@dataclass(frozen=True, slots=True)
+class GrantedActionIntent:
+    intent_id: IntentId
+    pending_id: PendingActionId
+    grant_id: GrantId
+    action: RiskyAction
+    normalized_action_json: str
+    action_digest: Sha256DigestText
+    expected_pre_state: ActionPreState
+    bindings: FrozenActionBindings
+    state: Literal["INTENT_RECORDED", "DISPATCHED", "SETTLED", "INDETERMINATE"] = "INTENT_RECORDED"
+
+    def to_effect_intent(self, recorded_sequence: AuditSequence) -> EffectIntent:
+        payload = canonical_json(
+            {
+                "action_digest": self.action_digest,
+                "grant_id": self.grant_id,
+                "normalized_action_json": self.normalized_action_json,
+                "pending_id": self.pending_id,
+                "bindings": asdict(self.bindings),
+            }
+        )
+        return EffectIntent(
+            intent_id=self.intent_id,
+            run_id=self.bindings.run_id,
+            kind="granted_risky_action",
+            idempotency_key=(
+                f"granted-action:{self.bindings.run_id}:{self.pending_id}:{self.grant_id}"
+            ),
+            applicable_revision_digests=self.bindings.applicable_revision_digests,
+            payload_digest=sha256_digest(payload),
+            normalized_payload_json=payload,
+            recorded_sequence=recorded_sequence,
+            expected_prestate_json=self.expected_pre_state.canonical_json(),
+            task_id=self.bindings.task_id,
+            attempt_id=self.bindings.attempt_id,
+            action_id=self.bindings.action_id,
+        )
 
 
 class Authority(Protocol):
@@ -1802,7 +2161,12 @@ class AuthorityService:
             policy_decision = (
                 "REQUIRE_APPROVAL" if request.authority_origin == "ADMISSION" else "DENY"
             )
-        elif request.action.kind in {"delete", "rename", "chmod_executable"}:
+        elif request.action.kind in {
+            "delete",
+            "rename",
+            "chmod_executable",
+            "risky_action",
+        }:
             policy_decision = "REQUIRE_APPROVAL"
         else:
             policy_decision = ActionPolicy.default().classify(request.action)
