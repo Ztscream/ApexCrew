@@ -764,3 +764,8 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Final spec review**: fresh reviewer `/root/r3_01_fix001_spec_final` returned PASS with no findings. It verified exact task scope, pre-release requested-model comparison, closed mismatch settlement, conservative charge, memory/SQLite ID/outcome/usage persistence, legacy absent-key compatibility, present-null tamper rejection, and the focused `68 passed` plus `mypy src` evidence. Code-quality review is now authorized and pending.
 - **Final quality review**: fresh reviewer `/root/r3_01_fix001_quality` returned PASS with no correctness, migration, typing, serialization, or maintainability findings. It confirmed the closed seven-path scope and a clean `git diff --check`; review was read-only and did not replace execution evidence.
 - **Final regression and commit readiness**: `uv run --python 3.12 pytest tests/unit/domain/test_model_requests.py tests/unit/domain/test_model_retry.py tests/contract/test_state_store.py tests/integration/test_model_restart.py -q` exited 0 with `70 passed`; `uv run --python 3.12 mypy src` exited 0 with `Success: no issues found in 33 source files`; `git diff --check` exited 0 with no output. Ordered review and verification are complete; the task is ready for the planned implementation commit.
+## M1-R3 ledger-audit M1-FIX-001
+- PLAN before SHA-256: 04487B354CCB8C6ECB295E800543E353D4083830491B9905E92DE97B6C53367A
+- PLAN after SHA-256: 13BB0887AAEDA4365C4F49C783E0E0A76F85354EC938A664DD723C3B8FD70E47
+- Cells: Status, Implementation commit
+- Implementation commit: 65d545bc3734bd1703d5b0793b52401da6f3b9cd
