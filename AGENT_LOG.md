@@ -1227,3 +1227,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON containment boundary; implementation commit follows.
 - **Human intervention**: none; no Docker daemon, socket, network, or credentials were accessed.
 - **Lesson**: security properties belong in the constructed command boundary before a process runner is connected.
+
+## 2026-08-04 / S14 - Python and TypeScript unit fixtures
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `278c007`.
+- **Task/skill**: S14; karpathy-guidelines.
+- **Prompt/context**: add the two approved minimal repositories for amount-unit and timestamp-unit drift experiments.
+- **Observed red**: fixture test setup was corrected before implementation verification because the initial repository-root calculation pointed into `tests/`.
+- **Implementation**: added a Python fixture whose public money API uses integer cents and a TypeScript fixture whose public time API uses milliseconds, with no dependency installation or network step.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_fixtures.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON fixture boundary; implementation commit follows.
+- **Human intervention**: none; fixture repositories contain no credentials or restricted transcripts.
+- **Lesson**: explicit units in tiny fixtures make later drift and ablation checks mechanically observable.
