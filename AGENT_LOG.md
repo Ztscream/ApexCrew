@@ -1167,3 +1167,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
 - **Human intervention**: none; no provider, Git, Docker, credential, or `SPEC.md` effect was invoked.
 - **Lesson**: restart recovery may retry only from exact observable state and must stop on uncertainty.
+
+## 2026-08-04 / S9 - Multi-intent indeterminate stub
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `0c79762`.
+- **Task/skill**: S9; karpathy-guidelines.
+- **Prompt/context**: represent multiple unresolved effects as a canonical set and refuse automatic precedence resolution.
+- **Observed red**: focused collection initially failed because `apexcrew.domain.indeterminate` did not exist.
+- **Implementation**: added a digest-bound `UnresolvedIntentSet`; `resolve_multiple_intents` always raises `IndeterminateResolution` and records `DEBT-M2-001`.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_indeterminate.py -q` passed with `1 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the required STUB fail-closed behavior; implementation commit follows.
+- **Human intervention**: none; no resolution authority is manufactured.
+- **Lesson**: an unresolved set is a stop state until a reviewed precedence policy exists.
