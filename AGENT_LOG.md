@@ -957,3 +957,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Reviewed candidate**: `f7e943d49e25030ababb8afcfca912b3c7f01994` on `codex/m1-fix005-inventory-plan`, limited to the M1-FIX-005 Git reservation inventory grammar. `PLAN.md` SHA-256 is `6A06200B7E34646404113B320608867DA3519A3A865265E477658884C820ED40`; frozen `SPEC.md` SHA-256 is `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; normalized execution-authorization digest is `CCCA771888777DDC0D90F91E30E0C822970E0EE9AE8CB3D553A3F5D1D27F841`.
 - **Independent review and owner decision**: the owner supplied the independent document-review verdict `APPROVED`, then explicitly recorded `M1 GO`. This authorizes the serial M1-R3 route only after this reviewed PLAN revision is merged into `main`; PR #8 remains unmerged and M2-M4 remain unauthorized.
 - **Boundary**: this is a gate record only. It contains no source, test, fixture, CI, or implementation evidence; M1-FIX-005 implementation may start only from the merged reviewed base and follows the binding red/green, ordered review, task-commit, and separate ledger-commit rules.
+
+## 2026-08-04 / SPRINT-PLAN - M1-M4 execution authorization
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `cc507639af907b635320f190e11e832fd7d8188c`.
+- **Task/skill**: SPRINT-PLAN; writing-plans and karpathy-guidelines.
+- **Prompt/context**: owner requested reading `SPRINT.md` and completing S1-S22; `SPEC.md` remains frozen and `SPRINT.md` is the execution scope.
+- **Observed evidence**: baseline `uv run --python 3.12 pytest -q` passed with `490 passed, 4 skipped`; Ruff check/format and `mypy src` passed. `PLAN.md` received the M1-M4 amendment; detailed plan and independent coverage review are in `docs/superpowers/plans/`.
+- **Subagent output/commit**: Codex self-review found complete S1-S22 coverage, no missing hard-denial boundary, and no credential requirement. Implementation commit pending.
+- **Human intervention**: none; no source, fixture, CI, credential, or `SPEC.md` change was made.
+- **Lesson**: keep SKELETON/STUB behavior explicitly fail closed and require observed output before claiming milestone completion.

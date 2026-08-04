@@ -14,6 +14,10 @@
 
 **Authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
 
+## M1-M4 Sprint Execution Amendment (2026-08-04)
+
+The owner request and root `SPRINT.md` authorize a bounded implementation pass through M4. The detailed task map, file ownership, red/green selectors, and final checks are recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4.md`; its independent coverage review is recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4-review.md`. This amendment supersedes the historical roadmap-only status for this execution turn, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, no-push rule, or owner-only PR/Pages actions. SPRINT depth labels remain authoritative: REAL behavior is tested, SKELETON behavior covers the main path and rejects unsupported edges, and STUB behavior raises or returns `INDETERMINATE` with a `DEBT-` marker.
+
 <!-- M1-R3-EXECUTION-CONTRACT-START -->
 
 ## M1-R3 Closeout Amendment (Binding)
