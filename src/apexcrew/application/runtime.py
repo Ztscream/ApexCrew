@@ -59,6 +59,9 @@ class RuntimeOwnerIdSource(Protocol):
         raise NotImplementedError
 
 
+_UNSET = object()
+
+
 class FileRunOwnership:
     def __init__(self, data_root: Path, locks: FileLockBackend, ids: RuntimeOwnerIdSource) -> None:
         self._data_root = data_root
@@ -66,9 +69,19 @@ class FileRunOwnership:
         self._ids = ids
 
     @contextmanager
-    def acquire(self, run_id: RunId) -> Iterator[RuntimeOwner | None]:
+    def acquire(
+        self, run_id: RunId, permit: RuntimePermit | None | object = _UNSET
+    ) -> Iterator[RuntimeOwner | None]:
+        # DEBT-M1-006: cross-process mutex and concrete OS file-lock ownership remain deferred.
+        if permit is not _UNSET and (
+            permit is None
+            or not isinstance(permit, RuntimePermit)
+            or permit.run_id != run_id
+            or permit.state not in {"UNCONSUMED", "CONSUMED"}
+        ):
+            yield None
+            return
         path = self._data_root / "runtime-locks" / f"{run_id}.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
         with self._locks.try_lock(path) as locked:
             yield RuntimeOwner(self._ids.next_runtime_owner_id()) if locked else None
 

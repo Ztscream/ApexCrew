@@ -1107,3 +1107,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-reviewed the changed adapter and race contract; implementation commit follows.
 - **Human intervention**: none; POSIX runtime evidence is pending a POSIX host, and no credentials/`SPEC.md`/push/PR changed.
 - **Lesson**: a platform-specific security primitive must preserve the tested fallback contract while marking the unproven platform path closed.
+
+## 2026-08-04 / S4 - Downgrade runtime OS locking to explicit debt
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `8b5d7f4b68a8865e28c37637587fc27fd8efb28b`.
+- **Task/skill**: S4; karpathy-guidelines.
+- **Prompt/context**: defer M1-FIX-006/007 OS/process locking while ensuring invalid Permit acquisition has zero side effects.
+- **Observed red**: the new lifecycle selector initially failed because `FileRunOwnership.acquire` had no Permit argument and created the lock directory before locking.
+- **Implementation**: `acquire` accepts an explicit Permit validation seam, rejects invalid values before any path operation, and no longer creates `runtime-locks`; `DEBT-M1-006` is recorded in source and `SECURITY.md`.
+- **Green evidence**: invalid-Permit lifecycle selector and existing runtime-permit suite passed; Ruff check/format and `mypy src` passed.
+- **Subagent output/commit**: Codex self-checked the fail-closed stub; implementation commit follows.
+- **Human intervention**: none; process/OS lock behavior remains explicitly unimplemented, with no credential/`SPEC.md`/push/PR change.
+- **Lesson**: a deferred concurrency control must reject unsupported acquisition rather than manufacture a lock path or imply exclusivity.

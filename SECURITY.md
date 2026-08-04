@@ -39,3 +39,11 @@ M1 establishes secret-path and action-policy primitives. Executor containment,
 history secret scanning, retention/purge, public replay, CI, and distribution are
 later reviewed milestones and are not claimed until their ledger rows and evidence
 are complete.
+
+## Known Runtime Debt
+
+`DEBT-M1-006`: runtime ownership currently provides only the in-process ownership
+path. The production process mutex plus POSIX/Windows OS file-lock backend is not
+implemented in this sprint. `FileRunOwnership.acquire` fails closed for an explicit
+invalid Permit and never creates a lock path; a missing pre-provisioned lock path
+does not grant ownership. Multi-process exclusivity is therefore not claimed.
