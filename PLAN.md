@@ -30356,7 +30356,7 @@ Static-contract rules above govern this EOF data table. Only the cells expressly
 
 | R3 task | Module | Status | Implementation commit |
 | --- | --- | --- | --- |
-| `M1-FIX-001` requested-model validation/persistence | R3-01 | COMPLETED (REMEDIATED) | 567ab10ec5601aedddca4e149a1a68f54e50e25e |
+| `M1-FIX-001` requested-model validation/persistence | R3-01 | COMPLETED (ANCHOR REMEDIATED) | 99bd398eac413119670c3dce2c97ab8271e30b6f |
 | `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 | COMPLETED | 205bd422bbd84a995882ceac50d597e4ef9c0f92 |
 | `M1-FIX-008` model provenance format regression closure | R3-01 | COMPLETED | 1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a |
 | `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 | NOT STARTED | Not created |
