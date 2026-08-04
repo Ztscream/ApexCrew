@@ -30359,7 +30359,7 @@ Static-contract rules above govern this EOF data table. Only the cells expressly
 | `M1-FIX-001` requested-model validation/persistence | R3-01 | COMPLETED (ANCHOR REMEDIATED) | 99bd398eac413119670c3dce2c97ab8271e30b6f |
 | `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 | COMPLETED | 205bd422bbd84a995882ceac50d597e4ef9c0f92 |
 | `M1-FIX-008` model provenance format regression closure | R3-01 | COMPLETED | 1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a |
-| `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 | NOT STARTED | Not created |
+| `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 | COMPLETED | 4a3e3235e7eb53b3427935cfdeef33860183edb5 |
 | `M1-FIX-004` random Target Reservation identity | R3-03 | NOT STARTED | Not created |
 | `M1-FIX-005` recursive reservation admin/data inventory | R3-03 | NOT STARTED | Not created |
 | `M1-FIX-006` process mutex and POSIX/Windows OS file locks | R3-04 | NOT STARTED | Not created |
