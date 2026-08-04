@@ -288,14 +288,14 @@ MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_GIT_ADMIN_ENTRIES = 4_096
 MAX_WORKTREE_ADMIN_ENTRIES = 2
 MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES = 4_096
-MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 16
+MAX_TARGET_RESERVATION_ADMIN_ENTRIES = 6
+MAX_TARGET_RESERVATION_LOG_HEAD_BYTES = 65_536
 MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
 MAX_GIT_STDOUT_BYTES = 2_000_000
 MAX_GIT_STDERR_BYTES = 65_536
-_TARGET_RESERVATION_REQUIRED_ADMIN_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
-_TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES = frozenset(
-    {"index", "locked", "logs", "ORIG_HEAD", "refs"}
-)
+_TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
+_TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES = frozenset({"logs", "refs"})
+_TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES = frozenset({"locked"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -1227,6 +1227,7 @@ class TargetReservationAdminRecord:
     gitdir: bytes
     commondir: bytes
     head: bytes
+    logs_head: bytes
     locked: bytes | None
     binding_digest: Sha256DigestText
 
@@ -1297,11 +1298,16 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         self.require_safe_before_list(reservation)
         names = self._worktree_admin_names()
         if not names:
+            if self._reservation_path_state(reservation)[0]:
+                raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
             return ReservationAdminObservation(admin_entry_name=None, admin_binding_digest=None)
         expected = _target_reservation_component(reservation.reservation_id)
         if names != (expected,):
             raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_INVENTORY_INVALID")
         record = self._read_exact_admin_record(reservation)
+        path_present, gitfile_exact = self._reservation_path_state(reservation)
+        if not path_present or not gitfile_exact:
+            raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
         return ReservationAdminObservation(
             admin_entry_name=record.entry_name,
             admin_binding_digest=record.binding_digest,
@@ -1376,14 +1382,15 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         prefix = ".git/worktrees/" + name
         entry = self._repository.handles.open(prefix, "directory")
         names = self._repository.handles.list_names(entry, MAX_TARGET_RESERVATION_ADMIN_ENTRIES)
-        allowed = (
-            _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES | _TARGET_RESERVATION_OPTIONAL_ADMIN_NAMES
-        )
         observed = set(names)
+        required = (
+            _TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES
+            | _TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES
+        )
         if (
-            not _TARGET_RESERVATION_REQUIRED_ADMIN_NAMES.issubset(observed)
-            or not observed.issubset(allowed)
-            or not (len(_TARGET_RESERVATION_REQUIRED_ADMIN_NAMES) <= len(observed) <= len(allowed))
+            len(names) != len(observed)
+            or len({item.casefold() for item in names}) != len(names)
+            or observed not in (required, required | _TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES)
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
         gitdir = _exact_admin_line(
@@ -1407,6 +1414,18 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
             ),
             label="HEAD",
         )
+        logs = self._repository.handles.open(prefix + "/logs", "directory")
+        if self._repository.handles.list_names(logs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES) != (
+            "HEAD",
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+        logs_head = self._repository.handles.read_bytes(
+            self._repository.handles.open(prefix + "/logs/HEAD", "file"),
+            MAX_TARGET_RESERVATION_LOG_HEAD_BYTES,
+        )
+        refs = self._repository.handles.open(prefix + "/refs", "directory")
+        if self._repository.handles.list_names(refs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES):
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
         locked_node = self._repository.handles.try_open(prefix + "/locked", "file")
         locked = (
             None
@@ -1437,11 +1456,14 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
                     "gitdir_hex": gitdir.hex(),
                     "commondir_hex": commondir.hex(),
                     "head_hex": head.hex(),
+                    "logs_head_hex": logs_head.hex(),
                     "locked_hex": None if locked is None else locked.hex(),
                 }
             )
         )
-        return TargetReservationAdminRecord(name, gitdir, commondir, head, locked, digest)
+        return TargetReservationAdminRecord(
+            name, gitdir, commondir, head, logs_head, locked, digest
+        )
 
     def _reservation_path_state(self, reservation: TargetReservation) -> tuple[bool, bool]:
         relative = "reservations/" + _target_reservation_component(reservation.reservation_id)
@@ -1485,6 +1507,47 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         self._data_root = data_root
         self._target_authority_digest = target_authority_digest
 
+    def _require_safe_reservation_state(
+        self, operation: TargetReservationOperation, *, post_operation: bool
+    ) -> None:
+        try:
+            if post_operation:
+                self._worktree_guard.require_exact_post_operation(operation)
+            elif operation.kind == "ADD_NO_CHECKOUT":
+                self._worktree_guard.require_absent_before_add(operation)
+            else:
+                self._worktree_guard.require_exact_registered_unlocked(operation)
+        except (RepositoryEffectError, RepositoryUnsafeError) as error:
+            raise RepositoryEffectError("TARGET_UNSAFE") from error
+
+    def _run_with_inventory_snapshots(
+        self,
+        operation: TargetReservationOperation,
+        git_operation: GitOperation,
+        *,
+        pre_state_is_post_operation: bool,
+        post_state_on_success: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one Git command between the required no-follow inventory snapshots."""
+        self._require_safe_reservation_state(operation, post_operation=pre_state_is_post_operation)
+        try:
+            result = self._runner.run(self._repository, git_operation)
+        except (RepositoryEffectError, RepositoryUnsafeError) as error:
+            raise RepositoryEffectError("TARGET_UNSAFE") from error
+        self._require_safe_reservation_state(
+            operation,
+            post_operation=post_state_on_success if result.returncode == 0 else False,
+        )
+        return result
+
+    @staticmethod
+    def _operation_command(
+        operation: TargetReservationOperation, expected: Path
+    ) -> GitWorktreeAddNoCheckout | GitWorktreeLock:
+        if operation.kind == "ADD_NO_CHECKOUT":
+            return GitWorktreeAddNoCheckout(expected, operation.target_ref)
+        return GitWorktreeLock(expected, operation.lock_reason)
+
     def apply(self, operation: TargetReservationOperation) -> TargetReservationOperationResult:
         expected = self._data_root / "reservations" / operation.reservation_id
         if (
@@ -1495,20 +1558,21 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             or not operation.target_ref.startswith("refs/heads/")
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_OPERATION_BINDING_INVALID")
-        self._require_pinned_target(operation)
-        git_operation: GitWorktreeAddNoCheckout | GitWorktreeLock
-        if operation.kind == "ADD_NO_CHECKOUT":
-            self._worktree_guard.require_absent_before_add(operation)
-            git_operation = GitWorktreeAddNoCheckout(expected, operation.target_ref)
-        else:
-            self._worktree_guard.require_exact_registered_unlocked(operation)
-            git_operation = GitWorktreeLock(expected, operation.lock_reason)
-        result = self._runner.run(self._repository, git_operation)
+        git_operation = self._operation_command(operation, expected)
+        self._require_pinned_target(operation, post_operation=False)
+        result = self._run_with_inventory_snapshots(
+            operation,
+            git_operation,
+            pre_state_is_post_operation=False,
+            post_state_on_success=True,
+        )
         if result.returncode != 0:
             raise RepositoryEffectError("TARGET_RESERVATION_" + operation.kind + "_FAILED")
-        self._worktree_guard.require_exact_post_operation(operation)
-        self._repository = self._repository.refresh_after_verified_owned_transition()
-        self._require_pinned_target(operation)
+        try:
+            self._repository = self._repository.refresh_after_verified_owned_transition()
+        except RepositoryUnsafeError as error:
+            raise RepositoryEffectError("TARGET_UNSAFE") from error
+        self._require_pinned_target(operation, post_operation=True)
         return TargetReservationOperationResult(intent_id=operation.intent_id, kind=operation.kind)
 
     def observe_registration(
@@ -1516,8 +1580,11 @@ class GitTargetReservationRepository(TargetReservationGitPort):
     ) -> ReservationRegistrationObservation:
         try:
             self._worktree_guard.require_safe_before_list(reservation)
-            admin = self._worktree_guard.require_compatible_observation(reservation)
+            admin_before = self._worktree_guard.require_compatible_observation(reservation)
             result = self._runner.run_bytes(self._repository, GitWorktreeListPorcelain())
+            admin_after = self._worktree_guard.require_compatible_observation(reservation)
+            if admin_after != admin_before:
+                raise RepositoryEffectError("TARGET_RESERVATION_OBSERVATION_CHANGED")
         except (RepositoryEffectError, RepositoryUnsafeError):
             return ReservationRegistrationObservation(False, False, False, True, False)
         if result.returncode != 0:
@@ -1565,11 +1632,18 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             exact_identity=exact,
             unexpected_registration=unexpected,
             observable=True,
-            admin_entry_name=admin.admin_entry_name,
-            admin_binding_digest=admin.admin_binding_digest,
+            admin_entry_name=admin_after.admin_entry_name,
+            admin_binding_digest=admin_after.admin_binding_digest,
         )
 
-    def _require_pinned_target(self, operation: TargetReservationOperation) -> None:
-        result = self._runner.run(self._repository, GitShowRefVerify(operation.target_ref))
+    def _require_pinned_target(
+        self, operation: TargetReservationOperation, *, post_operation: bool
+    ) -> None:
+        result = self._run_with_inventory_snapshots(
+            operation,
+            GitShowRefVerify(operation.target_ref),
+            pre_state_is_post_operation=post_operation,
+            post_state_on_success=post_operation,
+        )
         if result.returncode != 0 or result.stdout != f"{operation.pinned_target_oid}\n":
             raise RepositoryEffectError("TARGET_RESERVATION_PINNED_TARGET_MISMATCH")

@@ -18,9 +18,16 @@ from apexcrew.adapters.repository.git import (
     GitConfigEntry,
     GitRepositoryPreflight,
     GitStatusPorcelain,
+    GitTargetReservationRepository,
+    NoFollowTargetReservationWorktreeGuard,
     RepositoryUnsafeError,
     parse_git_config,
 )
+from apexcrew.adapters.repository.no_follow import StableHandleTree
+from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
+from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
+from apexcrew.domain.admission import RepositoryEffectError, TargetReservationOperation
+from apexcrew.domain.types import GitOid, IntentId, RepositoryId, RunId
 
 
 def test_byte_config_parser_supports_subsections_quotes_and_continuations() -> None:
@@ -142,6 +149,92 @@ def test_preflight_rejects_preexisting_linked_worktree(tmp_path: Path) -> None:
     repo = make_git_repository_with_linked_worktree(tmp_path)
     with pytest.raises(RepositoryUnsafeError, match="UNSUPPORTED_LINKED_WORKTREE"):
         GitRepositoryPreflight().inspect(repo)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "nested-log-entry",
+        "logs-head-directory",
+        "logs-head-link",
+        "locked-while-unlocked",
+        "case-collision",
+    ),
+)
+def test_reservation_inventory_rejects_malformed_admin_tree_before_git(
+    tmp_path: Path, malformation: str
+) -> None:
+    repository_root = make_git_repository(tmp_path)
+    repository = GitRepositoryPreflight().inspect(repository_root)
+    data_root = tmp_path / "data"
+    reservation_path = data_root / "reservations" / "reservation-1"
+    reservation_path.mkdir(parents=True)
+    (reservation_path / ".git").write_bytes(
+        b"gitdir: "
+        + os.fsencode((repository_root / ".git" / "worktrees" / "reservation-1").as_posix())
+        + b"\n"
+    )
+    admin = repository_root / ".git" / "worktrees" / "reservation-1"
+    (admin / "logs").mkdir(parents=True)
+    (admin / "refs").mkdir()
+    (admin / "gitdir").write_bytes(os.fsencode((reservation_path / ".git").as_posix()) + b"\n")
+    (admin / "commondir").write_bytes(b"../..\n")
+    (admin / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    (admin / "logs" / "HEAD").write_bytes(b"0000000000000000000000000000000000000000\n")
+    if malformation == "nested-log-entry":
+        (admin / "logs" / "unexpected").write_bytes(b"must not be read\n")
+    elif malformation == "logs-head-directory":
+        (admin / "logs" / "HEAD").unlink()
+        (admin / "logs" / "HEAD").mkdir()
+    elif malformation == "logs-head-link":
+        if os.name == "nt":
+            pytest.skip("creating links requires unavailable Windows privileges")
+        (admin / "logs" / "HEAD").unlink()
+        os.symlink("unexpected-target", admin / "logs" / "HEAD")
+    elif malformation == "locked-while-unlocked":
+        (admin / "locked").write_bytes(b"run-1\n")
+    else:
+        if os.name == "nt":
+            pytest.skip("the Windows filesystem cannot create case-colliding entries")
+        (admin / "head").write_bytes(b"ref: refs/heads/main\n")
+    repository = repository.refresh_after_verified_owned_transition()
+    backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
+    data_handles = StableHandleTree(data_root, backend)
+    operation = TargetReservationOperation(
+        intent_id=IntentId("intent-reservation-1"),
+        run_id=RunId("run-1"),
+        reservation_id="reservation-1",
+        kind="LOCK",
+        repository_id=RepositoryId("repository-1"),
+        repository_instance_digest="sha256:" + "a" * 64,
+        target_ref="refs/heads/main",
+        pinned_target_oid=GitOid("1" * 40),
+        reservation_path=str(reservation_path),
+        target_authority_digest="sha256:" + "c" * 64,
+        lock_reason="run-1",
+    )
+    guard = NoFollowTargetReservationWorktreeGuard(
+        repository, data_root, data_handles, repository_root
+    )
+    trusted_empty_dir = tmp_path / "trusted-empty"
+    trusted_empty_dir.mkdir()
+    spawner = RecordingGitSpawner()
+    adapter = GitTargetReservationRepository(
+        repository,
+        RepositoryId("repository-1"),
+        "sha256:" + "a" * 64,
+        GitCommandRunner(absolute_git(), trusted_empty_dir, spawner),
+        guard,
+        data_root,
+        "sha256:" + "c" * 64,
+    )
+    try:
+        with pytest.raises(RepositoryEffectError, match="^TARGET_UNSAFE$"):
+            adapter.apply(operation)
+        assert spawner.calls == []
+    finally:
+        data_handles.close()
+        repository.close()
 
 
 class RecordingGitSpawner:
