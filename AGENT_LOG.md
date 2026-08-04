@@ -1263,3 +1263,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON read-only boundary; implementation commit follows.
 - **Human intervention**: none; no credentials, commands, or Tier 2 data enter the replay.
 - **Lesson**: static and local views should consume a sanitized projection rather than reconstructing domain state.
+
+## 2026-08-04 / S17 - Reachable-history secret scan
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `fafbd36`.
+- **Task/skill**: S17; karpathy-guidelines.
+- **Prompt/context**: scan tracked content and every reachable commit with structured Git arguments and avoid printing matched values.
+- **Observed red**: the first scanner pattern treated documented PEM marker fixtures as credentials; the pattern was narrowed to high-confidence credential-shaped values so approved redaction tests remain valid.
+- **Implementation**: added `scripts/secret_scan.py` and a regression test. It scans `HEAD` and every `git rev-list --all` revision, returns non-zero on findings, and reports only a safe finding category.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_secret_scan.py -q` passed with `1 passed`; direct scan emitted `secret-scan: clean`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the REAL scanning boundary; implementation commit follows.
+- **Human intervention**: none; no credential source or API key was read.
+- **Lesson**: a useful scanner must distinguish fixture marker text from actual credential-shaped material while still checking all reachable history.
