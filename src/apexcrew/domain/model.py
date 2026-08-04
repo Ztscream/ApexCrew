@@ -26,6 +26,22 @@ from apexcrew.domain.types import (
 LogicalTurnId = str
 
 
+class ModelIdentitySource(Protocol):
+    def next_logical_turn_id(self) -> LogicalTurnId:
+        raise NotImplementedError
+
+    def next_provider_attempt_id(self) -> IntentId:
+        raise NotImplementedError
+
+
+class RandomModelIdentitySource:
+    def next_logical_turn_id(self) -> LogicalTurnId:
+        return f"model-turn-{uuid4().hex}"
+
+    def next_provider_attempt_id(self) -> IntentId:
+        return IntentId(f"model-intent-{uuid4().hex}")
+
+
 @dataclass(frozen=True, slots=True)
 class ModelUsage:
     input_tokens: int
@@ -94,6 +110,7 @@ RecoveryBlock = Literal[
 ]
 ModelDispatchOutcome = Literal[
     "COMPLETED",
+    "REQUESTED_MODEL_MISMATCH",
     "RETURNED_MODEL_MISMATCH",
     "KNOWN_CLOSED_REJECTION",
     "INDETERMINATE",
@@ -233,8 +250,11 @@ class LogicalModelTurn:
     state: Literal["OPEN"] = "OPEN"
 
     @classmethod
-    def new(cls, request: ModelRequest) -> LogicalModelTurn:
-        return cls(request.run_id, f"model-turn-{uuid4().hex}", request.request_digest)
+    def new(
+        cls, request: ModelRequest, *, ids: ModelIdentitySource | None = None
+    ) -> LogicalModelTurn:
+        source = RandomModelIdentitySource() if ids is None else ids
+        return cls(request.run_id, source.next_logical_turn_id(), request.request_digest)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,12 +273,15 @@ class ModelRequestIntent:
         turn: LogicalModelTurn,
         request: ModelRequest,
         provider_attempt_number: int = 1,
+        *,
+        ids: ModelIdentitySource | None = None,
     ) -> ModelRequestIntent:
         if turn.run_id != request.run_id or turn.request_digest != request.request_digest:
             raise ValueError("MODEL_TURN_REQUEST_BINDING_MISMATCH")
+        source = RandomModelIdentitySource() if ids is None else ids
         return cls(
             run_id=request.run_id,
-            intent_id=IntentId(f"model-intent-{uuid4().hex}"),
+            intent_id=source.next_provider_attempt_id(),
             logical_turn_id=turn.logical_turn_id,
             request=request,
             reserved_amounts=ModelBudgetAmounts(
@@ -276,6 +299,7 @@ class ModelDispatchResult:
     run_id: RunId
     logical_turn_id: LogicalTurnId
     outcome: ModelDispatchOutcome
+    response_requested_model_id: str | None
     returned_model_id: str | None
     normalized_action: Mapping[str, object] | None
     normalized_payload_digest: str | None
@@ -293,6 +317,7 @@ class ModelDispatchResult:
             run_id=run_id,
             logical_turn_id=logical_turn_id,
             outcome=outcome,
+            response_requested_model_id=None,
             returned_model_id=None,
             normalized_action=None,
             normalized_payload_digest=None,
@@ -309,6 +334,7 @@ class CommittedModelTurn:
     attempt_id: AttemptId | None
     tranche_id: str | None
     recovery_binding: ModelRecoveryBinding
+    response_requested_model_id: str | None
     returned_model_id: str
     normalized_output_digest: str
     normalized_payload: Mapping[str, object]
@@ -341,6 +367,7 @@ class RecoveredModelAction:
         if (
             turn.state != "COMPLETION_COMMITTED"
             or turn.downstream_intent_id is not None
+            or turn.dispatch_result.response_requested_model_id != turn.response_requested_model_id
             or turn.dispatch_result.normalized_action != turn.normalized_payload
             or turn.dispatch_result.normalized_payload_digest != turn.normalized_output_digest
         ):
@@ -405,31 +432,45 @@ def _normalized_payload_digest(payload: Mapping[str, object]) -> str:
     return "sha256:" + sha256(encoded).hexdigest()
 
 
+def _conservative_model_mismatch_charge(
+    intent: ModelRequestIntent, usage: ModelUsage | None
+) -> ModelBudgetAmounts:
+    if usage is None:
+        return intent.reserved_amounts
+    return ModelBudgetAmounts(
+        calls=1,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cost_usd=intent.reserved_amounts.cost_usd,
+    )
+
+
 def settle_model_completion(
     intent: ModelRequestIntent,
     completion: ModelCompletion,
     allowed_model_ids: frozenset[str],
 ) -> ModelDispatchResult:
-    if completion.returned_model_id not in allowed_model_ids:
-        usage = completion.usage
-        charged = (
-            intent.reserved_amounts
-            if usage is None
-            else ModelBudgetAmounts(
-                calls=1,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cost_usd=intent.reserved_amounts.cost_usd,
-            )
+    if completion.requested_model_id != intent.request.requested_model_id:
+        return ModelDispatchResult(
+            run_id=intent.run_id,
+            logical_turn_id=intent.logical_turn_id,
+            outcome="REQUESTED_MODEL_MISMATCH",
+            response_requested_model_id=completion.requested_model_id,
+            returned_model_id=completion.returned_model_id,
+            normalized_action=None,
+            normalized_payload_digest=None,
+            charged_amounts=_conservative_model_mismatch_charge(intent, completion.usage),
         )
+    if completion.returned_model_id not in allowed_model_ids:
         return ModelDispatchResult(
             run_id=intent.run_id,
             logical_turn_id=intent.logical_turn_id,
             outcome="RETURNED_MODEL_MISMATCH",
+            response_requested_model_id=completion.requested_model_id,
             returned_model_id=completion.returned_model_id,
             normalized_action=None,
             normalized_payload_digest=None,
-            charged_amounts=charged,
+            charged_amounts=_conservative_model_mismatch_charge(intent, completion.usage),
         )
     usage = completion.usage
     charged = (
@@ -446,6 +487,7 @@ def settle_model_completion(
         run_id=intent.run_id,
         logical_turn_id=intent.logical_turn_id,
         outcome="COMPLETED",
+        response_requested_model_id=completion.requested_model_id,
         returned_model_id=completion.returned_model_id,
         normalized_action=completion.normalized_action,
         normalized_payload_digest=_normalized_payload_digest(completion.normalized_action),
@@ -467,6 +509,7 @@ class SettledModelAttempt:
     charged_amounts: ModelBudgetAmounts
     result_digest: str
     dispatch_result: ModelDispatchResult
+    reported_usage: ModelUsage | None
     backoff_seconds: int | None = None
     state: Literal["CLOSED"] = "CLOSED"
 
@@ -505,6 +548,7 @@ class SettledModelAttempt:
                     if result.kind is ProviderAttemptKind.KNOWN_CLOSED_REJECTION
                     else "INDETERMINATE"
                 ),
+                response_requested_model_id=None,
                 returned_model_id=None,
                 normalized_action=None,
                 normalized_payload_digest=None,
@@ -522,6 +566,8 @@ class SettledModelAttempt:
                 "normalized_payload_digest": dispatch.normalized_payload_digest,
                 "provider_response_id": result.provider_response_id,
                 "reason_code": result.reason_code,
+                "response_requested_model_id": dispatch.response_requested_model_id,
+                "returned_model_id": dispatch.returned_model_id,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -539,6 +585,7 @@ class SettledModelAttempt:
             dispatch.charged_amounts,
             "sha256:" + sha256(digest_payload).hexdigest(),
             dispatch,
+            result.usage,
         )
 
 
@@ -644,6 +691,7 @@ def model_dispatch_result_to_json(result: ModelDispatchResult) -> str:
             "normalized_action": result.normalized_action,
             "normalized_payload_digest": result.normalized_payload_digest,
             "outcome": result.outcome,
+            "response_requested_model_id": result.response_requested_model_id,
             "returned_model_id": result.returned_model_id,
             "run_id": result.run_id,
         },
@@ -658,6 +706,7 @@ def model_dispatch_result_from_json(value: str) -> ModelDispatchResult:
         run_id=RunId(data["run_id"]),
         logical_turn_id=data["logical_turn_id"],
         outcome=data["outcome"],
+        response_requested_model_id=data.get("response_requested_model_id"),
         returned_model_id=data["returned_model_id"],
         normalized_action=data["normalized_action"],
         normalized_payload_digest=data["normalized_payload_digest"],

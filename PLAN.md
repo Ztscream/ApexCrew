@@ -125,11 +125,11 @@ while ($ledgerCursor -le $plan.Length - $ledgerHeader.Length) {
 if ($ledgerCount -ne 1) { throw 'M1_R3_LEDGER_NOT_UNIQUE' }
 $prefix = $utf8.GetString([byte[]]$plan[0..($ledgerAt - 1)])
 $ledger = $utf8.GetString([byte[]]$plan[$ledgerAt..($plan.Length - 1)])
-$rowPattern = '(?m)^(\| `(?:M1-FIX-00[1-7]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| )[^|\r\n]*(\| )[^|\r\n]*(\|\r?$)'
+$rowPattern = '(?m)^(\| `(?:M1-FIX-00[1-8]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| )[^|\r\n]*(\| )[^|\r\n]*(\|\r?$)'
 $rows = [regex]::Matches($ledger, $rowPattern)
-if ($rows.Count -ne 14) { throw 'M1_R3_LEDGER_ROW_SET_INVALID' }
+if ($rows.Count -ne 15) { throw 'M1_R3_LEDGER_ROW_SET_INVALID' }
 $normalizedLedger = [regex]::Replace($ledger, $rowPattern, '$1<MUTABLE-STATUS>$2<MUTABLE-COMMIT>$3')
-if ($normalizedLedger -match '(?m)^\| `(?:M1-FIX-00[1-7]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| (?!<MUTABLE-STATUS>).*') { throw 'M1_R3_LEDGER_NORMALIZATION_INVALID' }
+if ($normalizedLedger -match '(?m)^\| `(?:M1-FIX-00[1-8]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| (?!<MUTABLE-STATUS>).*') { throw 'M1_R3_LEDGER_NORMALIZATION_INVALID' }
 $normalized = $utf8.GetBytes($prefix + $normalizedLedger)
 [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($normalized))
 ```
@@ -193,6 +193,7 @@ The immutable task/module mapping is:
 | --- | --- |
 | `M1-FIX-001` requested-model validation/persistence | R3-01 |
 | `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 |
+| `M1-FIX-008` model provenance format regression closure | R3-01 |
 | `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 |
 | `M1-FIX-004` random Target Reservation identity | R3-03 |
 | `M1-FIX-005` recursive reservation admin/data inventory | R3-03 |
@@ -218,12 +219,19 @@ The immutable task/module mapping is:
 
 #### `M1-FIX-002` - make model identities injectable and scripted responses request-sensitive
 
-- **Exact allowed paths:** `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/model/__init__.py`, `src/apexcrew/adapters/model/scripted.py`, `tests/helpers/application.py`, `tests/contract/test_scripted_model.py`, `tests/integration/test_global_budget_producers.py`, `tests/integration/test_model_restart.py`, `tests/integration/test_planning_authorization.py`, `tests/integration/test_runtime_permits.py`, `tests/unit/domain/test_model_requests.py`, `tests/unit/domain/test_model_retry.py`, and `AGENT_LOG.md`. Stage only files actually changed from this closed set; no dynamic "every existing test" expansion is permitted.
+- **Exact allowed paths:** `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/model/__init__.py`, `src/apexcrew/adapters/model/scripted.py`, `tests/helpers/application.py`, `tests/contract/test_scripted_model.py`, `tests/contract/test_state_store.py`, `tests/integration/test_global_budget_producers.py`, `tests/integration/test_model_restart.py`, `tests/integration/test_planning_authorization.py`, `tests/integration/test_runtime_permits.py`, `tests/unit/domain/test_model_requests.py`, `tests/unit/domain/test_model_retry.py`, and `AGENT_LOG.md`. Stage only files actually changed from this closed set; no dynamic "every existing test" expansion is permitted.
 - **Red:** prove a scripted response bound to a different request digest/idempotency key is rejected and prove deterministic logical-turn/provider-attempt IDs through an injected finite source. Run `uv run --python 3.12 pytest tests/contract/test_scripted_model.py tests/unit/domain/test_model_retry.py tests/integration/test_model_restart.py -q`; the new tests must fail against unconditional deque consumption and direct `uuid4()` calls.
 - **Green contract:** production defaults remain random UUID-based, while tests inject finite ID sources. Every non-empty scripted step carries the expected request digest, idempotency key, and requested model ID beside its result; `ScriptedMockLLM` compares all three before consuming the step and fails closed without advancing on mismatch. An empty script remains a deterministic no-response fixture.
 - **Commit:** `fix(model): bind scripted responses to requests`.
 
-Module regression: run the focused selector, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, and `uv run --python 3.12 mypy src`.
+#### `M1-FIX-008` - close the model provenance format regression
+
+- **Exact allowed paths:** `src/apexcrew/domain/model.py`, `src/apexcrew/adapters/state/memory.py`, `src/apexcrew/adapters/state/sqlite.py`, and `AGENT_LOG.md` only.
+- **Red:** run `uv run --python 3.12 ruff format --check .`; it must fail only at `src/apexcrew/adapters/state/memory.py:3321`, `src/apexcrew/adapters/state/sqlite.py:5040`, and `src/apexcrew/domain/model.py:370`, which were introduced by `M1-FIX-001` and prevent the R3-01 module regression from passing.
+- **Green contract:** apply only Ruff's displayed line-layout replacements at those three conditions. Do not alter an operand, branch, type, persisted value, test, or any other path. Run `uv run --python 3.12 ruff format --check .`, `uv run --python 3.12 ruff check .`, `uv run --python 3.12 pytest -q`, `uv run --python 3.12 mypy src`, and `git diff --check`; every command must pass.
+- **Commit:** `style(model): normalize provenance bindings`.
+
+R3-01 module regression, only after the `M1-FIX-008` implementation commit: run all of the following from the R3-01 worktree: (1) `uv sync --frozen --all-groups`; (2) `uv run --python 3.12 pytest tests/unit/domain/test_model_requests.py tests/unit/domain/test_model_retry.py tests/contract/test_scripted_model.py tests/contract/test_state_store.py tests/integration/test_model_restart.py tests/integration/test_global_budget_producers.py tests/integration/test_planning_authorization.py tests/integration/test_runtime_permits.py -q`; (3) `uv run --python 3.12 pytest -q`; (4) `uv run --python 3.12 ruff format --check .`; (5) `uv run --python 3.12 ruff check .`; (6) `uv run --python 3.12 mypy src`; and (7) `git diff --check main...HEAD`.
 
 ### R3-02: Secret Path Contract Evidence
 
@@ -350,7 +358,9 @@ Create this worktree from `main` only after R3-01 through R3-04 merge. Do not ch
 
 ### M1 Closeout and Stop Rule
 
-For R3-01 through R3-04, after every task review and implementation commit run from that task's current corrective-module worktree:
+R3-01 has one narrow ordering exception. `M1-FIX-001` and `M1-FIX-002` run their listed task-local red/green, type, diff, and ordered-review checks before their commits. Because `M1-FIX-001` introduced the three exact format failures assigned to `M1-FIX-008`, neither earlier task is required to pass the complete seven-command module regression below. `M1-FIX-008` must pass its listed complete formatting, lint, suite, type, and diff checks before its ordered reviews; after its implementation commit, run the complete R3-01 seven-command module regression once. No other R3-01 exception exists.
+
+For R3-02 through R3-04, after every task review and implementation commit run from that task's current corrective-module worktree:
 
 1. `uv sync --frozen --all-groups`
 2. `uv run --python 3.12 pytest -q`
@@ -379,7 +389,7 @@ M1 closes only when all corrective/replacement PRs are merged, PR #8 is closed u
 - Hard-deny workspace escape, symlink/reparse traversal, `.git/**`, `.apexcrew/**`, effective secret paths, raw shell, host network, Docker socket, push, reset, clean, force, and target mutation outside Admission's final typed CAS.
 - Freeze Plan and Policy at `ACTIVE`; a risky effect needs an exact, one-use Grant. A command replay or direct runtime call never creates new mutation authority.
 - The deadline remains 2026-08-10 23:59 Asia/Shanghai and nominal capacity remains 30-40 hours/week. On 2026-08-03, R3 correction/replay is forecast at 29-57 implementation/review hours before owner PR administration. Do not claim that this fits the remaining window without a new observed capacity decision; report `HOLD` when it does not.
-- After the M1-R3 gate passes, new implementation authority is exactly `M1-FIX-001` through `M1-FIX-007`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. Existing Tasks 1-13 remain historical merged evidence subject to the explicit acceptance gate. Original Task 14-17 commits remain rejected PR #8 evidence. M2-M4 need their own exact revision, independent document review, and owner `GO` before any of their files may be retained.
+- After the M1-R3 gate passes, new implementation authority is exactly `M1-FIX-001` through `M1-FIX-008`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. Existing Tasks 1-13 remain historical merged evidence subject to the explicit acceptance gate. Original Task 14-17 commits remain rejected PR #8 evidence. M2-M4 need their own exact revision, independent document review, and owner `GO` before any of their files may be retained.
 - GitHub is the sole delivery remote. Do not configure an NJU or GitLab remote. The minimal `.github/workflows/ci.yml` already exists on `main`; R3 does not remove either trigger or broaden workflow authority. M3 Task 35A remains future roadmap.
 - No task authorizes push, publication, credentials, GitHub Pages enablement, workflow-permission changes, or a Runtime Grant. Every reviewed local R3 module still stops for explicit owner authorization before its first push. This host has no `gh` CLI, so PR creation is an owner action in the authenticated GitHub Web UI unless the owner separately authorizes another route.
 - Safety-bearing private helpers must have an explicit owning-task contract for expected-sequence CAS, locking, revision/Budget binding, settle-once authority, dispatch closure, and state transitions. The R2 helper inventory below remains historical input; R3 may add only the platform lock/mutation and ID-source helpers explicitly authorized above, with tests at their public module seams.
@@ -30318,7 +30328,7 @@ The deadline remains 2026-08-10 23:59 Asia/Shanghai at 30-40 hours/week. Recompu
 
 ## TASK Ledger Convention
 
-Every committed execution slice owns exactly one dated `AGENT_LOG.md` heading in the form `## <exact PLAN label> - <short title>`. Historical M1 labels remain fixed by the old ledger and are never reused. New work uses only `M1-FIX-001` through `M1-FIX-007`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. The exact implementation commit, R3 ledger row, agent/human attribution, and unique log label form one evidence association.
+Every committed execution slice owns exactly one dated `AGENT_LOG.md` heading in the form `## <exact PLAN label> - <short title>`. Historical M1 labels remain fixed by the old ledger and are never reused. New work uses only `M1-FIX-001` through `M1-FIX-008`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. The exact implementation commit, R3 ledger row, agent/human attribution, and unique log label form one evidence association.
 
 ## Required Evidence Per Commit
 
@@ -30346,8 +30356,9 @@ Static-contract rules above govern this EOF data table. Only the cells expressly
 
 | R3 task | Module | Status | Implementation commit |
 | --- | --- | --- | --- |
-| `M1-FIX-001` requested-model validation/persistence | R3-01 | NOT STARTED | Not created |
-| `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 | NOT STARTED | Not created |
+| `M1-FIX-001` requested-model validation/persistence | R3-01 | COMPLETED (ANCHOR REMEDIATED) | 99bd398eac413119670c3dce2c97ab8271e30b6f |
+| `M1-FIX-002` injectable model identities and request-sensitive scripted model | R3-01 | COMPLETED | 205bd422bbd84a995882ceac50d597e4ef9c0f92 |
+| `M1-FIX-008` model provenance format regression closure | R3-01 | COMPLETED | 1bbd0f3a1d89d2c46cec6790e4515aa4dadc6a9a |
 | `M1-FIX-003` keyed-HMAC and deterministic non-disclosure proof | R3-02 | NOT STARTED | Not created |
 | `M1-FIX-004` random Target Reservation identity | R3-03 | NOT STARTED | Not created |
 | `M1-FIX-005` recursive reservation admin/data inventory | R3-03 | NOT STARTED | Not created |

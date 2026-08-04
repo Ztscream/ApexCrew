@@ -15,6 +15,7 @@ from helpers.application import (
     make_create_run_command,
 )
 
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.admission import TargetReservationCreationOutcome
@@ -53,10 +54,14 @@ from apexcrew.domain.effects import (
     canonical_json,
 )
 from apexcrew.domain.model import (
+    DurableModelClient,
     LogicalModelTurn,
     ModelBudgetAmounts,
+    ModelCompletion,
+    ModelRecoveryBinding,
     ModelRequest,
     ModelRequestIntent,
+    ModelUsage,
     ProviderAttemptResult,
 )
 from apexcrew.domain.revisions import (
@@ -176,6 +181,65 @@ def test_sqlite_authority_model_reservation_is_run_bound_and_stale_safe(
     assert store.model_counters("run-b").calls == 0
     assert store.audit_sequence("run-a") == 1
     assert store.audit_sequence("run-b") == 0
+
+
+def test_sqlite_authorized_model_attempt_retries_preserve_requested_model_anchor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database)
+    authority = make_authority(store, run_id="run-anchor")
+    first_request = planning_reservation_request(store, "run-anchor", 0)
+    first = authority.reserve_model_attempt(first_request)
+    assert first.decision == "RESERVED"
+    assert first.turn is not None
+    assert first.intent is not None
+    store.settle_model_attempt(
+        first.intent,
+        ProviderAttemptResult.known_closed("response-1", "TRANSIENT_REJECTION"),
+        expected_sequence=store.audit_sequence("run-anchor"),
+    )
+    retry_request = replace(
+        first_request,
+        turn=first.turn,
+        provider_attempt_number=2,
+        expected_run_counters=store.model_counters("run-anchor"),
+        expected_sequence=store.audit_sequence("run-anchor"),
+    )
+    retry = authority.reserve_model_attempt(retry_request)
+    assert retry.decision == "RESERVED"
+    assert retry.intent is not None
+    store.settle_model_attempt(
+        retry.intent,
+        ProviderAttemptResult.completed(
+            ModelCompletion(
+                response_id="response-2",
+                requested_model_id="gpt-5.6-terra",
+                returned_model_id="gpt-5.6-terra",
+                usage=ModelUsage(120, 12, Decimal("0.00048")),
+                normalized_action={"kind": "finish"},
+            )
+        ),
+        expected_sequence=store.audit_sequence("run-anchor"),
+    )
+    attempts = store.model_attempts("run-anchor", first.turn.logical_turn_id)
+    store.close()
+
+    reopened = SqliteStateStore(database)
+    recovery_model = ScriptedMockLLM([])
+    recovered = DurableModelClient(model=recovery_model, journal=reopened).recover_committed(
+        "run-anchor",
+        first.turn.logical_turn_id,
+        ModelRecoveryBinding.from_request(first_request.model_request),
+    )
+
+    assert [attempt.request.requested_model_id for attempt in attempts] == [
+        "gpt-5.6-terra",
+        "gpt-5.6-terra",
+    ]
+    assert recovered.outcome == "COMPLETED"
+    assert recovered.normalized_action == {"kind": "finish"}
+    assert recovery_model.call_count == 0
 
 
 def seeded_authority_store(database: Path, run_id: str) -> SqliteStateStore:
@@ -362,6 +426,39 @@ def test_sqlite_model_backoff_survives_restart(tmp_path: Path) -> None:
     assert attempts[0].outcome == "KNOWN_CLOSED_REJECTION"
     assert attempts[0].backoff_seconds == 1
     assert attempts[0].charged_amounts == attempts[0].reserved_amounts
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_requested_model_mismatch_round_trips_for_each_state_store(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    completion = ModelCompletion(
+        response_id="response-requested-model-mismatch",
+        requested_model_id="gpt-5.6-mini",
+        returned_model_id="gpt-5.6-terra",
+        usage=ModelUsage(120, 12, Decimal("0.00048")),
+        normalized_action={"kind": "finish"},
+    )
+
+    result = DurableModelClient(
+        model=ScriptedMockLLM(
+            [ScriptedModelStep.for_request(request, ProviderAttemptResult.completed(completion))]
+        ),
+        journal=store,
+    ).complete(request)
+    attempts = store.model_attempts(request.run_id, result.logical_turn_id)
+
+    assert result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert result.normalized_action is None
+    assert len(attempts) == 1
+    assert attempts[0].request.requested_model_id == request.requested_model_id
+    assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
+    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert attempts[0].reported_usage == completion.usage
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])

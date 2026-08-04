@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -5,10 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.commands import ApplicableRevisionDigests
-from apexcrew.domain.effects import EffectIntent
+from apexcrew.domain.effects import EffectIntent, StateConflict
 from apexcrew.domain.model import (
     DurableModelClient,
     LogicalTurnId,
@@ -23,10 +25,15 @@ from apexcrew.domain.model import (
 from apexcrew.domain.types import AuditSequence, IntentId, RunId
 
 
-def completion(model_id: str, action: dict[str, str]) -> ModelCompletion:
+def completion(
+    model_id: str,
+    action: dict[str, str],
+    *,
+    requested_model_id: str = "gpt-5.6-terra",
+) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id=requested_model_id,
         returned_model_id=model_id,
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action=action,
@@ -75,7 +82,14 @@ def committed_model_turn(
     request = make_model_request()
     result = DurableModelClient(
         model=ScriptedMockLLM(
-            [ProviderAttemptResult.completed(completion("gpt-5.6-terra", {"kind": "finish"}))]
+            [
+                ScriptedModelStep.for_request(
+                    request,
+                    ProviderAttemptResult.completed(
+                        completion("gpt-5.6-terra", {"kind": "finish"})
+                    ),
+                )
+            ]
         ),
         journal=store,
     ).complete(request)
@@ -113,8 +127,11 @@ def test_restart_releases_committed_completion_without_provider_redispatch(
     request = make_model_request()
     first_model = ScriptedMockLLM(
         [
-            ProviderAttemptResult.completed(
-                completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+            ScriptedModelStep.for_request(
+                request,
+                ProviderAttemptResult.completed(
+                    completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+                ),
             )
         ]
     )
@@ -151,6 +168,349 @@ def test_recovery_binding_mismatch_releases_no_output(tmp_path: Path) -> None:
     assert recovered.outcome == "RECOVERY_BINDING_MISMATCH"
     assert recovered.normalized_action is None
     assert model.call_count == 0
+
+
+def remove_response_requested_model_id(
+    connection: sqlite3.Connection,
+    request: ModelRequest,
+    logical_turn_id: LogicalTurnId,
+) -> None:
+    row = connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    del dispatch["response_requested_model_id"]
+    dispatch_json = json.dumps(dispatch, sort_keys=True, separators=(",", ":"))
+    connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = NULL, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (dispatch_json, request.run_id, logical_turn_id),
+    )
+    connection.execute(
+        "UPDATE model_attempts SET response_requested_model_id = NULL, result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (dispatch_json, request.run_id, logical_turn_id),
+    )
+
+
+def schema_v16_database(
+    store: SqliteStateStore,
+    database: Path,
+    request: ModelRequest,
+    logical_turn_id: LogicalTurnId,
+    *,
+    remove_response_requested_model_id_value: bool = False,
+) -> Path:
+    store.close()
+
+    connection = sqlite3.connect(database)
+    if remove_response_requested_model_id_value:
+        remove_response_requested_model_id(connection, request, logical_turn_id)
+    connection.execute("ALTER TABLE model_attempts DROP COLUMN request_requested_model_id")
+    connection.execute("ALTER TABLE model_attempts DROP COLUMN response_requested_model_binding")
+    connection.execute("ALTER TABLE model_turns DROP COLUMN response_requested_model_binding")
+    connection.execute("DELETE FROM schema_migrations WHERE version IN (17, 18)")
+    connection.commit()
+    connection.close()
+    return database
+
+
+def legacy_result_digest(row: tuple[object, ...]) -> str:
+    dispatch = json.loads(str(row[4]))
+    digest_payload = json.dumps(
+        {
+            "charged": json.loads(str(row[3])),
+            "kind": row[0],
+            "normalized_payload_digest": dispatch["normalized_payload_digest"],
+            "provider_response_id": row[1],
+            "reason_code": row[2],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + sha256(digest_payload).hexdigest()
+
+
+def bound_result_digest(row: tuple[object, ...]) -> str:
+    dispatch = json.loads(str(row[4]))
+    digest_payload = json.dumps(
+        {
+            "charged": json.loads(str(row[3])),
+            "kind": row[0],
+            "normalized_payload_digest": dispatch["normalized_payload_digest"],
+            "provider_response_id": row[1],
+            "reason_code": row[2],
+            "response_requested_model_id": dispatch["response_requested_model_id"],
+            "returned_model_id": dispatch["returned_model_id"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + sha256(digest_payload).hexdigest()
+
+
+def schema_v15_database(
+    store: SqliteStateStore,
+    database: Path,
+    request: ModelRequest,
+    logical_turn_id: LogicalTurnId,
+) -> Path:
+    database = schema_v16_database(
+        store,
+        database,
+        request,
+        logical_turn_id,
+        remove_response_requested_model_id_value=True,
+    )
+    connection = sqlite3.connect(database)
+    row = connection.execute(
+        "SELECT outcome, provider_response_id, reason_code, charged_json, result_json "
+        "FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    connection.execute(
+        "UPDATE model_attempts SET result_digest = ? WHERE run_id = ? AND logical_turn_id = ?",
+        (legacy_result_digest(row), request.run_id, logical_turn_id),
+    )
+    connection.execute("ALTER TABLE model_attempts DROP COLUMN response_requested_model_id")
+    connection.execute("ALTER TABLE model_turns DROP COLUMN response_requested_model_id")
+    connection.execute("DELETE FROM schema_migrations WHERE version = 16")
+    connection.commit()
+    connection.close()
+    return database
+
+
+def test_schema_v16_committed_completion_without_binding_columns_recovers(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    database = schema_v16_database(store, tmp_path / "state.db", request, logical_turn_id)
+
+    reopened = SqliteStateStore(database)
+    committed = reopened.committed_model_turn(request.run_id, logical_turn_id)
+    recovery_model = ScriptedMockLLM([])
+    recovered = DurableModelClient(model=recovery_model, journal=reopened).recover_committed(
+        request.run_id,
+        logical_turn_id,
+        ModelRecoveryBinding.from_request(request),
+    )
+
+    assert committed is not None
+    assert committed.response_requested_model_id == request.requested_model_id
+    assert recovered.outcome == "COMPLETED"
+    assert recovered.normalized_action == {"kind": "finish"}
+    assert recovery_model.call_count == 0
+
+
+def test_legacy_committed_completion_without_response_requested_id_recovers(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    database = schema_v15_database(store, tmp_path / "state.db", request, logical_turn_id)
+
+    reopened = SqliteStateStore(database)
+    committed = reopened.committed_model_turn(request.run_id, logical_turn_id)
+    recovered = DurableModelClient(model=ScriptedMockLLM([]), journal=reopened).recover_committed(
+        request.run_id,
+        logical_turn_id,
+        ModelRecoveryBinding.from_request(request),
+    )
+
+    assert committed is not None
+    assert committed.response_requested_model_id is None
+    assert recovered.outcome == "COMPLETED"
+    assert recovered.normalized_action == {"kind": "finish"}
+
+
+def test_new_committed_completion_cannot_be_reclassified_as_legacy(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    database = schema_v16_database(
+        store,
+        tmp_path / "state.db",
+        request,
+        logical_turn_id,
+        remove_response_requested_model_id_value=True,
+    )
+    reopened = SqliteStateStore(database)
+
+    recovery_model = ScriptedMockLLM([])
+    with pytest.raises(StateConflict, match="MODEL_RESPONSE_REQUESTED_ID"):
+        reopened.model_attempts(request.run_id, logical_turn_id)
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        DurableModelClient(model=recovery_model, journal=reopened).recover_committed(
+            request.run_id,
+            logical_turn_id,
+            ModelRecoveryBinding.from_request(request),
+        )
+    assert recovery_model.call_count == 0
+
+
+def test_new_attempt_with_explicit_null_requested_model_id_is_closed(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT result_json FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    dispatch["response_requested_model_id"] = None
+    store._connection.execute(
+        "UPDATE model_attempts SET response_requested_model_id = NULL, result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        (
+            json.dumps(dispatch, sort_keys=True, separators=(",", ":")),
+            request.run_id,
+            logical_turn_id,
+        ),
+    )
+
+    with pytest.raises(StateConflict, match="MODEL_RESPONSE_REQUESTED_ID"):
+        store.model_attempts(request.run_id, logical_turn_id)
+
+
+def test_bound_completion_with_coherent_requested_model_id_tamper_is_closed(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    dispatch["response_requested_model_id"] = "gpt-5.6-mini"
+    dispatch_json = json.dumps(dispatch, sort_keys=True, separators=(",", ":"))
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = ?, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+    store._connection.execute(
+        "UPDATE model_attempts SET response_requested_model_id = ?, result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+
+    with pytest.raises(StateConflict, match="MODEL_RESPONSE_REQUESTED_ID"):
+        store.model_attempts(request.run_id, logical_turn_id)
+    recovery_model = ScriptedMockLLM([])
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        DurableModelClient(model=recovery_model, journal=store).recover_committed(
+            request.run_id,
+            logical_turn_id,
+            ModelRecoveryBinding.from_request(request),
+        )
+    assert recovery_model.call_count == 0
+
+
+def test_bound_completion_with_rewritten_request_json_is_closed(
+    tmp_path: Path,
+) -> None:
+    store, request, logical_turn_id = committed_model_turn(tmp_path)
+    row = store._connection.execute(
+        "SELECT dispatch_result_json FROM model_turns WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert row is not None
+    dispatch = json.loads(row[0])
+    dispatch["response_requested_model_id"] = "gpt-5.6-mini"
+    dispatch_json = json.dumps(dispatch, sort_keys=True, separators=(",", ":"))
+    request_row = store._connection.execute(
+        "SELECT request_json FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert request_row is not None
+    stored_request = json.loads(request_row[0])
+    stored_request["requested_model_id"] = "gpt-5.6-mini"
+    attempt_row = store._connection.execute(
+        "SELECT outcome, provider_response_id, reason_code, charged_json, result_json "
+        "FROM model_attempts WHERE run_id = ? AND logical_turn_id = ?",
+        (request.run_id, logical_turn_id),
+    ).fetchone()
+    assert attempt_row is not None
+    tampered_attempt = (*attempt_row[:4], dispatch_json)
+    store._connection.execute(
+        "UPDATE model_turns SET response_requested_model_id = ?, dispatch_result_json = ? "
+        "WHERE run_id = ? AND logical_turn_id = ?",
+        ("gpt-5.6-mini", dispatch_json, request.run_id, logical_turn_id),
+    )
+    store._connection.execute(
+        "UPDATE model_attempts SET request_json = ?, response_requested_model_id = ?, "
+        "result_json = ?, result_digest = ? WHERE run_id = ? AND logical_turn_id = ?",
+        (
+            json.dumps(stored_request, sort_keys=True, separators=(",", ":")),
+            "gpt-5.6-mini",
+            dispatch_json,
+            bound_result_digest(tampered_attempt),
+            request.run_id,
+            logical_turn_id,
+        ),
+    )
+
+    with pytest.raises(StateConflict, match="MODEL_REQUEST"):
+        store.model_attempts(request.run_id, logical_turn_id)
+    recovery_model = ScriptedMockLLM([])
+    with pytest.raises(StateConflict, match="COMMITTED_MODEL_RESPONSE_REQUESTED_ID"):
+        DurableModelClient(model=recovery_model, journal=store).recover_committed(
+            request.run_id,
+            logical_turn_id,
+            ModelRecoveryBinding.from_request(request),
+        )
+    assert recovery_model.call_count == 0
+
+
+def test_restart_preserves_requested_model_mismatch_without_releasing_action(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database)
+    request = make_model_request()
+    result = DurableModelClient(
+        model=ScriptedMockLLM(
+            [
+                ScriptedModelStep.for_request(
+                    request,
+                    ProviderAttemptResult.completed(
+                        completion(
+                            model_id="gpt-5.6-terra",
+                            action={"kind": "finish"},
+                            requested_model_id="gpt-5.6-mini",
+                        )
+                    ),
+                )
+            ]
+        ),
+        journal=store,
+    ).complete(request)
+    store.close()
+
+    reopened = SqliteStateStore(database)
+    attempts = reopened.model_attempts(request.run_id, result.logical_turn_id)
+    empty_model = ScriptedMockLLM([])
+    recovered = DurableModelClient(model=empty_model, journal=reopened).recover_committed(
+        request.run_id,
+        result.logical_turn_id,
+        ModelRecoveryBinding.from_request(request),
+    )
+
+    assert result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert result.normalized_action is None
+    assert len(attempts) == 1
+    assert attempts[0].request.requested_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
+    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
+    assert attempts[0].reported_usage == ModelUsage(120, 12, Decimal("0.00048"))
+    assert recovered.outcome == "MODEL_COMPLETION_NOT_COMMITTED"
+    assert recovered.normalized_action is None
+    assert empty_model.call_count == 0
 
 
 def test_committed_completion_with_downstream_intent_is_not_released_twice(

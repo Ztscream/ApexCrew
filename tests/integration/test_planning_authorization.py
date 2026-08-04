@@ -11,7 +11,7 @@ from helpers.application import (
     seed_unreleased_committed_completion,
 )
 
-from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.authority import AuthorityService, ModelReservationRequest
@@ -158,7 +158,7 @@ def reservation_request(store: InMemoryStateStore) -> ModelReservationRequest:
 
 
 class BarrierObservingModel(ScriptedMockLLM):
-    def __init__(self, store: InMemoryStateStore) -> None:
+    def __init__(self, store: InMemoryStateStore, request: ModelRequest) -> None:
         completion = ModelCompletion(
             response_id="response-1",
             requested_model_id="gpt-5.6-terra",
@@ -168,8 +168,11 @@ class BarrierObservingModel(ScriptedMockLLM):
         )
         super().__init__(
             [
-                ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION"),
-                ProviderAttemptResult.completed(completion),
+                ScriptedModelStep.for_request(
+                    request,
+                    ProviderAttemptResult.known_closed("reject-1", "TRANSIENT_REJECTION"),
+                ),
+                ScriptedModelStep.for_request(request, ProviderAttemptResult.completed(completion)),
             ]
         )
         self._store = store
@@ -182,14 +185,15 @@ class BarrierObservingModel(ScriptedMockLLM):
 
 def test_provider_retry_is_authority_reserved_and_has_an_open_runtime_barrier() -> None:
     store = seeded_store()
-    model = BarrierObservingModel(store)
+    request = reservation_request(store)
+    model = BarrierObservingModel(store, request.model_request)
     client = AuthorityModelClient(
         model=model,
         journal=store,
         authority=AuthorityService(journal=store),
         clock=lambda: datetime(2026, 7, 27, 0, 1, tzinfo=UTC),
     )
-    result = client.complete(reservation_request(store))
+    result = client.complete(request)
     assert isinstance(result, ModelDispatchResult)
     assert result.outcome == "COMPLETED"
     assert model.observed_barriers == ["IN_FLIGHT", "IN_FLIGHT"]
