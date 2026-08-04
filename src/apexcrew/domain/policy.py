@@ -86,6 +86,8 @@ class SecretPathPolicy:
 
     @classmethod
     def from_host_rules(cls, rules: Sequence[str], installation_key: bytes) -> SecretPathPolicy:
+        if not installation_key:
+            raise ValueError("INSTALLATION_KEY_REQUIRED")
         normalized = tuple(sorted({unicodedata.normalize("NFC", rule) for rule in rules}))
         effective = DEFAULT_SECRET_GLOBS + normalized
         return cls(
