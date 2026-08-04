@@ -4,11 +4,18 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError
+from apexcrew.adapters.repository.no_follow import (
+    OpenedNode,
+    RepositoryUnsafeError,
+    StableHandleTree,
+)
+from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
+from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.domain.actions import RiskyAction
 from apexcrew.domain.admission import RepositoryEffectUncertain
 from apexcrew.domain.effects import canonical_json, sha256_digest
@@ -21,9 +28,52 @@ _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?\
 
 
 class GrantedWorkspaceAdapter:
-    def __init__(self, root: Path, secret_paths: SecretPathPolicy) -> None:
+    def __init__(
+        self,
+        root: Path,
+        secret_paths: SecretPathPolicy,
+        *,
+        before_mutation: Callable[[], None] | None = None,
+    ) -> None:
         self._root = root.resolve(strict=True)
         self._secret_paths = secret_paths
+        self._before_mutation = before_mutation
+
+    def _authorized_parts(self, raw: str, *, require_protected: bool = False) -> tuple[str, ...]:
+        canonical = CanonicalPath.parse(raw)
+        if self._secret_paths.inspect(canonical).code != "ALLOW":
+            raise RepositoryUnsafeError("GRANTED_SECRET_PATH_DENIED")
+        protected = str(canonical) == ".gitlab-ci.yml" or str(canonical).startswith(
+            ".github/workflows/"
+        )
+        if require_protected != protected:
+            raise RepositoryUnsafeError("GRANTED_PROTECTED_SCOPE_MISMATCH")
+        return tuple(str(canonical).split("/"))
+
+    def _stable_handles(self) -> StableHandleTree:
+        backend = PosixNoFollowBackend() if os.name == "posix" else WindowsNoFollowBackend()
+        return StableHandleTree(self._root, backend)
+
+    def _guard_mutation(self, tree: StableHandleTree) -> None:
+        if self._before_mutation is not None:
+            self._before_mutation()
+        tree.assert_name_bindings()
+
+    @staticmethod
+    def _parent_and_name(tree: StableHandleTree, parts: tuple[str, ...]) -> tuple[OpenedNode, str]:
+        parent = tree.root_node if len(parts) == 1 else tree.open("/".join(parts[:-1]), "directory")
+        return parent, parts[-1]
+
+    @staticmethod
+    def _handle_regular(
+        tree: StableHandleTree, parts: tuple[str, ...]
+    ) -> tuple[OpenedNode, bytes, int]:
+        node = tree.open("/".join(parts), "file")
+        content = tree.read_bytes(node, 16 * 1024 * 1024)
+        if os.name != "posix":
+            raise RepositoryUnsafeError("GRANTED_HANDLE_MUTATION_UNSUPPORTED")
+        mode = stat.S_IMODE(os.fstat(node.handle).st_mode)
+        return node, content, mode
 
     @staticmethod
     def _is_link_or_reparse(metadata: os.stat_result) -> bool:
@@ -271,103 +321,259 @@ class GrantedWorkspaceAdapter:
             )
 
     def delete_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
+        if os.name != "posix":
+            try:
+                path = self._path(action.path)
+                content, mode = self._regular(path)
+            except (OSError, RepositoryUnsafeError, ValueError):
+                return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
+            if action.operation != "delete" or not self._matches_source(content, mode, expected):
+                return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+            try:
+                path.unlink()
+            except OSError as error:
+                raise RepositoryEffectUncertain("GRANTED_DELETE_UNCERTAIN") from error
+            return ToolResult(code="DELETED", content_digest=self._digest(content))
+        tree: StableHandleTree | None = None
         try:
-            path = self._path(action.path)
-            content, mode = self._regular(path)
+            parts = self._authorized_parts(action.path)
+            tree = self._stable_handles()
+            _node, content, mode = self._handle_regular(tree, parts)
         except (OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
             return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
         if action.operation != "delete" or not self._matches_source(content, mode, expected):
+            tree.close()
             return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+        parent, name = self._parent_and_name(tree, parts)
         try:
-            path.unlink()
+            self._guard_mutation(tree)
+            os.unlink(name, dir_fd=parent.handle)
         except OSError as error:
+            tree.close()
             raise RepositoryEffectUncertain("GRANTED_DELETE_UNCERTAIN") from error
+        except RepositoryUnsafeError:
+            tree.close()
+            return ToolResult.indeterminate("GRANTED_PRESTATE_CHANGED")
+        tree.close()
         return ToolResult(code="DELETED", content_digest=self._digest(content))
 
     def rename_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
         if action.destination is None:
             return ToolResult.indeterminate("GRANTED_RENAME_DESTINATION_REQUIRED")
+        if os.name != "posix":
+            try:
+                source = self._path(action.path)
+                destination = self._path(action.destination)
+                content, mode = self._regular(source)
+                destination_entry = self._regular_if_present(destination)
+            except (OSError, RepositoryUnsafeError, ValueError):
+                return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
+            if (
+                action.operation != "rename"
+                or not expected.destination_absent
+                or destination_entry is not None
+                or not self._matches_source(content, mode, expected)
+            ):
+                return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+            try:
+                source.rename(destination)
+            except OSError as error:
+                raise RepositoryEffectUncertain("GRANTED_RENAME_UNCERTAIN") from error
+            return ToolResult(code="RENAMED", content_digest=self._digest(content))
+        tree: StableHandleTree | None = None
         try:
-            source = self._path(action.path)
-            destination = self._path(action.destination)
-            content, mode = self._regular(source)
-            destination_entry = self._regular_if_present(destination)
+            source_parts = self._authorized_parts(action.path)
+            destination_parts = self._authorized_parts(action.destination)
+            tree = self._stable_handles()
+            _source_node, content, mode = self._handle_regular(tree, source_parts)
+            destination_handle = tree.try_open("/".join(destination_parts), "file")
+            destination_exists = destination_handle is not None
         except (OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
             return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
         if (
             action.operation != "rename"
             or not expected.destination_absent
-            or destination_entry is not None
+            or destination_exists
             or not self._matches_source(content, mode, expected)
         ):
+            tree.close()
             return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+        source_parent, source_name = self._parent_and_name(tree, source_parts)
+        destination_parent, destination_name = self._parent_and_name(tree, destination_parts)
         try:
-            source.rename(destination)
+            self._guard_mutation(tree)
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=source_parent.handle,
+                dst_dir_fd=destination_parent.handle,
+            )
         except OSError as error:
+            tree.close()
             raise RepositoryEffectUncertain("GRANTED_RENAME_UNCERTAIN") from error
+        except RepositoryUnsafeError:
+            tree.close()
+            return ToolResult.indeterminate("GRANTED_PRESTATE_CHANGED")
+        tree.close()
         return ToolResult(code="RENAMED", content_digest=self._digest(content))
 
     def set_executable(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
+        if os.name != "posix":
+            try:
+                path = self._path(action.path)
+                content, mode = self._regular(path)
+            except (OSError, RepositoryUnsafeError, ValueError):
+                return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
+            if (
+                action.operation != "set_executable"
+                or action.executable is None
+                or not self._matches_source(content, mode, expected)
+            ):
+                return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+            if os.name == "nt":
+                return ToolResult.indeterminate("GRANTED_EXECUTABLE_MODE_UNSUPPORTED")
+            target_mode = mode | 0o111 if action.executable else mode & ~0o111
+            try:
+                path.chmod(target_mode, follow_symlinks=False)
+            except OSError as error:
+                raise RepositoryEffectUncertain("GRANTED_EXECUTABLE_CHANGE_UNCERTAIN") from error
+            return ToolResult(code="EXECUTABLE_CHANGED", content_digest=self._digest(content))
+        tree: StableHandleTree | None = None
         try:
-            path = self._path(action.path)
-            content, mode = self._regular(path)
+            parts = self._authorized_parts(action.path)
+            tree = self._stable_handles()
+            _node, content, mode = self._handle_regular(tree, parts)
         except (OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
             return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
         if (
             action.operation != "set_executable"
             or action.executable is None
             or not self._matches_source(content, mode, expected)
         ):
+            tree.close()
             return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
         if os.name == "nt":
+            tree.close()
             return ToolResult.indeterminate("GRANTED_EXECUTABLE_MODE_UNSUPPORTED")
         target_mode = mode | 0o111 if action.executable else mode & ~0o111
         try:
-            path.chmod(target_mode, follow_symlinks=False)
+            parent, _ = self._parent_and_name(tree, parts)
+            self._guard_mutation(tree)
+            os.chmod(parts[-1], target_mode, dir_fd=parent.handle, follow_symlinks=False)
         except OSError as error:
+            tree.close()
             raise RepositoryEffectUncertain("GRANTED_EXECUTABLE_CHANGE_UNCERTAIN") from error
+        except RepositoryUnsafeError:
+            tree.close()
+            return ToolResult.indeterminate("GRANTED_PRESTATE_CHANGED")
+        tree.close()
         return ToolResult(code="EXECUTABLE_CHANGED", content_digest=self._digest(content))
 
     def apply_protected_patch(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
+        if os.name != "posix":
+            try:
+                path = self._path(action.path, require_protected=True)
+                content, mode = self._regular(path)
+                if action.operation != "protected_patch" or action.unified_diff is None:
+                    return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+                if not self._matches_source(content, mode, expected):
+                    return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
+                patched = self._apply_unified_diff(content, action.unified_diff)
+            except (OSError, RepositoryUnsafeError, ValueError):
+                return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
+            temporary_fd: int | None = None
+            temporary_path: str | None = None
+            applied = False
+            try:
+                temporary_fd, temporary_path = tempfile.mkstemp(
+                    prefix=".apexcrew-granted-", dir=path.parent
+                )
+                with os.fdopen(temporary_fd, "wb") as stream:
+                    temporary_fd = None
+                    stream.write(patched)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temporary_path, mode)
+                os.replace(temporary_path, path)
+                applied = True
+                temporary_path = None
+            except OSError as error:
+                if applied or not path.exists():
+                    raise RepositoryEffectUncertain("GRANTED_PROTECTED_PATCH_UNCERTAIN") from error
+                return ToolResult.indeterminate("GRANTED_PROTECTED_PATCH_FAILED")
+            finally:
+                if temporary_fd is not None:
+                    try:
+                        os.close(temporary_fd)
+                    except OSError:
+                        pass
+                if temporary_path is not None:
+                    try:
+                        os.unlink(temporary_path)
+                    except OSError:
+                        pass
+            return ToolResult(code="PROTECTED_PATCH_APPLIED", content_digest=self._digest(patched))
+        tree: StableHandleTree | None = None
         try:
-            path = self._path(action.path, require_protected=True)
-            content, mode = self._regular(path)
+            parts = self._authorized_parts(action.path, require_protected=True)
+            tree = self._stable_handles()
+            _node, content, mode = self._handle_regular(tree, parts)
             if action.operation != "protected_patch" or action.unified_diff is None:
+                tree.close()
                 return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
             if not self._matches_source(content, mode, expected):
+                tree.close()
                 return ToolResult.indeterminate("GRANTED_PRESTATE_MISMATCH")
             patched = self._apply_unified_diff(content, action.unified_diff)
         except (OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
             return ToolResult.indeterminate("GRANTED_PREFLIGHT_DENIED")
-        temporary_fd: int | None = None
-        temporary_path: str | None = None
+        parent, name = self._parent_and_name(tree, parts)
+        temporary_name: str | None = None
         applied = False
         try:
-            temporary_fd, temporary_path = tempfile.mkstemp(
-                prefix=".apexcrew-granted-", dir=path.parent
-            )
-            with os.fdopen(temporary_fd, "wb") as stream:
-                temporary_fd = None
+            self._guard_mutation(tree)
+            for attempt in range(16):
+                candidate = f".apexcrew-granted-{os.getpid()}-{attempt}"
+                try:
+                    fd = os.open(
+                        candidate,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        mode=mode,
+                        dir_fd=parent.handle,
+                    )
+                    temporary_name = candidate
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise OSError("temporary name exhaustion")
+            with os.fdopen(fd, "wb") as stream:
                 stream.write(patched)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(temporary_path, mode)
-            os.replace(temporary_path, path)
+            os.chmod(temporary_name, mode, dir_fd=parent.handle, follow_symlinks=False)
+            os.replace(temporary_name, name, src_dir_fd=parent.handle, dst_dir_fd=parent.handle)
             applied = True
-            temporary_path = None
+            temporary_name = None
         except OSError as error:
-            if applied or not path.exists():
+            if applied:
+                tree.close()
                 raise RepositoryEffectUncertain("GRANTED_PROTECTED_PATCH_UNCERTAIN") from error
+            tree.close()
             return ToolResult.indeterminate("GRANTED_PROTECTED_PATCH_FAILED")
         finally:
-            if temporary_fd is not None:
+            if temporary_name is not None:
                 try:
-                    os.close(temporary_fd)
+                    os.unlink(temporary_name, dir_fd=parent.handle)
                 except OSError:
                     pass
-            if temporary_path is not None:
-                try:
-                    os.unlink(temporary_path)
-                except OSError:
-                    pass
+        tree.close()
         return ToolResult(code="PROTECTED_PATCH_APPLIED", content_digest=self._digest(patched))

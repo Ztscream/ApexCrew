@@ -406,6 +406,39 @@ def test_granted_workspace_no_follow_denial_is_bounded(tmp_path: Path) -> None:
     assert outside.read_bytes() == b"outside\n"
 
 
+def test_granted_delete_rejects_ancestor_replacement_without_side_effect(
+    tmp_path: Path,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("ancestor replacement injection uses POSIX directory handles")
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    original = source_root / "old.py"
+    original.write_bytes(b"original\n")
+    replacement = tmp_path / "replacement.py"
+
+    def replace_ancestor() -> None:
+        source_root.rename(tmp_path / "src-old")
+        source_root.mkdir()
+        (source_root / "old.py").write_bytes(b"replacement\n")
+        replacement.write_bytes(b"sentinel\n")
+
+    adapter = GrantedWorkspaceAdapter(
+        tmp_path,
+        SecretPathPolicy.from_host_rules((), b"installation-key"),
+        before_mutation=replace_ancestor,
+    )
+    result = adapter.delete_regular_file(
+        RiskyAction(operation="delete", path="src/old.py"),
+        ActionPreState(source_digest=digest(b"original\n")),
+    )
+
+    assert result.code == "INDETERMINATE"
+    assert (tmp_path / "src-old" / "old.py").read_bytes() == b"original\n"
+    assert (source_root / "old.py").read_bytes() == b"replacement\n"
+    assert replacement.read_bytes() == b"sentinel\n"
+
+
 def test_granted_workspace_possibly_applied_failure_is_uncertain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

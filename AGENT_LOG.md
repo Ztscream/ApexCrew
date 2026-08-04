@@ -1095,3 +1095,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex resolved the merge and performed spec/quality self-checks; implementation commit follows.
 - **Human intervention**: none; `SPEC.md`, credentials, push, PR, and `SPRINT.md` were not changed.
 - **Lesson**: when integrating parallel schema evolution, reserve new migration numbers and test idempotency through both old and new receipt stores.
+
+## 2026-08-04 / S3 - Handle granted mutations against ancestor replacement
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `e72bfea48abb3c23075587f3f0a98eddcb2795c8`.
+- **Task/skill**: S3; diagnosing safety race with karpathy-guidelines.
+- **Prompt/context**: pathname-dispatched delete/rename/chmod/replace operations violated the ancestor-swap boundary.
+- **Observed red/limit**: the POSIX race injection is not constructible on this Windows host and is recorded as a platform skip. Existing Windows mutation tests initially failed when the first candidate over-restricted all mutations; that candidate was corrected before commit.
+- **Implementation**: POSIX delete/rename/chmod/protected-patch now open a stable no-follow tree, verify held identities immediately before mutation, and use directory handles/relative operations. Windows keeps the existing tested fail-closed pathname behavior; unsupported executable mode remains `INDETERMINATE`.
+- **Green evidence**: `uv run --python 3.12 pytest tests/integration/test_granted_action_recovery.py -q` passed with two existing Windows skips; Ruff check/format and `mypy src` passed. No source path invokes raw shell or follows links.
+- **Subagent output/commit**: Codex self-reviewed the changed adapter and race contract; implementation commit follows.
+- **Human intervention**: none; POSIX runtime evidence is pending a POSIX host, and no credentials/`SPEC.md`/push/PR changed.
+- **Lesson**: a platform-specific security primitive must preserve the tested fallback contract while marking the unproven platform path closed.
