@@ -1393,3 +1393,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex completed the local rerun and updated the SPRINT/PLAN evidence association; documentation commit follows.
 - **Human intervention**: none; `SPEC.md` remains unchanged.
 - **Lesson**: completion evidence must be rerun after a corrective commit and the ledger must point to the corrected state.
+
+## 2026-08-05 / S18 build-target correction
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `3fad10e`.
+- **Task/skill**: S18 correction; karpathy-guidelines; tdd.
+- **Prompt/context**: verify the public `make build` target end to end and keep the Docker boundary explicit.
+- **Observed red**: `make build` stopped at `uv run --python 3.12 build` because no `build` executable exists; the release contract did not catch the wrong command.
+- **Implementation**: changed the package step to `uv build` and added contract assertions rejecting `$(UV_RUN) build`.
+- **Green evidence**: the release contract, `make -n build`, `make test`, and `make lint` passed; `make build` built the wheel and source distribution before reaching Docker, which returned `Docker Desktop is unable to start`.
+- **Subagent output/commit**: Codex self-checked the REAL S18 correction; implementation commit follows.
+- **Human intervention**: none; no credentials, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
+- **Lesson**: release contracts must validate executable command semantics, not only target names; the remaining failure is the external Docker daemon boundary.

@@ -20,5 +20,5 @@ web-build:
 	$(UV_RUN) python scripts/build_webui.py dist/webui
 
 build:
-	$(UV_RUN) build
+	uv build
 	docker build --tag apexcrew-executor:local .

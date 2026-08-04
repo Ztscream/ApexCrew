@@ -14,6 +14,8 @@ def test_release_artifacts_are_declared() -> None:
     assert all(
         f"{target}:" in makefile for target in ("test", "lint", "demo", "secret-scan", "build")
     )
+    assert "\n\tuv build\n" in makefile
+    assert "$(UV_RUN) build" not in makefile
     assert "unit-test:" in gitlab
     assert "uv run pytest" in gitlab
     assert "build:" in workflow
