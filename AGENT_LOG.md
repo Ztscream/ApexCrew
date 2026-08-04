@@ -1179,3 +1179,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the required STUB fail-closed behavior; implementation commit follows.
 - **Human intervention**: none; no resolution authority is manufactured.
 - **Lesson**: an unresolved set is a stop state until a reviewed precedence policy exists.
+
+## 2026-08-04 / S10 - Reservation cleanup and tombstone
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `e284c2e`.
+- **Task/skill**: S10; karpathy-guidelines.
+- **Prompt/context**: provide an idempotent terminal reservation cleanup state with a minimal tombstone.
+- **Observed red**: focused collection initially failed because `apexcrew.domain.reservation_cleanup` did not exist.
+- **Implementation**: added an idempotent cleanup state machine. Unknown observation and unauthorized removal fail closed; repeated settlement returns the same minimal tombstone.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/domain/test_reservation_cleanup.py -q` passed with `2 passed`; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the SKELETON boundary; implementation commit follows.
+- **Human intervention**: none; no Git deletion/force cleanup path was added.
+- **Lesson**: cleanup can be idempotent without making an unobserved external effect look successful.
