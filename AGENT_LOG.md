@@ -1239,3 +1239,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the SKELETON fixture boundary; implementation commit follows.
 - **Human intervention**: none; fixture repositories contain no credentials or restricted transcripts.
 - **Lesson**: explicit units in tiny fixtures make later drift and ablation checks mechanically observable.
+
+## 2026-08-04 / S15 - Deterministic mechanism demo
+
+- **Timestamp/base SHA**: 2026-08-04 Asia/Singapore; `4d1c30a`.
+- **Task/skill**: S15; karpathy-guidelines.
+- **Prompt/context**: provide a repeatable offline demonstration of the three required A.6 behaviors.
+- **Observed red**: focused collection initially failed because `apexcrew.demo` did not exist.
+- **Implementation**: added `build_demo_trace` and a module entry point covering dangerous-action denial, failed-check feedback changing the next action, and dependency-based stale evidence.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_demo.py -q` passed with `1 passed`; `uv run --python 3.12 python -m apexcrew.demo` emitted the three expected JSON events; Ruff check/format, `mypy src`, and `git diff --check` passed.
+- **Subagent output/commit**: Codex self-checked the REAL deterministic demo boundary; implementation commit follows.
+- **Human intervention**: none; the demo uses no provider, network, credential, or repository mutation.
+- **Lesson**: a small deterministic trace makes governance, feedback, and freshness behavior inspectable without claiming production orchestration.
