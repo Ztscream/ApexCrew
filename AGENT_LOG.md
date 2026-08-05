@@ -2124,3 +2124,9 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Independent spec finding**: the fresh R4-02A review blocked the implementation because the module-level composition contract required A-stage completion of planning snapshot/context, Worker tools, and every phase driver, while the binding R4-02B task row owns those exact wiring files and reopen behavior. It also found that default DeepSeek composition rejected its missing schema registry.
 - **Documentation correction**: the R4-02 contract now separates R4-02A's shared bundle/provider boundary from R4-02B's final A-Hybrid planning/Worker/phase wiring. A-stage fail-closed capability adapters are explicitly non-final and cannot support a release claim; the completed R4-02 module remains gated on R4-02B.
 - **Review status**: this PLAN correction requires a fresh independent document review before further source correction. No provider, credential, network, push, or PR action occurred.
+
+## 2026-08-06 / R4-02 contract correction refinement
+
+- **Document review finding**: Popper accepted the A/B split but blocked ownership/task precision because R4-04 owns planning/snapshot/executor adapter implementation while R4-02B did not explicitly require replacing every deferred boundary or assert that no deferred boundary remained.
+- **Documentation correction**: R4-02B now owns concrete composition graph replacement and a no-deferred integration assertion; R4-04 owns adapter implementation and hardening consumed through those seams. The final R4-02 module requirement remains unchanged.
+- **Review status**: this refinement requires a fresh independent document review before further source correction. No provider, credential, network, push, or PR action occurred.
