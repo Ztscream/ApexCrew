@@ -49,7 +49,18 @@ def test_budget_missing_price_for_allowed_id_is_rejected() -> None:
         model_reservation_amounts(_request(), fixture_budget(priced_model="legacy-model"))
 
 
-def test_worst_case_reservation_matches_revision_3_rates() -> None:
+def test_per_request_reservation_matches_revision_3_rates() -> None:
     amounts = model_reservation_amounts(_request(), fixture_budget())
 
     assert amounts.cost_usd == Decimal("0.000672")
+
+
+def test_budget_ceiling_reservation_matches_spec_493() -> None:
+    amounts = model_reservation_amounts(
+        _request(max_input_tokens=2_000_000, max_output_tokens=200_000),
+        fixture_budget(),
+    )
+
+    assert amounts.input_tokens == 2_000_000
+    assert amounts.output_tokens == 200_000
+    assert amounts.cost_usd == Decimal("0.672")

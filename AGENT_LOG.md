@@ -1516,3 +1516,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality-Review**: self-review PASS. Changes are limited to test configuration/fixtures and cost assertions, preserve intentional mismatch/legacy rejection cases, add no dependency or production behavior, and pass the complete regression/static checks.
 - **Implementation commit**: `a0eb48e6485ba8a1a87577687409117f1bb985a2`; no publication action.
 - **Lesson**: model identity and pricing must be changed together because reservation validates every allowed returned-model ID before dispatch.
+
+## 2026-08-05 / P3 - pricing ceiling coverage correction
+
+- **Base and task**: `9b02033`, P3 coverage correction from `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
+- **Subagent**: Codex inline execution.
+- **Human-Changes**: none.
+- **Observed baseline**: the existing pricing selector passed, but only exercised a small per-request reservation (`2,000/200` tokens) while naming it as a worst-case test.
+- **Implementation**: renamed the test to `test_per_request_reservation_matches_revision_3_rates` and added `test_budget_ceiling_reservation_matches_spec_493`, asserting the exact `2,000,000/200,000` ceilings and USD `0.672` reservation from `SPEC.md:493`.
+- **Green evidence**: `uv run --python 3.12 pytest tests/contract/test_model_configuration.py -q` passed with `4 passed`.
+- **Spec-Review**: PASS; the new assertion directly covers both token ceilings and the published arithmetic.
+- **Quality-Review**: PASS; tests only, no production or fixture behavior changed.
