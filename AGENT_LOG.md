@@ -2118,3 +2118,9 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Green evidence**: exact selector -> `2 passed`; focused Ruff -> `All checks passed`; focused mypy -> `Success: no issues found in 3 source files`; `git diff --check` -> exit code 0.
 - **Review status**: `Spec-Review: pending`; `Quality-Review: pending`.
 - **No provider, credential, network, live API, push, or PR action occurred.**
+
+## 2026-08-06 / R4-02 contract correction proposal
+
+- **Independent spec finding**: the fresh R4-02A review blocked the implementation because the module-level composition contract required A-stage completion of planning snapshot/context, Worker tools, and every phase driver, while the binding R4-02B task row owns those exact wiring files and reopen behavior. It also found that default DeepSeek composition rejected its missing schema registry.
+- **Documentation correction**: the R4-02 contract now separates R4-02A's shared bundle/provider boundary from R4-02B's final A-Hybrid planning/Worker/phase wiring. A-stage fail-closed capability adapters are explicitly non-final and cannot support a release claim; the completed R4-02 module remains gated on R4-02B.
+- **Review status**: this PLAN correction requires a fresh independent document review before further source correction. No provider, credential, network, push, or PR action occurred.
