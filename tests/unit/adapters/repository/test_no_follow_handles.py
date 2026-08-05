@@ -287,6 +287,23 @@ def test_control_path_guard_preserves_appeared_entry_error_when_cleanup_fails() 
     guard.close()
 
 
+def test_control_path_guard_context_preserves_primary_error_when_cleanup_fails() -> None:
+    backend = recording_posix_backend()
+
+    with (
+        pytest.raises(RepositoryUnsafeError, match="CONTROL_PATH_APPEARED"),
+        ControlPathGuard(backend.absolute_root, backend) as guard,
+    ):
+        guard.ensure()
+        control = guard._control
+        assert control is not None
+        backend.fail_close_names.add("config.json")
+        guard._assert_entry(control, "config.json", None)
+
+    backend.fail_close_names.remove("config.json")
+    guard.close()
+
+
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:
     handles = StableHandleTree(backend.absolute_root, backend)
     git_dir = handles.open(".git", "directory")

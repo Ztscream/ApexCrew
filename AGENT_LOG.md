@@ -1924,6 +1924,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A appeared-path SHA`.
 
+## 2026-08-06 / R4-01A Beauvoir context cleanup correction
+
+- **Task**: bounded R4-01A context-manager exception-priority correction after Beauvoir spec review of `5a916cd`; scope remains guard cleanup semantics.
+- **Spec-review finding**: Beauvoir found `ControlPathGuard.__exit__` could replace a primary `CONTROL_PATH_APPEARED` error with a pending cleanup failure during context exit.
+- **Correction**: `__exit__` now preserves an active primary exception and adds cleanup failure as a note; cleanup errors are still raised when no primary exception exists. Added a real nested-context regression test.
+- **Observed verification**: focused guard/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
 ## 2026-08-06 / R4-01A Aquinas final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.

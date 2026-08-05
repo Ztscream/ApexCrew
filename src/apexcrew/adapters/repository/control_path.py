@@ -47,8 +47,13 @@ class ControlPathGuard:
     def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
-        self.close()
+    def __exit__(self, _type: object, value: BaseException | None, _traceback: object) -> None:
+        try:
+            self.close()
+        except (OSError, RepositoryUnsafeError) as cleanup_error:
+            if value is None:
+                raise
+            value.add_note(f"control path cleanup failed: {cleanup_error}")
 
     def ensure(self) -> None:
         if self._control is not None:
