@@ -1789,3 +1789,10 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A final security SHA`.
+
+## 2026-08-06 / R4-01A Hume final spec review
+
+- **Task**: final fresh spec-compliance review of HEAD `024f939` and implementation `82bf23d`.
+- **Reviewer**: Hume; verdict `PASS`.
+- **Observed result**: Hume confirmed stable repeated binding, POSIX descriptor-based SQLite opening, canonical root and ancestor identity checks, POSIX no-follow flags, Windows delete/rename denial, connection cleanup, final SHA ledger, and bounded task scope. No files were modified; no network, credential, provider, or live API call occurred.
+- **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
