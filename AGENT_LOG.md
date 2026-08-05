@@ -1587,3 +1587,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality review**: PASS — generated output contains only the three expected static files, and the scoped WebUI/documentation tests pass.
 - **Human changes**: None.
 - **Intended commit**: `ci(pages): deploy static fixture replay`.
+
+## 2026-08-05 / E1 money unit drift acceptance
+
+- **Task**: E1 — drive Python money cents/unit drift through the end-to-end acceptance surface.
+- **Implementation subagent**: Codex.
+- **Red evidence**: `uv run --python 3.12 pytest tests/acceptance/test_money_unit_drift_run.py --runxfail -vv` exited 1. The test seeded a real temporary Git repository from `fixtures/python-money`, changed integer cents to floating-point dollars, committed the defect, confirmed no remote, and then received `INVALID` with first boundary `CREATE_RUN_BINDING_INVALID` while `CrewControl.handle` attempted Run creation.
+- **Outcome**: SKELETON boundary, strict `xfail`. The existing acceptance application fixture's `FixtureRepositoryBootstrapAuthorityService` returns a fixed `fixture://sqlite-only-repository` identity and all-`a` target OID, so it cannot bind the real repository. The test therefore does not enter `CrewRuntime`, planning, patch/check, evidence, Admission, or CAS, and no state is fabricated.
+- **Changes**: Added structured Git commit/revision helpers and `tests/acceptance/test_money_unit_drift_run.py` with the exact requested test name, real defect seed, no-push assertion, and strict documented `xfail`.
+- **Spec review**: PASS — the test stops at the observed first skeleton boundary and preserves the requested end-to-end assertions as the continuation target.
+- **Quality review**: PASS — `uv run --python 3.12 pytest tests/acceptance/test_money_unit_drift_run.py -q -rxX` reported one expected strict xfail; `git diff --check` passed.
+- **Human changes**: None.
+- **Intended commit**: `test(acceptance): drive money unit drift end to end`.
