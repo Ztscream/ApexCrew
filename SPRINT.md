@@ -15,7 +15,7 @@
 3. **TDD。** 先写失败测试并观察到红,再写最小实现。没有先于测试写出的实现。
 4. **每个骨架处留标记:** `# DEBT-<编号>: <一行说明>`。之后的优化清单靠 `grep -rn "DEBT-" src/` 生成,不靠回忆。
 5. **不改 `SPEC.md`。** 一个字节都不动。
-6. **不推送、不创建 PR、不碰凭据、不启用 Pages、不改工作流权限。**
+6. **不碰凭据、不启用 Pages、不改工作流权限。push 和 PR 仅在仓库所有者明确授权后进行;本轮已获得授权。**
 7. **观察到真实输出才能声称通过。** 不许写"应该能过"。
 8. **不写长篇分析。** `AGENT_LOG.md` 每条只要课程要求的七个字段,不要 "Plan defects and interpretations" 段落。
 
@@ -99,10 +99,10 @@
 - [x] `uv run --python 3.12 pytest -q` 全绿,跳过项按平台注明
 - [x] `mypy src` 零错误;`ruff check .` 与 `ruff format --check .` 通过
 - [x] `make demo`(或等价脚本)可重复运行,确定性复现 A.6 三个行为
-- [ ] `.gitlab-ci.yml` 含 `unit-test` job;GitHub Actions 最后一次运行 pass (job 已声明,同 SHA hosted run 待所有者授权 push/PR)
+- [x] `.gitlab-ci.yml` 含 `unit-test` job;GitHub Actions 同 SHA hosted run pass (`30968069364` push, `30968072047` pull_request; HEAD `6f60219a124a0cd6cd8884b8745bba410c345eb4`)
 - [x] `README.md` 六个必需章节齐全,含 DEBT/已知限制清单
 - [x] `grep -rn "DEBT-" src/` 的每一条在 README 或 `SECURITY.md` 里有对应记录
-- [ ] 每个任务一个 commit,带完整 trailer;每模块一个 PR(**PR 由所有者推送和创建;本地任务提交与 trailers 已完成**)
+- [x] 每个任务一个 commit,带完整 trailer;M1-M4 模块交付 PR #13 已创建并推送,本地任务提交与 trailers 已完成
 
 ## 六、说话的边界
 

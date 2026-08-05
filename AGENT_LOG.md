@@ -1441,3 +1441,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the S3 test correction; implementation commit follows.
 - **Human intervention**: none; no credentials, provider call, or `SPEC.md` edit occurred.
 - **Lesson**: cross-platform recovery tests must inject failures at the platform-specific public syscall seam.
+
+## 2026-08-05 / Final hosted M1-M4 acceptance
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `6f60219`.
+- **Task/skill**: final SPRINT acceptance; karpathy-guidelines.
+- **Prompt/context**: verify the corrected S1/S3 state on hosted Windows and Ubuntu CI after the owner authorized push and PR delivery.
+- **Observed evidence**: push workflow `30968069364` and pull-request workflow `30968072047` both passed for HEAD `6f60219a124a0cd6cd8884b8745bba410c345eb4`; each passed `quality`, `build`, `unit-ubuntu`, and `unit-windows`.
+- **Implementation**: none; this entry records external acceptance and closes the hosted gate. `SPEC.md` remains unchanged.
+- **Subagent output/commit**: Codex self-checked the final acceptance; documentation update follows.
+- **Human intervention**: owner explicitly authorized push and PR creation; no credentials, provider call, or Pages enablement occurred.
+- **Lesson**: the final claim is tied to a concrete reviewed HEAD and both event types, not to an earlier failed run.
