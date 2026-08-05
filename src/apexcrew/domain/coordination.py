@@ -967,9 +967,9 @@ class WorkerTurnRunner(Protocol):
 
 
 class CoordinatorService:
-    _scheduling: SchedulingState
-    _worker_attempts: WorkerAttemptCreator
-    _workers: WorkerTurnRunner
+    _scheduling: SchedulingState | None
+    _worker_attempts: WorkerAttemptCreator | None
+    _workers: WorkerTurnRunner | None
 
     def __init__(
         self,
@@ -981,6 +981,9 @@ class CoordinatorService:
         journal: AuthorityModelJournal,
         state: PlanningState,
         clock: Clock,
+        scheduling: SchedulingState | None = None,
+        attempts: WorkerAttemptCreator | None = None,
+        workers: WorkerTurnRunner | None = None,
     ) -> None:
         self._planning_authorization = planning_authorization
         self._context = context
@@ -989,6 +992,9 @@ class CoordinatorService:
         self._journal = journal
         self._state = state
         self._clock = clock
+        self._scheduling = scheduling
+        self._worker_attempts = attempts
+        self._workers = workers
 
     @classmethod
     def for_worker_scheduling(
@@ -1005,6 +1011,8 @@ class CoordinatorService:
         return service
 
     def schedule(self, run_id: RunId) -> RuntimeDecision:
+        if self._scheduling is None or self._worker_attempts is None or self._workers is None:
+            return RuntimeDecision.pause("WORKER_SCHEDULING_NOT_COMPOSED")
         selection = self._scheduling.next_dispatchable(run_id)
         if isinstance(selection, RuntimeDecision):
             return selection

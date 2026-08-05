@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 
 from apexcrew.adapters.credentials.model_key import ModelCredentialPort
@@ -38,9 +39,27 @@ from apexcrew.domain.admission import (
     TargetReservationOperationResult,
 )
 from apexcrew.domain.authority import AuthorityService, SystemUtcClock
-from apexcrew.domain.commands import RuntimeDecision, RuntimePermit
-from apexcrew.domain.coordination import AuthorityModelClient, CoordinatorService
-from apexcrew.domain.effects import RecoveryService, ReservationObservation, TargetReservation
+from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
+from apexcrew.domain.coordination import (
+    AuthorityModelClient,
+    BoundedPlanningContextBuilder,
+    CoordinatorService,
+    PlanningActionApplier,
+    PlanningAuthorization,
+    PlanningManifest,
+    PlanningReadGateway,
+    PlanningReadIntent,
+    PlanningReadResult,
+    PlanningTurnBinding,
+)
+from apexcrew.domain.effects import (
+    RecoveryService,
+    ReservationObservation,
+    TargetReservation,
+    canonical_json,
+    sha256_digest,
+)
+from apexcrew.domain.evidence import ContextCapsule
 from apexcrew.domain.model import DurableModelClient, ModelRequest
 from apexcrew.domain.projection import ProjectionService
 from apexcrew.domain.revisions import (
@@ -49,7 +68,7 @@ from apexcrew.domain.revisions import (
     Sha256DigestText,
 )
 from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
-from apexcrew.domain.types import AttemptId, IntentId, RunId
+from apexcrew.domain.types import AttemptId, IntentId, RevisionDigest, RunId
 from apexcrew.domain.worker import WorkerActionCodec, WorkerLoopService
 
 
@@ -61,21 +80,143 @@ class _TargetAuthority(TargetAuthorityDigestService):
         return self._store.target_authority_digest(run_id)
 
 
-class _DeferredWorkerContext:
-    def build_current(self, attempt_id: AttemptId) -> object:
-        raise RuntimeError("WORKER_CONTEXT_NOT_COMPOSED")
+class _CompositionWorkerContext:
+    def __init__(self, store: SqliteStateStore) -> None:
+        self._store = store
+
+    def build_current(self, attempt_id: AttemptId) -> ContextCapsule:
+        binding = self._store.current_worker_turn_binding(attempt_id)
+        return ContextCapsule.create(
+            run_id=str(binding.run_id),
+            task_id=str(binding.task_id),
+            revision_digest=str(binding.plan_digest),
+            dependencies=(str(binding.dependency_fingerprint_basis),),
+            content="ApexCrew worker context is bounded to the persisted attempt binding.",
+        )
 
 
-class _DeferredWorkerRequests:
+class _CompositionWorkerRequests:
+    def __init__(self, store: SqliteStateStore) -> None:
+        self._store = store
+
     def for_attempt(self, attempt_id: AttemptId, capsule: object) -> ModelRequest:
-        del attempt_id, capsule
-        raise RuntimeError("WORKER_REQUEST_FACTORY_NOT_COMPOSED")
+        binding = self._store.current_worker_turn_binding(attempt_id)
+        content = capsule.content if isinstance(capsule, ContextCapsule) else str(capsule)
+        digest = sha256_digest(canonical_json({"attempt_id": str(attempt_id), "content": content}))
+        return ModelRequest(
+            run_id=binding.run_id,
+            plan_digest=RevisionDigest(str(binding.plan_digest)),
+            policy_digest=RevisionDigest(str(binding.policy_digest)),
+            budget_digest=RevisionDigest(str(binding.budget_digest)),
+            model_configuration_digest=RevisionDigest(str(binding.model_configuration_digest)),
+            requested_model_id="deepseek-v4-flash",
+            allowed_model_ids=frozenset({"deepseek-v4-flash"}),
+            prompt=({"role": "user", "content": content},),
+            tool_schema_digest=str(binding.tool_schema_digest),
+            request_digest=digest,
+            idempotency_key=f"worker-request:{attempt_id}:{digest}",
+            max_input_tokens=32_000,
+            max_output_tokens=4_096,
+            reserved_cost_usd=Decimal("0.01"),
+            owner_kind="WORKER",
+            task_id=binding.task_id,
+            attempt_id=binding.attempt_id,
+            tranche_id=binding.tranche_id,
+        )
 
 
-class _DeferredWorkerTools:
+class _CompositionWorkerTools:
     def execute(self, intent: ToolIntent) -> ToolResult:
-        del intent
-        raise RuntimeError("WORKER_TOOL_RUNTIME_NOT_COMPOSED")
+        return ToolResult(
+            code="INDETERMINATE",
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            bounded_payload={"reason": "TOOL_RUNTIME_NOT_CONNECTED"},
+        )
+
+
+class _CompositionPlanningAuthorization:
+    _DIGEST = Sha256DigestText("sha256:" + "0" * 64)
+
+    def current(self, run_id: RunId) -> PlanningAuthorization:
+        return self._paused(run_id)
+
+    def current_for_recovery(self, run_id: RunId, action: object) -> PlanningAuthorization:
+        del action
+        return self._paused(run_id)
+
+    @classmethod
+    def _paused(cls, run_id: RunId) -> PlanningAuthorization:
+        return PlanningAuthorization(
+            run_id=run_id,
+            decision="PAUSE",
+            reason="PLANNING_AUTHORITY_NOT_CONNECTED",
+            applicable_revision_digests=ApplicableRevisionDigests(),
+            target_safety_digest=cls._DIGEST,
+            credential_profile=None,
+            read_authorization=None,
+            turn_binding=None,
+            planning_request_count=0,
+            planning_request_ceiling=8,
+        )
+
+
+class _CompositionPlanningContext:
+    def build_planning_request(
+        self, run_id: RunId, authorization: PlanningAuthorization
+    ) -> ModelRequest:
+        del authorization
+        return ModelRequest(
+            run_id=run_id,
+            plan_digest=None,
+            policy_digest=RevisionDigest(str(_CompositionPlanningAuthorization._DIGEST)),
+            budget_digest=RevisionDigest(str(_CompositionPlanningAuthorization._DIGEST)),
+            model_configuration_digest=RevisionDigest(
+                str(_CompositionPlanningAuthorization._DIGEST)
+            ),
+            requested_model_id="deepseek-v4-flash",
+            allowed_model_ids=frozenset({"deepseek-v4-flash"}),
+            prompt=({"role": "user", "content": "planning"},),
+            tool_schema_digest=str(_CompositionPlanningAuthorization._DIGEST),
+            request_digest=sha256_digest(str(run_id)),
+            idempotency_key=f"planning-request:{run_id}",
+            max_input_tokens=32_000,
+            max_output_tokens=4_096,
+            reserved_cost_usd=Decimal("0.01"),
+        )
+
+
+class _CompositionPlanningManifests:
+    def manifest(self, binding: PlanningTurnBinding) -> PlanningManifest:
+        del binding
+        return PlanningManifest(entries=(), total_bytes=0)
+
+
+class _CompositionPlanningRequests:
+    def create(
+        self,
+        *,
+        run_id: RunId,
+        authorization: PlanningAuthorization,
+        manifest: PlanningManifest,
+    ) -> ModelRequest:
+        del manifest
+        return _CompositionPlanningContext().build_planning_request(run_id, authorization)
+
+
+class _CompositionPlanningReads(PlanningReadGateway):
+    def execute(
+        self, intent: PlanningReadIntent, authorization: PlanningAuthorization
+    ) -> PlanningReadResult:
+        del authorization
+        return PlanningReadResult(
+            intent_id=intent.intent_id,
+            run_id=intent.run_id,
+            result_class="DENIED",
+            bounded_payload={"reason": "PLANNING_SNAPSHOT_NOT_CONNECTED"},
+            snapshot_digest=intent.snapshot_digest,
+            returned_bytes=0,
+        )
 
 
 class _RuntimeIds:
@@ -93,22 +234,22 @@ class _RuntimeIds:
         return IntentId(self._value("intent", run_id))
 
 
-class _DeferredReservationObserver(TargetReservationObserver):
+class _CompositionReservationObserver(TargetReservationObserver):
     def observe(self, reservation: TargetReservation) -> ReservationObservation:
         del reservation
         return ReservationObservation(False, False, False, False, False)
 
 
-class _DeferredReservationGit(TargetReservationGitPort):
+class _CompositionReservationGit(TargetReservationGitPort):
     def apply(self, operation: TargetReservationOperation) -> TargetReservationOperationResult:
         del operation
-        raise RuntimeError("TARGET_RESERVATION_GIT_NOT_COMPOSED")
+        raise RuntimeError("TARGET_RESERVATION_GIT_NOT_CONNECTED")
 
 
-class _DeferredRuntimeDriver:
+class _CompositionPhaseDriver:
     def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         del run_id, permit
-        return RuntimeDecision.pause("RUNTIME_DRIVER_NOT_COMPOSED")
+        return RuntimeDecision.pause("RUNTIME_PHASE_DRIVER_NOT_CONNECTED")
 
     resume = initialize
     integrate = initialize
@@ -195,17 +336,32 @@ def build_application_bundle(
         ids = _RuntimeIds()
         worker = WorkerLoopService(
             attempts=store,
-            capsules=_DeferredWorkerContext(),
-            requests=_DeferredWorkerRequests(),
+            capsules=_CompositionWorkerContext(store),
+            requests=_CompositionWorkerRequests(store),
             models=worker_model,
             actions=WorkerActionCodec(lambda _binding, _action: ActionPreState()),
             authority=authority,
-            tools=_DeferredWorkerTools(),
+            tools=_CompositionWorkerTools(),
             journal=store,
             ids=ids,
             clock=SystemUtcClock().now,
         )
-        coordinator = CoordinatorService.for_worker_scheduling(
+        planning = PlanningActionApplier(
+            state=store,
+            reads=_CompositionPlanningReads(),
+            ids=ids,
+        )
+        coordinator = CoordinatorService(
+            planning_authorization=_CompositionPlanningAuthorization(),
+            context=BoundedPlanningContextBuilder(
+                manifests=_CompositionPlanningManifests(),
+                requests=_CompositionPlanningRequests(),
+            ),
+            models=worker_model,
+            planning_actions=planning,
+            journal=store,
+            state=store,
+            clock=SystemUtcClock(),
             scheduling=store,
             attempts=store,
             workers=worker,
@@ -217,9 +373,9 @@ def build_application_bundle(
                 repository_authority=repository,
             )
         )
-        reservation_observer = _DeferredReservationObserver()
+        reservation_observer = _CompositionReservationObserver()
         reservation_effects = TargetReservationAdmissionService(
-            reservation_observer, _DeferredReservationGit()
+            reservation_observer, _CompositionReservationGit()
         )
         target_reservations = TargetReservationDriver(
             TargetReservationBootstrapAdmissionService(
@@ -231,10 +387,10 @@ def build_application_bundle(
         phase_drivers = RuntimePhaseDriverService(
             recovered_actions=RecoveredActionRouter(coordinator, worker),
             target_reservations=target_reservations,
-            private_refs=_DeferredRuntimeDriver(),
-            resolution=_DeferredRuntimeDriver(),
-            integration=_DeferredRuntimeDriver(),
-            cleanup=_DeferredRuntimeDriver(),
+            private_refs=_CompositionPhaseDriver(),
+            resolution=_CompositionPhaseDriver(),
+            integration=_CompositionPhaseDriver(),
+            cleanup=_CompositionPhaseDriver(),
         )
         runtime = RuntimeService(
             store=store,

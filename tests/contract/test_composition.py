@@ -127,3 +127,52 @@ def test_bundle_close_attempts_all_resources_after_failure() -> None:
     assert closed == ["failing", "recording", "failing"]
     bundle.close()
     assert closed == ["failing", "recording", "failing"]
+
+
+def _assert_no_deferred_boundary(
+    value: object, seen: set[int] | None = None, depth: int = 0
+) -> None:
+    if seen is None:
+        seen = set()
+    if depth > 10 or id(value) in seen:
+        return
+    seen.add(id(value))
+    assert not type(value).__name__.startswith("_Deferred"), type(value).__name__
+    if isinstance(value, (str, bytes, int, float, bool, type(None))):
+        return
+    if isinstance(value, (tuple, list, set, frozenset)):
+        for item in value:
+            _assert_no_deferred_boundary(item, seen, depth + 1)
+        return
+    for name in getattr(value, "__slots__", ()):
+        if isinstance(name, str) and hasattr(value, name):
+            _assert_no_deferred_boundary(getattr(value, name), seen, depth + 1)
+    for item in getattr(value, "__dict__", {}).values():
+        _assert_no_deferred_boundary(item, seen, depth + 1)
+
+
+def test_bundle_exposes_only_public_interfaces_and_no_deferred_graph(tmp_path: Path) -> None:
+    factory = _bundle_factory()
+    revisions = default_revision_documents()
+    bundle = factory(
+        tmp_path,
+        repository_authority=FixtureRepositoryAuthority(),
+        model_configuration=revisions.model_configuration.model_copy(
+            update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
+        ),
+        scripted_model=ScriptedMockLLM(()),
+    )
+    try:
+        assert set(bundle.__slots__) == {
+            "_closeables",
+            "_closed",
+            "_closed_indices",
+            "control",
+            "queries",
+            "runtime",
+        }
+        _assert_no_deferred_boundary(bundle.control)
+        _assert_no_deferred_boundary(bundle.runtime)
+        _assert_no_deferred_boundary(bundle.queries)
+    finally:
+        bundle.close()

@@ -2161,6 +2161,21 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Ledger**: `PLAN.md` records R4-02A as `COMPLETED`. R4-02B remains pending and owns replacement of every explicit deferred A-stage boundary plus the no-deferred/reopen integration proof. This closeout does not claim the final-user runtime is complete.
 - **No provider, credential, network, live API, push, or PR action occurred.**
 
+## 2026-08-06 / R4-02B red/green
+
+- **Task**: replace the A-stage deferred composition graph with concrete planning, Worker, Coordinator, and phase-driver composition objects, and prove reopen/no-deferred behavior.
+- **Red selector**: `uv run --python 3.12 pytest tests/integration/test_production_wiring.py::test_reopened_bundle_preserves_run_bindings tests/contract/test_composition.py::test_bundle_exposes_only_public_interfaces_and_no_deferred_graph -q`.
+- **Observed red**: the named integration test file was absent; after the contract existed, the selector failed on `_DeferredWorkerContext` and the initial projection assertion used fields not exposed by `RunQueries`.
+- **Implementation**: added concrete composition adapters for bounded Worker context/request/tools, planning authorization/context/read gateway, target reservation boundary, and runtime phase drivers; extended `CoordinatorService` to receive the complete scheduling graph; added reopen and no-deferred graph contracts.
+- **Observed green evidence**:
+  - R4-02B selector -> `2 passed`.
+  - `uv run --python 3.12 pytest tests/contract/test_composition.py tests/integration/test_provider_selection.py tests/contract/test_deepseek_responses_adapter.py tests/unit/domain/test_model_retry.py -q` -> `20 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `135 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02B spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
+
 ## 2026-08-06 / R4-02A cleanup retry correction completion
 
 - **Independent quality finding**: after a close failure, retrying `ApplicationBundle.close()` could repeat already successful closes.
