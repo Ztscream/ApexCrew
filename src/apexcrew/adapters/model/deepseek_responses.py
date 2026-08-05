@@ -61,6 +61,8 @@ def _schema_matches(
     if isinstance(reference, str) and reference.startswith("#/$defs/"):
         target = definitions.get(reference.removeprefix("#/$defs/"))
         return isinstance(target, Mapping) and _schema_matches(value, target, definitions)
+    if "const" in schema and value != schema["const"]:
+        return False
     one_of = schema.get("oneOf")
     if isinstance(one_of, list):
         return (
@@ -105,12 +107,27 @@ def _schema_matches(
         )
     if kind == "array":
         items = schema.get("items")
-        return isinstance(value, list) and (
-            not isinstance(items, Mapping)
-            or all(_schema_matches(item, items, definitions) for item in value)
+        if not isinstance(value, list):
+            return False
+        minimum = schema.get("minItems")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and len(value) < minimum:
+            return False
+        maximum = schema.get("maxItems")
+        if isinstance(maximum, int) and not isinstance(maximum, bool) and len(value) > maximum:
+            return False
+        return not isinstance(items, Mapping) or all(
+            _schema_matches(item, items, definitions) for item in value
         )
     if kind == "string":
-        return isinstance(value, str)
+        if not isinstance(value, str):
+            return False
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int) and not isinstance(minimum, bool) and len(value) < minimum:
+            return False
+        maximum = schema.get("maxLength")
+        return not (
+            isinstance(maximum, int) and not isinstance(maximum, bool) and len(value) > maximum
+        )
     if kind == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if kind == "number":
@@ -311,7 +328,7 @@ class DeepSeekResponsesAdapter:
         if not isinstance(response_id, str) or not response_id:
             return ProviderAttemptResult.unknown("MISSING_RESPONSE_ID")
         if not isinstance(returned_model_id, str) or not returned_model_id:
-            return ProviderAttemptResult.unknown("MISSING_RETURNED_MODEL_ID")
+            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_MISMATCH")
         if (
             self._allowed_returned_model_ids is not None
             and returned_model_id not in self._allowed_returned_model_ids

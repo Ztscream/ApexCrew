@@ -207,6 +207,44 @@ def test_non_conformant_payload_fails_closed() -> None:
     assert result.completion is None
 
 
+def test_schema_length_constraint_fails_closed() -> None:
+    schema = {
+        "type": "json_schema",
+        "name": "apexcrew_action",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary"],
+            "properties": {"summary": {"type": "string", "minLength": 1}},
+        },
+    }
+    client = RecordingResponsesClient(_response(action={"summary": ""}, usage=_usage()))
+    adapter = DeepSeekResponsesAdapter(
+        credential_source=MemoryCredentialStore({"deepseek": "key"}),
+        response_schemas={SCHEMA_DIGEST: schema},
+        pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
+        client_factory=RecordingClientFactory(client),
+    )
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "KNOWN_CLOSED_REJECTION"
+    assert result.reason_code == "MALFORMED_STRUCTURED_OUTPUT"
+    assert result.completion is None
+
+
+def test_missing_returned_model_id_is_closed_model_mismatch() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+    client.response.model = None
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "KNOWN_CLOSED_REJECTION"
+    assert result.reason_code == "RETURNED_MODEL_MISMATCH"
+    assert result.completion is None
+
+
 def test_model_configuration_accepts_deepseek_origin() -> None:
     configuration = ModelConfigurationRevisionDocument(
         schema_version="model-configuration-revision-v1",

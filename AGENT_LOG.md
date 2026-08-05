@@ -2153,3 +2153,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `uv run --python 3.12 ruff format --check src tests` -> `134 files already formatted`.
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
+
+## 2026-08-06 / R4-02A provider response correction
+
+- **Independent spec finding**: the provider response validator accepted schema-invalid empty strings because it ignored JSON Schema length constraints, and it classified a response with a valid response ID but absent returned model ID as an unknown transport outcome.
+- **Correction**: `_schema_matches()` now enforces `const`, `minLength`, `maxLength`, `minItems`, and `maxItems` constraints used by the closed action schema. A missing returned model ID with a valid response ID now settles as `RETURNED_MODEL_MISMATCH` with no normalized completion.
+- **Observed green evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_deepseek_responses_adapter.py tests/integration/test_provider_selection.py -q` -> `12 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_deepseek_responses_adapter.py tests/integration/test_provider_selection.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `134 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
