@@ -43,7 +43,7 @@
 改动路径集不重叠的模块可并行开 worktree。观察到的依赖:
 
 ```
-P1 → P2 → P3 → P4 → P5(卡所有者授权)
+P1 → P2 → P3 → P4 → P6 → P5(卡所有者授权)
 R1  ────────────────────────┐
 T1 / T2 → T3 / T4  ─────────┤→ Z1(DEBT 清零核对)
 W2 / W3 / W4 ───────────────┤
@@ -187,6 +187,39 @@ W1 卡所有者合并 PR #13
 **执行前必须停下来等所有者授权。不得自行运行。**
 
 **提交:** `test(model): add authorized provider smoke`
+
+---
+
+### P6 — 推理参数纳入版本化配置(P4 修正)
+
+**深度:** REAL · **必须在 P5 之前完成**
+
+**目标:** 关闭一个治理缺口——`SPEC.md:469` 要求 adapter 记录 "inference parameters",但当前 temperature 与 reasoning effort 既不在任何已批准修订里,也不进 attempt 记录。
+
+**观察到的现状:**
+- `src/apexcrew/domain/revisions.py` 的 `InferenceSettingsDocument` 只有三个字段:`max_input_tokens`、`max_output_tokens`、`provider_storage_enabled`。
+- `src/apexcrew/adapters/model/deepseek_responses.py` 把两个参数写成模块常量:`DEFAULT_TEMPERATURE = 0.0`、`DEFAULT_REASONING_EFFORT = "medium"`,经构造器默认值生效。
+
+**为什么这是缺口而不是风格问题:** `reasoning.effort` 直接决定 reasoning token 产量,而 `SPEC.md:493`(revision 3)规定 **reasoning tokens 计入输出上限与成本**。因此当前状态下,**一个不在任何已批准 Model Configuration 里、也不出现在 attempt 记录里的常量,直接决定一次 Run 的花费**。预算机制的全部意义就是不允许这种事。
+
+**文件:**
+- 修改 `src/apexcrew/domain/revisions.py`(`InferenceSettingsDocument`)
+- 修改 `src/apexcrew/adapters/model/deepseek_responses.py`
+- 修改 `src/apexcrew/domain/model.py`(attempt 记录携带生效推理参数)
+- 修改 `tests/contract/test_deepseek_responses_adapter.py`
+
+**实现要点:**
+- `InferenceSettingsDocument` 增加 `temperature` 与 `reasoning_effort` 两个字段,取值域收窄(`reasoning_effort` 用 `Literal`,只允许 provider 文档列出的档位)。
+- adapter **删除两个模块级默认常量**,改为从传入的已批准 Model Configuration 读取。缺字段即 fail closed,不得回落到内置默认值。
+- 生效的推理参数写进 attempt 记录,使其可从日志复原。
+- 不改 `SPEC.md`——本任务是让实现追上 469 行既有要求,不是新增规范。
+
+**先写的失败测试:**
+1. `test_inference_parameters_come_from_approved_configuration` — 构造两个 temperature/effort 不同的 Model Configuration,断言实际发出的请求参数随之改变(证明不再是常量)。
+2. `test_missing_inference_parameter_fails_closed` — 配置缺 `reasoning_effort` 时必须拒绝,**不得使用内置默认值**。
+3. `test_effective_inference_parameters_are_recorded` — attempt 记录里能读回本次生效的 temperature 与 reasoning effort。
+
+**提交:** `fix(model): version and record inference parameters`
 
 ---
 
@@ -385,7 +418,8 @@ W1 卡所有者合并 PR #13
 | P2 CLI 凭据命令 | REAL | — | DONE | `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3` |
 | P3 定价换绑 | REAL | — | DONE | `a0eb48e6485ba8a1a87577687409117f1bb985a2` |
 | P4 DeepSeek adapter | REAL | `DEBT-M4-001` | DONE | `932ad3fbc9e5ee689ae618ed87fad2005647c4b3` |
-| P5 live smoke | REAL | — | BLOCKED(所有者授权) | |
+| P6 推理参数版本化 | REAL | — | TODO | |
+| P5 live smoke | REAL | — | BLOCKED(所有者授权,且须 P6 先完成) | |
 | R1 跨进程锁 | REAL | `DEBT-M1-006` | TODO | |
 | T1 多意图消解 | REAL | `DEBT-M2-001` | TODO | |
 | T2 保留分级脱敏 | REAL | `DEBT-M2-002`/`003` | TODO | |

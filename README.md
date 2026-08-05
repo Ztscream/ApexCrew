@@ -25,6 +25,23 @@ uv run --python 3.12 python -m apexcrew.demo
 
 The demo is deterministic and local-only. The CLI refuses runtime or approval actions when no composed authority/Permit exists.
 
+## 凭据安全配置
+
+The offline suite, the demo, and every delivery command run without a provider credential. A credential is required only to drive the real DeepSeek adapter.
+
+```text
+uv run --python 3.12 apexcrew credentials set      # hidden interactive input
+uv run --python 3.12 apexcrew credentials status   # prints source only, never the value
+uv run --python 3.12 apexcrew credentials clear    # idempotent removal
+uv run --python 3.12 apexcrew doctor               # reports presence, not the value
+```
+
+The value is stored in the OS keyring under service `apexcrew`, account `model-credential-deepseek`. `set` accepts the secret only through hidden interactive input — there is deliberately no `--value` flag, because a command-line argument would land in shell history and the process table.
+
+Resolution order is keyring first, then the single environment variable `APEXCREW_DEEPSEEK_API_KEY`. That fallback exists for headless CI, which should inject it from a secret store; other headless use should supply it through a supervisor or secret manager rather than an interactive shell. Repository `.env` files are deliberately **not** loaded, because the repository and its scripts are untrusted input.
+
+The credential is read at request time and never cached on an instance, never written to logs, never included in `repr`/`str`, never passed to a child process, and never mounted into the restricted executor. Missing or unreadable credentials fail closed with `MODEL_CREDENTIAL_MISSING` rather than degrading to an unauthenticated call. `SECURITY.md` documents the full trust boundary.
+
 ## 分发命令
 
 ```text
