@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
@@ -49,6 +50,7 @@ class StableHandleTree:
         self._backend = backend
         self._root_chain = backend.open_root_chain(root)
         self._nodes: dict[tuple[str, ...], OpenedNode] = {(): self._root_chain[-1]}
+        self._pending_closes: dict[int, OpenedNode] = {}
 
     @property
     def root_node(self) -> OpenedNode:
@@ -113,6 +115,7 @@ class StableHandleTree:
         return self._backend.list_names(node, maximum)
 
     def assert_name_bindings(self) -> None:
+        self._retry_pending_closes()
         probes = self._backend.open_root_chain(self.root)
         try:
             if tuple(node.identity for node in probes) != tuple(
@@ -133,23 +136,39 @@ class StableHandleTree:
                     raise RepositoryUnsafeError("GIT_STORAGE_IDENTITY_CHANGED")
                 probe_by_parts[parts] = probe
         finally:
-            for node in reversed(probes):
-                self._backend.close(node)
+            self._close_many(reversed(probes))
 
     def close(self) -> None:
         owned = {node.handle: node for node in (*self._nodes.values(), *self._root_chain)}
-        first_error: BaseException | None = None
-        remaining: dict[int, OpenedNode] = {}
-        for node in reversed(tuple(owned.values())):
+        try:
+            self._close_many((*self._pending_closes.values(), *reversed(tuple(owned.values()))))
+        finally:
+            pending_handles = set(self._pending_closes)
+            self._nodes = {
+                parts: node for parts, node in self._nodes.items() if node.handle in pending_handles
+            }
+            self._root_chain = tuple(
+                node for node in self._root_chain if node.handle in pending_handles
+            )
+
+    def _retry_pending_closes(self) -> None:
+        if self._pending_closes:
+            self._close_many(tuple(self._pending_closes.values()))
+
+    def _close_many(self, nodes: Iterable[OpenedNode]) -> None:
+        first_error: Exception | None = None
+        attempted: set[int] = set()
+        for node in nodes:
+            if node.handle in attempted:
+                continue
+            attempted.add(node.handle)
             try:
                 self._backend.close(node)
             except (OSError, RepositoryUnsafeError) as error:
-                remaining[node.handle] = node
+                self._pending_closes[node.handle] = node
                 if first_error is None:
                     first_error = error
-        self._nodes = {
-            parts: node for parts, node in self._nodes.items() if node.handle in remaining
-        }
-        self._root_chain = tuple(node for node in self._root_chain if node.handle in remaining)
+            else:
+                self._pending_closes.pop(node.handle, None)
         if first_error is not None:
             raise first_error

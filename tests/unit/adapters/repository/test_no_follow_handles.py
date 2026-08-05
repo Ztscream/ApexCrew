@@ -224,6 +224,20 @@ def test_control_path_guard_close_attempts_all_resources_after_failure() -> None
     assert root_handles & set(backend.closed_handles)
 
 
+def test_stable_handle_tree_retries_failed_probe_close_after_closing_all_probes() -> None:
+    backend = recording_posix_backend()
+    tree = StableHandleTree(backend.absolute_root, backend)
+    backend.fail_close_handles.add(backend.volume_handle)
+
+    with pytest.raises(RepositoryUnsafeError, match="HANDLE_CLOSE_FAILED"):
+        tree.assert_name_bindings()
+
+    assert backend.repo_handle in backend.closed_handles
+    backend.fail_close_handles.remove(backend.volume_handle)
+    tree.assert_name_bindings()
+    tree.close()
+
+
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:
     handles = StableHandleTree(backend.absolute_root, backend)
     git_dir = handles.open(".git", "directory")

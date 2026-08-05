@@ -1823,3 +1823,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Reviewer**: Gibbs; verdict `PASS`.
 - **Observed result**: Gibbs confirmed pre-materialization root/ancestor preflight, stable repeated state binding, complete cleanup after close failure, POSIX no-follow/fd opening, Windows delete/rename denial, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
 - **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
+
+## 2026-08-06 / R4-01A Chandrasekhar quality correction
+
+- **Task**: bounded R4-01A temporary-probe cleanup correction after Chandrasekhar review of `57f0dbd`; scope remains no-follow handle ownership.
+- **Quality-review finding**: Chandrasekhar found `StableHandleTree.assert_name_bindings()` stopped after the first probe close failure, leaking remaining probes and losing retry ownership.
+- **Correction**: add a tree-level pending-close set; probe cleanup now attempts every temporary handle, preserves failures for retry, and prunes successfully closed tree nodes even when a later close raises. Added a close-failure/retry regression test.
+- **Observed verification**: focused guard/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/no_follow.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
