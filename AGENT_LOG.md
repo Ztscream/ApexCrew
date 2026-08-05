@@ -1656,3 +1656,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: none.
 - **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): make R4 task contracts exact`.
+
+## 2026-08-05 / M1-R4 independent plan review 5
+
+- **Task**: R4 plan gate final independent re-review of `adcaba11a97adeb55a1960da3de687f6eaa95d7b`.
+- **Implementation subagent**: none; fresh review subagent `Banach`.
+- **Observed review**: verdict `PASS` with zero blockers. The reviewer confirmed SPEC revision 3 authority and stale-status governance, preserved revision-2 history, concrete files and red/green selectors for all ten A/B tasks, the gated DeepSeek CLI approval/Permit/runtime lifecycle with exactly one live request, and coherent worktree/commit/review ordering. No files were edited and no network/live calls were made.
+- **Reviewed digests**: `PLAN.md` SHA-256 `F15B8A55DC50D99548C51D86AE2AD3A21880938331A420C45A6FBC8A317A0221`; frozen `SPEC.md` SHA-256 `E4385008CD75E4E3B0E70B25A6EBDFD976F3E1031F2ACD81FF0B6284EF6668AB`.
+- **Owner decision**: `M1 GO`. The owner authorizes creation of the first implementation worktree `codex/m1-r4-01-bootstrap` / `.worktrees/m1-r4-01-bootstrap`; source, fixture, test, and CI edits remain governed by the serial R4 task protocol.
+- **Human changes**: owner decision only; no document-content changes.
+- **Next boundary**: begin `R4-01A` with a fresh implementation subagent and observed red test in the new module worktree.
