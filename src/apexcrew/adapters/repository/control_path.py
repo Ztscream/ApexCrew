@@ -144,7 +144,7 @@ class ControlPathGuard:
             self._assert_entry(control, "config.json", self._config_identity)
             self._assert_entry(control, "state.db", self._database_identity)
         finally:
-            self._backend.close(control)
+            self._close_node(control)
         self._tree.assert_name_bindings()
 
     def close(self) -> None:

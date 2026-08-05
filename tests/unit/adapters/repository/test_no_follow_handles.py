@@ -258,6 +258,20 @@ def test_control_path_guard_retries_failed_temporary_probe_close() -> None:
     assert "config.json" in backend.closed_names
 
 
+def test_control_path_guard_retries_failed_control_probe_close() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    guard.ensure()
+    backend.fail_close_names.add(".apexcrew")
+
+    with pytest.raises(RepositoryUnsafeError, match="HANDLE_CLOSE_FAILED"):
+        guard.assert_current()
+
+    backend.fail_close_names.remove(".apexcrew")
+    guard.close()
+    assert ".apexcrew" in backend.closed_names
+
+
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:
     handles = StableHandleTree(backend.absolute_root, backend)
     git_dir = handles.open(".git", "directory")
