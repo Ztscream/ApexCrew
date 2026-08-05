@@ -9,6 +9,7 @@ from apexcrew.domain.model import (
     LogicalModelTurn,
     ModelRequest,
     ModelRequestIntent,
+    SettledModelAttempt,
     settle_model_completion,
 )
 from apexcrew.domain.revisions import (
@@ -241,11 +242,23 @@ def test_missing_returned_model_id_is_closed_model_mismatch() -> None:
     adapter, _, client = _adapter(_response(usage=_usage()))
     client.response.model = None
 
-    result = adapter.complete(_request())
+    request = _request()
+    result = adapter.complete(request)
 
     assert result.kind == "KNOWN_CLOSED_REJECTION"
     assert result.reason_code == "RETURNED_MODEL_MISMATCH"
     assert result.completion is None
+    assert result.response_requested_model_id == request.requested_model_id
+    assert result.returned_model_id is None
+    assert result.usage is not None
+    intent = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    settled = SettledModelAttempt.from_result(intent, result)
+    assert settled.dispatch_result.outcome == "RETURNED_MODEL_MISMATCH"
+    assert settled.dispatch_result.response_requested_model_id == request.requested_model_id
+    assert settled.dispatch_result.returned_model_id is None
+    assert settled.charged_amounts.input_tokens == 120
+    assert settled.charged_amounts.output_tokens == 12
+    assert settled.charged_amounts.cost_usd == request.reserved_cost_usd
 
 
 def test_unexpected_returned_model_id_is_closed_model_mismatch() -> None:
@@ -259,6 +272,11 @@ def test_unexpected_returned_model_id_is_closed_model_mismatch() -> None:
     assert result.kind == "KNOWN_CLOSED_REJECTION"
     assert result.reason_code == "RETURNED_MODEL_MISMATCH"
     assert result.completion is None
+    assert result.response_requested_model_id == _request().requested_model_id
+    assert result.returned_model_id == "deepseek-v4-flash-0731"
+    assert result.usage is not None
+    assert result.usage.input_tokens == 120
+    assert result.usage.output_tokens == 12
 
 
 def test_model_configuration_accepts_deepseek_origin() -> None:

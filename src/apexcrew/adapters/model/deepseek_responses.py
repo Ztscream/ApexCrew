@@ -162,7 +162,7 @@ def _action_from_response(
 
 def _usage_from_response(
     response: object,
-    model_id: str,
+    model_id: str | None,
     request: ModelRequest,
     pricing: Mapping[str, tuple[Decimal, Decimal]],
 ) -> ModelUsage | None:
@@ -176,7 +176,7 @@ def _usage_from_response(
     if input_tokens is None or visible_output_tokens is None or reasoning_tokens is None:
         return None
     output_tokens = visible_output_tokens + reasoning_tokens
-    rates = pricing.get(model_id)
+    rates = pricing.get(model_id) if model_id is not None else None
     cost = request.reserved_cost_usd
     if rates is not None:
         input_rate, output_rate = rates
@@ -328,12 +328,23 @@ class DeepSeekResponsesAdapter:
         if not isinstance(response_id, str) or not response_id:
             return ProviderAttemptResult.unknown("MISSING_RESPONSE_ID")
         if not isinstance(returned_model_id, str) or not returned_model_id:
-            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_MISMATCH")
+            return ProviderAttemptResult.known_closed(
+                response_id,
+                "RETURNED_MODEL_MISMATCH",
+                _usage_from_response(response, None, request, self._pricing),
+                response_requested_model_id=request.requested_model_id,
+            )
         if (
             self._allowed_returned_model_ids is not None
             and returned_model_id not in self._allowed_returned_model_ids
         ):
-            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_MISMATCH")
+            return ProviderAttemptResult.known_closed(
+                response_id,
+                "RETURNED_MODEL_MISMATCH",
+                _usage_from_response(response, returned_model_id, request, self._pricing),
+                response_requested_model_id=request.requested_model_id,
+                returned_model_id=returned_model_id,
+            )
         if status == "incomplete":
             return ProviderAttemptResult.known_closed(
                 response_id,

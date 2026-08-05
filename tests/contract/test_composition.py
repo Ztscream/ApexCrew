@@ -87,3 +87,34 @@ def test_bundle_shares_one_state_store(tmp_path: Path) -> None:
         assert after.sequence == before.sequence
     finally:
         bundle.close()
+
+
+def test_bundle_close_attempts_all_resources_after_failure() -> None:
+    module = importlib.import_module("apexcrew.application.composition")
+    bundle_type = module.ApplicationBundle
+    closed: list[str] = []
+
+    class FailingClose:
+        def close(self) -> None:
+            closed.append("failing")
+            raise RuntimeError("close failed")
+
+    class RecordingClose:
+        def close(self) -> None:
+            closed.append("recording")
+
+    bundle = bundle_type(
+        control=object(),
+        runtime=object(),
+        queries=object(),
+        closeables=(RecordingClose(), FailingClose()),
+    )
+
+    try:
+        bundle.close()
+    except RuntimeError as error:
+        assert str(error) == "close failed"
+    else:
+        raise AssertionError("bundle cleanup should report the first close failure")
+
+    assert closed == ["failing", "recording"]

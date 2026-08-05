@@ -142,6 +142,8 @@ class ProviderAttemptResult:
     reason_code: str | None
     completion: ModelCompletion | None
     usage: ModelUsage | None
+    response_requested_model_id: str | None = None
+    returned_model_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", ProviderAttemptKind(self.kind))
@@ -162,6 +164,9 @@ class ProviderAttemptResult:
         provider_response_id: str,
         reason_code: str,
         usage: ModelUsage | None = None,
+        *,
+        response_requested_model_id: str | None = None,
+        returned_model_id: str | None = None,
     ) -> ProviderAttemptResult:
         return cls(
             ProviderAttemptKind.KNOWN_CLOSED_REJECTION,
@@ -169,6 +174,8 @@ class ProviderAttemptResult:
             reason_code,
             None,
             usage,
+            response_requested_model_id,
+            returned_model_id,
         )
 
     @classmethod
@@ -544,12 +551,16 @@ class SettledModelAttempt:
                 run_id=intent.run_id,
                 logical_turn_id=intent.logical_turn_id,
                 outcome=(
-                    "KNOWN_CLOSED_REJECTION"
-                    if result.kind is ProviderAttemptKind.KNOWN_CLOSED_REJECTION
-                    else "INDETERMINATE"
+                    "RETURNED_MODEL_MISMATCH"
+                    if result.reason_code == "RETURNED_MODEL_MISMATCH"
+                    else (
+                        "KNOWN_CLOSED_REJECTION"
+                        if result.kind is ProviderAttemptKind.KNOWN_CLOSED_REJECTION
+                        else "INDETERMINATE"
+                    )
                 ),
-                response_requested_model_id=None,
-                returned_model_id=None,
+                response_requested_model_id=result.response_requested_model_id,
+                returned_model_id=result.returned_model_id,
                 normalized_action=None,
                 normalized_payload_digest=None,
                 charged_amounts=charged,

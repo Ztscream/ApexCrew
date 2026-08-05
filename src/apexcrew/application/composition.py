@@ -137,11 +137,18 @@ class ApplicationBundle:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        first_error: BaseException | None = None
         for closeable in reversed(self._closeables):
             close = getattr(closeable, "close", None)
             if callable(close):
-                close()
+                try:
+                    close()
+                except BaseException as error:  # noqa: BLE001 - cleanup must continue
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise first_error
+        self._closed = True
 
 
 def build_application_bundle(
@@ -234,10 +241,12 @@ def build_application_bundle(
         )
         queries = RunQueryService(ProjectionService(store))
     except BaseException:
-        store.close()
-        close = getattr(repository, "close", None)
-        if callable(close):
-            close()
+        try:
+            store.close()
+        finally:
+            close = getattr(repository, "close", None)
+            if callable(close):
+                close()
         raise
     return ApplicationBundle(
         control=control,

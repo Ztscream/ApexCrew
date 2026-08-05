@@ -909,6 +909,7 @@ class AuthorityModelClient:
             )
             if (
                 settled.kind != ProviderAttemptKind.KNOWN_CLOSED_REJECTION
+                or settled.dispatch_result.outcome != "KNOWN_CLOSED_REJECTION"
                 or retry_index == V01_MECHANISM_LIMITS.provider_retry_ceiling
             ):
                 return settled.dispatch_result
