@@ -106,4 +106,4 @@ The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python 
 
 ## 已知债务
 
-The following markers are intentionally fail-closed and are not production claims: `DEBT-M1-006` (cross-process runtime/OS lock), `DEBT-M2-001` (multi-intent precedence), `DEBT-M2-002` (Tier 2 export), `DEBT-M2-003` (retention export), `DEBT-M2-004` (durable eviction), `DEBT-M2-005` (Docker process runner), and `DEBT-M4-001` (OpenAI transport). Their exact source locations are generated with `rg -n "DEBT-" src`.
+The following markers are intentionally fail-closed and are not production claims: `DEBT-M1-006` (cross-process runtime/OS lock), `DEBT-M2-001` (multi-intent precedence), `DEBT-M2-002` (Tier 2 export), `DEBT-M2-003` (retention export), `DEBT-M2-004` (durable eviction), and `DEBT-M2-005` (Docker process runner). Their exact source locations are generated with `rg -n "DEBT-" src`.

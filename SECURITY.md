@@ -53,5 +53,3 @@ does not grant ownership. Multi-process exclusivity is therefore not claimed.
 because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
 Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
 builds a restricted digest-pinned argv but does not launch a Docker process.
-`DEBT-M4-001` keeps the DeepSeek Responses transport disabled until an explicit
-provider integration review; the offline path does not read credentials.

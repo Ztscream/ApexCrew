@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from types import SimpleNamespace
+
+from apexcrew.adapters.credentials.model_key import MemoryCredentialStore
+from apexcrew.adapters.model.deepseek_responses import DeepSeekResponsesAdapter
+from apexcrew.domain.model import (
+    LogicalModelTurn,
+    ModelRequest,
+    ModelRequestIntent,
+    settle_model_completion,
+)
+from apexcrew.domain.revisions import (
+    InferenceSettingsDocument,
+    ModelConfigurationRevisionDocument,
+    ReturnedModelAliasDocument,
+)
+
+SCHEMA_DIGEST = "sha256:" + "6" * 64
+RESPONSE_SCHEMA: dict[str, object] = {
+    "type": "json_schema",
+    "name": "apexcrew_action",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["kind"],
+        "properties": {"kind": {"type": "string"}},
+    },
+}
+
+
+class RecordingResponsesClient:
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.requests: list[dict[str, object]] = []
+        self.responses = self
+
+    def create(self, **request: object) -> object:
+        self.requests.append(dict(request))
+        return self.response
+
+
+class RecordingClientFactory:
+    def __init__(self, client: RecordingResponsesClient) -> None:
+        self.client = client
+        self.options: dict[str, object] | None = None
+
+    def __call__(self, **options: object) -> RecordingResponsesClient:
+        self.options = dict(options)
+        return self.client
+
+
+def _response(
+    *,
+    model: str = "deepseek-v4-flash",
+    status: str = "completed",
+    action: object = None,
+    usage: object = None,
+    response_id: str = "response-1",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=response_id,
+        model=model,
+        status=status,
+        incomplete_details=SimpleNamespace(reason="max_output_tokens")
+        if status == "incomplete"
+        else None,
+        output_parsed={"kind": "finish"} if action is None else action,
+        usage=usage,
+    )
+
+
+def _usage(
+    *, input_tokens: int = 120, output_tokens: int = 12, reasoning_tokens: int = 0
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+    )
+
+
+def _request() -> ModelRequest:
+    return ModelRequest(
+        run_id="run-1",
+        plan_digest=None,
+        policy_digest="sha256:" + "3" * 64,
+        budget_digest="sha256:" + "4" * 64,
+        model_configuration_digest="sha256:" + "5" * 64,
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
+        prompt=({"role": "user", "content": "finish"},),
+        tool_schema_digest=SCHEMA_DIGEST,
+        request_digest="sha256:" + "7" * 64,
+        idempotency_key="request-1",
+        max_input_tokens=1_000,
+        max_output_tokens=200,
+        reserved_cost_usd=Decimal("0.01"),
+    )
+
+
+def _adapter(
+    response: object,
+) -> tuple[DeepSeekResponsesAdapter, RecordingClientFactory, RecordingResponsesClient]:
+    client = RecordingResponsesClient(response)
+    factory = RecordingClientFactory(client)
+    return (
+        DeepSeekResponsesAdapter(
+            credential_source=MemoryCredentialStore({"deepseek": "key"}),
+            response_schemas={SCHEMA_DIGEST: RESPONSE_SCHEMA},
+            pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
+            client_factory=factory,
+        ),
+        factory,
+        client,
+    )
+
+
+def test_request_pins_no_sdk_retries_and_deepseek_parameters() -> None:
+    adapter, factory, client = _adapter(
+        _response(usage=_usage()),
+    )
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "COMPLETED"
+    assert factory.options == {
+        "api_key": "key",
+        "base_url": "https://api.deepseek.com",
+        "max_retries": 0,
+    }
+    assert client.requests == [
+        {
+            "model": "deepseek-v4-flash",
+            "input": [{"role": "user", "content": "finish"}],
+            "instructions": "Return exactly one JSON object matching the supplied ApexCrew action schema.",
+            "max_output_tokens": 200,
+            "temperature": 0.0,
+            "text": {"format": RESPONSE_SCHEMA},
+            "reasoning": {"effort": "medium"},
+            "store": False,
+        }
+    ]
+
+
+def test_returned_model_mismatch_releases_no_action() -> None:
+    adapter, _, _ = _adapter(
+        _response(model="deepseek-v4-flash-0731", usage=_usage()),
+    )
+    request = _request()
+    result = adapter.complete(request)
+    assert result.completion is not None
+
+    intent = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    settled = settle_model_completion(
+        intent,
+        result.completion,
+        request.allowed_model_ids,
+    )
+    assert settled.outcome == "RETURNED_MODEL_MISMATCH"
+    assert settled.normalized_action is None
+    assert settled.charged_amounts.cost_usd == request.reserved_cost_usd
+
+
+def test_incomplete_status_is_closed_failure() -> None:
+    adapter, _, _ = _adapter(_response(status="incomplete", usage=_usage()))
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "KNOWN_CLOSED_REJECTION"
+    assert result.reason_code == "INCOMPLETE_RESPONSE"
+    assert result.completion is None
+
+
+def test_missing_usage_keeps_the_full_reservation() -> None:
+    adapter, _, _ = _adapter(_response(usage=None))
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "COMPLETED"
+    assert result.completion is not None
+    assert result.completion.usage is None
+
+
+def test_reasoning_tokens_count_as_output_and_cost() -> None:
+    adapter, _, _ = _adapter(_response(usage=_usage(reasoning_tokens=1_000)))
+
+    result = adapter.complete(_request())
+
+    assert result.completion is not None
+    assert result.completion.usage is not None
+    assert result.completion.usage.output_tokens == 1_012
+    assert result.completion.usage.cost_usd == Decimal("0.00060032")
+
+
+def test_non_conformant_payload_fails_closed() -> None:
+    adapter, _, _ = _adapter(
+        _response(action={"kind": "finish", "unexpected": True}, usage=_usage()),
+    )
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "KNOWN_CLOSED_REJECTION"
+    assert result.reason_code == "MALFORMED_STRUCTURED_OUTPUT"
+    assert result.completion is None
+
+
+def test_model_configuration_accepts_deepseek_origin() -> None:
+    configuration = ModelConfigurationRevisionDocument(
+        schema_version="model-configuration-revision-v1",
+        provider="deepseek_responses",
+        provider_base_origin="https://api.deepseek.com",
+        requested_model_id="deepseek-v4-flash",
+        returned_model_aliases=(
+            ReturnedModelAliasDocument(
+                returned_model_id="deepseek-v4-flash",
+                canonical_model_id="deepseek-v4-flash",
+            ),
+        ),
+        inference_settings=InferenceSettingsDocument(
+            max_input_tokens=32_000,
+            max_output_tokens=4_096,
+            provider_storage_enabled=False,
+        ),
+        tool_schema_digest=SCHEMA_DIGEST,
+    )
+
+    assert configuration.provider_base_origin == "https://api.deepseek.com"

@@ -1527,3 +1527,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Green evidence**: `uv run --python 3.12 pytest tests/contract/test_model_configuration.py -q` passed with `4 passed`.
 - **Spec-Review**: PASS; the new assertion directly covers both token ceilings and the published arithmetic.
 - **Quality-Review**: PASS; tests only, no production or fixture behavior changed.
+
+## 2026-08-05 / P4 - DeepSeek Responses adapter
+
+- **Base and task**: `87fc6fe`, P4 from `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
+- **Subagent**: Codex inline execution.
+- **Human-Changes**: none.
+- **Observed red**: `uv run --python 3.12 pytest tests/contract/test_deepseek_responses_adapter.py -q` failed during collection because the DeepSeek adapter module did not exist.
+- **Implementation**: added the injected, offline-testable DeepSeek Responses transport with request-time credential resolution, `https://api.deepseek.com`, `max_retries=0`, storage disabled, pinned instructions/temperature/reasoning effort, exact response identity/status checks, reasoning-token-inclusive usage/cost settlement, and strict structured payload validation. Replaced the old OpenAI stub, added the DeepSeek provider/origin revision mapping, and removed `DEBT-M4-001` from README/SECURITY.
+- **Green evidence**: the adapter contract passed with `7 passed`; focused configuration/provider regression passed with `29 passed`; the full offline suite passed with `493 passed, 8 skipped`; mypy passed for 54 source files; Ruff check/format and `git diff --check` passed. No network or real credential was used.
+- **Spec-Review**: PASS; no adapter retry, returned-model aliasing, missing-usage optimism, unsupported payload release, or request-only safety assumption remains in this path.
+- **Quality-Review**: PASS; transport is injected for deterministic tests, provider credentials are resolved only at dispatch, and the old disabled stub surface is removed.

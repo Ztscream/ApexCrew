@@ -171,8 +171,8 @@ class ReturnedModelAliasDocument(FrozenDocument):
 
 class ModelConfigurationRevisionDocument(FrozenDocument):
     schema_version: Literal["model-configuration-revision-v1"]
-    provider: Literal["scripted_mock", "openai_responses"]
-    provider_base_origin: Literal["mock://scripted", "https://api.openai.com"]
+    provider: Literal["scripted_mock", "deepseek_responses"]
+    provider_base_origin: Literal["mock://scripted", "https://api.deepseek.com"]
     requested_model_id: str = Field(min_length=1)
     returned_model_aliases: tuple[ReturnedModelAliasDocument, ...]
     inference_settings: InferenceSettingsDocument
@@ -190,7 +190,7 @@ class ModelConfigurationRevisionDocument(FrozenDocument):
             raise ValueError("every alias target must equal requested_model_id")
         required_origin = {
             "scripted_mock": "mock://scripted",
-            "openai_responses": "https://api.openai.com",
+            "deepseek_responses": "https://api.deepseek.com",
         }[self.provider]
         if self.provider_base_origin != required_origin:
             raise ValueError("provider and provider_base_origin must match exactly")
