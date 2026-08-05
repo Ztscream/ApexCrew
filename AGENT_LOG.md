@@ -2154,6 +2154,13 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4-02A closeout
+
+- **Final implementation**: `fcab0fe` (`fix(runtime): make bundle cleanup retry-safe`), with the R4-02A implementation/correction chain `47cbe7e`, `8a50a37`, `88fe78c`, `8fa2c86`, `b1cfc66`, `e7b259a`, `aa1412b`, and `fcab0fe`.
+- **Final independent reviews**: fresh spec reviewer `Anscombe; PASS`; fresh quality reviewer `James; PASS`, both against `8909fb4...fcab0fe`.
+- **Ledger**: `PLAN.md` records R4-02A as `COMPLETED`. R4-02B remains pending and owns replacement of every explicit deferred A-stage boundary plus the no-deferred/reopen integration proof. This closeout does not claim the final-user runtime is complete.
+- **No provider, credential, network, live API, push, or PR action occurred.**
+
 ## 2026-08-06 / R4-02A cleanup retry correction completion
 
 - **Independent quality finding**: after a close failure, retrying `ApplicationBundle.close()` could repeat already successful closes.
