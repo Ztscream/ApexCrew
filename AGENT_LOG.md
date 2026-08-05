@@ -1962,6 +1962,22 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Observed result**: Ohm confirmed root/object cleanup, retry ownership, primary security-error precedence through context exit, ancestor preflight, stable state binding, POSIX/Windows controls, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
 - **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
 
+## 2026-08-06 / R4-01A final ancestor-priority ledger correction
+
+- **Task**: record final implementation correction SHA `f136374` before re-running reviews touched by final ancestor error aggregation.
+- **Correction**: update the R4-01A ledger to `f136374`; prior Ohm PASS and Kant BLOCKED findings remain historical, while this final correction is pending fresh ordered review.
+- **Observed verification**: full offline pytest, mypy, Ruff check/format, and `git diff --check` passed on `f136374`. No provider, credential, network, push, PR, or live API call.
+- **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
+- **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): record R4-01A ancestor priority SHA`.
+
+## 2026-08-06 / R4-01A Euclid final spec review
+
+- **Task**: final fresh spec-compliance review of HEAD `2f48aca` and implementation `f136374`.
+- **Reviewer**: Euclid; verdict `PASS`.
+- **Observed result**: Euclid confirmed pre/post ancestor checks, stable state binding, primary-error precedence through final checks and context exit, root/object/probe cleanup with retry ownership, POSIX/Windows controls, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
+- **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
+
 ## 2026-08-06 / R4-01A Aquinas final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.
