@@ -1490,3 +1490,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Claude (assisting agent) authored the plan; execution is delegated to Codex.
 - **Human intervention**: the owner requested the plan and will hand it to Codex. Tasks P5 and W1 are marked `BLOCKED` because they depend on owner-only actions.
 - **Lesson**: writing the failing test into the plan rather than the implementation keeps a delegated agent honest about observing red first.
+
+## 2026-08-05 / P2 - CLI credential commands
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `1176031`.
+- **Task/skill**: P2; karpathy-guidelines.
+- **Prompt/context**: expose credential set/status/clear commands and a doctor presence check without adding a credential-bearing CLI argument.
+- **Observed red**: `uv run --python 3.12 pytest tests/contract/test_cli_credentials.py -q` failed all four tests because the `credentials` command group did not exist.
+- **Implementation**: added the `credentials` Typer group, hidden-input `set`, source-only `status`, idempotent `clear`, and `credential_source` to the read-only doctor result while retaining existing top-level commands.
+- **Green evidence**: the focused and legacy CLI/model credential selectors exited `0` with `10 passed`; `uv run --python 3.12 mypy src` passed with no issues in 54 source files; scoped Ruff check/format and `git diff --check` passed.
+- **Spec-Review**: Codex self-check passed: no argv credential value is accepted, status/doctor expose only source/presence, and clear is safe when the keyring entry is absent.
+- **Quality-Review**: Codex self-check passed; the existing CLI contract remained green and no critical issues remain.
+- **Subagent/Human-Changes**: Codex; none.
+- **Changed paths**: `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_credentials.py`, `AGENT_LOG.md`.
+- **Intended commit**: `feat(cli): add credential commands and doctor check`.
