@@ -8108,6 +8108,26 @@ class SqliteStateStore:
         with self._read_transaction() as connection:
             return self._current_revision_digests_in_transaction(connection, run_id)
 
+    @staticmethod
+    def current_revision_digest_from_read_only(
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        revision_class: Literal["POLICY", "BUDGET", "MODEL_CONFIGURATION"],
+    ) -> RevisionDigest:
+        column = {
+            "POLICY": "current_policy_digest",
+            "BUDGET": "current_budget_digest",
+            "MODEL_CONFIGURATION": "current_model_configuration_digest",
+        }[revision_class]
+        row = connection.execute(
+            f"SELECT {column} FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        if row[0] is None:
+            raise StateConflict("REVISION_NOT_FOUND")
+        return RevisionDigest(str(row[0]))
+
     def approved_revision_classes(self, run_id: RunId) -> tuple[str, ...]:
         with self._read_transaction() as connection:
             current = self._current_revision_digests_in_transaction(connection, run_id)

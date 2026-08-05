@@ -338,24 +338,6 @@ def _approval_request_id(payload: CommandPayload) -> str:
     return "cli-approval-" + digest.hexdigest()
 
 
-def _read_preview_digest(
-    connection: sqlite3.Connection,
-    run_id: RunId,
-    revision_class: Literal["POLICY", "BUDGET", "MODEL_CONFIGURATION"],
-) -> RevisionDigest:
-    column = {
-        "POLICY": "current_policy_digest",
-        "BUDGET": "current_budget_digest",
-        "MODEL_CONFIGURATION": "current_model_configuration_digest",
-    }[revision_class]
-    row = connection.execute(f"SELECT {column} FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-    if row is None:
-        raise StateConflict("RUN_NOT_FOUND")
-    if row[0] is None:
-        raise StateConflict("REVISION_NOT_FOUND")
-    return RevisionDigest(str(row[0]))
-
-
 def _approve_revision(
     command_kind: Literal["approve_policy", "approve_budget", "approve_model_configuration"],
     revision_kind: Literal["policy", "budget", "model_configuration"],
@@ -374,7 +356,9 @@ def _approve_revision(
             if preview:
                 connection = control_paths.open_existing_database_read_only()
                 try:
-                    current_digest = _read_preview_digest(connection, run_id, revision_class)
+                    current_digest = SqliteStateStore.current_revision_digest_from_read_only(
+                        connection, run_id, revision_class
+                    )
                 finally:
                     connection.close()
             else:
@@ -449,9 +433,11 @@ def _approve_revision(
     ) as error:
         _reject("APPROVAL_REJECTED", error)
     finally:
-        if store is not None:
-            store.close()
-        repository_authority.close()
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            repository_authority.close()
     if outcome.status != "ACCEPTED":
         _emit(
             "APPROVAL_REJECTED",

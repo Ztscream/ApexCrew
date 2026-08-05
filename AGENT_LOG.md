@@ -2083,3 +2083,17 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_approvals.py`, and `AGENT_LOG.md`.
 - **Review status**: `Spec-Review: pending`; `Quality-Review: pending`; no review was performed.
 - **No provider, credential, network, live API, push, or PR action occurred.**
+
+## 2026-08-06 / R4-01B quality correction
+
+- **Independent reviews**: Hubble returned `Spec-Review: PASS`. Ptolemy returned `Quality-Review: BLOCKED` for three findings: the preview-only adapter seam was outside the R4-01B path row, delivery executed a raw SQLite query, and cleanup could skip repository-authority close if the state-store close raised.
+- **Correction**: the R4-01B path row now explicitly permits the two read-only safety adapter seams; `SqliteStateStore.current_revision_digest_from_read_only()` owns the bounded mapped-column query; and nested cleanup `finally` blocks always attempt repository-authority close after store close failure.
+- **Observed correction evidence**:
+  - Original R4-01B selector -> `2 passed`.
+  - `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py -q` -> `4 passed`.
+  - `uv run --python 3.12 pytest tests/unit/adapters/repository/test_no_follow_handles.py tests/contract/test_repository_bootstrap.py -q` -> `54 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 57 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_cli_approvals.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests/contract/test_cli_approvals.py` -> `58 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: the spec result remains `PASS`; quality review is pending fresh review of this correction. No provider, credential, network, live API, push, or PR action occurred.
