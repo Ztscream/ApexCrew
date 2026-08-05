@@ -1417,3 +1417,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL S18 acceptance amendment; documentation commit follows.
 - **Human intervention**: none; no credentials, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
 - **Lesson**: image security claims are stronger when the built image configuration and networkless CLI startup are observed, not only declared in a Dockerfile.
+
+## 2026-08-05 / S1 hosted Linux test correction
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `e45935b`.
+- **Task/skill**: S1 correction; diagnosing-bugs; tdd.
+- **Prompt/context**: repair the hosted Ubuntu failure for a symlinked linked-worktree admin log without weakening no-follow enforcement.
+- **Observed red**: hosted `unit-ubuntu` failed because `refresh_after_verified_owned_transition` correctly raised `NO_FOLLOW_OPEN_DENIED` before the test reached the reservation guard.
+- **Implementation**: adjusted the integration test to accept and assert that earlier fail-closed rejection path; production no-follow behavior is unchanged.
+- **Green evidence**: the targeted test passed in the Linux container and the complete Windows suite remained green.
+- **Subagent output/commit**: Codex self-checked the S1 test correction; implementation commit follows.
+- **Human intervention**: none; no credentials, provider call, or `SPEC.md` edit occurred.
+- **Lesson**: security tests must accept every safe rejection boundary while still asserting that Git is never invoked.

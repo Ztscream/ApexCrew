@@ -197,7 +197,14 @@ def test_reservation_inventory_rejects_malformed_admin_tree_before_git(
         if os.name == "nt":
             pytest.skip("the Windows filesystem cannot create case-colliding entries")
         (admin / "head").write_bytes(b"ref: refs/heads/main\n")
-    repository = repository.refresh_after_verified_owned_transition()
+    try:
+        repository = repository.refresh_after_verified_owned_transition()
+    except RepositoryUnsafeError as error:
+        if malformation != "logs-head-link":
+            raise
+        assert str(error) == "NO_FOLLOW_OPEN_DENIED"
+        repository.close()
+        return
     backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
     data_handles = StableHandleTree(data_root, backend)
     operation = TargetReservationOperation(
