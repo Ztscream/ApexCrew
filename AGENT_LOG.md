@@ -1576,3 +1576,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality review**: PASS — documentation-only, scoped to `PLAN.md` and this evidence entry.
 - **Human changes**: None.
 - **Intended commit**: `docs(plan): define granted action read helper`.
+
+## 2026-08-05 / W1 GitHub Pages deployment
+
+- **Task**: W1 — publish the static WebUI replay through GitHub Pages.
+- **Implementation subagent**: Codex.
+- **Observed verification**: `make web-build` passed and produced `dist/webui/app.js`, `index.html`, and `styles.css`; `uv run --python 3.12 pytest tests/unit/test_webui_build.py tests/contract/test_documentation_delivery.py -q` passed with 2 tests; `git diff --check` passed. `actionlint` and `yamllint` are not installed locally, so workflow validation was performed by inspecting the structured job/permission syntax.
+- **Changes**: Added a `web-build` job that runs `make web-build` and uploads `dist/webui` as a Pages artifact, plus a permission-scoped `deploy-pages` job. Updated README and deployment documentation to call the site a sanitized deterministic fixture replay, not an execution service.
+- **Spec review**: PASS — deployment consumes only the static build artifact and retains the read-only boundary.
+- **Quality review**: PASS — generated output contains only the three expected static files, and the scoped WebUI/documentation tests pass.
+- **Human changes**: None.
+- **Intended commit**: `ci(pages): deploy static fixture replay`.

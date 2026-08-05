@@ -55,6 +55,7 @@ make build
 
 `make build` creates the wheel and the digest-pinned executor image. CI repeats quality, tests, wheel build, and image build.
 `make web-build` creates the static read-only bundle described in `docs/deployment.md`.
+The GitHub Pages site is a sanitized, deterministic fixture replay for inspection; it is not an execution service and cannot run agents, accept commands, or mutate repositories.
 
 ## 目录结构
 
