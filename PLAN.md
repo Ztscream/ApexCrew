@@ -30342,3 +30342,13 @@ depth/known boundary used for the claim.
 | S20 OpenAI adapter | SKELETON | COMPLETED | `2b71a8cbfee82814cb49b664b6452d55e4cb9ece` | offline call denied |
 | S21 static WebUI deployment | SKELETON | COMPLETED | `5feb82f8c21ef40331b4336e65dce7b307239bb4` | bundle generated |
 | S22 design workbench | STUB | COMPLETED | `aef591522bac228d0c9b2511b665f7b441de5282` | non-executing document green |
+
+## 2026-08-05 Owner Follow-Up Task Ledger
+
+| Task | Requested depth | Status | Implementation commit | Verification boundary |
+| --- | --- | --- | --- | --- |
+| A1 coverage gate | REAL | COMPLETED | `0f727b3` + log correction `2bc9fc1` | `make coverage`: 77% total; XML package distribution recorded in `AGENT_LOG.md` |
+| E1 Python money unit drift | REAL | COMPLETED (SKELETON BOUNDARY) | `d90dfb7` | strict xfail at `CREATE_RUN_BINDING_INVALID` before Run creation; real defect repository seeded |
+| E2 TypeScript timestamp unit drift | REAL | COMPLETED (SKELETON BOUNDARY) | `05e1bab` | strict xfail reproduces E1's first boundary without re-debugging later phases |
+| Z0 granted-action read definition | REAL | COMPLETED | `7065c14` | `PLAN.md` defines read-only exact-Run/state/order/binding behavior |
+| W1 GitHub Pages deployment | REAL | COMPLETED (OWNER GATE) | `1a0af04` | `make web-build` and static WebUI tests pass; deploy is main-push gated and still requires owner Pages setup |
