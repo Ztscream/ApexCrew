@@ -1904,6 +1904,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A backend cleanup SHA`.
 
+## 2026-08-06 / R4-01A Kepler exception-priority correction
+
+- **Task**: bounded R4-01A primary-rejection correction after Kepler spec review of `5c29d80`; scope remains control-path error reporting.
+- **Spec-review finding**: Kepler found `CONTROL_PATH_APPEARED` could be replaced by a close failure when an unexpected entry probe failed to close.
+- **Correction**: preserve the primary appeared-entry rejection, attach cleanup failure as an exception note, retain the failed probe in guard pending ownership, and add a combined fault regression test.
+- **Observed verification**: focused guard/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
 ## 2026-08-06 / R4-01A Aquinas final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.

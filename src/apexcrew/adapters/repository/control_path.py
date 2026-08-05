@@ -202,12 +202,12 @@ class ControlPathGuard:
         node = self._backend.try_open_child(control, name, "file")
         if expected is None:
             if node is not None:
+                appeared_error = RepositoryUnsafeError("CONTROL_PATH_APPEARED")
                 try:
                     self._close_node(node)
                 except (OSError, RepositoryUnsafeError) as cleanup_error:
-                    cleanup_error.add_note("unexpected control entry was observed")
-                    raise
-                raise RepositoryUnsafeError("CONTROL_PATH_APPEARED")
+                    appeared_error.add_note(f"unexpected entry cleanup failed: {cleanup_error}")
+                raise appeared_error
             return
         if node is None:
             raise RepositoryUnsafeError("CONTROL_PATH_DISAPPEARED")
