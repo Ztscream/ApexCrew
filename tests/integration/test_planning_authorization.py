@@ -70,12 +70,12 @@ def budget(*, model_call_ceiling: int = 240) -> BudgetRevisionDocument:
         output_token_ceiling=200_000,
         cost_reserve_usd=Decimal(10),
         concurrent_worker_ceiling=3,
-        pricing_observed_on=date(2026, 7, 26),
+        pricing_observed_on=date(2026, 8, 5),
         pricing_entries=(
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal("15.00"),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     )
@@ -123,8 +123,8 @@ def model_request(store: InMemoryStateStore) -> ModelRequest:
         policy_digest=RevisionDigest("sha256:" + "3" * 64),
         budget_digest=budget_digest,
         model_configuration_digest=RevisionDigest("sha256:" + "5" * 64),
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "plan"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "2" * 64,
@@ -161,8 +161,8 @@ class BarrierObservingModel(ScriptedMockLLM):
     def __init__(self, store: InMemoryStateStore, request: ModelRequest) -> None:
         completion = ModelCompletion(
             response_id="response-1",
-            requested_model_id="gpt-5.6-terra",
-            returned_model_id="gpt-5.6-terra",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
             usage=ModelUsage(10, 5, Decimal("0.0001")),
             normalized_action={"kind": "fail", "reason": "done"},
         )

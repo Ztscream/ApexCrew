@@ -53,7 +53,7 @@ def _budget(task_ceiling: int = 12) -> BudgetRevisionDocument:
         output_token_ceiling=200_000,
         cost_reserve_usd=Decimal(10),
         concurrent_worker_ceiling=3,
-        pricing_observed_on=date(2026, 7, 26),
+        pricing_observed_on=date(2026, 8, 5),
         pricing_entries=(
             ModelPricingEntryDocument(
                 returned_model_id="mock-model",

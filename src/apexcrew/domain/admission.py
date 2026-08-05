@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from secrets import token_hex
 from typing import Literal, Protocol, Self, cast
 
 from pydantic import Field, model_validator
@@ -26,6 +28,42 @@ from apexcrew.domain.types import (
     RunState,
     RuntimeOwnerId,
 )
+
+MAX_TARGET_RESERVATION_ID_ATTEMPTS = 16
+_TARGET_RESERVATION_ID_PREFIX = "reservation-"
+
+
+class TargetReservationIdAllocationError(RuntimeError):
+    def __init__(self, failed_invariant: str) -> None:
+        super().__init__(failed_invariant)
+        self.failed_invariant = failed_invariant
+
+
+def random_target_reservation_id() -> str:
+    return _TARGET_RESERVATION_ID_PREFIX + token_hex(16)
+
+
+def allocate_target_reservation_id(
+    source: Callable[[], object], is_reserved: Callable[[str], bool]
+) -> str:
+    for _ in range(MAX_TARGET_RESERVATION_ID_ATTEMPTS):
+        try:
+            candidate = source()
+        except StopIteration as error:
+            raise TargetReservationIdAllocationError("TARGET_RESERVATION_ID_EXHAUSTED") from error
+        if (
+            not isinstance(candidate, str)
+            or len(candidate) != len(_TARGET_RESERVATION_ID_PREFIX) + 32
+            or not candidate.startswith(_TARGET_RESERVATION_ID_PREFIX)
+            or any(
+                character not in "0123456789abcdef"
+                for character in candidate[len(_TARGET_RESERVATION_ID_PREFIX) :]
+            )
+        ):
+            raise TargetReservationIdAllocationError("TARGET_RESERVATION_ID_SOURCE_INVALID")
+        if not is_reserved(candidate):
+            return candidate
+    raise TargetReservationIdAllocationError("TARGET_RESERVATION_ID_EXHAUSTED")
 
 
 def private_ref(run_id: RunId) -> str:

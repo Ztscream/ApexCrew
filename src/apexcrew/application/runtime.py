@@ -17,7 +17,7 @@ from apexcrew.domain.admission import (
     TargetReservationBootstrapAdmissionService,
     private_ref,
 )
-from apexcrew.domain.authority import ActiveRunTimeBoundaryDecision
+from apexcrew.domain.authority import ActiveRunTimeBoundaryDecision, GrantedActionIntent
 from apexcrew.domain.commands import RunStop, RuntimeDecision, RuntimePermit, RuntimeState
 from apexcrew.domain.effects import EffectIntent, RecoveryOutcome, StateConflict, canonical_json
 from apexcrew.domain.model import (
@@ -28,6 +28,7 @@ from apexcrew.domain.model import (
     RecoveredModelAction,
 )
 from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.tools import GrantedActionJournal, GrantedActionToolPort
 from apexcrew.domain.types import (
     AuditSequence,
     IntentId,
@@ -58,6 +59,9 @@ class RuntimeOwnerIdSource(Protocol):
         raise NotImplementedError
 
 
+_UNSET = object()
+
+
 class FileRunOwnership:
     def __init__(self, data_root: Path, locks: FileLockBackend, ids: RuntimeOwnerIdSource) -> None:
         self._data_root = data_root
@@ -65,9 +69,19 @@ class FileRunOwnership:
         self._ids = ids
 
     @contextmanager
-    def acquire(self, run_id: RunId) -> Iterator[RuntimeOwner | None]:
+    def acquire(
+        self, run_id: RunId, permit: RuntimePermit | None | object = _UNSET
+    ) -> Iterator[RuntimeOwner | None]:
+        # DEBT-M1-006: cross-process mutex and concrete OS file-lock ownership remain deferred.
+        if permit is not _UNSET and (
+            permit is None
+            or not isinstance(permit, RuntimePermit)
+            or permit.run_id != run_id
+            or permit.state not in {"UNCONSUMED", "CONSUMED"}
+        ):
+            yield None
+            return
         path = self._data_root / "runtime-locks" / f"{run_id}.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
         with self._locks.try_lock(path) as locked:
             yield RuntimeOwner(self._ids.next_runtime_owner_id()) if locked else None
 
@@ -260,6 +274,86 @@ class TerminalCleanupDriver(Protocol):
         raise NotImplementedError
 
 
+class GrantedActionDriver(Protocol):
+    def execute(self, run_id: RunId, permit: RuntimePermit, intent_id: IntentId) -> RuntimeDecision:
+        raise NotImplementedError
+
+
+class GrantedActionRuntime(GrantedActionDriver):
+    def __init__(self, journal: GrantedActionJournal, tools: GrantedActionToolPort) -> None:
+        self._journal = journal
+        self._tools = tools
+
+    def execute(self, run_id: RunId, permit: RuntimePermit, intent_id: IntentId) -> RuntimeDecision:
+        if permit.state != "CONSUMED" or permit.allowed_phase != "ACTIVE":
+            raise ValueError("GRANTED_ACTION_PERMIT_PHASE_MISMATCH")
+        intent = self._journal.require_unsettled_granted_intent(intent_id)
+        if (
+            intent.bindings.run_id != run_id
+            or permit.run_id != run_id
+            or permit.applicable_revision_digests != intent.bindings.applicable_revision_digests
+        ):
+            raise ValueError("GRANTED_ACTION_PERMIT_BINDING_MISMATCH")
+        observation = self._tools.observe_granted_action(intent)
+        if observation.state == "EXACT_POST":
+            sequence = self._journal.settle_granted_action(
+                run_id=run_id,
+                intent_id=intent_id,
+                result=observation.result_for(intent),
+                applicable_revision_digests=intent.bindings.applicable_revision_digests,
+                expected_sequence=self._journal.audit_sequence(run_id),
+            )
+            return RuntimeDecision(
+                code="ACTION_RECORDED",
+                stop_reason=None,
+                resulting_sequence=sequence,
+            )
+        if observation.state == "EXACT_PRE":
+            if intent.state == "INTENT_RECORDED":
+                intent = self._journal.mark_granted_action_dispatched(
+                    run_id=run_id,
+                    intent_id=intent_id,
+                    applicable_revision_digests=intent.bindings.applicable_revision_digests,
+                    expected_sequence=self._journal.audit_sequence(run_id),
+                )
+            if intent.state != "DISPATCHED":
+                raise StateConflict("GRANTED_ACTION_DISPATCH_STATE_INVALID")
+            try:
+                result = self._tools.execute_granted(intent)
+            except RepositoryEffectUncertain:
+                return self._mark_indeterminate(run_id, intent, observation.digest)
+            if result.code in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}:
+                return self._mark_indeterminate(run_id, intent, observation.digest)
+            sequence = self._journal.settle_granted_action(
+                run_id=run_id,
+                intent_id=intent_id,
+                result=result,
+                applicable_revision_digests=intent.bindings.applicable_revision_digests,
+                expected_sequence=self._journal.audit_sequence(run_id),
+            )
+            return RuntimeDecision(
+                code="ACTION_RECORDED",
+                stop_reason=None,
+                resulting_sequence=sequence,
+            )
+        return self._mark_indeterminate(run_id, intent, observation.digest)
+
+    def _mark_indeterminate(
+        self,
+        run_id: RunId,
+        intent: GrantedActionIntent,
+        observation_digest: Sha256DigestText,
+    ) -> RuntimeDecision:
+        sequence = self._journal.mark_granted_action_indeterminate(
+            run_id=run_id,
+            intent_id=intent.intent_id,
+            observation_digest=observation_digest,
+            applicable_revision_digests=intent.bindings.applicable_revision_digests,
+            expected_sequence=self._journal.audit_sequence(run_id),
+        )
+        return RuntimeDecision.pause("INDETERMINATE", sequence)
+
+
 class RuntimePhaseDriverService:
     def __init__(
         self,
@@ -269,6 +363,7 @@ class RuntimePhaseDriverService:
         resolution: ResolutionDriver,
         integration: FinalIntegrationDriver,
         cleanup: TerminalCleanupDriver,
+        granted_actions: GrantedActionDriver | None = None,
     ) -> None:
         self._recovered_actions = recovered_actions
         self._target_reservations = target_reservations
@@ -276,6 +371,7 @@ class RuntimePhaseDriverService:
         self._resolution = resolution
         self._integration = integration
         self._cleanup = cleanup
+        self._granted_actions = granted_actions
 
     def resume_recovered_model_action(
         self, run_id: RunId, permit: RuntimePermit, action: RecoveredModelAction
@@ -299,11 +395,19 @@ class RuntimePhaseDriverService:
     def reconcile_terminal_cleanup(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         return self._cleanup.reconcile(run_id, permit)
 
+    def execute_granted_action(
+        self, run_id: RunId, permit: RuntimePermit, intent_id: IntentId
+    ) -> RuntimeDecision:
+        if self._granted_actions is None:
+            return RuntimeDecision.pause("GRANTED_ACTION_DRIVER_NOT_INSTALLED")
+        return self._granted_actions.execute(run_id, permit, intent_id)
+
 
 RuntimeFaultPhase = Literal[
     "PERMIT_CONSUMPTION",
     "TARGET_RESERVATION",
     "RECOVERED_ACTION",
+    "GRANTED_ACTION_RECOVERY",
     "EFFECT_RECOVERY",
     "MODEL_RECOVERY",
     "PLANNING",
@@ -386,6 +490,7 @@ class RuntimeStateStore(Protocol):
 class RuntimeRecoveryJournal(Protocol):
     def next_recovered_model_action(self, run_id: RunId) -> RecoveredModelAction | None: ...
     def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None: ...
+    def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None: ...
     def record_downstream_action_intent(
         self,
         run_id: RunId,
@@ -517,11 +622,15 @@ class RuntimeService:
     ) -> RunStop:
         state = self._store.load_runtime_state(run_id)
         if state.state == RunState.DRAFT:
-            return self._drive_phase(run_id, permit, context)
+            return self._drive_permitted_phase(run_id, permit, context)
         context.phase = "RECOVERED_ACTION"
         recovered = self._journal.next_recovered_model_action(run_id)
         if recovered is not None:
             return self._resume_recovered(run_id, permit, recovered, context)
+        context.phase = "GRANTED_ACTION_RECOVERY"
+        granted = self._journal.next_unsettled_granted_action(run_id)
+        if granted is not None:
+            return self._drive_granted_action(run_id, permit, granted.intent_id, context)
         context.phase = "EFFECT_RECOVERY"
         recovery = self._recovery.reconcile(run_id)
         if recovery.requires_human_resolution:
@@ -566,7 +675,27 @@ class RuntimeService:
                 sequence,
             )
             return self._resume_recovered(run_id, permit, action, context)
-        return self._drive_phase(run_id, permit, context)
+        return self._drive_permitted_phase(run_id, permit, context)
+
+    def _drive_granted_action(
+        self,
+        run_id: RunId,
+        permit: RuntimePermit,
+        intent_id: IntentId,
+        context: RuntimeFaultContext,
+    ) -> RunStop:
+        context.phase = "GRANTED_ACTION_RECOVERY"
+        decision = self._phase_drivers.execute_granted_action(run_id, permit, intent_id)
+        budget_stop = self._boundary(run_id)
+        if decision.resulting_sequence is None:
+            state = self._store.load_runtime_state(run_id)
+            return _stop_for_state(run_id, state, RunStopReason.INTERRUPTED)
+        if budget_stop is not None:
+            return budget_stop
+        if decision.code in {"CONTINUE", "MALFORMED_ACTION", "ACTION_RECORDED"}:
+            return self._drive_permitted_phase(run_id, permit, context)
+        state = self._store.load_runtime_state(run_id)
+        return _stop_for_state(run_id, state, _stop_reason_for_decision(decision.stop_reason))
 
     def _resume_recovered(
         self,
@@ -580,11 +709,11 @@ class RuntimeService:
         if budget is not None:
             return budget
         if decision.code in {"CONTINUE", "MALFORMED_ACTION", "ACTION_RECORDED"}:
-            return self._drive_phase(run_id, permit, context)
+            return self._drive_permitted_phase(run_id, permit, context)
         state = self._store.load_runtime_state(run_id)
         return _stop_for_state(run_id, state, _stop_reason_for_decision(decision.stop_reason))
 
-    def _drive_phase(
+    def _drive_permitted_phase(
         self, run_id: RunId, permit: RuntimePermit, context: RuntimeFaultContext
     ) -> RunStop:
         draft_initialized = False

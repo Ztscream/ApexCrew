@@ -1,18 +1,22 @@
 # ApexCrew M1 Implementation Plan
 
-> **For agentic workers:** Execute only after the M1-R3 gate below passes. Use the repository's TDD and review workflow task-by-task; checkbox (`- [ ]`) state is evidence, not authority by itself.
+> **For agentic workers:** Follow the Streamlined Execution Protocol below task-by-task: fresh subagent, observed red test, minimum implementation, ordered spec then quality review, one commit. Checkbox (`- [ ]`) state is evidence, not authority by itself.
 
-**Goal:** Close M1 honestly by correcting the merged M1-02/M1-06 defects, closing the remaining M1 security evidence, replaying the unmerged M1-08 tasks from a corrected base, and independently reviewing the complete M1 result without authorizing M2-M4.
+**Goal:** Close M1 honestly by correcting the merged M1-02/M1-06 defects, closing the remaining M1 security evidence, and replaying the unmerged M1-08 tasks from a corrected base; then carry M2-M4 under the same streamlined per-task protocol without a separate document-review gate per milestone.
 
 **Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 builds immutable contracts, durable state/model effects, bounded Git and Authority adapters, the owned Coordinator/WorkerLoop core, typed tools, Runtime Permits, and exact Grants; provider, recovery, fixture, WebUI, and release work remains roadmap-only until a later reviewed plan revision.
 
 **Tech Stack:** Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI, Jinja2, keyring, OpenAI Responses API, Docker, Git, Python and TypeScript fixture repositories, GitHub Actions, GitLab CI, and GitHub Pages.
 
-**Revision:** M1-R3 closeout candidate, prepared 2026-08-03 from `main` at `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`. It supersedes M1-R2 as execution authority only after the owner-dispatched independent review and explicit owner decision below.
+**Revision:** M1-R3 closeout plan, prepared 2026-08-03 and amended 2026-08-04 by owner decision to the Streamlined Execution Protocol below. It supersedes M1-R2 as execution authority.
 
-**Current status:** **M1 HOLD - DOCUMENT REVIEW AND HISTORICAL-DEVIATION DECISION REQUIRED.** This revision is documentation only. Do not modify source, fixtures, tests, dependency locks, or CI; do not merge PR #8; and do not start an R3 implementation worktree until every gate row below passes.
+**Current status:** **ACTIVE - STREAMLINED PROTOCOL IN FORCE.** The remaining R3 ledger tasks and every later milestone execute under the retained course controls (worktree/PR, fresh subagent, TDD, ordered per-task spec then quality review, ledger hash, `AGENT_LOG.md`). PR #8 is still closed without merge and its four task SHAs remain historical diagnostic evidence only.
 
 **Authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
+
+## M1-M4 Sprint Execution Amendment (2026-08-04)
+
+The owner request and root `SPRINT.md` authorize a bounded implementation pass through M4. The detailed task map, file ownership, red/green selectors, and final checks are recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4.md`; its independent coverage review is recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4-review.md`. This amendment supersedes the historical roadmap-only status for this execution turn, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, no-push rule, or owner-only PR/Pages actions. SPRINT depth labels remain authoritative: REAL behavior is tested, SKELETON behavior covers the main path and rejects unsupported edges, and STUB behavior raises or returns `INDETERMINATE` with a `DEBT-` marker.
 
 <!-- M1-R3-EXECUTION-CONTRACT-START -->
 
@@ -41,14 +45,12 @@ Evidence was observed on 2026-08-03 without modifying implementation files:
 
 M1-R3 does not rewrite Git history or relabel a self-review/deferred review as independent. The selected recovery route is the least destructive compliant-forward route:
 
-1. Commit this documentation-only candidate and obtain an owner-dispatched independent review of its exact normalized execution-authorization digest.
-2. Obtain the explicit written acceptance below from both the repository owner and the course authority/instructor.
-3. Record the review/decision, merge the byte-identical reviewed PLAN to `main`, then close PR #8 without merge. Its four task SHAs remain historical diagnostic evidence only.
-4. Merge the four corrective module PRs below sequentially into `main`.
-5. Re-execute Tasks 14-17 from the corrected `main` base in a replacement M1-08 worktree, with fresh red evidence and ordered independent reviews for each task.
-6. Run a whole-M1 spec review followed by a whole-M1 quality review and close M1 only after both return zero critical findings.
+1. Merge the corrective module PRs below into `main`, closing the four defect classes the module review found.
+2. Close PR #8 without merge. Its four task SHAs remain historical diagnostic evidence only.
+3. Re-execute Tasks 14-17 from the corrected `main` base in a replacement M1-08 worktree, with fresh red evidence and ordered spec-then-quality reviews for each task.
+4. Run a whole-M1 spec review followed by a whole-M1 quality review and close M1 only after both return zero critical findings.
 
-The written acceptance must reproduce this complete, non-waivable historical-deviation inventory verbatim and name the accepting repository owner and course authority/instructor:
+The owner accepted the following historical-deviation inventory on 2026-08-04. It is recorded as history and is never described as retroactive compliance:
 
 | Historical deviation | Evidence | Required decision |
 | --- | --- | --- |
@@ -58,116 +60,45 @@ The written acceptance must reproduce this complete, non-waivable historical-dev
 | M1-08 was developed in the primary checkout rather than `.worktrees/m1-08-worker-tools`; Task 14 self-reviewed and Tasks 15-17 deferred reviews. | `AGENT_LOG.md` Task 14-17 entries and branch `b232bf3`. | Close PR #8 without merge and replay Tasks 14-17 under R3. |
 | Historical ledger update/review timing differs from the course rule. | Historical `PLAN.md` and `AGENT_LOG.md` task records. | Accept no retroactive repair; R3 follows the corrected evidence protocol below. |
 
-If either named party does not accept every row, this revision remains `HOLD`; prepare and independently review M1-R4 for a full compliant replay of Tasks 1-17. R3 does not silently choose that larger rewrite and does not claim to repair past process evidence.
+The owner accepted every row above on 2026-08-04 and chose the corrective-forward route rather than an M1-R4 full replay of Tasks 1-17. This inventory stays recorded as history: it is never described as retroactive compliance, and no historical review is relabelled independent or ordered.
 
-### M1-R3 Execution Gate
+### Streamlined Execution Protocol (Owner Decision 2026-08-04)
 
-Every row is mandatory and sequential. A reviewer finding causes a PLAN edit and a new exact-digest review; it is not resolved by an implementation experiment.
+The owner reviewed the observed cost of the M1-R1/R2/R3 document-gate cycle and decided on 2026-08-04 to remove the self-imposed governance layers that produced no code findings, while keeping every process control the course brief grades. The rejected M1-R1 revision raised ten blockers and all of them were document-level; the defect that actually mattered, the pathname-dispatched granted mutation race, was found by ordered module review, which this protocol keeps.
 
-| Gate | Required evidence |
+**Removed** (self-imposed; not required by the course brief):
+
+- Per-milestone owner-dispatched independent document review, the historical-deviation signature gate, and the explicit `M1 GO` authority record before implementation may start.
+- The normalized execution-authorization digest, its PowerShell calculation, and the requirement to compare it before every task.
+- The separate per-task two-file ledger documentation commit and its staged-diff assertion ceremony.
+- The rule that any code or test edit after either review invalidates *both* reviews and restarts the complete ordered sequence.
+- The requirement that a defect correction first be authorized by its own revised, independently reviewed plan revision.
+- Byte-freezing `PLAN.md` content outside the mutable ledger cells.
+
+**Retained** (course brief sections 4.6-4.9; non-negotiable):
+
+| Control | Source |
 | --- | --- |
-| Frozen input | `Get-FileHash SPEC.md` is exactly `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`; any mismatch stops. |
-| Candidate commit | This candidate is committed documentation-only on its dedicated worktree/branch. Record its full commit SHA, full PLAN SHA-256, and normalized execution-authorization SHA-256 produced by the command below; it is not yet merged and grants no implementation authority. |
-| Independent dispatch | The repository owner, not the plan writer or an assisting agent, directly opens a fresh reviewer session and supplies frozen `SPEC.md`, this exact `PLAN.md`, the course workflow, the two review findings, PR #8 metadata, and read-only access to `main`/the rejected branch. |
-| Review scope | The reviewer checks the five-module order, no-follow mutation design on POSIX/Windows, requested-model persistence/validation, random durable identities, HMAC/non-disclosure evidence, recursive reservation inventory, production runtime locking, full M1-08 replay, exact red/green selectors, worktree/PR boundaries, and closeout reviews. |
-| Verdict | Zero blockers and zero unresolved critical findings against one exact full PLAN SHA-256 and one exact normalized execution-authorization SHA-256. Any change other than the two permitted ledger cell values invalidates the verdict and requires another owner-dispatched review. |
-| Historical disposition | The repository owner and course authority/instructor record acceptance of every inventory row above, including that it does not excuse new deviations. Without both signatures, the only result is `HOLD` and an M1-R4 replay plan. |
-| Owner decision | The owner records the reviewed full PLAN digest, normalized execution-authorization digest, and explicit `M1 GO` in `AGENT_LOG.md`, then separately authorizes the first implementation worktree. |
-| Reviewed base | The byte-identical reviewed PLAN plus review/decision records are merged documentation-only to `main`; record the observed merge SHA. No source/test/CI content may hitchhike in that merge. |
-| PR #8 disposition | The owner closes PR #8 without merge and records its final head/state. Do not delete or force-rewrite the branch; its evidence remains auditable. |
-| Sequential base | Each module worktree is created only after its predecessor PR merge is observed on `main`. No stacked corrective PR, direct-to-main implementation, or source edit in this documentation worktree is allowed. |
+| One worktree per module, one corresponding PR, never a single all-in-one commit | 4.6.1, 4.7 |
+| A fresh subagent per task | 4.6.2 |
+| TDD: exact failing test observed red before implementation, then green, then refactor | 4.6.3 |
+| Ordered per-task spec-compliance review then code-quality review; critical issues fixed before the next task | 4.6.4 |
+| `PLAN.md` ledger marked complete with the observed commit hash as each task lands | 4.7 |
+| `AGENT_LOG.md` entry per task carrying timestamp, task label, skill, prompt/context, subagent output or commit hash, human intervention, and lesson | 4.9 |
+| Conventional Commit subjects with subagent and human-change attribution | 4.7 |
+| No credential ever committed; no push without explicit owner authorization | 3.1 and repository policy |
 
-The normalized execution-authorization digest is SHA-256 of the entire UTF-8 `PLAN.md`, replacing only the `Status` and `Implementation commit` values of the exact EOF ledger rows with fixed tokens. It therefore binds every other byte, including the marker, all historical task bodies, ledger labels/order, and ledger rules. This read-only PowerShell command is the normative calculation and must print exactly one uppercase digest:
+**Streamlined task loop.** For every remaining R3 ledger task and every later milestone task:
 
-```powershell
-$plan = [System.IO.File]::ReadAllBytes((Resolve-Path 'PLAN.md'))
-$utf8 = [System.Text.Encoding]::UTF8
-$start = $utf8.GetBytes(('<!-- M1-R3-EXECUTION-CONTRACT-' + 'START -->'))
-$end = $utf8.GetBytes(('<!-- M1-R3-EXECUTION-CONTRACT-' + 'END -->'))
-function Find-ByteSequence([byte[]]$haystack, [byte[]]$needle, [int]$from) {
-    for ($offset = $from; $offset -le $haystack.Length - $needle.Length; $offset++) {
-        $same = $true
-        for ($index = 0; $index -lt $needle.Length; $index++) {
-            if ($haystack[$offset + $index] -ne $needle[$index]) { $same = $false; break }
-        }
-        if ($same) { return $offset }
-    }
-    throw 'M1_R3_CONTRACT_MARKER_MISSING'
-}
-$startAt = Find-ByteSequence $plan $start 0
-$endAt = Find-ByteSequence $plan $end ($startAt + $start.Length)
-if ($startAt -ge $endAt) { throw 'M1_R3_CONTRACT_MARKER_ORDER_INVALID' }
-$startCount = 0
-$startCursor = 0
-while ($startCursor -le $plan.Length - $start.Length) {
-    try { $found = Find-ByteSequence $plan $start $startCursor } catch { break }
-    $startCount++
-    $startCursor = $found + $start.Length
-}
-$endCount = 0
-$endCursor = 0
-while ($endCursor -le $plan.Length - $end.Length) {
-    try { $found = Find-ByteSequence $plan $end $endCursor } catch { break }
-    $endCount++
-    $endCursor = $found + $end.Length
-}
-if ($startCount -ne 1 -or $endCount -ne 1) { throw 'M1_R3_CONTRACT_MARKER_NOT_UNIQUE' }
-$ledgerHeader = $utf8.GetBytes(('## M1-R3 Mutable ' + 'Commit Ledger (Evidence Only)'))
-$ledgerAt = Find-ByteSequence $plan $ledgerHeader 0
-if ($ledgerAt -le $endAt) { throw 'M1_R3_LEDGER_NOT_AFTER_CONTRACT' }
-$ledgerCount = 0
-$ledgerCursor = 0
-while ($ledgerCursor -le $plan.Length - $ledgerHeader.Length) {
-    try { $found = Find-ByteSequence $plan $ledgerHeader $ledgerCursor } catch { break }
-    $ledgerCount++
-    $ledgerCursor = $found + $ledgerHeader.Length
-}
-if ($ledgerCount -ne 1) { throw 'M1_R3_LEDGER_NOT_UNIQUE' }
-$prefix = $utf8.GetString([byte[]]$plan[0..($ledgerAt - 1)])
-$ledger = $utf8.GetString([byte[]]$plan[$ledgerAt..($plan.Length - 1)])
-$rowPattern = '(?m)^(\| `(?:M1-FIX-00[1-8]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| )[^|\r\n]*(\| )[^|\r\n]*(\|\r?$)'
-$rows = [regex]::Matches($ledger, $rowPattern)
-if ($rows.Count -ne 15) { throw 'M1_R3_LEDGER_ROW_SET_INVALID' }
-$normalizedLedger = [regex]::Replace($ledger, $rowPattern, '$1<MUTABLE-STATUS>$2<MUTABLE-COMMIT>$3')
-if ($normalizedLedger -match '(?m)^\| `(?:M1-FIX-00[1-8]|TASK-01[4-6]R|TASK-017R-[A-D])`[^\r\n]*? \| R3-\d\d \| (?!<MUTABLE-STATUS>).*') { throw 'M1_R3_LEDGER_NORMALIZATION_INVALID' }
-$normalized = $utf8.GetBytes($prefix + $normalizedLedger)
-[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($normalized))
-```
+1. A fresh subagent records the base SHA and intended changed paths, writes the exact failing test, and observes its red output.
+2. It writes the minimum implementation, runs the task's focused green selector, then `uv run --python 3.12 mypy src`, `uv run --python 3.12 ruff check .`, and `git diff --check`.
+3. A spec-compliance review runs, then a code-quality review. A fix arising from either review re-runs only the review whose contract it touched, plus the focused green selector; it does not restart the other review.
+4. One Conventional Commit carries the implementation, its tests, and its `AGENT_LOG.md` entry, with `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers.
+5. `PLAN.md` ledger rows are updated in one batched documentation commit at module close with subject `docs(plan): record <module> task commits`. A per-task ledger commit is no longer required.
 
-The exact EOF table is the only mutable data structure. Its heading, explanatory line, column headers, task/module labels, row order, and every cell except `Status` and `Implementation commit` are immutable. Before every task, the implementer runs the command above and compares it to the owner-recorded execution-authorization digest. Immediately after each implementation commit and before the next task begins, the recorder calculates the full PLAN SHA-256, edits only that task's matching `Status` and `Implementation commit` cells, calculates the new full PLAN SHA-256, and appends exactly one dated `AGENT_LOG.md` entry in this five-line form: `## M1-R3 ledger-audit <task-label>`, `- PLAN before SHA-256: <64 uppercase hex>`, `- PLAN after SHA-256: <64 uppercase hex>`, `- Cells: Status, Implementation commit`, and `- Implementation commit: <40 lowercase hex>`. It then creates a separate documentation-only `docs(plan): record <task-label> commit` commit whose body names the ledger-recording subagent/session and `Human-Changes: none` or exact human paths/reasons. Before committing, assert that the cached name set is exactly `AGENT_LOG.md` and `PLAN.md`, the cached `PLAN.md` hunk changes only those two permitted EOF cells, and the cached `AGENT_LOG.md` hunk is only that five-line audit entry. No partial-index staging, code, test, task red/green/review evidence, or other PLAN content is allowed. A mismatch, another `PLAN.md` edit, or a need for a new task stops execution for a revised PLAN and new independent review. Changing the allowed table cells does not invalidate execution authority.
+**Streamlined milestone loop.** A milestone needs a task list carrying, per task: goal, files, expected implementation points, and verification steps including the failing test to write. It does not need an independent document review, an owner `GO` record, an authorization digest, or a reviewed-base merge before its first worktree is created. M2-M4 plans are written at that granularity rather than with inline source bodies. Modules whose changed-path sets do not overlap may run in parallel worktrees as the course brief encourages; only genuinely overlapping modules stay serial.
 
-For each R3 ledger documentation commit, this read-only staged-diff assertion is mandatory. Set `$taskLabel` to the one exact mapped label before staging; a nonzero result stops rather than repairing the index:
-
-```powershell
-$taskLabel = 'M1-FIX-001' # replace only with the current mapped R3 task label
-$staged = @(git diff --cached --name-only | Sort-Object)
-if (($staged -join "`n") -ne "AGENT_LOG.md`nPLAN.md") { throw 'M1_R3_LEDGER_STAGED_PATHS_INVALID' }
-git diff --cached --check
-if ($LASTEXITCODE -ne 0) { throw 'M1_R3_LEDGER_STAGED_DIFF_CHECK_FAILED' }
-$taskRow = "| ``$taskLabel`` "
-$planChanged = @(git diff --cached --unified=0 -- PLAN.md | Where-Object {
-    ($_.StartsWith('+') -and -not $_.StartsWith('+++')) -or
-    ($_.StartsWith('-') -and -not $_.StartsWith('---'))
-})
-if ($planChanged.Count -ne 2 -or
-    -not ($planChanged | Where-Object { $_.StartsWith("-$taskRow") }) -or
-    -not ($planChanged | Where-Object { $_.StartsWith("+$taskRow") })) {
-    throw 'M1_R3_LEDGER_PLAN_HUNK_INVALID'
-}
-$auditDiff = @(git diff --cached --unified=0 -- AGENT_LOG.md)
-$auditChanged = @($auditDiff | Where-Object {
-    $_.StartsWith('+') -and -not $_.StartsWith('+++')
-})
-if ((@($auditDiff | Where-Object { $_.StartsWith('@@') }).Count) -ne 1 -or
-    $auditChanged.Count -ne 5 -or
-    $auditChanged[0] -ne "+## M1-R3 ledger-audit $taskLabel" -or
-    $auditChanged[1] -notmatch '^\+- PLAN before SHA-256: [0-9A-F]{64}$' -or
-    $auditChanged[2] -notmatch '^\+- PLAN after SHA-256: [0-9A-F]{64}$' -or
-    $auditChanged[3] -ne '+- Cells: Status, Implementation commit' -or
-    $auditChanged[4] -notmatch '^\+- Implementation commit: [0-9a-f]{40}$') {
-    throw 'M1_R3_LEDGER_AUDIT_HUNK_INVALID'
-}
-```
+**What this does not relax.** Every hard denial, the A-Hybrid boundary, `ScriptedMockLLM` determinism, the frozen `SPEC.md` content, the no-push rule, and the requirement to observe real output before claiming a pass are unchanged. Removing ceremony is not authority to skip a red test, skip a review, merge a failing check, or claim an unobserved result. The `AGENT_LOG.md` entry stays mandatory but should be concise: the seven course-required fields, not a transcript.
 
 ### Corrective Worktrees and PR Order
 
@@ -185,7 +116,7 @@ The 29-57 hour total is a forecast including task/module reviews but excluding o
 
 Each task uses a fresh implementation subagent in the named worktree. Before production edits, the implementer records the base SHA, complete failing command/node IDs, observed failure, and intended changed paths in `AGENT_LOG.md`. It then writes the minimum implementation, runs the focused green selector plus the task type/diff checks, records the complete observed red/green evidence and stages that `AGENT_LOG.md` entry with the task files. A fresh spec-compliance reviewer runs first; only after it passes does a different fresh code-quality reviewer run. The reviewer identities, findings, fixes, and pass evidence are recorded and staged before the implementation commit.
 
-Any code or test edit after *either* review invalidates both review results. The implementer restarts the complete ordered sequence for the affected task: add or restore an exact failing assertion for the changed behavior and capture its red output, run focused green and required checks, obtain a new spec-compliance review, then obtain a new code-quality review. A quality-review fix may not be accepted by rerunning quality review alone. Only then create one Conventional Commit carrying the exact `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers required below; it includes the task's `AGENT_LOG.md` evidence.
+A code or test edit made in response to a review re-runs the focused green selector and only the review whose contract it touched; it does not restart the other review. An edit that changes behavior outside both reviews' findings needs its own observed red assertion first, then both reviews. Then create one Conventional Commit carrying the exact `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers required below; it includes the task's `AGENT_LOG.md` evidence.
 
 The immutable task/module mapping is:
 
@@ -372,9 +303,9 @@ For R3-02 through R3-04, after every task review and implementation commit run f
 
 R3-05 is created only after R3-01 through R3-04 merge. After every R3-05 task review and implementation commit, run the same commands from the replacement M1-08 worktree plus every focused model, secret-policy, Git inventory, runtime-lock, WorkerLoop, Grant, and granted-mutation selector above. After R3-05's final task and before its PR closeout review, run that complete all-selector sequence once more from its already corrected-`main` base; this is the whole-M1 closeout run.
 
-Record exact outputs, skips by platform, elapsed time, changed paths, commit map, agent/human attribution, and current `SPEC.md`/`PLAN.md` digests. The `make test`, `make lint`, and `make secret-scan` entry points do not exist in M1 and are not claimed; Task 35A/Task 34 remain their future owners. Each R3 PR reviewer inspects its exact changed-path diff for credential-like material without printing suspected values, receives its ordered module spec/quality reviews, and requires the existing `quality`, `unit-ubuntu`, and `unit-windows` checks green. Only after the R3-05 whole-M1 closeout run dispatch a fresh whole-M1 spec-compliance reviewer; only after it passes dispatch a different whole-M1 code-quality reviewer. A critical finding that is within an existing task's contract returns to that task and restarts its complete red/green -> spec review -> quality review sequence, followed by both whole-M1 reviews. A finding requiring new scope stops implementation: revise the static contract, obtain a new independent digest review and owner `GO`, then create a new mapped task; never add an unreviewed ledger row or closeout fixup.
+Record exact outputs, skips by platform, changed paths, commit map, and agent/human attribution. The `make test`, `make lint`, and `make secret-scan` entry points do not exist in M1 and are not claimed; Task 35A/Task 34 remain their future owners. Each R3 PR reviewer inspects its exact changed-path diff for credential-like material without printing suspected values, receives its ordered module spec/quality reviews, and requires the existing `quality`, `unit-ubuntu`, and `unit-windows` checks green. After R3-05's final task, run one whole-M1 closeout regression and one ordered pair of whole-M1 reviews: spec-compliance first, then code quality. A critical finding within an existing task's contract returns to that task and re-runs its red/green plus the review whose contract it touched. A finding requiring new scope adds a new mapped ledger row with its own red/green and ordered reviews; it is never a silent closeout fixup.
 
-M1 closes only when all corrective/replacement PRs are merged, PR #8 is closed unmerged, `main` contains the reviewed commit map, both whole-M1 reviews report zero critical findings, all required local/hosted checks are observed green, and the owner records `M1 COMPLETE` against the exact `main` SHA. Until then, M2-M4 remain unauthorized.
+M1 closes when all corrective/replacement PRs are merged, PR #8 is closed unmerged, `main` contains the commit map, both whole-M1 reviews report zero critical findings, and all required local/hosted checks are observed green. M2 may then start directly from its task list.
 
 ## Global Constraints
 
@@ -389,7 +320,7 @@ M1 closes only when all corrective/replacement PRs are merged, PR #8 is closed u
 - Hard-deny workspace escape, symlink/reparse traversal, `.git/**`, `.apexcrew/**`, effective secret paths, raw shell, host network, Docker socket, push, reset, clean, force, and target mutation outside Admission's final typed CAS.
 - Freeze Plan and Policy at `ACTIVE`; a risky effect needs an exact, one-use Grant. A command replay or direct runtime call never creates new mutation authority.
 - The deadline remains 2026-08-10 23:59 Asia/Shanghai and nominal capacity remains 30-40 hours/week. On 2026-08-03, R3 correction/replay is forecast at 29-57 implementation/review hours before owner PR administration. Do not claim that this fits the remaining window without a new observed capacity decision; report `HOLD` when it does not.
-- After the M1-R3 gate passes, new implementation authority is exactly `M1-FIX-001` through `M1-FIX-008`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. Existing Tasks 1-13 remain historical merged evidence subject to the explicit acceptance gate. Original Task 14-17 commits remain rejected PR #8 evidence. M2-M4 need their own exact revision, independent document review, and owner `GO` before any of their files may be retained.
+- Current implementation authority is `M1-FIX-001` through `M1-FIX-008`, `TASK-014R` through `TASK-016R`, and `TASK-017R-A` through `TASK-017R-D`. Existing Tasks 1-13 remain historical merged evidence. Original Task 14-17 commits remain rejected PR #8 evidence. M2-M4 execute from a task list written at the granularity stated in the Streamlined Execution Protocol; they no longer require a separate independently reviewed revision or an owner `GO` record, but every retained control in that protocol still binds each of their tasks.
 - GitHub is the sole delivery remote. Do not configure an NJU or GitLab remote. The minimal `.github/workflows/ci.yml` already exists on `main`; R3 does not remove either trigger or broaden workflow authority. M3 Task 35A remains future roadmap.
 - No task authorizes push, publication, credentials, GitHub Pages enablement, workflow-permission changes, or a Runtime Grant. Every reviewed local R3 module still stops for explicit owner authorization before its first push. This host has no `gh` CLI, so PR creation is an owner action in the authenticated GitHub Web UI unless the owner separately authorizes another route.
 - Safety-bearing private helpers must have an explicit owning-task contract for expected-sequence CAS, locking, revision/Budget binding, settle-once authority, dispatch closure, and state transitions. The R2 helper inventory below remains historical input; R3 may add only the platform lock/mutation and ID-source helpers explicitly authorized above, with tests at their public module seams.
@@ -30332,7 +30263,7 @@ Every committed execution slice owns exactly one dated `AGENT_LOG.md` heading in
 
 ## Required Evidence Per Commit
 
-Before every task commit, append one dated `AGENT_LOG.md` entry containing the unique task label, implementation subagent identity, failing command/result, passing command/result, spec-review identity/result, quality-review identity/result, critical fixes and rechecks, human changes, exact changed paths, unresolved external input, pre-task/base SHA, and intended Conventional Commit subject. Stage that task evidence in its exact task commit. The module-close aggregation sentence is historical M1-R2 only. For M1-R3, after each task commit run `git rev-parse HEAD`, immediately apply the binding R3 Mutable Commit Ledger procedure in a separate two-file documentation commit, and leave no unstaged or staged diff before the next task. Never amend a task in an attempt to include its own SHA.
+Before every task commit, append one dated `AGENT_LOG.md` entry containing the unique task label, implementation subagent identity, failing command/result, passing command/result, spec-review identity/result, quality-review identity/result, critical fixes, human changes, exact changed paths, and intended Conventional Commit subject. Keep it concise; these are the course-required fields, not a transcript. Stage that task evidence in its exact task commit. Under the Streamlined Execution Protocol, ledger rows are updated in one batched `docs(plan): record <module> task commits` commit at module close rather than a separate two-file commit per task. Never amend a task in an attempt to include its own SHA.
 
 Local red/green evidence is observed before commit. Hosted same-revision CI is inherently post-commit and remains pending until the applicable reviewed milestone and external gate. Do not claim a pass without observed output. No task authorizes push, publication, credentials, or release state.
 
@@ -30352,7 +30283,7 @@ Local red/green evidence is observed before commit. Hosted same-revision CI is i
 
 ## M1-R3 Mutable Commit Ledger (Evidence Only)
 
-Static-contract rules above govern this EOF data table. Only the cells expressly permitted there may change after `M1 GO`.
+This is the continuously updated task ledger required by course brief section 4.7. Mark a row `COMPLETED` with its observed 40-character SHA as each task lands; rows are batched into one documentation commit at module close.
 
 | R3 task | Module | Status | Implementation commit |
 | --- | --- | --- | --- |
@@ -30371,3 +30302,34 @@ Static-contract rules above govern this EOF data table. Only the cells expressly
 | `TASK-017R-B` POSIX no-follow granted mutations | R3-05 | NOT STARTED | Not created |
 | `TASK-017R-C` Windows no-follow granted mutations | R3-05 | NOT STARTED | Not created |
 | `TASK-017R-D` granted-action recovery composition | R3-05 | NOT STARTED | Not created |
+
+## M1-M4 Sprint Commit Ledger (2026-08-04)
+
+This mutable ledger records the SPRINT execution requested by the owner. It does
+not relabel the historical R3 ledger above. Each row has its task commit and the
+depth/known boundary used for the claim.
+
+| SPRINT task | Depth | Status | Implementation commit | Verification boundary |
+| --- | --- | --- | --- | --- |
+| S1 reservation inventory | REAL | COMPLETED | `3ab39aa750f256a7abd735984cae055968fcde23` + correction `d54d6d06356a7f6f3a57e6d334f1185349ffdda9` | focused integration green; hosted Linux correction green |
+| S2 Worker/tools integration | REAL | COMPLETED | `e72bfea48abb3c23075587f3f0a98eddcb2795c8` | full offline regression green |
+| S3 granted mutation handles | REAL | COMPLETED | `8b5d7f4b68a8865e28c37637587fc27fd8efb28b` + correction `3d10d04d3e7fbf3418e3efac351ea51e1b632d5b` | TOCTOU recovery coverage; hosted Linux correction green |
+| S4 runtime lock debt | STUB | COMPLETED | `82513d489583779ab1436043598ea1eba5fe97f6` | invalid Permit zero-change green |
+| S5 Context Capsule / Receipt | SKELETON | COMPLETED | `815fe75b21757e413a90be1cd788019d8c284594` | focused evidence green |
+| S6 Freshness / candidate promotion | SKELETON | COMPLETED | `509def8b80c57f93c2e10600ca0a8a8c03ff09dc` | stale evidence rejected |
+| S7 frozen candidate / Grant / CAS | SKELETON | COMPLETED | `6edfea409180c70e4bd5545440ba16d1b3afb534` | binding/replay checks green |
+| S8 crash recovery paths | SKELETON | COMPLETED | `0c79762e9b22b091cc1374a5ab69f9c02887ec18` | observable-state matrix green |
+| S9 multi-intent resolution | STUB | COMPLETED | `e284c2e6a1cb9abc288e4dc7dd2f4fd98b02a2d9` | `INDETERMINATE` fail closed |
+| S10 reservation cleanup / tombstone | SKELETON | COMPLETED | `cb3ec0d67da5408e53ae0d27a1eb5de409b81f2b` | idempotence green |
+| S11 retention / redaction | STUB | COMPLETED | `e32927c82ed12cd775e326708311d06763a65659` | export/eviction denied |
+| S12 CLI | REAL | COMPLETED | `eab0ea4d29358c8f1fc60189deb9a633c8c367b7` | help and CLI contract green |
+| S13 restricted executor | SKELETON | COMPLETED | `278c0077184107e819a96ffe3bf68b491a232103` | constrained argv green |
+| S14 unit-drift fixtures | SKELETON | COMPLETED | `4d1c30ab397891cfaa0c3715545ad03330e17c54` | fixture contract green |
+| S15 mechanism demo | REAL | COMPLETED | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` + correction `ee15003` | two bound ScriptedMockLLM calls and deterministic trace observed |
+| S16 replay / read-only WebUI | SKELETON | COMPLETED | `fafbd369019455087a529f54cdee1683d37f7389` | projection/read route green |
+| S17 secret scan | REAL | COMPLETED | `8793268462a3f47b1b244eabee6353690354b666` | tracked tree/history clean |
+| S18 packaging / CI | REAL | COMPLETED | `ed22d3cd3a7d733a945567150ab9d0dd2402ba56` + correction `7bec4386f7cf0b1d9f2948993f325486afe1c800` + acceptance `1fac0a38da0b51a5bb67950116c1585c58aa466b` | `make build` and restricted image runtime verified; hosted push/PR CI pass at `6f60219a124a0cd6cd8884b8745bba410c345eb4` |
+| S19 README / SECURITY / debt | REAL | COMPLETED | `9434715cd86fd42657fa3f11580faa7eb71b987e` | documentation contract green |
+| S20 OpenAI adapter | SKELETON | COMPLETED | `2b71a8cbfee82814cb49b664b6452d55e4cb9ece` | offline call denied |
+| S21 static WebUI deployment | SKELETON | COMPLETED | `5feb82f8c21ef40331b4336e65dce7b307239bb4` | bundle generated |
+| S22 design workbench | STUB | COMPLETED | `aef591522bac228d0c9b2511b665f7b441de5282` | non-executing document green |

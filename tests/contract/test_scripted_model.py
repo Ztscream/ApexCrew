@@ -22,8 +22,8 @@ def test_scripted_model_consumes_one_completion_without_network(
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "2" * 64,
@@ -34,8 +34,8 @@ def test_scripted_model_consumes_one_completion_without_network(
     )
     completion = ModelCompletion(
         response_id="response-1",
-        requested_model_id="gpt-5.6-terra",
-        returned_model_id="gpt-5.6-terra",
+        requested_model_id="deepseek-v4-flash",
+        returned_model_id="deepseek-v4-flash",
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action={"kind": "finish"},
     )
@@ -50,8 +50,8 @@ def test_scripted_model_rejects_unbound_nonempty_input() -> None:
     raw_result = ProviderAttemptResult.completed(
         ModelCompletion(
             response_id="response-1",
-            requested_model_id="gpt-5.6-terra",
-            returned_model_id="gpt-5.6-terra",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
             usage=ModelUsage(120, 12, Decimal("0.00048")),
             normalized_action={"kind": "finish"},
         )
@@ -68,8 +68,8 @@ def test_scripted_model_rejects_a_different_request_without_consuming_the_step()
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "2" * 64,
@@ -81,8 +81,8 @@ def test_scripted_model_rejects_a_different_request_without_consuming_the_step()
     response = ProviderAttemptResult.completed(
         ModelCompletion(
             response_id="response-1",
-            requested_model_id="gpt-5.6-terra",
-            returned_model_id="gpt-5.6-terra",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
             usage=ModelUsage(120, 12, Decimal("0.00048")),
             normalized_action={"kind": "finish"},
         )

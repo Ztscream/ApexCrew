@@ -329,6 +329,22 @@ The first amendment to the frozen specification. Revision 1, SHA-256 `2F1434AB29
 
 **What this revision does not do**: it authorizes no implementation, gives no `M1 GO`, and does not address review blockers 4-10, which are plan defects belonging to the M1-R2 revision.
 
+## Specification Revision 3 - approved and applied (2026-08-05)
+
+The second amendment to the frozen specification. Revision 2, SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, signed 2026-07-31, is superseded but remains the authoritative identity for every decision recorded before this point, including the whole of M1 and the M1-M4 sprint delivered under it.
+
+**Revision 3**: SHA-256 `E4385008CD75E4E3B0E70B25A6EBDFD976F3E1031F2ACD81FF0B6284EF6668AB`, 131,813 bytes, 636 lines.
+
+**Basis**: proposal `docs/proposals/0002-replace-model-provider-with-deepseek.md`, raised because the owner elected to change the model provider and provider identity is frozen text rather than configuration. The owner approved the replacement and authorized the edit on 2026-08-05.
+
+**Applied changes**, 7 insertions and 7 deletions across sections 2, 3, 4, 10.1, 10.2, and 12. Line count is deliberately unchanged at 636 so that every existing line-number citation in `AGENT_LOG.md`, `SPEC_PROCESS.md`, and `PLAN.md` remains valid:
+
+1. **Provider identity.** Lines 25, 61, 137, 469, 473, and 569 now name the DeepSeek Responses API and `deepseek-v4-flash` in place of the OpenAI Responses API and `gpt-5.6-terra`, reached through an OpenAI-compatible client pinned to the DeepSeek base URL. The headless CI credential variable becomes `APEXCREW_DEEPSEEK_API_KEY`. The exact-returned-ID allowlist still has exactly one member, so line 198's `RETURNED_MODEL_MISMATCH` machinery is unchanged in force and the provider's dated `DeepSeek-V4-Flash-0731` build is **not** pre-authorized.
+2. **Pricing snapshot.** Line 493 now maps to the 2026-08-05 `deepseek-v4-flash` peak-hour rates, USD 0.28 per million input tokens and USD 0.56 per million output tokens, pinned at peak rather than standard so published time-of-day pricing variation cannot under-reserve a Run crossing a peak boundary. Provider-reported reasoning tokens are declared output tokens for both the output ceiling and cost. Worst-case reservation against the token ceilings falls from USD 8.00 to USD 0.672. The USD 10 table maximum and every other non-raiseable cap are unchanged.
+3. **Silently ignored request parameters.** Line 469 now states that because this provider silently ignores unsupported request parameters instead of rejecting them, no safety property may rest on a request parameter alone; the adapter derives every settlement input from the observed response, and an absent or unexpected completion status, returned model ID, usage object, or schema-conformant payload is a closed failure releasing no output. This also makes the provider's own documentation conflict over `text.format: json_schema` support harmless, because a non-conformant payload fails closed either way.
+
+**What this revision does not do**: it authorizes no live provider call. Section 10.1's credential rules and `PLAN.md` line 359's separately authorized smoke both remain in force, and the credential boundary they presuppose does not exist in `src/` yet. No `src/` file required modification for this revision, because model IDs and prices already travel as data through `allowed_model_ids` and `BudgetRevisionDocument.pricing_entries`.
+
 **Consequence for the rejected M1-R1 candidate**: its `Frozen input` gate requires revision 1's digest, so that plan now fails its own precondition and cannot be executed. This is the intended outcome; M1-R2 must cite revision 2.
 
 ### Standing qualification on the revision-1 sign-off

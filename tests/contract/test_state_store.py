@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier, Event, Lock
 
 import pytest
 from helpers.application import (
@@ -18,13 +19,30 @@ from helpers.application import (
 from apexcrew.adapters.model.scripted import ScriptedMockLLM, ScriptedModelStep
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.state.sqlite import SqliteStateStore
-from apexcrew.domain.admission import TargetReservationCreationOutcome
+from apexcrew.domain.actions import (
+    CheckAction,
+    FinishAction,
+    PatchAction,
+    ReadAction,
+    RiskyAction,
+    SearchAction,
+)
+from apexcrew.domain.admission import (
+    RefEffectBinding,
+    RefPathBinding,
+    StartGuardBinding,
+    StartGuardDecision,
+    TargetReservationCreationOutcome,
+)
 from apexcrew.domain.authority import (
     AuthorityService,
+    AuthorizationDecision,
+    AuthorizationRequest,
     CheckpointKey,
     ModelReservationRequest,
     MonotonicInstant,
     TaskAuthority,
+    confirmation_code_for_pending_digest,
 )
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -34,9 +52,13 @@ from apexcrew.domain.commands import (
     BeginPlanningPayload,
     CommandEnvelope,
     CommandOutcome,
+    GrantPayload,
     PausePayload,
     ProposePolicyPayload,
+    RevisionApprovalPreview,
+    RevisionApprovalResult,
     RunStop,
+    StartPayload,
 )
 from apexcrew.domain.effects import (
     AuditEvent,
@@ -69,6 +91,7 @@ from apexcrew.domain.revisions import (
     ModelPricingEntryDocument,
     revision_digest,
 )
+from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -83,6 +106,7 @@ from apexcrew.domain.types import (
     RuntimeOwnerId,
     TaskId,
 )
+from apexcrew.domain.worker import WorkerTurnBinding, normalized_action_digest
 
 
 def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
@@ -92,7 +116,7 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id="deepseek-v4-flash",
         allowed_model_ids=frozenset(allowed_model_ids),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
@@ -115,12 +139,12 @@ def make_authority(store: SqliteStateStore, run_id: str) -> AuthorityService:
         output_token_ceiling=200_000,
         cost_reserve_usd=Decimal(10),
         concurrent_worker_ceiling=3,
-        pricing_observed_on=datetime(2026, 7, 26, tzinfo=UTC).date(),
+        pricing_observed_on=datetime(2026, 8, 5, tzinfo=UTC).date(),
         pricing_entries=(
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal("15.00"),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     )
@@ -134,7 +158,7 @@ def planning_reservation_request(
 ) -> ModelReservationRequest:
     budget_digest, _ = store.current_approved_budget(run_id)
     request = replace(
-        make_model_request({"gpt-5.6-terra"}),
+        make_model_request({"deepseek-v4-flash"}),
         run_id=run_id,
         budget_digest=budget_digest,
         request_digest="sha256:" + ("a" if run_id == "run-a" else "b") * 64,
@@ -173,7 +197,7 @@ def test_sqlite_authority_model_reservation_is_run_bound_and_stale_safe(
         calls=1,
         input_tokens=1_000,
         output_tokens=200,
-        cost_usd=Decimal("0.0055"),
+        cost_usd=Decimal("0.000392"),
     )
     assert stale.decision == "DENY"
     assert stale.reason == "STALE_SEQUENCE"
@@ -214,8 +238,8 @@ def test_sqlite_authorized_model_attempt_retries_preserve_requested_model_anchor
         ProviderAttemptResult.completed(
             ModelCompletion(
                 response_id="response-2",
-                requested_model_id="gpt-5.6-terra",
-                returned_model_id="gpt-5.6-terra",
+                requested_model_id="deepseek-v4-flash",
+                returned_model_id="deepseek-v4-flash",
                 usage=ModelUsage(120, 12, Decimal("0.00048")),
                 normalized_action={"kind": "finish"},
             )
@@ -234,8 +258,8 @@ def test_sqlite_authorized_model_attempt_retries_preserve_requested_model_anchor
     )
 
     assert [attempt.request.requested_model_id for attempt in attempts] == [
-        "gpt-5.6-terra",
-        "gpt-5.6-terra",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash",
     ]
     assert recovered.outcome == "COMPLETED"
     assert recovered.normalized_action == {"kind": "finish"}
@@ -367,7 +391,7 @@ def test_task_stop_cap_is_not_caller_selectable(
 
 def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.db"
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     first = SqliteStateStore(database)
     before = first.audit_sequence(request.run_id)
     intent = first.reserve_model_request(request, expected_sequence=before)
@@ -378,13 +402,13 @@ def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:
     assert restored.intent_id == intent.intent_id
     assert restored.logical_turn_id == intent.logical_turn_id
     assert restored.request.request_digest == request.request_digest
-    assert restored.request.allowed_model_ids == frozenset({"gpt-5.6-terra"})
+    assert restored.request.allowed_model_ids == frozenset({"deepseek-v4-flash"})
     assert reopened.reserved_call_count(request.run_id) == 1
 
 
 def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
     request = replace(
-        make_model_request(allowed_model_ids={"gpt-5.6-terra"}),
+        make_model_request(allowed_model_ids={"deepseek-v4-flash"}),
         owner_kind="WORKER",
         task_id=TaskId("task-1"),
         attempt_id=AttemptId("attempt-1"),
@@ -405,7 +429,7 @@ def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
 def test_sqlite_model_backoff_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.db"
     store = SqliteStateStore(database)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     turn, intent = store.begin_model_turn_and_reserve(
         request, expected_sequence=store.audit_sequence(request.run_id)
     )
@@ -434,11 +458,11 @@ def test_requested_model_mismatch_round_trips_for_each_state_store(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     completion = ModelCompletion(
         response_id="response-requested-model-mismatch",
         requested_model_id="gpt-5.6-mini",
-        returned_model_id="gpt-5.6-terra",
+        returned_model_id="deepseek-v4-flash",
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action={"kind": "finish"},
     )
@@ -456,7 +480,7 @@ def test_requested_model_mismatch_round_trips_for_each_state_store(
     assert len(attempts) == 1
     assert attempts[0].request.requested_model_id == request.requested_model_id
     assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
-    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.returned_model_id == "deepseek-v4-flash"
     assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
     assert attempts[0].reported_usage == completion.usage
 
@@ -467,7 +491,7 @@ def test_model_attempt_cannot_be_settled_twice(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     _, intent = store.begin_model_turn_and_reserve(
         request, expected_sequence=store.audit_sequence(request.run_id)
     )
@@ -489,7 +513,7 @@ def test_unjournaled_model_attempt_cannot_be_settled(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     turn = LogicalModelTurn.new(request)
     intent = ModelRequestIntent.reserve(turn, request)
     with pytest.raises(StateConflict, match="MODEL_ATTEMPT_BINDING_MISMATCH"):
@@ -507,7 +531,7 @@ def test_model_reservation_and_counters_roll_back_together(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     before = store.audit_sequence(request.run_id)
     store.fail_next_commit_after_state_write_for_test()
     with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):
@@ -588,6 +612,470 @@ def seed_command_run(
             phase="ALLOCATED",
         ),
     )
+
+
+def worker_binding(
+    *, run_id: RunId, attempt_id: str, budget_digest: RevisionDigest
+) -> WorkerTurnBinding:
+    digest = "sha256:" + "1" * 64
+    return WorkerTurnBinding(
+        run_id=run_id,
+        task_id=TaskId("task-worker"),
+        attempt_id=AttemptId(attempt_id),
+        tranche_id="tranche-worker",
+        lease_id=f"lease-{attempt_id}",
+        lease_generation=int(attempt_id.rsplit("-", maxsplit=1)[-1]),
+        admissible_head="1" * 40,
+        task_contract_digest=digest,
+        plan_digest=RevisionDigest(digest),
+        policy_digest=RevisionDigest(digest),
+        budget_digest=budget_digest,
+        model_configuration_digest=RevisionDigest(digest),
+        tool_schema_digest=digest,
+        target_safety_digest=digest,
+        credential_profile="default",
+        repository_id="repository-worker",
+        snapshot_digest=digest,
+        scope_digest=digest,
+        dependency_fingerprint_basis=digest,
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_worker_malformed_actions_fail_attempt_release_lease_and_pause_identically(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-worker-invalid")
+    seed_command_run(store, tmp_path, str(run_id))
+    make_authority(store, str(run_id))
+    budget_digest, _ = store.current_approved_budget(run_id)
+    action_digest = "sha256:" + "9" * 64
+
+    for number in range(1, 4):
+        current = worker_binding(
+            run_id=run_id,
+            attempt_id=f"attempt-{number}",
+            budget_digest=budget_digest,
+        )
+        store.install_worker_attempt_for_test(current)
+        decision = store.record_malformed_worker_action(
+            binding=current,
+            logical_turn_id=f"turn-{number}",
+            action_digest=action_digest,
+            recovered_marker=None,
+            permit=None,
+            expected_sequence=store.audit_sequence(run_id),
+        )
+        assert decision.attempt_state == "FAILED"
+        assert store.attempt(current.attempt_id).state == "FAILED"
+        assert store.active_lease_for_task(current.task_id) is None
+
+    assert decision.task_state == "PAUSED"
+    assert decision.pause_reason == "REPEATED_INVALID_ACTION"
+    assert store.invalid_action_count(TaskId("task-worker")) == 3
+    assert store.task_record(TaskId("task-worker")).state == "PAUSED"
+
+
+def _worker_authorization_request(
+    binding: WorkerTurnBinding,
+    *,
+    action: PatchAction | CheckAction | FinishAction | RiskyAction,
+    action_id: str,
+    logical_turn_id: str,
+    expected_sequence: AuditSequence,
+) -> tuple[AuthorizationRequest, ActionPreState]:
+    prestate = ActionPreState(source_digest="sha256:" + "4" * 64)
+    started_at = datetime.now(UTC)
+    request = AuthorizationRequest(
+        run_id=binding.run_id,
+        task_id=binding.task_id,
+        attempt_id=binding.attempt_id,
+        logical_turn_id=logical_turn_id,
+        action_id=action_id,
+        action=action,
+        authority_origin="WORKER",
+        action_digest=normalized_action_digest(action),
+        expected_prestate_digest="sha256:"
+        + sha256(prestate.canonical_json().encode("utf-8")).hexdigest(),
+        lease_id=binding.lease_id,
+        lease_generation=binding.lease_generation,
+        admissible_head=binding.admissible_head,
+        task_contract_digest=binding.task_contract_digest,
+        plan_digest=binding.plan_digest,
+        policy_digest=binding.policy_digest,
+        budget_digest=binding.budget_digest,
+        model_configuration_digest=binding.model_configuration_digest,
+        tool_schema_digest=binding.tool_schema_digest,
+        target_safety_digest=binding.target_safety_digest,
+        started_at_utc=started_at,
+        deadline_at_utc=started_at + timedelta(seconds=600 if action.kind == "check" else 120),
+        expected_sequence=expected_sequence,
+    )
+    return request, prestate
+
+
+def _worker_allow_decision(request: AuthorizationRequest) -> AuthorizationDecision:
+    action_class = {
+        "check": "DECLARED_CHECK",
+        "finish": "FINISH",
+        "patch": "PATCH",
+    }[request.action.kind]
+    return AuthorizationDecision(
+        decision="ALLOW",
+        reason="AUTHORIZED",
+        run_id=request.run_id,
+        task_id=request.task_id,
+        attempt_id=request.attempt_id,
+        action_id=request.action_id,
+        action_digest=request.action_digest,
+        binding_digest="sha256:" + "8" * 64,
+        action_class=action_class,
+        approved_timeout_seconds=600 if request.action.kind == "check" else 120,
+        deadline_at_utc=request.deadline_at_utc,
+        persistence="WITH_EFFECT_INTENT",
+        effect_intent_id=None,
+        pending_action_id=None,
+        resulting_sequence=None,
+    )
+
+
+def _worker_approval_decision(request: AuthorizationRequest) -> AuthorizationDecision:
+    return AuthorizationDecision(
+        decision="REQUIRE_APPROVAL",
+        reason="APPROVAL_REQUIRED",
+        run_id=request.run_id,
+        task_id=request.task_id,
+        attempt_id=request.attempt_id,
+        action_id=request.action_id,
+        action_digest=request.action_digest,
+        binding_digest="sha256:" + "8" * 64,
+        action_class="RISKY",
+        approved_timeout_seconds=120,
+        deadline_at_utc=request.deadline_at_utc,
+        persistence="WITH_PENDING_ACTION",
+        effect_intent_id=None,
+        pending_action_id=None,
+        resulting_sequence=None,
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_granted_action_journal_contract_is_atomic_and_restart_safe(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    target_authority = StoreTargetAuthority(store)
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    created = store.apply_control_command(
+        make_create_run_command(request_id="granted-contract-create"),
+        target_authority,
+        repository_authority,
+    )
+    assert created.run_id is not None
+    run_id = created.run_id
+    current = store.current_revision_digests(run_id)
+    approvals = (
+        (
+            "granted-contract-policy",
+            "approve_policy",
+            "POLICY",
+            current.policy_digest,
+            ApprovePolicyPayload,
+        ),
+        (
+            "granted-contract-budget",
+            "approve_budget",
+            "BUDGET",
+            current.budget_digest,
+            ApproveBudgetPayload,
+        ),
+        (
+            "granted-contract-model",
+            "approve_model_configuration",
+            "MODEL_CONFIGURATION",
+            current.model_configuration_digest,
+            ApproveModelConfigurationPayload,
+        ),
+    )
+    for request_id, command_kind, revision_class, digest, payload_type in approvals:
+        assert digest is not None
+        code = control_approval_code(command_kind, run_id, revision_class, digest)
+        if payload_type is ApprovePolicyPayload:
+            payload = payload_type(run_id=run_id, policy_digest=digest, confirmation_code=code)
+        elif payload_type is ApproveBudgetPayload:
+            payload = payload_type(run_id=run_id, budget_digest=digest, confirmation_code=code)
+        else:
+            payload = payload_type(
+                run_id=run_id,
+                model_configuration_digest=digest,
+                confirmation_code=code,
+            )
+        outcome = store.apply_control_command(
+            CommandEnvelope(
+                request_id=request_id,
+                expected_sequence=store.audit_sequence(run_id),
+                applicable_revision_digests=approved_control_bindings(store, run_id),
+                payload=payload,
+            ),
+            target_authority,
+            repository_authority,
+        )
+        assert outcome.status == CommandStatus.ACCEPTED
+    budget_digest, _ = store.current_approved_budget(run_id)
+    current = store.current_revision_digests(run_id)
+    assert current.policy_digest is not None
+    assert current.model_configuration_digest is not None
+    plan_digest = RevisionDigest("sha256:" + "1" * 64)
+    head = str(store.run_record(run_id).pinned_target_oid)
+    expected_sequence = store.audit_sequence(run_id)
+    if isinstance(store, InMemoryStateStore):
+
+        def seed_plan_and_head(copied: InMemoryStateStore) -> None:
+            copied._runs[run_id] = replace(
+                copied._runs[run_id],
+                state=RunState.ACTIVE,
+                current_plan_digest=plan_digest,
+            )
+
+    else:
+
+        def seed_plan_and_head(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                "UPDATE runs SET state = 'ACTIVE', current_plan_digest = ?, "
+                "run_head_oid = ? "
+                "WHERE run_id = ?",
+                (plan_digest, head, run_id),
+            )
+
+    store._commit_state_and_event(  # type: ignore[arg-type]
+        run_id=run_id,
+        expected_sequence=expected_sequence,
+        event=AuditEvent.kind("TEST_GRANTED_CONTRACT_PLAN_AND_HEAD_SEEDED"),
+        mutate=seed_plan_and_head,
+    )
+    binding = worker_binding(
+        run_id=run_id,
+        attempt_id="attempt-1",
+        budget_digest=budget_digest,
+    )
+    binding = replace(
+        binding,
+        admissible_head=head,
+        plan_digest=plan_digest,
+        policy_digest=current.policy_digest,
+        model_configuration_digest=current.model_configuration_digest,
+    )
+    store.install_worker_attempt_for_test(binding)
+    action = RiskyAction(operation="delete", path="src/old.py")
+    request, prestate = _worker_authorization_request(
+        binding,
+        action=action,
+        action_id="action-granted-contract",
+        logical_turn_id="turn-granted-contract",
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    decision = _worker_approval_decision(request)
+    frozen = store.freeze_authorized_pending_action(
+        request=request,
+        decision=decision,
+        expected_prestate=prestate,
+        recovered_marker=None,
+        permit=None,
+        expected_sequence=request.expected_sequence,
+    )
+    pending = store.pending_action(frozen.pending_id)
+    command = CommandEnvelope(
+        request_id="grant-contract",
+        expected_sequence=store.audit_sequence(run_id),
+        applicable_revision_digests=binding.applicable_revision_digests,
+        payload=GrantPayload(
+            run_id=run_id,
+            pending_action_id=pending.pending_id,
+            pending_action_digest=pending.pending_action_digest,
+            confirmation_code=confirmation_code_for_pending_digest(pending.pending_action_digest),
+        ),
+    )
+    store.fail_next_commit_after_state_write_for_test()
+    with pytest.raises(StateCommitFault):
+        store.accept_pending_action_grant(
+            command=command,
+            now=request.started_at_utc + timedelta(seconds=1),
+            expected_sequence=store.audit_sequence(run_id),
+        )
+    assert store.pending_action(pending.pending_id) == pending
+    assert store.approval_grant_count(pending.pending_id) == 0
+    assert store.granted_intent_count(pending.pending_id) == 0
+    assert store.unconsumed_permit_count(run_id) == 0
+
+    intent = store.accept_pending_action_grant(
+        command=command,
+        now=request.started_at_utc + timedelta(seconds=1),
+        expected_sequence=store.audit_sequence(run_id),
+    )
+
+    assert intent is not None
+    assert store.approval_grant_count(pending.pending_id) == 1
+    assert store.granted_intent_count(pending.pending_id) == 1
+    assert store.pending_action(pending.pending_id).state == "GRANT_CONSUMED"
+    assert store.next_unsettled_granted_action(run_id) == intent
+    replayed = store.apply_control_command(command, target_authority, repository_authority)
+    assert replayed.status == CommandStatus.ACCEPTED
+    assert store.approval_grant_count(pending.pending_id) == 1
+    assert store.granted_intent_count(pending.pending_id) == 1
+    assert store.unconsumed_permit_count(run_id) == 1
+    if isinstance(store, SqliteStateStore):
+        store.close()
+        store = SqliteStateStore(tmp_path / "state.db")
+        assert store.next_unsettled_granted_action(run_id) == intent
+
+    dispatched = store.mark_granted_action_dispatched(
+        run_id=run_id,
+        intent_id=intent.intent_id,
+        applicable_revision_digests=binding.applicable_revision_digests,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    settled_sequence = store.settle_granted_action(
+        run_id=run_id,
+        intent_id=intent.intent_id,
+        result=ToolResult(code="DELETED", run_id=run_id, intent_id=intent.intent_id),
+        applicable_revision_digests=binding.applicable_revision_digests,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+
+    assert dispatched.state == "DISPATCHED"
+    assert settled_sequence == store.audit_sequence(run_id)
+    assert store.next_unsettled_granted_action(run_id) is None
+    assert store.pending_action(pending.pending_id).state == "SETTLED"
+    assert store.effect_for_pending(pending.pending_id).state == "SETTLED"
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_worker_action_intent_result_and_feedback_are_bound_identically(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-worker-action")
+    seed_command_run(store, tmp_path, str(run_id))
+    make_authority(store, str(run_id))
+    budget_digest, _ = store.current_approved_budget(run_id)
+    binding = worker_binding(
+        run_id=run_id,
+        attempt_id="attempt-1",
+        budget_digest=budget_digest,
+    )
+    store.install_worker_attempt_for_test(binding)
+    action = CheckAction(check_id="task-check-1")
+    request, prestate = _worker_authorization_request(
+        binding,
+        action=action,
+        action_id="action-1",
+        logical_turn_id="turn-1",
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    decision = _worker_allow_decision(request)
+    intent = ToolIntent.for_authorized_worker_action(
+        intent_id=IntentId("intent-worker-1"),
+        run_id=run_id,
+        task_id=binding.task_id,
+        attempt_id=binding.attempt_id,
+        action_id=request.action_id,
+        action=action,
+        authorization_binding_digest=decision.binding_digest,
+        applicable_revision_digests=binding.applicable_revision_digests,
+        repository_id=binding.repository_id,
+        snapshot_digest=binding.snapshot_digest,
+        scope_digest=binding.scope_digest,
+        dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
+        idempotency_key=f"worker-tool:{run_id}:{binding.attempt_id}:turn-1",
+        expected_prestate_json=prestate.canonical_json(),
+    )
+    assert (
+        store.record_authorized_worker_action(
+            intent=intent,
+            request=request,
+            decision=decision,
+            expected_prestate=prestate,
+            recovered_marker=None,
+            permit=None,
+            expected_sequence=request.expected_sequence,
+        )
+        == intent
+    )
+    with pytest.raises(StateConflict, match="WORKER_ACTION_DUPLICATE"):
+        store.record_authorized_worker_action(
+            intent=intent,
+            request=request,
+            decision=decision,
+            expected_prestate=prestate,
+            recovered_marker=None,
+            permit=None,
+            expected_sequence=store.audit_sequence(run_id),
+        )
+    result = ToolResult(
+        code="CHECK_FAILED",
+        run_id=run_id,
+        intent_id=intent.intent_id,
+        passed=False,
+        bounded_payload={
+            "output": "expected 3.00, received 2.99",
+            "output_bytes": len(b"expected 3.00, received 2.99"),
+            "snapshot_digest": binding.snapshot_digest,
+        },
+    )
+    store.settle_worker_action(
+        intent=intent,
+        authorization=decision,
+        result=result,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    assert "expected 3.00" in (store.latest_worker_feedback(binding.attempt_id) or "")
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_worker_finish_succeeds_and_releases_lease_identically(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-worker-finish")
+    seed_command_run(store, tmp_path, str(run_id))
+    make_authority(store, str(run_id))
+    budget_digest, _ = store.current_approved_budget(run_id)
+    binding = worker_binding(
+        run_id=run_id,
+        attempt_id="attempt-1",
+        budget_digest=budget_digest,
+    )
+    store.install_worker_attempt_for_test(binding)
+    action = FinishAction(summary="done")
+    request, _ = _worker_authorization_request(
+        binding,
+        action=action,
+        action_id="action-finish",
+        logical_turn_id="turn-finish",
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    decision = _worker_allow_decision(request)
+
+    result = store.finish_attempt(
+        binding=binding,
+        logical_turn_id=request.logical_turn_id,
+        action=action,
+        action_digest=request.action_digest,
+        authorization=decision,
+        recovered_marker=None,
+        permit=None,
+        expected_sequence=request.expected_sequence,
+    )
+
+    assert result.code == "ACTION_RECORDED"
+    assert store.attempt(binding.attempt_id).state == "SUCCEEDED"
+    assert store.task_record(binding.task_id).state == "SUCCEEDED"
+    assert store.active_lease_for_task(binding.task_id) is None
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
@@ -853,6 +1341,773 @@ def test_control_transaction_rolls_back_complete_bootstrap_state(
     assert accepted.status == CommandStatus.ACCEPTED
     assert accepted.run_id is not None
     assert store.target_reservation_count(accepted.run_id) == 1
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+def test_target_reservation_id_source_retries_collisions_and_exhausts_closed(
+    tmp_path: Path, backend: str
+) -> None:
+    first_id = "reservation-" + "1" * 32
+    second_id = "reservation-" + "2" * 32
+    values = iter((first_id, second_id, *(first_id for _ in range(16))))
+    calls = 0
+
+    def source() -> str:
+        nonlocal calls
+        calls += 1
+        return next(values)
+
+    def make_store(
+        path: Path, id_source: Callable[[], object]
+    ) -> InMemoryStateStore | SqliteStateStore:
+        if backend == "memory":
+            return InMemoryStateStore(target_reservation_id_source=id_source)
+        return SqliteStateStore(path, target_reservation_id_source=id_source)
+
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    store = make_store(tmp_path / "state.db", source)
+    target_authority = StoreTargetAuthority(store)
+    first_command = make_create_run_command(request_id="reservation-first")
+    first = store.apply_control_command(first_command, target_authority, repository_authority)
+    second_command = make_create_run_command(request_id="reservation-second")
+    second = store.apply_control_command(second_command, target_authority, repository_authority)
+    assert first.status == second.status == CommandStatus.ACCEPTED
+    assert first.run_id is not None
+    assert second.run_id is not None
+    assert store.target_reservation_for_run(first.run_id).reservation_id == first_id
+    assert store.target_reservation_for_run(second.run_id).reservation_id == second_id
+
+    before_sequences = (
+        store.audit_sequence(first.run_id),
+        store.audit_sequence(second.run_id),
+    )
+    before_revisions = (
+        store.current_revision_digests(first.run_id),
+        store.current_revision_digests(second.run_id),
+    )
+    exhausted_command = make_create_run_command(request_id="reservation-exhausted")
+    exhausted = store.apply_control_command(
+        exhausted_command, target_authority, repository_authority
+    )
+    assert exhausted.status == CommandStatus.CONFLICT
+    assert exhausted.run_id is None
+    assert exhausted.resulting_sequence is None
+    assert exhausted.failed_invariant == "TARGET_RESERVATION_ID_EXHAUSTED"
+    assert calls == 18
+    assert store.run_count() == 2
+    assert (
+        store.target_reservation_count(first.run_id),
+        store.target_reservation_count(second.run_id),
+    ) == (1, 1)
+    assert (
+        store.audit_sequence(first.run_id),
+        store.audit_sequence(second.run_id),
+    ) == before_sequences
+    assert (
+        store.current_revision_digests(first.run_id),
+        store.current_revision_digests(second.run_id),
+    ) == before_revisions
+    assert (
+        store.apply_control_command(exhausted_command, target_authority, repository_authority)
+        == exhausted
+    )
+    assert calls == 18
+
+    reused_request = exhausted_command.model_copy(
+        update={"payload": exhausted_command.payload.model_copy(update={"goal": "changed"})}
+    )
+    reuse = store.apply_control_command(reused_request, target_authority, repository_authority)
+    assert reuse.status == CommandStatus.CONFLICT
+    assert reuse.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
+    assert reuse.run_id is None
+    assert reuse.resulting_sequence is None
+
+    invalid_values = iter(("reservation-" + "A" * 32,))
+    invalid_calls = 0
+
+    def invalid_source() -> str:
+        nonlocal invalid_calls
+        invalid_calls += 1
+        return next(invalid_values)
+
+    invalid_store = make_store(tmp_path / "invalid.db", invalid_source)
+    invalid_authority = StoreTargetAuthority(invalid_store)
+    invalid_command = make_create_run_command(request_id="reservation-invalid")
+    invalid = invalid_store.apply_control_command(
+        invalid_command, invalid_authority, repository_authority
+    )
+    assert invalid.status == CommandStatus.CONFLICT
+    assert invalid.run_id is None
+    assert invalid.resulting_sequence is None
+    assert invalid.failed_invariant == "TARGET_RESERVATION_ID_SOURCE_INVALID"
+    assert invalid_store.run_count() == 0
+    assert (
+        invalid_store.apply_control_command(
+            invalid_command, invalid_authority, repository_authority
+        )
+        == invalid
+    )
+    assert invalid_calls == 1
+
+    non_string_calls = 0
+
+    def non_string_source() -> object:
+        nonlocal non_string_calls
+        non_string_calls += 1
+        return 42
+
+    non_string_store = make_store(tmp_path / "non-string.db", non_string_source)
+    non_string_authority = StoreTargetAuthority(non_string_store)
+    non_string_command = make_create_run_command(request_id="reservation-non-string")
+    non_string = non_string_store.apply_control_command(
+        non_string_command, non_string_authority, repository_authority
+    )
+    assert non_string.status == CommandStatus.CONFLICT
+    assert non_string.run_id is None
+    assert non_string.resulting_sequence is None
+    assert non_string.failed_invariant == "TARGET_RESERVATION_ID_SOURCE_INVALID"
+    assert non_string_store.run_count() == 0
+    assert (
+        non_string_store.apply_control_command(
+            non_string_command, non_string_authority, repository_authority
+        )
+        == non_string
+    )
+    assert non_string_calls == 1
+
+    empty_calls = 0
+
+    def exhausted_source() -> str:
+        nonlocal empty_calls
+        empty_calls += 1
+        raise StopIteration
+
+    empty_store = make_store(tmp_path / "empty.db", exhausted_source)
+    empty_authority = StoreTargetAuthority(empty_store)
+    empty_command = make_create_run_command(request_id="reservation-source-empty")
+    source_exhausted = empty_store.apply_control_command(
+        empty_command, empty_authority, repository_authority
+    )
+    assert source_exhausted.status == CommandStatus.CONFLICT
+    assert source_exhausted.run_id is None
+    assert source_exhausted.resulting_sequence is None
+    assert source_exhausted.failed_invariant == "TARGET_RESERVATION_ID_EXHAUSTED"
+    assert empty_store.run_count() == 0
+    assert (
+        empty_store.apply_control_command(empty_command, empty_authority, repository_authority)
+        == source_exhausted
+    )
+    assert empty_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("backend", "source_values", "expected_status"),
+    (
+        (
+            "memory",
+            ("reservation-" + "F" * 32, "reservation-" + "a" * 32),
+            CommandStatus.CONFLICT,
+        ),
+        (
+            "sqlite",
+            ("reservation-" + "F" * 32, "reservation-" + "a" * 32),
+            CommandStatus.CONFLICT,
+        ),
+        (
+            "memory",
+            ("reservation-" + "a" * 32, "reservation-" + "F" * 32),
+            CommandStatus.ACCEPTED,
+        ),
+        (
+            "sqlite",
+            ("reservation-" + "a" * 32, "reservation-" + "F" * 32),
+            CommandStatus.ACCEPTED,
+        ),
+    ),
+)
+def test_concurrent_create_run_arbitrates_bootstrap_receipts(
+    tmp_path: Path,
+    backend: str,
+    source_values: tuple[str, str],
+    expected_status: CommandStatus,
+) -> None:
+    values = iter(source_values)
+    source_lock = Lock()
+    source_calls = 0
+
+    def source() -> str:
+        nonlocal source_calls
+        with source_lock:
+            source_calls += 1
+            return next(values)
+
+    if backend == "memory":
+        primary: InMemoryStateStore | SqliteStateStore = InMemoryStateStore(
+            target_reservation_id_source=source
+        )
+        stores = (primary, primary)
+        closable: tuple[SqliteStateStore, ...] = ()
+    else:
+        first = SqliteStateStore(tmp_path / "state.db", target_reservation_id_source=source)
+        second = SqliteStateStore(tmp_path / "state.db", target_reservation_id_source=source)
+        primary = first
+        stores = (first, second)
+        closable = (first, second)
+    command = make_create_run_command(request_id=f"concurrent-create-{backend}-{expected_status}")
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+    barrier = Barrier(2)
+
+    def apply(store: InMemoryStateStore | SqliteStateStore) -> CommandOutcome:
+        barrier.wait()
+        return store.apply_control_command(
+            command,
+            StoreTargetAuthority(store),
+            repository_authority,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = tuple(executor.map(apply, stores))
+        assert outcomes[0] == outcomes[1]
+        outcome = outcomes[0]
+        assert outcome.status == expected_status
+        assert source_calls == 1
+        replay = primary.apply_control_command(
+            command,
+            StoreTargetAuthority(primary),
+            repository_authority,
+        )
+        assert replay == outcome
+        assert source_calls == 1
+        if expected_status == CommandStatus.CONFLICT:
+            assert outcome.run_id is None
+            assert outcome.resulting_sequence is None
+            assert outcome.failed_invariant == "TARGET_RESERVATION_ID_SOURCE_INVALID"
+            assert primary.run_count() == 0
+        else:
+            assert outcome.run_id is not None
+            assert outcome.resulting_sequence == 1
+            assert primary.run_count() == 1
+            assert primary.audit_sequence(outcome.run_id) == 1
+            assert primary.target_reservation_count(outcome.run_id) == 1
+    finally:
+        for store in closable:
+            store.close()
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("create_wins", (True, False))
+def test_control_request_id_arbitrates_bootstrap_and_normal_commands(
+    tmp_path: Path, backend: str, create_wins: bool
+) -> None:
+    source_calls = 0
+    source_entered = Event()
+    release_source = Event()
+    create_ready = Event()
+    release_create = Event()
+
+    def invalid_source() -> str:
+        nonlocal source_calls
+        source_calls += 1
+        source_entered.set()
+        assert release_source.wait(timeout=5)
+        return "reservation-" + "F" * 32
+
+    if backend == "memory":
+        primary: InMemoryStateStore | SqliteStateStore = InMemoryStateStore(
+            target_reservation_id_source=invalid_source
+        )
+        create_store = primary
+        normal_store = primary
+        closable: tuple[SqliteStateStore, ...] = ()
+    else:
+        database = tmp_path / "state.db"
+        create_store = SqliteStateStore(database, target_reservation_id_source=invalid_source)
+        normal_store = SqliteStateStore(database)
+        primary = create_store
+        closable = (create_store, normal_store)
+
+    run_id = RunId("run-shared-request")
+    seed_command_run(primary, tmp_path, str(run_id))
+    request_id = f"shared-bootstrap-normal-{backend}-{create_wins}"
+    create_command = make_create_run_command(request_id=request_id)
+    normal_command = make_pause_command(
+        request_id=request_id,
+        expected_sequence=1,
+        run_id=str(run_id),
+        reason="shared request id",
+    )
+    repository_authority = FixtureRepositoryBootstrapAuthorityService()
+
+    def apply_create() -> CommandOutcome:
+        if not create_wins:
+            create_ready.set()
+            assert release_create.wait(timeout=5)
+        return create_store.apply_control_command(
+            create_command,
+            StoreTargetAuthority(create_store),
+            repository_authority,
+        )
+
+    def apply_normal() -> CommandOutcome:
+        return normal_store.apply_control_command(
+            normal_command,
+            StoreTargetAuthority(normal_store),
+            repository_authority,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            create_future = executor.submit(apply_create)
+            if create_wins:
+                assert source_entered.wait(timeout=5)
+                normal_future = executor.submit(apply_normal)
+                release_source.set()
+            else:
+                assert create_ready.wait(timeout=5)
+                normal_future = executor.submit(apply_normal)
+                normal = normal_future.result(timeout=5)
+                release_create.set()
+            create = create_future.result(timeout=5)
+            normal = normal_future.result(timeout=5)
+
+        if create_wins:
+            assert create.status == CommandStatus.CONFLICT
+            assert create.failed_invariant == "TARGET_RESERVATION_ID_SOURCE_INVALID"
+            assert normal.status == CommandStatus.CONFLICT
+            assert normal.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
+            assert source_calls == 1
+            assert primary.audit_sequence(run_id) == 1
+            assert (
+                primary.apply_control_command(
+                    create_command,
+                    StoreTargetAuthority(primary),
+                    repository_authority,
+                )
+                == create
+            )
+        else:
+            assert normal.status == CommandStatus.INVALID
+            assert normal.failed_invariant == "COMMAND_NOT_AVAILABLE_IN_TASK_10"
+            assert normal.run_id == run_id
+            assert normal.resulting_sequence == 2
+            assert create.status == CommandStatus.CONFLICT
+            assert create.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
+            assert source_calls == 0
+            assert primary.audit_sequence(run_id) == 2
+            assert (
+                primary.apply_control_command(
+                    normal_command,
+                    StoreTargetAuthority(primary),
+                    repository_authority,
+                )
+                == normal
+            )
+        assert primary.run_count() == 1
+        assert primary.target_reservation_count(run_id) == 1
+        assert source_calls == (1 if create_wins else 0)
+    finally:
+        release_source.set()
+        release_create.set()
+        for store in closable:
+            store.close()
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("identical", (True, False))
+def test_concurrent_ordinary_control_commands_claim_before_sequence_check(
+    tmp_path: Path, backend: str, identical: bool
+) -> None:
+    if backend == "memory":
+        primary: InMemoryStateStore | SqliteStateStore = InMemoryStateStore()
+        stores = (primary, primary)
+        closable: tuple[SqliteStateStore, ...] = ()
+    else:
+        database = tmp_path / "state.db"
+        first = SqliteStateStore(database)
+        second = SqliteStateStore(database)
+        primary = first
+        stores = (first, second)
+        closable = (first, second)
+
+    run_id = RunId("run-ordinary-race")
+    seed_command_run(primary, tmp_path, str(run_id))
+    request_id = f"ordinary-race-{backend}-{identical}"
+    first_command = make_pause_command(
+        request_id=request_id,
+        expected_sequence=1,
+        run_id=str(run_id),
+        reason="first",
+    )
+    second_command = (
+        first_command
+        if identical
+        else make_pause_command(
+            request_id=request_id,
+            expected_sequence=1,
+            run_id=str(run_id),
+            reason="second",
+        )
+    )
+    gate = Barrier(2)
+    gate_lock = Lock()
+    gated_calls = 0
+
+    def install_gate(store: InMemoryStateStore | SqliteStateStore) -> None:
+        nonlocal gated_calls
+        original = store._existing_control_outcome
+
+        def gated(command: CommandEnvelope) -> CommandOutcome | None:
+            nonlocal gated_calls
+            outcome = original(command)
+            if outcome is not None:
+                return outcome
+            with gate_lock:
+                should_wait = gated_calls < 2
+                gated_calls += 1
+            if should_wait:
+                gate.wait(timeout=5)
+            return None
+
+        store._existing_control_outcome = gated  # type: ignore[method-assign]
+
+    for store in dict.fromkeys(stores):
+        install_gate(store)
+
+    def apply(
+        store: InMemoryStateStore | SqliteStateStore, command: CommandEnvelope
+    ) -> CommandOutcome:
+        return store.apply_control_command(
+            command,
+            StoreTargetAuthority(store),
+            FixtureRepositoryBootstrapAuthorityService(),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(apply, stores[0], first_command)
+            second_future = executor.submit(apply, stores[1], second_command)
+            first = first_future.result(timeout=5)
+            second = second_future.result(timeout=5)
+
+        if identical:
+            assert first == second
+            assert first.status == CommandStatus.INVALID
+            assert first.failed_invariant == "COMMAND_NOT_AVAILABLE_IN_TASK_10"
+            assert first.resulting_sequence == 2
+        else:
+            outcomes = (first, second)
+            winner = next(
+                outcome for outcome in outcomes if outcome.status == CommandStatus.INVALID
+            )
+            loser = next(
+                outcome for outcome in outcomes if outcome.status == CommandStatus.CONFLICT
+            )
+            assert winner.failed_invariant == "COMMAND_NOT_AVAILABLE_IN_TASK_10"
+            assert winner.resulting_sequence == 2
+            assert loser.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
+            assert loser.run_id == run_id
+            assert loser.resulting_sequence == 2
+        assert primary.audit_sequence(run_id) == 2
+        assert primary.run_record(run_id).state == RunState.DRAFT
+        assert (
+            primary.apply_control_command(
+                first_command,
+                StoreTargetAuthority(primary),
+                FixtureRepositoryBootstrapAuthorityService(),
+            )
+            == first
+        )
+        assert (
+            primary.apply_control_command(
+                second_command,
+                StoreTargetAuthority(primary),
+                FixtureRepositoryBootstrapAuthorityService(),
+            )
+            == second
+        )
+    finally:
+        for store in closable:
+            store.close()
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_request_id_reuse_with_result_never_validates_against_new_payload(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-result-reuse")
+    seed_command_run(store, tmp_path, str(run_id))
+    original = CommandEnvelope(
+        request_id="result-reuse",
+        expected_sequence=1,
+        payload=ProposePolicyPayload(run_id=run_id, policy_revision=fixture_policy()),
+    )
+    accepted = CommandOutcome.for_payload(
+        original.payload,
+        status=CommandStatus.ACCEPTED,
+        run_id=run_id,
+        resulting_sequence=AuditSequence(2),
+        result=RevisionApprovalResult(
+            approvals=(
+                RevisionApprovalPreview(
+                    revision_kind="policy",
+                    revision_digest=RevisionDigest("sha256:" + "b" * 64),
+                    confirmation_code="ABC123",
+                ),
+            )
+        ),
+    )
+    assert store.record_command(original, accepted) == accepted
+
+    changed = make_pause_command(
+        request_id=original.request_id,
+        expected_sequence=1,
+        run_id=str(run_id),
+        reason="different payload",
+    )
+    conflict = store.apply_control_command(
+        changed,
+        StoreTargetAuthority(store),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert conflict.status == CommandStatus.CONFLICT
+    assert conflict.failed_invariant == "IDEMPOTENCY_KEY_REUSE"
+    assert conflict.run_id == run_id
+    assert conflict.resulting_sequence == 2
+    assert store.audit_sequence(run_id) == 2
+
+
+class _CountingStartGuard:
+    def __init__(self, decision: StartGuardDecision) -> None:
+        self._decision = decision
+        self.calls = 0
+
+    def inspect(
+        self,
+        *,
+        run_id: RunId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> StartGuardDecision:
+        self.calls += 1
+        return self._decision
+
+
+def _start_guard_binding(
+    store: InMemoryStateStore | SqliteStateStore,
+    run_id: RunId,
+    current: ApplicableRevisionDigests,
+    *,
+    pinned_target_oid: GitOid | None = None,
+) -> StartGuardBinding:
+    run = store.run_record(run_id)
+    reservation = store.target_reservation_for_run(run_id)
+    absent = RefPathBinding(state="ABSENT")
+    return StartGuardBinding(
+        run_id=run_id,
+        repository_id=run.repository_id,
+        target_reservation_id=reservation.reservation_id,
+        pinned_target_oid=run.pinned_target_oid if pinned_target_oid is None else pinned_target_oid,
+        target_safety_digest=store.target_authority_digest(run_id),
+        ref_effect_binding=RefEffectBinding(
+            repository_instance_digest=run.repository_instance_digest,
+            checkout_registration_digest="sha256:" + "c" * 64,
+            ref_file=absent,
+            ref_lock=absent,
+            reflog=absent,
+            reflog_lock=absent,
+            reflog_exists=False,
+            reflog_message="ApexCrew initialize run head",
+        ),
+        applicable_revision_digests=current,
+    )
+
+
+def _prepare_startable_run(
+    store: InMemoryStateStore | SqliteStateStore, tmp_path: Path
+) -> tuple[RunId, ApplicableRevisionDigests]:
+    created = store.apply_control_command(
+        make_create_run_command(request_id="start-guard-create"),
+        StoreTargetAuthority(store),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert created.run_id is not None
+    run_id = created.run_id
+    expected = store.audit_sequence(run_id)
+    plan_digest = RevisionDigest("sha256:" + "d" * 64)
+    approval = PlanApproval(
+        run_id=run_id,
+        plan_digest=plan_digest,
+        approval_request_id="start-guard-plan-approval",
+        approval_sequence=AuditSequence(expected + 1),
+        binding_digest="sha256:" + "e" * 64,
+    )
+
+    if isinstance(store, InMemoryStateStore):
+
+        def mutate_memory(copied: InMemoryStateStore) -> None:
+            copied._runs[run_id] = replace(
+                copied._runs[run_id],
+                state=RunState.READY_TO_START,
+                current_plan_digest=plan_digest,
+            )
+            copied._plan_approvals[run_id] = approval
+
+        mutate = mutate_memory
+    else:
+
+        def mutate_sqlite(connection: sqlite3.Connection) -> None:
+            assert (
+                connection.execute(
+                    "UPDATE runs SET state = ?, current_plan_digest = ? WHERE run_id = ?",
+                    (RunState.READY_TO_START, plan_digest, run_id),
+                ).rowcount
+                == 1
+            )
+            connection.execute(
+                "INSERT INTO plan_approvals(run_id, plan_digest, approval_request_id, "
+                "approval_sequence, binding_digest) VALUES (?, ?, ?, ?, ?)",
+                (
+                    approval.run_id,
+                    approval.plan_digest,
+                    approval.approval_request_id,
+                    approval.approval_sequence,
+                    approval.binding_digest,
+                ),
+            )
+
+        mutate = mutate_sqlite
+
+    store._commit_state_and_event(
+        run_id=run_id,
+        expected_sequence=expected,
+        event=AuditEvent.kind("TEST_START_READY"),
+        mutate=mutate,
+    )
+    return run_id, store.current_revision_digests(run_id)
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_start_guard_terminal_outcomes_are_globally_replayed(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id, current = _prepare_startable_run(store, tmp_path)
+    expected = store.audit_sequence(run_id)
+    valid_guard = _CountingStartGuard(
+        StartGuardDecision(ok=True, binding=_start_guard_binding(store, run_id, current))
+    )
+    mismatched_guard = _CountingStartGuard(
+        StartGuardDecision(
+            ok=True,
+            binding=_start_guard_binding(
+                store,
+                run_id,
+                current,
+                pinned_target_oid=GitOid("f" * 40),
+            ),
+        )
+    )
+    denied_guard = _CountingStartGuard(StartGuardDecision(ok=False, reason="PRIVATE_REF_CONFLICT"))
+    cases = (
+        (
+            "plan-binding",
+            RevisionDigest("sha256:" + "a" * 64),
+            valid_guard,
+            CommandStatus.STALE,
+            "PLAN_APPROVAL_BINDING_MISMATCH",
+        ),
+        (
+            "unavailable",
+            current.plan_digest,
+            None,
+            CommandStatus.CONFLICT,
+            "START_GUARD_UNAVAILABLE",
+        ),
+        (
+            "denied",
+            current.plan_digest,
+            denied_guard,
+            CommandStatus.CONFLICT,
+            "PRIVATE_REF_CONFLICT",
+        ),
+        (
+            "binding-mismatch",
+            current.plan_digest,
+            mismatched_guard,
+            CommandStatus.STALE,
+            "START_GUARD_BINDING_MISMATCH",
+        ),
+    )
+    for suffix, plan_digest, initial_guard, status, failed_invariant in cases:
+        command = CommandEnvelope(
+            request_id=f"start-guard-{suffix}",
+            expected_sequence=expected,
+            applicable_revision_digests=current,
+            payload=StartPayload(run_id=run_id, plan_digest=plan_digest),
+        )
+        first = store.apply_control_command(
+            command,
+            StoreTargetAuthority(store),
+            FixtureRepositoryBootstrapAuthorityService(),
+            initial_guard,
+        )
+        assert first.status == status
+        assert first.failed_invariant == failed_invariant
+        assert first.run_id == run_id
+        assert first.resulting_sequence == expected
+        assert store.audit_sequence(run_id) == expected
+
+        replay_guard = _CountingStartGuard(
+            StartGuardDecision(ok=True, binding=_start_guard_binding(store, run_id, current))
+        )
+        assert (
+            store.apply_control_command(
+                command,
+                StoreTargetAuthority(store),
+                FixtureRepositoryBootstrapAuthorityService(),
+                replay_guard,
+            )
+            == first
+        )
+        assert replay_guard.calls == 0
+        assert store.audit_sequence(run_id) == expected
+
+
+def test_sqlite_create_run_claim_precedes_bootstrap_rows(tmp_path: Path) -> None:
+    store = SqliteStateStore(tmp_path / "state.db")
+    statements: list[str] = []
+    store._connection.set_trace_callback(statements.append)
+    try:
+        accepted = store.apply_control_command(
+            make_create_run_command(request_id="create-claim-first"),
+            StoreTargetAuthority(store),
+            FixtureRepositoryBootstrapAuthorityService(),
+        )
+    finally:
+        store._connection.set_trace_callback(None)
+
+    assert accepted.status == CommandStatus.ACCEPTED
+    upper = tuple(statement.upper() for statement in statements)
+    claim_index = next(
+        index
+        for index, statement in enumerate(upper)
+        if "INSERT INTO CONTROL_REQUEST_CLAIMS" in statement
+    )
+    for table in (
+        "RUN_SEQUENCES",
+        "RUNS",
+        "TARGET_RESERVATIONS",
+        "RUN_BOOTSTRAP_INPUTS",
+        "REVISION_DOCUMENTS",
+    ):
+        bootstrap_index = next(
+            index for index, statement in enumerate(upper) if f"INSERT INTO {table}" in statement
+        )
+        assert claim_index < bootstrap_index
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
@@ -1435,3 +2690,126 @@ def test_unsettled_intents_have_identical_deterministic_order(
     store.record_intent(first, AuditSequence(0))
     store.record_intent(second, AuditSequence(1))
     assert store.unsettled_intents(run_id) == (first, second)
+
+
+def make_contract_tool_intent(
+    *, intent_id: str, action: ReadAction | SearchAction | PatchAction | CheckAction
+) -> ToolIntent:
+    digest = "sha256:" + "1" * 64
+    return ToolIntent.for_authorized_worker_action(
+        intent_id=IntentId(intent_id),
+        run_id=RunId("run-tool-contract"),
+        task_id=TaskId("task-1"),
+        attempt_id=AttemptId("attempt-1"),
+        action_id=intent_id,
+        action=action,
+        authorization_binding_digest=digest,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        repository_id="repository-1",
+        snapshot_digest=digest,
+        scope_digest=digest,
+        dependency_fingerprint_basis=digest,
+        idempotency_key=f"tool:{intent_id}",
+        expected_prestate_json="{}",
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_read_and_search_tool_intents_use_the_same_effect_journal_contract(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    documents = (
+        make_contract_tool_intent(intent_id="intent-read", action=ReadAction(path="src/a.py")),
+        make_contract_tool_intent(
+            intent_id="intent-search",
+            action=SearchAction(query="name", paths=("src/**",)),
+        ),
+    )
+    effects = tuple(
+        document.to_effect_intent(AuditSequence(index + 1))
+        for index, document in enumerate(documents)
+    )
+    for index, effect in enumerate(effects):
+        store.record_intent(effect, AuditSequence(index))
+        assert (
+            ToolIntent.from_effect_intent(store.effect_intent(effect.intent_id)) == documents[index]
+        )
+    assert (
+        tuple(
+            ToolIntent.from_effect_intent(effect)
+            for effect in store.unsettled_intents(documents[0].run_id)
+        )
+        == documents
+    )
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_patch_and_check_tool_documents_use_the_same_effect_journal_contract(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    patch = make_contract_tool_intent(
+        intent_id="intent-patch",
+        action=PatchAction(path="src/a.py", unified_diff="@@ -1 +1 @@\n-old\n+new\n"),
+    )
+    check = make_contract_tool_intent(
+        intent_id="intent-check",
+        action=CheckAction(check_id="task-check-1"),
+    )
+    patch_effect = patch.to_effect_intent(AuditSequence(1))
+    check_effect = check.to_effect_intent(AuditSequence(2))
+    store.record_intent(patch_effect, AuditSequence(0))
+    store.record_intent(check_effect, AuditSequence(1))
+    result = ToolResult(
+        code="CHECK_PASSED",
+        run_id=check.run_id,
+        intent_id=check.intent_id,
+        passed=True,
+        bounded_payload={"snapshot_digest": check.snapshot_digest, "timing_ms": 10},
+    )
+    store.settle_intent(
+        check.run_id,
+        check.intent_id,
+        result.to_effect_result(AuditSequence(3)),
+        check.applicable_revision_digests,
+        AuditSequence(2),
+    )
+
+    assert ToolIntent.from_effect_intent(store.effect_intent(patch.intent_id)) == patch
+    assert store.effect_result(check.intent_id).result_class == "CHECK_PASSED"
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_timed_out_check_cannot_be_settled_as_passing(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    check = make_contract_tool_intent(
+        intent_id="intent-timeout-forged-pass",
+        action=CheckAction(check_id="task-check-1"),
+    )
+    effect = check.to_effect_intent(AuditSequence(1))
+    store.record_intent(effect, AuditSequence(0))
+    forged = ToolResult.model_construct(
+        code="CHECK_PASSED",
+        run_id=check.run_id,
+        intent_id=check.intent_id,
+        passed=True,
+        timed_out=True,
+        matches=(),
+        bounded_payload={"snapshot_digest": check.snapshot_digest},
+        content_digest=None,
+    ).to_effect_result(AuditSequence(2))
+
+    with pytest.raises(StateConflict, match="CHECK_RESULT_BINDING_INVALID"):
+        store.settle_intent(
+            check.run_id,
+            check.intent_id,
+            forged,
+            check.applicable_revision_digests,
+            AuditSequence(1),
+        )

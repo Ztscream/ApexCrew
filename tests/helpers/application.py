@@ -237,7 +237,7 @@ def fixture_budget(
     *,
     active_run_seconds_ceiling: int = 28_800,
     model_call_ceiling: int = 240,
-    priced_model: str = "mock-model",
+    priced_model: str = "deepseek-v4-flash",
 ) -> BudgetRevisionDocument:
     return BudgetRevisionDocument(
         schema_version="budget-revision-v1",
@@ -247,21 +247,21 @@ def fixture_budget(
         model_call_ceiling=model_call_ceiling,
         input_token_ceiling=2_000_000,
         output_token_ceiling=200_000,
-        cost_reserve_usd=Decimal(10),
+        cost_reserve_usd=Decimal(1),
         concurrent_worker_ceiling=3,
-        pricing_observed_on=date(2026, 7, 26),
+        pricing_observed_on=date(2026, 8, 5),
         pricing_entries=(
             ModelPricingEntryDocument(
                 returned_model_id=priced_model,
-                input_usd_per_million=Decimal(1),
-                output_usd_per_million=Decimal(1),
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     )
 
 
 def fixture_model_configuration(
-    model_id: str = "mock-model",
+    model_id: str = "deepseek-v4-flash",
 ) -> ModelConfigurationRevisionDocument:
     return ModelConfigurationRevisionDocument(
         schema_version="model-configuration-revision-v1",
@@ -512,7 +512,7 @@ def make_approve_budget_replacement(app: ApplicationFixture, run_id: RunId) -> C
 
 
 def make_priced_model_replacement(app: ApplicationFixture, run_id: RunId) -> CommandEnvelope:
-    model = fixture_model_configuration("mock-model")
+    model = fixture_model_configuration("deepseek-v4-flash")
     app.proposed_model_digest = revision_digest(model)
     return _envelope(
         "priced-model",

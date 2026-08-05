@@ -1,0 +1,6 @@
+unit-test:
+  image: python:3.12
+  script:
+    - pip install uv
+    - uv sync --frozen --all-groups
+    - uv run pytest -q
