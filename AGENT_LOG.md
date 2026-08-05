@@ -1944,6 +1944,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A context cleanup SHA`.
 
+## 2026-08-06 / R4-01A Kant final ancestor-priority correction
+
+- **Task**: bounded R4-01A final ancestor-check exception-priority correction after Kant quality review of `67b7088`; scope remains guard error aggregation.
+- **Quality-review finding**: Kant found the final `assert_name_bindings()` could replace an earlier `CONTROL_PATH_IDENTITY_CHANGED` after an interleaved root replacement.
+- **Correction**: fold the final ancestor check into the same primary-error aggregation, attach the later check failure as a note, and add an interleaved identity/close regression test.
+- **Observed verification**: focused guard/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
 ## 2026-08-06 / R4-01A Ohm final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `fc174e6` and implementation `27d2230`.

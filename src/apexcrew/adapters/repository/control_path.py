@@ -159,7 +159,13 @@ class ControlPathGuard:
                     primary_error = cleanup_error
                 else:
                     primary_error.add_note(f"control probe cleanup failed: {cleanup_error}")
-        self._tree.assert_name_bindings()
+        try:
+            self._tree.assert_name_bindings()
+        except (OSError, RepositoryUnsafeError) as final_error:
+            if primary_error is None:
+                primary_error = final_error
+            else:
+                primary_error.add_note(f"final ancestor check failed: {final_error}")
         if primary_error is not None:
             raise primary_error
 

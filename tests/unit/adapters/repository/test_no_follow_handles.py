@@ -69,6 +69,7 @@ class _RecordingBackend:
         self.closed_names: list[str] = []
         self.fail_close_handles: set[int] = set()
         self.fail_close_names: set[str] = set()
+        self.replace_repo_on_control_close = False
 
     @property
     def opened_components(self) -> list[tuple[int, str]]:
@@ -145,6 +146,8 @@ class _RecordingBackend:
         self.closed_handles.append(node.handle)
         if node.components:
             self.closed_names.append(node.components[-1])
+            if node.components[-1] == ".apexcrew" and self.replace_repo_on_control_close:
+                self.replace_name_binding(("repo",), 999)
 
     def every_open_has(self, flags: int) -> bool:
         return all(item.flags & flags == flags for item in self.opens)
@@ -301,6 +304,20 @@ def test_control_path_guard_context_preserves_primary_error_when_cleanup_fails()
         guard._assert_entry(control, "config.json", None)
 
     backend.fail_close_names.remove("config.json")
+    guard.close()
+
+
+def test_control_path_guard_preserves_primary_error_when_final_ancestor_check_fails() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    guard.ensure()
+    backend.replace_name_binding(("config.json",), 999)
+    backend.replace_repo_on_control_close = True
+
+    with pytest.raises(RepositoryUnsafeError, match="CONTROL_PATH_IDENTITY_CHANGED") as error:
+        guard.assert_current()
+
+    assert any("final ancestor check failed" in note for note in error.value.__notes__)
     guard.close()
 
 
