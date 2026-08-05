@@ -1883,3 +1883,10 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A control probe SHA`.
+
+## 2026-08-06 / R4-01A Aquinas final spec review
+
+- **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.
+- **Reviewer**: Aquinas; verdict `PASS`.
+- **Observed result**: Aquinas confirmed pre-materialization ancestor preflight, stable state binding, independent/retryable cleanup for all temporary/control/owned handles, POSIX no-follow/fd opening, Windows delete/rename denial, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
+- **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
