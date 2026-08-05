@@ -1559,7 +1559,7 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 
 - **Task**: A1 — measure test coverage without enforcing a threshold.
 - **Implementation subagent**: Codex.
-- **Observed verification**: `make coverage` passed with 491 passed, 8 skipped, and 1 existing warning in 48.39s. Total coverage was 77% (12,741 statements; 2,888 missed). Package distribution from `coverage.xml`: `src.apexcrew` 91% (39/43), `adapters` 68% (1,308/1,931), `adapters.state` 72% (4,173/5,791), `application` 83% (336/406), `delivery` 93% (67/72), and `domain` 88% (3,643/4,125); other adapter subpackages were `credentials` 76%, `executor` 80%, and `model` 74%.
+- **Observed verification**: `make coverage` passed with 491 passed, 8 skipped, and 1 existing warning in 48.39s. Total coverage was 77% (12,741 statements; 2,888 missed). Every package row from `coverage.xml`: `src.apexcrew` 91% (39/43); `src.apexcrew.adapters` 86% (30/35); `src.apexcrew.adapters.credentials` 76% (74/97); `src.apexcrew.adapters.executor` 80% (57/71); `src.apexcrew.adapters.model` 74% (126/170); `src.apexcrew.adapters.repository` 68% (1,308/1,931); `src.apexcrew.adapters.state` 72% (4,173/5,791); `src.apexcrew.application` 83% (336/406); `src.apexcrew.delivery` 93% (67/72); and `src.apexcrew.domain` 88% (3,643/4,125).
 - **Changes**: Added `pytest-cov` to the dev group and refreshed `uv.lock`; added `make coverage` with terminal-missing and XML reports; added the quality-job coverage step and `coverage.xml` artifact upload. No threshold was set.
 - **Spec review**: PASS — measurement-only behavior, no `--cov-fail-under`, and CI artifact is produced by the quality job.
 - **Quality review**: PASS — `git diff --check` passed; no source behavior changed.
