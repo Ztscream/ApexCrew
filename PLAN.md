@@ -30352,3 +30352,89 @@ depth/known boundary used for the claim.
 | E2 TypeScript timestamp unit drift | REAL | COMPLETED (SKELETON BOUNDARY) | `05e1bab` | strict xfail reproduces E1's first boundary without re-debugging later phases |
 | Z0 granted-action read definition | REAL | COMPLETED | `7065c14` | `PLAN.md` defines read-only exact-Run/state/order/binding behavior |
 | W1 GitHub Pages deployment | REAL | COMPLETED (OWNER GATE) | `1a0af04` | `make web-build` and static WebUI tests pass; deploy is main-push gated and still requires owner Pages setup |
+
+## M1-R4 Proposed Final User Runtime Revision (2026-08-05)
+
+**Status: PROPOSED / NOT EXECUTABLE.** This section is a new M1 revision proposal for the final-user runtime objective. It does not authorize source, fixture, test, or CI changes until an independent document reviewer examines the complete revised `PLAN.md`, the owner records the reviewed digest and an explicit `M1 GO`, and the first module worktree is created from that reviewed documentation commit. `SPEC.md` remains frozen and is not changed by this proposal.
+
+### Objective
+
+Deliver the smallest complete end-user path for one user and one supported local Git repository: configure DeepSeek without exposing the credential, create a durable Run from a goal and acceptance criteria, assemble `CrewControl`, `CrewRuntime`, `RunQueries`, Coordinator, WorkerLoop, Admission, Authority, recovery, state, repository, executor, and model adapters behind the existing A-Hybrid boundary, consume a current one-use Runtime Permit, pause for exact approvals, resume after approval, and expose only a sanitized Run projection. The final target branch must remain protected by the existing typed Admission/CAS and Grant rules.
+
+### R4 Non-Negotiable Boundaries
+
+1. `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get` remain the only Run-facing application interfaces. CLI submits typed commands and never coordinates internal modules.
+2. ApexCrew owns Coordinator and WorkerLoop. DeepSeek returns one low-level structured completion and never owns tools, scheduling, approvals, budgets, or stop conditions.
+3. Real provider calls are opt-in and bounded. Normal tests, demos, builds, and CI remain offline under `ScriptedMockLLM`.
+4. Credentials are resolved at request time through the existing keyring/environment adapter, never stored in Run configuration, logs, transcripts, subprocesses, or executor environments.
+5. Runtime mutation requires a current one-use Permit. Risky repository effects require an exact Grant and Admission-issued typed CAS; the target worktree is never mutated directly.
+6. Repository commands remain structured `argv` and run only through the restricted, networkless, non-root executor against sanitized regular-file snapshots. Raw shell, symlink/reparse traversal, secret paths, `.git/**`, host network, Docker socket, push, reset, clean, and force remain hard denials.
+7. Unsupported or unobservable provider, Git, executor, recovery, and approval outcomes fail closed or become `INDETERMINATE`; no component guesses success.
+
+### R4 Module Ledger
+
+| Task | Module/worktree | Depth | Exact scope | Red/green evidence |
+| --- | --- | --- | --- | --- |
+| `R4-01` | production configuration/bootstrap | REAL | New `src/apexcrew/application/configuration.py`, new `src/apexcrew/adapters/repository/bootstrap.py`, CLI create command, focused configuration/bootstrap contracts | Invalid root/ref/config red; valid repository produces a durable typed `CreateRunPayload` with zero model calls |
+| `R4-02` | application composition root | REAL | New `src/apexcrew/application/composition.py`, model factory, production adapter wiring, no policy duplication | Offline bundle shares one state store across all three public interfaces; exploding network fake observes zero calls |
+| `R4-03` | Permit-gated CLI lifecycle | REAL | CLI create/run/approve/show, sanitized query projection, persisted bundle reopening | Create → Permit-gated run → exact approval pause → replay rejection; CLI has no direct internal coordinator calls |
+| `R4-04` | runtime ownership and repository execution | REAL | Platform file-lock adapter, production planning snapshot/tool path, restricted executor process boundary | Cross-process lock, regular-file snapshot, argv-only checks, hostile path/network/socket/credential denials |
+| `R4-05` | real DeepSeek smoke and delivery | REAL | Opt-in one-call smoke, README/SECURITY/Makefile, onboarding and release checks | Default skip without authorization; authorized run records observed response/model/usage without exposing credential |
+
+### R4-01 Production Configuration/Bootstrap Contract
+
+The implementation must introduce immutable configuration types equivalent to:
+
+```python
+@dataclass(frozen=True, slots=True)
+class RunOptions:
+    goal: str
+    constraints: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+    repository_root: Path
+    target_ref: str
+```
+
+The repository bootstrap adapter must delegate to the existing no-follow Git preflight and return observed repository identity, target ref, and target OID. It must reject a missing/non-Git root, a non-direct target ref, checkout/reservation conflicts, unsafe Git layout, unknown configuration fields, and repository-provided `.env` credential loading. The CLI create operation records no credential and dispatches no provider request.
+
+### R4-02 Composition Contract
+
+`ApplicationBundle` may expose only `control`, `runtime`, `queries`, and lifecycle cleanup. Its factory must wire SQLite, repository bootstrap, model credential source, selected `ModelPort`, `AuthorityService`, recovery, planning snapshot, Coordinator, WorkerLoop, phase drivers, and query projection. It must select `scripted_mock` only for deterministic tests and `deepseek_responses` only for an approved model configuration whose returned-model allowlist, pricing, and inference settings are complete. The factory never issues a Permit or silently approves policy/model/budget revisions.
+
+### R4-03 CLI Contract
+
+The supported workflow is:
+
+```text
+uv sync --frozen --all-groups
+uv run --python 3.12 apexcrew init --root <repo>
+uv run --python 3.12 apexcrew credentials set
+uv run --python 3.12 apexcrew run-create --root <repo> --target-ref refs/heads/main --goal "..."
+uv run --python 3.12 apexcrew run <run-id> --root <repo>
+uv run --python 3.12 apexcrew approve <run-id> --root <repo> --approval-id <exact-id>
+uv run --python 3.12 apexcrew show <run-id> --root <repo>
+```
+
+`run` must refuse with zero mutation when no current Permit exists; a valid control command must issue exactly one Permit bound to the current phase and revision, and Runtime must consume it before any mutation. `approve` must validate Run, approval identity, revision binding, nonce/generation, and expected sequence through `CrewControl`; it must never fabricate a Grant. `show` exposes only the sanitized `RunQueries` projection.
+
+### R4-04 Execution Contract
+
+The concrete runtime owner must validate the Permit before creating lock state. POSIX and Windows process ownership use platform adapters. Planning reads/searches use sanitized regular-file snapshots. Worker checks and patches use typed action envelopes and structured `argv`; the restricted runner enforces non-root identity, digest-pinned image, network none, no Docker socket, bounded resources, and no host credential. Any unsupported host capability returns a fail-closed result and remains visibly documented.
+
+### R4-05 Provider/Delivery Contract
+
+`APEXCREW_LIVE_SMOKE=1` is required for the single live DeepSeek request. The test is skipped otherwise, never runs in ordinary CI, uses no SDK retries, does not print prompt/credential bytes, and settles from observed response status, response ID, returned model ID, usage, reasoning tokens, and structured action validity. README and SECURITY must distinguish a usable local CLI from the read-only WebUI and static Pages replay.
+
+### R4 Required Verification
+
+Each R4 task gets its own worktree, failing test, observed red output, minimum implementation, focused green output, `mypy`, Ruff, diff check, ordered spec-compliance review, ordered quality review, Conventional Commit, and concise `AGENT_LOG.md` evidence. R4 closes only after the complete offline suite, opt-in live-smoke evidence or an explicitly recorded owner-authorized skip, secret scan over tracked tree and reachable history, wheel/build checks, and a reopened-process end-to-end lifecycle are observed green. The final release claim must list every remaining debt; no SKELETON/STUB is described as production-ready.
+
+### R4 Independent Review Record
+
+| Field | Value |
+| --- | --- |
+| Proposed PLAN SHA-256 | record only after this revision is complete and independently reviewed |
+| Independent reviewer | owner-dispatched fresh reviewer required |
+| Verdict | pending |
+| Owner decision | pending `M1 GO` or `HOLD` |
+| Reviewed documentation commit | pending |
