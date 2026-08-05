@@ -2041,3 +2041,45 @@ ERROR: found no collectors for C:\\Users\\29119\\Desktop\\AI4SE\\.worktrees\\m1-
 - **Changed paths**: `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_approvals.py`, and `AGENT_LOG.md`.
 - **Review status**: no spec-compliance or quality review was performed, as explicitly requested.
 - **No model, credential, network, live API, push, or PR action occurred.**
+
+## 2026-08-06 / R4-01B bounded correction red
+
+- **Task**: correct preview read-only behavior and malformed generic `approve` output after Carver spec review.
+- **Red selector**: `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py::test_revision_preview_is_read_only tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_bounded_json -q`.
+- **Complete observed failure output**:
+
+```text
+FF                                                                       [100%]
+================================== FAILURES ===================================
+_____________________ test_revision_preview_is_read_only ______________________
+...
+>       assert json.loads(result.stdout)["status"] == "APPROVAL_REJECTED"
+E       json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+...
+_______________ test_malformed_generic_approve_is_bounded_json ________________
+...
+>           assert json.loads(result.stdout) == {
+E           json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+=========================== short test summary info ============================
+FAILED tests/contract/test_cli_approvals.py::test_revision_preview_is_read_only
+FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_bounded_json
+```
+
+- **Changed paths at correction red checkpoint**: `tests/contract/test_cli_approvals.py`, `AGENT_LOG.md`.
+- **No review, provider, credential, network, live API, push, or PR action occurred.**
+
+## 2026-08-06 / R4-01B bounded correction green
+
+- **Correction**: `ControlPathGuard.open_existing_database_read_only()` now binds only existing `.apexcrew/state.db` handles, opens SQLite with `mode=ro`, and performs no control-path materialization. Preview reads the fixed current-revision column through that connection and never constructs `SqliteStateStore` or enters migrations. Generic `approve` accepts missing/unknown arguments into an explicit bounded `UNSUPPORTED_COMMAND` response without state access.
+- **Observed green evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py::test_revision_preview_is_read_only tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_bounded_json -q` -> `2 passed`.
+  - Original R4-01B selector -> `2 passed`.
+  - `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py -q` -> `4 passed`.
+  - `uv run --python 3.12 pytest tests/unit/adapters/repository/test_no_follow_handles.py tests/contract/test_repository_bootstrap.py -q` -> `54 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 57 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_cli_approvals.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests/contract/test_cli_approvals.py` -> `58 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_approvals.py`, and `AGENT_LOG.md`.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending`; no review was performed.
+- **No provider, credential, network, live API, push, or PR action occurred.**

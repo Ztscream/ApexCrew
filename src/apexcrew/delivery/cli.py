@@ -264,10 +264,14 @@ def approve_model(
     )
 
 
-@app.command("approve", hidden=True)
-def approve_legacy(run_id: str) -> None:
+@app.command(
+    "approve",
+    hidden=True,
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def approve_legacy(ctx: typer.Context, run_id: str | None = None) -> None:
     """Reject the removed generic approval command without state access."""
-    del run_id
+    del ctx, run_id
     _emit("UNSUPPORTED_COMMAND", command="approve")
     raise typer.Exit(code=2)
 
@@ -334,6 +338,24 @@ def _approval_request_id(payload: CommandPayload) -> str:
     return "cli-approval-" + digest.hexdigest()
 
 
+def _read_preview_digest(
+    connection: sqlite3.Connection,
+    run_id: RunId,
+    revision_class: Literal["POLICY", "BUDGET", "MODEL_CONFIGURATION"],
+) -> RevisionDigest:
+    column = {
+        "POLICY": "current_policy_digest",
+        "BUDGET": "current_budget_digest",
+        "MODEL_CONFIGURATION": "current_model_configuration_digest",
+    }[revision_class]
+    row = connection.execute(f"SELECT {column} FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise StateConflict("RUN_NOT_FOUND")
+    if row[0] is None:
+        raise StateConflict("REVISION_NOT_FOUND")
+    return RevisionDigest(str(row[0]))
+
+
 def _approve_revision(
     command_kind: Literal["approve_policy", "approve_budget", "approve_model_configuration"],
     revision_kind: Literal["policy", "budget", "model_configuration"],
@@ -349,16 +371,24 @@ def _approve_revision(
     try:
         run_id = RunId(run_id_text)
         with ControlPathGuard(root.resolve()) as control_paths:
-            database = control_paths.prepare_database()
-            store = SqliteStateStore(database, connection=control_paths.open_database())
-            current = store.current_revision_digests(run_id)
-            current_digest = {
-                "POLICY": current.policy_digest,
-                "BUDGET": current.budget_digest,
-                "MODEL_CONFIGURATION": current.model_configuration_digest,
-            }[revision_class]
-            if current_digest is None:
-                raise StateConflict("REVISION_NOT_FOUND")
+            if preview:
+                connection = control_paths.open_existing_database_read_only()
+                try:
+                    current_digest = _read_preview_digest(connection, run_id, revision_class)
+                finally:
+                    connection.close()
+            else:
+                database = control_paths.prepare_database()
+                store = SqliteStateStore(database, connection=control_paths.open_database())
+                current = store.current_revision_digests(run_id)
+                current_digest_candidate = {
+                    "POLICY": current.policy_digest,
+                    "BUDGET": current.budget_digest,
+                    "MODEL_CONFIGURATION": current.model_configuration_digest,
+                }[revision_class]
+                if current_digest_candidate is None:
+                    raise StateConflict("REVISION_NOT_FOUND")
+                current_digest = current_digest_candidate
             if digest_text is not None and RevisionDigest(digest_text) != current_digest:
                 _emit(
                     "APPROVAL_REJECTED",
@@ -385,6 +415,8 @@ def _approve_revision(
                     run_id=run_id_text,
                 )
                 raise typer.Exit(code=2)
+            if store is None:
+                raise StateConflict("STATE_STORE_UNAVAILABLE")
             payload = _approval_payload(command_kind, run_id, current_digest, confirmation_code)
             command = CommandEnvelope(
                 request_id=_approval_request_id(payload),

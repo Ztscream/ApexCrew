@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -55,6 +56,26 @@ def _confirmation_code(
         }
     ).encode("utf-8")
     return base64.b32encode(hashlib.sha256(value).digest()).decode("ascii")[:6]
+
+
+def _database_snapshot(
+    database: Path,
+) -> tuple[bytes, tuple[tuple[object, ...], ...], tuple[tuple[object, ...], ...]]:
+    with sqlite3.connect(database) as connection:
+        schema = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT name, type, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        )
+        audit = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT run_id, sequence, event_kind, correlation_json, payload_json "
+                "FROM audit_events ORDER BY run_id, sequence"
+            ).fetchall()
+        )
+    return database.read_bytes(), schema, audit
 
 
 def test_specialized_approval_commands_bind_exact_revision(tmp_path: Path) -> None:
@@ -147,3 +168,35 @@ def test_replayed_approval_is_side_effect_free(tmp_path: Path) -> None:
     assert replay_payload["status"] == "APPROVAL_REJECTED"
     assert replay_payload["failed_invariant"] == "IDEMPOTENCY_KEY_REUSE"
     assert replay_payload["resulting_sequence"] == first_payload["resulting_sequence"]
+
+
+def test_revision_preview_is_read_only(tmp_path: Path, monkeypatch: object) -> None:
+    root = _repository(tmp_path)
+    _run_create(root)
+    database = root / ".apexcrew" / "state.db"
+    before = _database_snapshot(database)
+
+    def fail_prepare(_guard: object) -> None:
+        raise AssertionError("preview must not prepare or migrate the database")
+
+    monkeypatch.setattr("apexcrew.delivery.cli.ControlPathGuard.prepare_database", fail_prepare)
+    result = CliRunner().invoke(
+        app,
+        ["approve-policy", "missing-preview-run", "--root", str(root), "--preview"],
+    )
+
+    assert result.exit_code == 1, result.stdout
+    assert json.loads(result.stdout)["status"] == "APPROVAL_REJECTED"
+    assert _database_snapshot(database) == before
+
+
+def test_malformed_generic_approve_is_bounded_json() -> None:
+    runner = CliRunner()
+    for arguments in (("approve",), ("approve", "run-1", "--digest", "sha256:" + "a" * 64)):
+        result = runner.invoke(app, list(arguments))
+        assert result.exit_code == 2
+        assert "Usage:" not in result.stdout
+        assert json.loads(result.stdout) == {
+            "command": "approve",
+            "status": "UNSUPPORTED_COMMAND",
+        }
