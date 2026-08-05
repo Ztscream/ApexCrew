@@ -2154,6 +2154,18 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4-02A returned-model correction completion
+
+- **Independent spec finding**: the approved adapter classified an unexpected allowlisted-model miss as `RETURNED_MODEL_NOT_ALLOWED`, while the frozen SPEC requires absent and unexpected returned IDs to use the `RETURNED_MODEL_MISMATCH` closed outcome.
+- **Correction**: both absent and unexpected returned model IDs now use the same mismatch reason code; the adapter contract covers the configured allowlist path.
+- **Observed green evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_deepseek_responses_adapter.py tests/integration/test_provider_selection.py tests/contract/test_composition.py -q` -> `14 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_deepseek_responses_adapter.py tests/integration/test_provider_selection.py tests/contract/test_composition.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format src/apexcrew/adapters/model/deepseek_responses.py tests/contract/test_deepseek_responses_adapter.py` -> `2 files left unchanged`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
+
 ## 2026-08-06 / R4-02A provider response correction
 
 - **Independent spec finding**: the provider response validator accepted schema-invalid empty strings because it ignored JSON Schema length constraints, and it classified a response with a valid response ID but absent returned model ID as an unknown transport outcome.

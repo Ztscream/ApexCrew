@@ -103,6 +103,8 @@ def _request() -> ModelRequest:
 
 def _adapter(
     response: object,
+    *,
+    allowed_returned_model_ids: frozenset[str] | None = None,
 ) -> tuple[DeepSeekResponsesAdapter, RecordingClientFactory, RecordingResponsesClient]:
     client = RecordingResponsesClient(response)
     factory = RecordingClientFactory(client)
@@ -112,6 +114,7 @@ def _adapter(
             response_schemas={SCHEMA_DIGEST: RESPONSE_SCHEMA},
             pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
             client_factory=factory,
+            allowed_returned_model_ids=allowed_returned_model_ids,
         ),
         factory,
         client,
@@ -237,6 +240,19 @@ def test_schema_length_constraint_fails_closed() -> None:
 def test_missing_returned_model_id_is_closed_model_mismatch() -> None:
     adapter, _, client = _adapter(_response(usage=_usage()))
     client.response.model = None
+
+    result = adapter.complete(_request())
+
+    assert result.kind == "KNOWN_CLOSED_REJECTION"
+    assert result.reason_code == "RETURNED_MODEL_MISMATCH"
+    assert result.completion is None
+
+
+def test_unexpected_returned_model_id_is_closed_model_mismatch() -> None:
+    adapter, _, _ = _adapter(
+        _response(model="deepseek-v4-flash-0731", usage=_usage()),
+        allowed_returned_model_ids=frozenset({"deepseek-v4-flash"}),
+    )
 
     result = adapter.complete(_request())
 

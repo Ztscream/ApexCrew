@@ -333,7 +333,7 @@ class DeepSeekResponsesAdapter:
             self._allowed_returned_model_ids is not None
             and returned_model_id not in self._allowed_returned_model_ids
         ):
-            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_NOT_ALLOWED")
+            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_MISMATCH")
         if status == "incomplete":
             return ProviderAttemptResult.known_closed(
                 response_id,
