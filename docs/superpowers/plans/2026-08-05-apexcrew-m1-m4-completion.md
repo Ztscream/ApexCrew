@@ -383,7 +383,7 @@ W1 卡所有者合并 PR #13
 | --- | --- | --- | --- | --- |
 | P1 模型凭据端口 | REAL | — | TODO | |
 | P2 CLI 凭据命令 | REAL | — | TODO | |
-| P3 定价换绑 | REAL | — | TODO | |
+| P3 定价换绑 | REAL | — | DONE | `a0eb48e2d94ec726ed97f9b6cf7c721a24e5a5d2` |
 | P4 DeepSeek adapter | REAL | `DEBT-M4-001` | TODO | |
 | P5 live smoke | REAL | — | BLOCKED(所有者授权) | |
 | R1 跨进程锁 | REAL | `DEBT-M1-006` | TODO | |

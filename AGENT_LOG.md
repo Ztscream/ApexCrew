@@ -1514,5 +1514,5 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Green evidence**: focused P3 selector `3 passed`; full offline suite passed with 7 skips; mypy passed for 54 source files; Ruff format/check passed; `git diff --check` passed.
 - **Spec-Review**: self-review PASS. P3's single-member identity, revision 3 pricing/date, USD 1 operational reserve, missing-price denial, and USD 0.000672 worst-case reservation are all asserted; no source hardcoding or dated alias was introduced.
 - **Quality-Review**: self-review PASS. Changes are limited to test configuration/fixtures and cost assertions, preserve intentional mismatch/legacy rejection cases, add no dependency or production behavior, and pass the complete regression/static checks.
-- **Implementation commit**: pending creation; no publication action.
+- **Implementation commit**: `a0eb48e6485ba8a1a87577687409117f1bb985a2`; no publication action.
 - **Lesson**: model identity and pricing must be changed together because reservation validates every allowed returned-model ID before dispatch.
