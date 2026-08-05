@@ -85,6 +85,26 @@ def test_bootstrap_rejects_malformed_loose_direct_local_ref(tmp_path: Path, cont
         RepositoryBootstrapAuthorityService().inspect(str(root), "refs/heads/alias")
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    ("a" * 40, "a" * 40 + "\n\n", "A" * 40 + "\n", "\n" + "a" * 40 + "\n"),
+)
+def test_parse_target_oid_requires_one_lowercase_line(stdout: str) -> None:
+    from apexcrew.adapters.repository.bootstrap import (
+        RepositoryBootstrapError,
+        _parse_target_oid,
+    )
+
+    with pytest.raises(RepositoryBootstrapError, match="invalid target OID"):
+        _parse_target_oid(stdout)
+
+
+def test_parse_target_oid_accepts_exact_one_lowercase_line() -> None:
+    from apexcrew.adapters.repository.bootstrap import _parse_target_oid
+
+    assert _parse_target_oid("a" * 40 + "\n") == "a" * 40
+
+
 def test_bootstrap_rejects_checked_out_target_ref(tmp_path: Path) -> None:
     from apexcrew.adapters.repository.bootstrap import (
         RepositoryBootstrapAuthorityService,

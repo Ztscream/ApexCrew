@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import stat
+import sqlite3
+import subprocess
 from pathlib import Path
 
 import typer
@@ -15,6 +16,8 @@ from apexcrew.adapters.repository.bootstrap import (
     RepositoryBootstrapAuthorityService,
     RepositoryBootstrapError,
 )
+from apexcrew.adapters.repository.control_path import ControlPathGuard
+from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.application.configuration import (
     ConfigurationError,
@@ -40,42 +43,22 @@ def _emit(status: str, **fields: str) -> None:
     typer.echo(json.dumps({"status": status, **fields}, sort_keys=True))
 
 
-def _config_path(root: Path) -> Path:
-    return root / ".apexcrew" / "config.json"
-
-
-def _validate_control_path(path: Path, *, directory: bool) -> bool:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return False
-    if path.is_symlink() or stat.S_ISLNK(metadata.st_mode):
-        raise OSError("control path is a symlink")
-    if directory and not stat.S_ISDIR(metadata.st_mode):
-        raise OSError("control path is not a directory")
-    if not directory and not stat.S_ISREG(metadata.st_mode):
-        raise OSError("control path is not a regular file")
-    return True
-
-
-def _validate_control_paths(root: Path) -> tuple[Path, Path]:
-    control_dir = root / ".apexcrew"
-    config = control_dir / "config.json"
-    database = control_dir / "state.db"
-    _validate_control_path(control_dir, directory=True)
-    _validate_control_path(config, directory=False)
-    _validate_control_path(database, directory=False)
-    return config, database
-
-
 def _failed_invariant(error: BaseException) -> str:
     if isinstance(error, ConfigurationError):
         return "CONFIGURATION_INVALID"
+    if isinstance(error, RepositoryUnsafeError):
+        return "CONTROL_PATH_UNSAFE"
     if isinstance(error, RepositoryBootstrapError):
         return "REPOSITORY_BOOTSTRAP_REJECTED"
+    if isinstance(error, sqlite3.Error):
+        return "STATE_STORE_UNAVAILABLE"
+    if isinstance(error, StateConflict):
+        return "STATE_CONFLICT"
     if isinstance(error, OSError):
         return "CONTROL_PATH_UNSAFE"
-    return "STATE_CONFLICT"
+    if isinstance(error, (subprocess.TimeoutExpired, TimeoutError, UnicodeError, ValueError)):
+        return "REPOSITORY_BOOTSTRAP_REJECTED"
+    return "BOOTSTRAP_FAILED"
 
 
 def _reject(status: str, error: BaseException) -> None:
@@ -96,17 +79,27 @@ def init(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> 
     """Create non-sensitive local ApexCrew configuration."""
     try:
         root = root.resolve()
-        config, _ = _validate_control_paths(root)
         repository_authority = RepositoryBootstrapAuthorityService()
         try:
             repository_authority.validate_repository(root)
         finally:
             repository_authority.close()
-        config.parent.mkdir(parents=True, exist_ok=True)
-        _validate_control_paths(root)
-        if not _validate_control_path(config, directory=False):
-            config.write_text('{"schema_version":"cli-config-v1"}\n', encoding="utf-8")
-    except (ConfigurationError, RepositoryBootstrapError, OSError, StateConflict) as error:
+        with ControlPathGuard(root) as control_paths:
+            control_paths.ensure()
+            control_paths.write_config_if_missing()
+            config = control_paths.state.config
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+        TimeoutError,
+        UnicodeError,
+        OSError,
+        ValueError,
+        StateConflict,
+    ) as error:
         _reject("INIT_REJECTED", error)
     _emit("INITIALIZED", path=str(config))
 
@@ -120,9 +113,9 @@ def run_create(
     acceptance: list[str] = typer.Option([], "--acceptance"),  # noqa: B008
 ) -> None:
     """Create and persist one DRAFT Run without dispatching a model request."""
+    store: SqliteStateStore | None = None
     try:
         root = root.resolve()
-        _validate_control_paths(root)
         options = RunOptions(
             goal=goal,
             constraints=tuple(constraints),
@@ -140,11 +133,9 @@ def run_create(
                 applicable_revision_digests=ApplicableRevisionDigests(),
                 payload=payload,
             )
-            database = _config_path(root).with_name("state.db")
-            database.parent.mkdir(parents=True, exist_ok=True)
-            _validate_control_paths(root)
-            store = SqliteStateStore(database)
-            try:
+            with ControlPathGuard(root) as control_paths:
+                database = control_paths.prepare_database()
+                store = SqliteStateStore(database)
                 control = CrewControlService(
                     ControlCommandService(
                         state=store,
@@ -153,11 +144,23 @@ def run_create(
                     )
                 )
                 outcome = control.handle(command)
-            finally:
-                store.close()
+                control_paths.assert_current()
         finally:
+            if store is not None:
+                store.close()
             repository_authority.close()
-    except (ConfigurationError, RepositoryBootstrapError, OSError, StateConflict) as error:
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+        TimeoutError,
+        UnicodeError,
+        OSError,
+        ValueError,
+        StateConflict,
+    ) as error:
         _reject("RUN_CREATE_REJECTED", error)
     if outcome.status != "ACCEPTED" or outcome.run_id is None:
         _emit(
@@ -190,7 +193,16 @@ def run(run_id: str, root: Path = typer.Option(Path("."), exists=True, file_okay
 @app.command()
 def status(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Read local CLI bootstrap status without reconciling a Run."""
-    _emit("INITIALIZED" if _config_path(root).is_file() else "NOT_INITIALIZED")
+    try:
+        with ControlPathGuard(root.resolve()) as control_paths:
+            initialized = control_paths.config_exists()
+    except (
+        RepositoryUnsafeError,
+        OSError,
+        ValueError,
+    ) as error:
+        _reject("STATUS_REJECTED", error)
+    _emit("INITIALIZED" if initialized else "NOT_INITIALIZED")
 
 
 @app.command()
@@ -228,9 +240,17 @@ def credentials_clear(profile: str = typer.Option(DEEPSEEK_PROFILE, "--profile")
 @app.command()
 def doctor(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Run read-only local configuration checks."""
-    config = _config_path(root)
-    source = KeyringModelCredentialStore().source(DEEPSEEK_PROFILE)
-    _emit("READY" if config.is_file() else "NOT_INITIALIZED", credential_source=source)
+    try:
+        with ControlPathGuard(root.resolve()) as control_paths:
+            initialized = control_paths.config_exists()
+        source = KeyringModelCredentialStore().source(DEEPSEEK_PROFILE)
+    except (
+        RepositoryUnsafeError,
+        OSError,
+        ValueError,
+    ) as error:
+        _reject("DOCTOR_REJECTED", error)
+    _emit("READY" if initialized else "NOT_INITIALIZED", credential_source=source)
 
 
 def main() -> None:

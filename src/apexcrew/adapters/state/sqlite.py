@@ -1455,18 +1455,23 @@ class SqliteStateStore:
     ) -> None:
         self._database = database
         self._data_root = database.parent / "data"
-        self._connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._lock = RLock()
-        self._fail_next_commit_after_state_write = False
-        self._monotonic_clock = monotonic_clock
-        self._target_reservation_id_source = (
-            random_target_reservation_id
-            if target_reservation_id_source is None
-            else target_reservation_id_source
-        )
-        self._apply_migrations()
+        connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
+        try:
+            self._connection = connection
+            self._connection.row_factory = sqlite3.Row
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._lock = RLock()
+            self._fail_next_commit_after_state_write = False
+            self._monotonic_clock = monotonic_clock
+            self._target_reservation_id_source = (
+                random_target_reservation_id
+                if target_reservation_id_source is None
+                else target_reservation_id_source
+            )
+            self._apply_migrations()
+        except BaseException:
+            connection.close()
+            raise
 
     def _apply_migrations(self) -> None:
         connection = self._connection

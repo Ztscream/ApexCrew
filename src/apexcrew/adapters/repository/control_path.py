@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Self
+
+from apexcrew.adapters.repository.no_follow import (
+    HandleIdentity,
+    NoFollowBackend,
+    OpenedNode,
+    RepositoryUnsafeError,
+    StableHandleTree,
+)
+from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
+from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPathState:
+    config: Path
+    database: Path
+
+
+class ControlPathGuard:
+    """Bind `.apexcrew` entries to no-follow parent handles and identities."""
+
+    def __init__(self, root: Path, backend: NoFollowBackend | None = None) -> None:
+        selected = (
+            (WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend())
+            if backend is None
+            else backend
+        )
+        self._tree = StableHandleTree(root, selected)
+        self._backend = selected
+        self._control: OpenedNode | None = None
+        self._config_identity: HandleIdentity | None = None
+        self._database_identity: HandleIdentity | None = None
+        self.state = ControlPathState(
+            root / ".apexcrew" / "config.json", root / ".apexcrew" / "state.db"
+        )
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+    def ensure(self) -> None:
+        if self._control is None:
+            control = self._backend.try_open_child(self._tree.root_node, ".apexcrew", "directory")
+            if control is None:
+                control = self._backend.create_child_directory(self._tree.root_node, ".apexcrew")
+            self._control = control
+        self._config_identity = self._observe_entry("config.json")
+        self._database_identity = self._observe_entry("state.db")
+
+    def config_exists(self) -> bool:
+        control = self._backend.try_open_child(self._tree.root_node, ".apexcrew", "directory")
+        if control is None:
+            return False
+        try:
+            node = self._backend.try_open_child(control, "config.json", "file")
+            if node is None:
+                return False
+            self._backend.close(node)
+            return True
+        finally:
+            self._backend.close(control)
+
+    def write_config_if_missing(self) -> None:
+        self.ensure()
+        if self._config_identity is not None:
+            self.assert_current()
+            return
+        control = self._require_control()
+        node = self._backend.create_child_file(control, "config.json")
+        try:
+            self._backend.write_bytes(node, b'{"schema_version":"cli-config-v1"}\n')
+            self._config_identity = node.identity
+        finally:
+            self._backend.close(node)
+        self.assert_current()
+
+    def prepare_database(self) -> Path:
+        self.ensure()
+        if self._database_identity is None:
+            node = self._backend.create_child_file(self._require_control(), "state.db")
+            try:
+                self._database_identity = node.identity
+            finally:
+                self._backend.close(node)
+        self.assert_current()
+        return self.state.database
+
+    def assert_current(self) -> None:
+        control = self._backend.open_child(self._tree.root_node, ".apexcrew", "directory")
+        try:
+            if self._control is None or control.identity != self._control.identity:
+                raise RepositoryUnsafeError("CONTROL_PATH_IDENTITY_CHANGED")
+            self._assert_entry(control, "config.json", self._config_identity)
+            self._assert_entry(control, "state.db", self._database_identity)
+        finally:
+            self._backend.close(control)
+
+    def close(self) -> None:
+        if self._control is not None:
+            self._backend.close(self._control)
+            self._control = None
+        self._tree.close()
+
+    def _observe_entry(self, name: str) -> HandleIdentity | None:
+        node = self._backend.try_open_child(self._require_control(), name, "file")
+        if node is None:
+            return None
+        self._backend.close(node)
+        return node.identity
+
+    def _assert_entry(
+        self,
+        control: OpenedNode,
+        name: str,
+        expected: HandleIdentity | None,
+    ) -> None:
+        node = self._backend.try_open_child(control, name, "file")
+        if expected is None:
+            if node is not None:
+                self._backend.close(node)
+                raise RepositoryUnsafeError("CONTROL_PATH_APPEARED")
+            return
+        if node is None:
+            raise RepositoryUnsafeError("CONTROL_PATH_DISAPPEARED")
+        try:
+            if node.identity != expected:
+                raise RepositoryUnsafeError("CONTROL_PATH_IDENTITY_CHANGED")
+        finally:
+            self._backend.close(node)
+
+    def _require_control(self) -> OpenedNode:
+        if self._control is None:
+            raise RepositoryUnsafeError("CONTROL_PATH_NOT_BOUND")
+        return self._control

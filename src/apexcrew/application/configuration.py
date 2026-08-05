@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Self, cast
+from typing import Self
 
 from apexcrew.domain.commands import CreateRunPayload
 from apexcrew.domain.revisions import (
@@ -209,17 +209,12 @@ def _text_value(value: object, field_name: str) -> str:
 
 
 def _text_sequence(value: object, field_name: str) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)):
+    if not isinstance(value, (tuple, list)):
         raise ConfigurationError(f"{field_name} must be a sequence of text")
-    if not isinstance(value, Iterable):
-        raise ConfigurationError(f"{field_name} must be a sequence of text")
-    try:
-        values = tuple(cast(Iterable[object], value))
-    except TypeError as error:
-        raise ConfigurationError(f"{field_name} must be a sequence of text") from error
+    values = tuple(value)
     if any(not isinstance(item, str) for item in values):
         raise ConfigurationError(f"{field_name} must be a sequence of text")
-    return cast(tuple[str, ...], values)
+    return values
 
 
 def _path_value(value: object) -> Path:

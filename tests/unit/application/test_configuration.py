@@ -101,3 +101,18 @@ def test_run_options_rejects_missing_mapping_values() -> None:
 
     with pytest.raises(ConfigurationError, match="missing configuration key"):
         RunOptions.from_mapping({"goal": "bootstrap"})
+
+
+@pytest.mark.parametrize("value", [{"first": "value"}, {"first", "second"}])
+def test_text_sequence_rejects_unordered_iterables(value: object) -> None:
+    from apexcrew.application.configuration import ConfigurationError, _text_sequence
+
+    with pytest.raises(ConfigurationError, match="sequence of text"):
+        _text_sequence(value, "constraints")
+
+
+@pytest.mark.parametrize("value", [[], ["offline"]])
+def test_text_sequence_accepts_only_list_or_tuple(value: list[str]) -> None:
+    from apexcrew.application.configuration import _text_sequence
+
+    assert _text_sequence(value, "constraints") == tuple(value)

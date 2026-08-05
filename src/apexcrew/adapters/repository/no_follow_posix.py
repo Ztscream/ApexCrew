@@ -76,6 +76,31 @@ class PosixNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_OPEN_DENIED") from error
         return self._node(parent.components + (name,), handle, kind)
 
+    def create_child_directory(self, parent: OpenedNode, name: str) -> OpenedNode:
+        _required_open_flags()
+        if os.mkdir not in os.supports_dir_fd:
+            raise RepositoryUnsafeError("POSIX_OPENAT_REQUIRED")
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent.handle)
+        except OSError as error:
+            raise RepositoryUnsafeError("NO_FOLLOW_CREATE_DENIED") from error
+        return self.open_child(parent, name, "directory")
+
+    def create_child_file(self, parent: OpenedNode, name: str) -> OpenedNode:
+        close_on_exec, _directory, no_follow = _required_open_flags()
+        if os.open not in os.supports_dir_fd:
+            raise RepositoryUnsafeError("POSIX_OPENAT_REQUIRED")
+        try:
+            handle = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | close_on_exec | no_follow,
+                0o600,
+                dir_fd=parent.handle,
+            )
+        except OSError as error:
+            raise RepositoryUnsafeError("NO_FOLLOW_CREATE_DENIED") from error
+        return self._node(parent.components + (name,), handle, "file")
+
     def try_open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode | None:
         try:
             return self.open_child(parent, name, kind)
@@ -104,6 +129,19 @@ class PosixNoFollowBackend:
         if len(value) > maximum:
             raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
         return value
+
+    def write_bytes(self, node: OpenedNode, value: bytes) -> None:
+        if not stat.S_ISREG(os.fstat(node.handle).st_mode):
+            raise RepositoryUnsafeError("GIT_STORAGE_KIND_CHANGED")
+        try:
+            os.lseek(node.handle, 0, os.SEEK_SET)
+            os.ftruncate(node.handle, 0)
+            written = 0
+            while written < len(value):
+                written += os.write(node.handle, value[written:])
+            os.fsync(node.handle)
+        except OSError as error:
+            raise RepositoryUnsafeError("NO_FOLLOW_WRITE_DENIED") from error
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         names = tuple(sorted(os.listdir(node.handle)))

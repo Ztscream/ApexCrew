@@ -39,6 +39,7 @@ else:
 
 
 FILE_OPEN = 1
+FILE_CREATE = 2
 FILE_DIRECTORY_FILE = 0x00000001
 FILE_NON_DIRECTORY_FILE = 0x00000040
 FILE_OPEN_REPARSE_POINT = 0x00200000
@@ -50,6 +51,7 @@ FILE_SHARE_DELETE = 4
 OBJ_CASE_INSENSITIVE = 0x40
 SYNCHRONIZE = 0x00100000
 FILE_READ_DATA = 0x0001
+FILE_WRITE_DATA = 0x0002
 FILE_LIST_DIRECTORY = 0x0001
 FILE_READ_ATTRIBUTES = 0x0080
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -65,6 +67,7 @@ STATUS_NO_MORE_FILES = -2_147_483_642
 STATUS_OBJECT_NAME_NOT_FOUND = -1_073_741_772
 STATUS_OBJECT_PATH_NOT_FOUND = -1_073_741_766
 STATUS_NOT_A_DIRECTORY = -1_073_741_565
+STATUS_OBJECT_NAME_COLLISION = c_long(0xC0000035).value
 
 
 class UNICODE_STRING(Structure):
@@ -145,6 +148,14 @@ class WindowsNoFollowBackend:
             c_void_p,
         ]
         self._kernel32.ReadFile.restype = wintypes.BOOL
+        self._kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE,
+            c_void_p,
+            wintypes.DWORD,
+            POINTER(wintypes.DWORD),
+            c_void_p,
+        ]
+        self._kernel32.WriteFile.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
         self._ntdll.NtCreateFile.argtypes = [
@@ -193,7 +204,13 @@ class WindowsNoFollowBackend:
         )
 
     def _open_relative(
-        self, parent: int, name: str, components: tuple[str, ...], kind: NodeKind
+        self,
+        parent: int,
+        name: str,
+        components: tuple[str, ...],
+        kind: NodeKind,
+        *,
+        create: bool = False,
     ) -> OpenedNode:
         encoded_name = name.encode("utf-16-le")
         if len(encoded_name) > 65_532:
@@ -220,17 +237,19 @@ class WindowsNoFollowBackend:
             | (FILE_DIRECTORY_FILE if kind == "directory" else FILE_NON_DIRECTORY_FILE)
         )
         self._last_ntstatus = None
+        access = FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        access |= FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA
+        if create and kind == "file":
+            access |= FILE_WRITE_DATA
         status = self._ntdll.NtCreateFile(
             byref(handle),
-            FILE_READ_ATTRIBUTES
-            | SYNCHRONIZE
-            | (FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA),
+            access,
             byref(attributes),
             byref(io),
             None,
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_OPEN,
+            FILE_CREATE if create else FILE_OPEN,
             options,
             None,
             0,
@@ -241,6 +260,26 @@ class WindowsNoFollowBackend:
         if handle.value is None:
             raise RepositoryUnsafeError("NO_FOLLOW_OPEN_DENIED")
         return self._identity(int(handle.value), components, kind)
+
+    def create_child_directory(self, parent: OpenedNode, name: str) -> OpenedNode:
+        try:
+            return self._open_relative(
+                parent.handle, name, parent.components + (name,), "directory", create=True
+            )
+        except RepositoryUnsafeError as error:
+            if self._last_ntstatus == STATUS_OBJECT_NAME_COLLISION:
+                raise RepositoryUnsafeError("NO_FOLLOW_CREATE_RACE") from error
+            raise
+
+    def create_child_file(self, parent: OpenedNode, name: str) -> OpenedNode:
+        try:
+            return self._open_relative(
+                parent.handle, name, parent.components + (name,), "file", create=True
+            )
+        except RepositoryUnsafeError as error:
+            if self._last_ntstatus == STATUS_OBJECT_NAME_COLLISION:
+                raise RepositoryUnsafeError("NO_FOLLOW_CREATE_RACE") from error
+            raise
 
     def _open_volume_root(self, root: str) -> OpenedNode:
         handle = self._kernel32.CreateFileW(
@@ -381,6 +420,16 @@ class WindowsNoFollowBackend:
 
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._read_file_handle_bounded(node.handle, maximum)
+
+    def write_bytes(self, node: OpenedNode, value: bytes) -> None:
+        buffer = create_string_buffer(value)
+        written = wintypes.DWORD()
+        if not self._kernel32.SetFilePointerEx(wintypes.HANDLE(node.handle), 0, None, 0):
+            raise RepositoryUnsafeError("HANDLE_SEEK_FAILED")
+        if not self._kernel32.WriteFile(
+            wintypes.HANDLE(node.handle), buffer, len(value), byref(written), None
+        ) or written.value != len(value):
+            raise RepositoryUnsafeError("NO_FOLLOW_WRITE_DENIED")
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._query_directory_handle_names(node.handle, maximum)

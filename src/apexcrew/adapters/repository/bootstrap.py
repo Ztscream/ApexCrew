@@ -136,10 +136,13 @@ def _validate_loose_target_ref(repository: RepositoryInstance, target_ref: str) 
 
 
 def _parse_target_oid(stdout: str) -> GitOid:
-    value = stdout.strip()
-    if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+    if (
+        len(stdout) != 41
+        or stdout[-1:] != "\n"
+        or any(character not in "0123456789abcdef" for character in stdout[:-1])
+    ):
         raise RepositoryBootstrapError("Git returned an invalid target OID")
-    return GitOid(value)
+    return GitOid(stdout[:-1])
 
 
 def _repository_identity(repository: RepositoryInstance) -> dict[str, object]:
