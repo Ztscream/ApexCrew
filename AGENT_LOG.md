@@ -1843,3 +1843,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A probe cleanup SHA`.
+
+## 2026-08-06 / R4-01A Hegel guard-probe correction
+
+- **Task**: bounded R4-01A guard temporary-handle ownership correction after Hegel spec review of `e8956e5`; scope remains control-path close handling.
+- **Spec-review finding**: Hegel found `ControlPathGuard` temporary config/state/control probes called backend close directly; a close failure lost the node and prevented later retry.
+- **Correction**: add guard-level pending-close ownership and route all temporary probes, assertion probes, and retained database/control nodes through independent close attempts with first-error reporting and retry retention. Added config-probe failure/retry coverage.
+- **Observed verification**: focused guard/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.

@@ -66,7 +66,9 @@ class _RecordingBackend:
         self.empty_dir = Path("C:/empty")
         self._replacement_ids: dict[tuple[str, ...], int] = {}
         self.closed_handles: list[int] = []
+        self.closed_names: list[str] = []
         self.fail_close_handles: set[int] = set()
+        self.fail_close_names: set[str] = set()
 
     @property
     def opened_components(self) -> list[tuple[int, str]]:
@@ -136,9 +138,13 @@ class _RecordingBackend:
         return ()
 
     def close(self, node: OpenedNode) -> None:
-        if node.handle in self.fail_close_handles:
+        if node.handle in self.fail_close_handles or (
+            node.components and node.components[-1] in self.fail_close_names
+        ):
             raise RepositoryUnsafeError("HANDLE_CLOSE_FAILED")
         self.closed_handles.append(node.handle)
+        if node.components:
+            self.closed_names.append(node.components[-1])
 
     def every_open_has(self, flags: int) -> bool:
         return all(item.flags & flags == flags for item in self.opens)
@@ -236,6 +242,20 @@ def test_stable_handle_tree_retries_failed_probe_close_after_closing_all_probes(
     backend.fail_close_handles.remove(backend.volume_handle)
     tree.assert_name_bindings()
     tree.close()
+
+
+def test_control_path_guard_retries_failed_temporary_probe_close() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    guard.ensure()
+    backend.fail_close_names.add("config.json")
+
+    with pytest.raises(RepositoryUnsafeError, match="HANDLE_CLOSE_FAILED"):
+        guard.assert_current()
+
+    backend.fail_close_names.remove("config.json")
+    guard.close()
+    assert "config.json" in backend.closed_names
 
 
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:

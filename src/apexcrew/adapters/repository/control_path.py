@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -38,6 +39,7 @@ class ControlPathGuard:
         self._config_identity: HandleIdentity | None = None
         self._database_identity: HandleIdentity | None = None
         self._database_node: OpenedNode | None = None
+        self._pending_closes: dict[int, OpenedNode] = {}
         self.state = ControlPathState(
             root / ".apexcrew" / "config.json", root / ".apexcrew" / "state.db"
         )
@@ -70,10 +72,10 @@ class ControlPathGuard:
             node = self._backend.try_open_child(control, "config.json", "file")
             if node is None:
                 return False
-            self._backend.close(node)
+            self._close_node(node)
             return True
         finally:
-            self._backend.close(control)
+            self._close_node(control)
 
     def write_config_if_missing(self) -> None:
         self.ensure()
@@ -86,7 +88,7 @@ class ControlPathGuard:
             self._backend.write_bytes(node, b'{"schema_version":"cli-config-v1"}\n')
             self._config_identity = node.identity
         finally:
-            self._backend.close(node)
+            self._close_node(node)
         self.assert_current()
 
     def prepare_database(self) -> Path:
@@ -146,22 +148,22 @@ class ControlPathGuard:
         self._tree.assert_name_bindings()
 
     def close(self) -> None:
-        first_error: BaseException | None = None
-        if self._database_node is not None:
-            try:
-                self._backend.close(self._database_node)
-            except (OSError, RepositoryUnsafeError) as error:
-                first_error = error
-            else:
-                self._database_node = None
-        if self._control is not None:
-            try:
-                self._backend.close(self._control)
-            except (OSError, RepositoryUnsafeError) as error:
-                if first_error is None:
-                    first_error = error
-            else:
-                self._control = None
+        first_error: Exception | None = None
+        try:
+            self._close_many(
+                (
+                    *self._pending_closes.values(),
+                    *(() if self._database_node is None else (self._database_node,)),
+                    *(() if self._control is None else (self._control,)),
+                )
+            )
+        except (OSError, RepositoryUnsafeError) as error:
+            first_error = error
+        pending_handles = set(self._pending_closes)
+        if self._database_node is not None and self._database_node.handle not in pending_handles:
+            self._database_node = None
+        if self._control is not None and self._control.handle not in pending_handles:
+            self._control = None
         try:
             self._tree.close()
         except (OSError, RepositoryUnsafeError) as error:
@@ -177,7 +179,7 @@ class ControlPathGuard:
         if name == "state.db":
             self._database_node = node
             return node.identity
-        self._backend.close(node)
+        self._close_node(node)
         return node.identity
 
     def _assert_entry(
@@ -189,7 +191,7 @@ class ControlPathGuard:
         node = self._backend.try_open_child(control, name, "file")
         if expected is None:
             if node is not None:
-                self._backend.close(node)
+                self._close_node(node)
                 raise RepositoryUnsafeError("CONTROL_PATH_APPEARED")
             return
         if node is None:
@@ -198,7 +200,28 @@ class ControlPathGuard:
             if node.identity != expected:
                 raise RepositoryUnsafeError("CONTROL_PATH_IDENTITY_CHANGED")
         finally:
-            self._backend.close(node)
+            self._close_node(node)
+
+    def _close_node(self, node: OpenedNode) -> None:
+        self._close_many((node,))
+
+    def _close_many(self, nodes: Iterable[OpenedNode]) -> None:
+        first_error: Exception | None = None
+        attempted: set[int] = set()
+        for node in nodes:
+            if node.handle in attempted:
+                continue
+            attempted.add(node.handle)
+            try:
+                self._backend.close(node)
+            except (OSError, RepositoryUnsafeError) as error:
+                self._pending_closes[node.handle] = node
+                if first_error is None:
+                    first_error = error
+            else:
+                self._pending_closes.pop(node.handle, None)
+        if first_error is not None:
+            raise first_error
 
     def _require_control(self) -> OpenedNode:
         if self._control is None:
