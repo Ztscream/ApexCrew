@@ -1666,3 +1666,18 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Owner decision**: `M1 GO`. The owner authorizes creation of the first implementation worktree `codex/m1-r4-01-bootstrap` / `.worktrees/m1-r4-01-bootstrap`; source, fixture, test, and CI edits remain governed by the serial R4 task protocol.
 - **Human changes**: owner decision only; no document-content changes.
 - **Next boundary**: begin `R4-01A` with a fresh implementation subagent and observed red test in the new module worktree.
+
+## 2026-08-05 / R4-01A implementation correction
+
+- **Task**: R4-01A production configuration and repository bootstrap correction of implementation commit `df8c7ef`.
+- **Implementation subagent**: Einstein.
+- **Original red evidence**: `uv run --python 3.12 pytest tests/unit/application/test_configuration.py::test_run_options_reject_unknown_keys tests/contract/test_repository_bootstrap.py::test_bootstrap_rejects_non_direct_target_ref -q` returned `2 failed` because both production modules/symbols were missing.
+- **Initial green evidence**: the same selector returned `2 passed` after the first implementation.
+- **Correction red evidence**: `uv run --python 3.12 pytest tests/unit/application/test_configuration.py::test_run_options_rejects_malformed_direct_values tests/contract/test_repository_bootstrap.py::test_cli_run_create_parses_options_without_provider_dispatch -q` returned `8 failed, 1 passed`, reproducing malformed direct-construction acceptance/`AttributeError` and the non-persisted `RUN_DRAFT` CLI behavior.
+- **Correction green evidence**: the same correction selector returned `9 passed` after strict validation, durable SQLite creation, absolute-root normalization, DeepSeek defaults, and the no-dispatch boundary were implemented.
+- **Spec-review finding/fix**: review blocked `df8c7ef` for non-strict `RunOptions` direct construction and a non-durable `RUN_DRAFT` CLI result. The correction now raises `ConfigurationError` for malformed direct values, submits a typed `CommandEnvelope` through `CrewControlService` and `SqliteStateStore.create_bootstrap_run`, emits deterministic `RUN_CREATED`, reopens the DRAFT SQLite record in tests, uses absolute resolved roots, and defaults user-facing revisions to DeepSeek with 32,000/4,096 caps and storage disabled.
+- **Observed verification**: mandated selector returned `2 passed`; focused configuration/bootstrap/CLI/preflight tests returned `60 passed, 4 skipped`; full strict mypy returned `Success: no issues found in 56 source files`; full Ruff returned `All checks passed!`; `git diff --check` passed.
+- **Provider boundary**: the contract test replaces the DeepSeek client with an exploding fake; run creation succeeds without constructing or dispatching a model/network request. No credential or `.env` reads were added.
+- **Human changes**: none.
+- **Changed paths**: `src/apexcrew/application/configuration.py`, `src/apexcrew/adapters/repository/bootstrap.py`, `src/apexcrew/delivery/cli.py`, `tests/unit/application/test_configuration.py`, `tests/contract/test_repository_bootstrap.py`, `AGENT_LOG.md`.
+- **Commit action**: amend the single R4-01A implementation commit; no second implementation commit, push, PR, or live API call.
