@@ -1432,7 +1432,7 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 
 ## 2026-08-05 / S3 hosted Linux unlink seam correction
 
-- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `d54d6d0`.
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `3d10d04`.
 - **Task/skill**: S3 correction; diagnosing-bugs; tdd.
 - **Prompt/context**: repair the hosted Ubuntu failure for uncertain granted deletion while preserving the POSIX handle-based implementation.
 - **Observed red**: hosted `unit-ubuntu` patched `Path.unlink`, but the POSIX adapter calls `os.unlink` with the protected parent handle, so the uncertainty injection never ran.

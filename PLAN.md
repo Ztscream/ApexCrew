@@ -30311,9 +30311,9 @@ depth/known boundary used for the claim.
 
 | SPRINT task | Depth | Status | Implementation commit | Verification boundary |
 | --- | --- | --- | --- | --- |
-| S1 reservation inventory | REAL | COMPLETED | `3ab39aa750f256a7abd735984cae055968fcde23` | focused integration green |
+| S1 reservation inventory | REAL | COMPLETED | `3ab39aa750f256a7abd735984cae055968fcde23` + correction `d54d6d06356a7f6f3a57e6d334f1185349ffdda9` | focused integration green; hosted Linux correction green |
 | S2 Worker/tools integration | REAL | COMPLETED | `e72bfea48abb3c23075587f3f0a98eddcb2795c8` | full offline regression green |
-| S3 granted mutation handles | REAL | COMPLETED | `8b5d7f4b68a8865e28c37637587fc27fd8efb28b` | TOCTOU recovery coverage |
+| S3 granted mutation handles | REAL | COMPLETED | `8b5d7f4b68a8865e28c37637587fc27fd8efb28b` + correction `3d10d04d3e7fbf3418e3efac351ea51e1b632d5b` | TOCTOU recovery coverage; hosted Linux correction green |
 | S4 runtime lock debt | STUB | COMPLETED | `82513d489583779ab1436043598ea1eba5fe97f6` | invalid Permit zero-change green |
 | S5 Context Capsule / Receipt | SKELETON | COMPLETED | `815fe75b21757e413a90be1cd788019d8c284594` | focused evidence green |
 | S6 Freshness / candidate promotion | SKELETON | COMPLETED | `509def8b80c57f93c2e10600ca0a8a8c03ff09dc` | stale evidence rejected |
