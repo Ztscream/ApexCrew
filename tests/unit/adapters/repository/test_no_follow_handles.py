@@ -66,6 +66,7 @@ class _RecordingBackend:
         self.empty_dir = Path("C:/empty")
         self._replacement_ids: dict[tuple[str, ...], int] = {}
         self.closed_handles: list[int] = []
+        self.fail_close_handles: set[int] = set()
 
     @property
     def opened_components(self) -> list[tuple[int, str]]:
@@ -135,6 +136,8 @@ class _RecordingBackend:
         return ()
 
     def close(self, node: OpenedNode) -> None:
+        if node.handle in self.fail_close_handles:
+            raise RepositoryUnsafeError("HANDLE_CLOSE_FAILED")
         self.closed_handles.append(node.handle)
 
     def every_open_has(self, flags: int) -> bool:
@@ -191,6 +194,34 @@ def test_control_path_guard_rejects_replaced_repository_ancestor() -> None:
         guard.assert_current()
 
     guard.close()
+
+
+def test_control_path_guard_preflights_ancestor_before_materializing_control_path() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    backend.replace_name_binding(("repo",), 999)
+
+    with pytest.raises(RepositoryUnsafeError, match="REPOSITORY_ANCESTOR_IDENTITY_CHANGED"):
+        guard.ensure()
+
+    assert not any(opened.name == ".apexcrew" for opened in backend.opens)
+    guard.close()
+
+
+def test_control_path_guard_close_attempts_all_resources_after_failure() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    guard.ensure()
+    database_handle = guard._database_node.handle if guard._database_node else -1
+    control_handle = guard._control.handle if guard._control else -1
+    root_handles = {node.handle for node in guard._tree._root_chain}
+    backend.fail_close_handles.add(database_handle)
+
+    with pytest.raises(RepositoryUnsafeError, match="HANDLE_CLOSE_FAILED"):
+        guard.close()
+
+    assert control_handle in backend.closed_handles
+    assert root_handles & set(backend.closed_handles)
 
 
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:

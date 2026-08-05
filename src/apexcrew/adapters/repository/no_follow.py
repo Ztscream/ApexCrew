@@ -138,5 +138,18 @@ class StableHandleTree:
 
     def close(self) -> None:
         owned = {node.handle: node for node in (*self._nodes.values(), *self._root_chain)}
+        first_error: BaseException | None = None
+        remaining: dict[int, OpenedNode] = {}
         for node in reversed(tuple(owned.values())):
-            self._backend.close(node)
+            try:
+                self._backend.close(node)
+            except (OSError, RepositoryUnsafeError) as error:
+                remaining[node.handle] = node
+                if first_error is None:
+                    first_error = error
+        self._nodes = {
+            parts: node for parts, node in self._nodes.items() if node.handle in remaining
+        }
+        self._root_chain = tuple(node for node in self._root_chain if node.handle in remaining)
+        if first_error is not None:
+            raise first_error

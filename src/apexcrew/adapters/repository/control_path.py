@@ -52,6 +52,7 @@ class ControlPathGuard:
         if self._control is not None:
             self.assert_current()
             return
+        self._tree.assert_name_bindings()
         if self._control is None:
             control = self._backend.try_open_child(self._tree.root_node, ".apexcrew", "directory")
             if control is None:
@@ -59,6 +60,7 @@ class ControlPathGuard:
             self._control = control
         self._config_identity = self._observe_entry("config.json")
         self._database_identity = self._observe_entry("state.db")
+        self.assert_current()
 
     def config_exists(self) -> bool:
         control = self._backend.try_open_child(self._tree.root_node, ".apexcrew", "directory")
@@ -144,13 +146,29 @@ class ControlPathGuard:
         self._tree.assert_name_bindings()
 
     def close(self) -> None:
+        first_error: BaseException | None = None
         if self._database_node is not None:
-            self._backend.close(self._database_node)
-            self._database_node = None
+            try:
+                self._backend.close(self._database_node)
+            except (OSError, RepositoryUnsafeError) as error:
+                first_error = error
+            else:
+                self._database_node = None
         if self._control is not None:
-            self._backend.close(self._control)
-            self._control = None
-        self._tree.close()
+            try:
+                self._backend.close(self._control)
+            except (OSError, RepositoryUnsafeError) as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self._control = None
+        try:
+            self._tree.close()
+        except (OSError, RepositoryUnsafeError) as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _observe_entry(self, name: str) -> HandleIdentity | None:
         node = self._backend.try_open_child(self._require_control(), name, "file")

@@ -1796,3 +1796,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Reviewer**: Hume; verdict `PASS`.
 - **Observed result**: Hume confirmed stable repeated binding, POSIX descriptor-based SQLite opening, canonical root and ancestor identity checks, POSIX no-follow flags, Windows delete/rename denial, connection cleanup, final SHA ledger, and bounded task scope. No files were modified; no network, credential, provider, or live API call occurred.
 - **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
+
+## 2026-08-06 / R4-01A Dewey quality correction
+
+- **Task**: bounded R4-01A quality correction after Dewey review of `df7c3ba`; scope remains control-path resource safety and first-use preflight.
+- **Quality-review findings**: Dewey blocked because `close()` stopped after the first backend close failure and leaked later handles; first `ensure()` could materialize `.apexcrew` from a held descriptor before rechecking canonical ancestor identity.
+- **Correction**: close database, control, and tree resources independently, retain failed nodes for retry, and re-raise the first typed close error; run ancestor binding preflight before first control-path observation/materialization and retain post-binding verification.
+- **Observed verification**: added failure-injection and preflight regression tests; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/adapters/repository/no_follow.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
