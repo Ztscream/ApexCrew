@@ -1769,3 +1769,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A task commits`.
+
+## 2026-08-06 / R4-01A Nietzsche spec security correction
+
+- **Task**: bounded R4-01A ancestor-binding correction after fresh spec review of `7492b08`; scope remains repository control paths only.
+- **Spec-review finding**: Nietzsche found `ControlPathGuard.assert_current()` did not call `StableHandleTree.assert_name_bindings()`, so replacement of the canonical repository root or an ancestor could go undetected despite held descriptors.
+- **Correction red evidence**: fresh review identified the missing ancestor check and confirmed existing tests did not cover POSIX ancestor replacement.
+- **Correction green evidence**: added `test_control_path_guard_rejects_replaced_repository_ancestor`; the focused guard/CLI selector passed, full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this final correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.

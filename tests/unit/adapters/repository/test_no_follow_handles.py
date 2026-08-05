@@ -181,6 +181,18 @@ def test_control_path_guard_does_not_rebind_database_on_repeated_ensure() -> Non
     assert backend.closed_handles.count(database_node.handle if database_node else -1) == 1
 
 
+def test_control_path_guard_rejects_replaced_repository_ancestor() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+    guard.ensure()
+    backend.replace_name_binding(("repo",), 999)
+
+    with pytest.raises(RepositoryUnsafeError, match="REPOSITORY_ANCESTOR_IDENTITY_CHANGED"):
+        guard.assert_current()
+
+    guard.close()
+
+
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:
     handles = StableHandleTree(backend.absolute_root, backend)
     git_dir = handles.open(".git", "directory")

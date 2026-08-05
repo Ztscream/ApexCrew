@@ -132,6 +132,7 @@ class ControlPathGuard:
         return connection
 
     def assert_current(self) -> None:
+        self._tree.assert_name_bindings()
         control = self._backend.open_child(self._tree.root_node, ".apexcrew", "directory")
         try:
             if self._control is None or control.identity != self._control.identity:
@@ -140,6 +141,7 @@ class ControlPathGuard:
             self._assert_entry(control, "state.db", self._database_identity)
         finally:
             self._backend.close(control)
+        self._tree.assert_name_bindings()
 
     def close(self) -> None:
         if self._database_node is not None:
