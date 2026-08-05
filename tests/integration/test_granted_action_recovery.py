@@ -451,11 +451,13 @@ def test_granted_workspace_possibly_applied_failure_is_uncertain(
     action = RiskyAction(operation="delete", path="src/old.py")
     expected = ActionPreState(source_digest=digest(b"old\n"))
 
-    def fail_unlink(path: Path) -> None:
-        del path
+    def fail_unlink(*_args: object, **_kwargs: object) -> None:
         raise OSError("injected unlink uncertainty")
 
-    monkeypatch.setattr(Path, "unlink", fail_unlink)
+    if os.name == "posix":
+        monkeypatch.setattr(os, "unlink", fail_unlink)
+    else:
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
 
     with pytest.raises(RepositoryEffectUncertain, match="GRANTED_DELETE_UNCERTAIN"):
         adapter.delete_regular_file(action, expected)

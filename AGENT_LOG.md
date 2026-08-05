@@ -1429,3 +1429,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the S1 test correction; implementation commit follows.
 - **Human intervention**: none; no credentials, provider call, or `SPEC.md` edit occurred.
 - **Lesson**: security tests must accept every safe rejection boundary while still asserting that Git is never invoked.
+
+## 2026-08-05 / S3 hosted Linux unlink seam correction
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `d54d6d0`.
+- **Task/skill**: S3 correction; diagnosing-bugs; tdd.
+- **Prompt/context**: repair the hosted Ubuntu failure for uncertain granted deletion while preserving the POSIX handle-based implementation.
+- **Observed red**: hosted `unit-ubuntu` patched `Path.unlink`, but the POSIX adapter calls `os.unlink` with the protected parent handle, so the uncertainty injection never ran.
+- **Implementation**: made the test patch `os.unlink` on POSIX and retain `Path.unlink` on Windows; production deletion remains handle-based.
+- **Green evidence**: the targeted test passed in both the Linux container and Windows suite; complete Windows tests and lint passed before commit.
+- **Subagent output/commit**: Codex self-checked the S3 test correction; implementation commit follows.
+- **Human intervention**: none; no credentials, provider call, or `SPEC.md` edit occurred.
+- **Lesson**: cross-platform recovery tests must inject failures at the platform-specific public syscall seam.
