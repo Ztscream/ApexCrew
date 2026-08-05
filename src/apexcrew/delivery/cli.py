@@ -4,7 +4,9 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+from base64 import b32encode
 from pathlib import Path
+from typing import Literal
 
 import typer
 
@@ -29,17 +31,25 @@ from apexcrew.application.control import (
     CrewControlService,
     TargetAuthorityDigestService,
 )
-from apexcrew.domain.commands import ApplicableRevisionDigests, CommandEnvelope, CreateRunPayload
+from apexcrew.domain.commands import (
+    ApplicableRevisionDigests,
+    ApproveBudgetPayload,
+    ApproveModelConfigurationPayload,
+    ApprovePolicyPayload,
+    CommandEnvelope,
+    CommandPayload,
+    CreateRunPayload,
+)
 from apexcrew.domain.effects import StateConflict, canonical_json
 from apexcrew.domain.revisions import Sha256DigestText
-from apexcrew.domain.types import RunId
+from apexcrew.domain.types import RevisionDigest, RunId
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 credentials_app = typer.Typer(no_args_is_help=True, add_completion=False)
 app.add_typer(credentials_app, name="credentials")
 
 
-def _emit(status: str, **fields: str) -> None:
+def _emit(status: str, **fields: object) -> None:
     typer.echo(json.dumps({"status": status, **fields}, sort_keys=True))
 
 
@@ -205,10 +215,226 @@ def status(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -
     _emit("INITIALIZED" if initialized else "NOT_INITIALIZED")
 
 
-@app.command()
-def approve(run_id: str) -> None:
-    """Submit an approval through CrewControl when composed by a host."""
-    _emit("APPROVAL_REQUIRED", run_id=run_id)
+@app.command("approve-policy")
+def approve_policy(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+    digest: str | None = typer.Option(None, "--digest"),
+    confirmation_code: str | None = typer.Option(None, "--confirmation-code"),
+    preview: bool = typer.Option(False, "--preview"),
+) -> None:
+    """Preview or submit the exact current Policy revision approval."""
+    _approve_revision(
+        "approve_policy", "policy", "POLICY", run_id, root, digest, confirmation_code, preview
+    )
+
+
+@app.command("approve-budget")
+def approve_budget(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+    digest: str | None = typer.Option(None, "--digest"),
+    confirmation_code: str | None = typer.Option(None, "--confirmation-code"),
+    preview: bool = typer.Option(False, "--preview"),
+) -> None:
+    """Preview or submit the exact current Budget revision approval."""
+    _approve_revision(
+        "approve_budget", "budget", "BUDGET", run_id, root, digest, confirmation_code, preview
+    )
+
+
+@app.command("approve-model")
+def approve_model(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+    digest: str | None = typer.Option(None, "--digest"),
+    confirmation_code: str | None = typer.Option(None, "--confirmation-code"),
+    preview: bool = typer.Option(False, "--preview"),
+) -> None:
+    """Preview or submit the exact current Model Configuration approval."""
+    _approve_revision(
+        "approve_model_configuration",
+        "model_configuration",
+        "MODEL_CONFIGURATION",
+        run_id,
+        root,
+        digest,
+        confirmation_code,
+        preview,
+    )
+
+
+@app.command("approve", hidden=True)
+def approve_legacy(run_id: str) -> None:
+    """Reject the removed generic approval command without state access."""
+    del run_id
+    _emit("UNSUPPORTED_COMMAND", command="approve")
+    raise typer.Exit(code=2)
+
+
+def _approved_revision_bindings(
+    store: SqliteStateStore, run_id: RunId
+) -> ApplicableRevisionDigests:
+    current = store.current_revision_digests(run_id)
+    approved = frozenset(store.approved_revision_classes(run_id))
+    return ApplicableRevisionDigests(
+        plan_digest=current.plan_digest if "PLAN" in approved else None,
+        policy_digest=current.policy_digest if "POLICY" in approved else None,
+        budget_digest=current.budget_digest if "BUDGET" in approved else None,
+        model_configuration_digest=current.model_configuration_digest
+        if "MODEL_CONFIGURATION" in approved
+        else None,
+    )
+
+
+def _approval_confirmation_code(
+    command_kind: str,
+    run_id: RunId,
+    revision_class: str,
+    digest: RevisionDigest,
+) -> str:
+    value = canonical_json(
+        {
+            "command_kind": command_kind,
+            "revision_class": revision_class,
+            "revision_digest": digest,
+            "run_id": run_id,
+        }
+    ).encode("utf-8")
+    return b32encode(hashlib.sha256(value).digest()).decode("ascii")[:6]
+
+
+def _approval_payload(
+    command_kind: Literal["approve_policy", "approve_budget", "approve_model_configuration"],
+    run_id: RunId,
+    digest: RevisionDigest,
+    confirmation_code: str,
+) -> CommandPayload:
+    if command_kind == "approve_policy":
+        return ApprovePolicyPayload(
+            run_id=run_id,
+            policy_digest=digest,
+            confirmation_code=confirmation_code,
+        )
+    if command_kind == "approve_budget":
+        return ApproveBudgetPayload(
+            run_id=run_id,
+            budget_digest=digest,
+            confirmation_code=confirmation_code,
+        )
+    return ApproveModelConfigurationPayload(
+        run_id=run_id,
+        model_configuration_digest=digest,
+        confirmation_code=confirmation_code,
+    )
+
+
+def _approval_request_id(payload: CommandPayload) -> str:
+    digest = hashlib.sha256(canonical_json(payload.model_dump(mode="json")).encode("utf-8"))
+    return "cli-approval-" + digest.hexdigest()
+
+
+def _approve_revision(
+    command_kind: Literal["approve_policy", "approve_budget", "approve_model_configuration"],
+    revision_kind: Literal["policy", "budget", "model_configuration"],
+    revision_class: Literal["POLICY", "BUDGET", "MODEL_CONFIGURATION"],
+    run_id_text: str,
+    root: Path,
+    digest_text: str | None,
+    confirmation_code: str | None,
+    preview: bool,
+) -> None:
+    store: SqliteStateStore | None = None
+    repository_authority = RepositoryBootstrapAuthorityService()
+    try:
+        run_id = RunId(run_id_text)
+        with ControlPathGuard(root.resolve()) as control_paths:
+            database = control_paths.prepare_database()
+            store = SqliteStateStore(database, connection=control_paths.open_database())
+            current = store.current_revision_digests(run_id)
+            current_digest = {
+                "POLICY": current.policy_digest,
+                "BUDGET": current.budget_digest,
+                "MODEL_CONFIGURATION": current.model_configuration_digest,
+            }[revision_class]
+            if current_digest is None:
+                raise StateConflict("REVISION_NOT_FOUND")
+            if digest_text is not None and RevisionDigest(digest_text) != current_digest:
+                _emit(
+                    "APPROVAL_REJECTED",
+                    failed_invariant="REVISION_DIGEST_MISMATCH",
+                    run_id=run_id_text,
+                )
+                raise typer.Exit(code=1)
+            expected_code = _approval_confirmation_code(
+                command_kind, run_id, revision_class, current_digest
+            )
+            if preview:
+                _emit(
+                    "APPROVAL_PREVIEW",
+                    confirmation_code=expected_code,
+                    revision_digest=current_digest,
+                    revision_kind=revision_kind,
+                    run_id=run_id,
+                )
+                return
+            if digest_text is None or confirmation_code is None:
+                _emit(
+                    "APPROVAL_REJECTED",
+                    failed_invariant="APPROVAL_ARGUMENTS_REQUIRED",
+                    run_id=run_id_text,
+                )
+                raise typer.Exit(code=2)
+            payload = _approval_payload(command_kind, run_id, current_digest, confirmation_code)
+            command = CommandEnvelope(
+                request_id=_approval_request_id(payload),
+                expected_sequence=store.audit_sequence(run_id),
+                applicable_revision_digests=_approved_revision_bindings(store, run_id),
+                payload=payload,
+            )
+            control = CrewControlService(
+                ControlCommandService(
+                    state=store,
+                    target_authority=_SqliteTargetAuthorityDigestService(store),
+                    repository_authority=repository_authority,
+                )
+            )
+            outcome = control.handle(command)
+            control_paths.assert_current()
+    except typer.Exit:
+        raise
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+        TimeoutError,
+        UnicodeError,
+        OSError,
+        ValueError,
+        StateConflict,
+    ) as error:
+        _reject("APPROVAL_REJECTED", error)
+    finally:
+        if store is not None:
+            store.close()
+        repository_authority.close()
+    if outcome.status != "ACCEPTED":
+        _emit(
+            "APPROVAL_REJECTED",
+            failed_invariant=outcome.failed_invariant or "UNKNOWN",
+            resulting_sequence=outcome.resulting_sequence,
+            run_id=run_id_text,
+        )
+        raise typer.Exit(code=1)
+    _emit(
+        "APPROVED",
+        resulting_sequence=outcome.resulting_sequence,
+        revision_digest=current_digest,
+        revision_kind=revision_kind,
+        run_id=run_id_text,
+    )
 
 
 @credentials_app.command("set")

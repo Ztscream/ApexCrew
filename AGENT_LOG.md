@@ -1998,3 +1998,46 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Reviewer**: Aquinas; verdict `PASS`.
 - **Observed result**: Aquinas confirmed pre-materialization ancestor preflight, stable state binding, independent/retryable cleanup for all temporary/control/owned handles, POSIX no-follow/fd opening, Windows delete/rename denial, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
 - **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
+
+## 2026-08-06 / R4-01B red selector
+
+- **Task**: begin R4-01B revision approval CLI and previews.
+- **Required red command**: `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py::test_specialized_approval_commands_bind_exact_revision tests/contract/test_cli_approvals.py::test_replayed_approval_is_side_effect_free -q`.
+- **Complete observed failure output**:
+
+```text
+==================================== ERRORS ====================================
+____________ ERROR collecting tests/contract/test_cli_approvals.py ____________
+ImportError while importing test module 'C:\\Users\\29119\\Desktop\\AI4SE\\.worktrees\\m1-r4-01-bootstrap\\tests\\contract\\test_cli_approvals.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+..\\..\\..\\..\\AppData\\Roaming\\uv\\python\\cpython-3.12.12-windows-x86_64-none\\Lib\\importlib\\__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\\contract\\test_cli_approvals.py:16: in <module>
+    from tests.helpers.git_repository import commit_repository, make_git_repository
+E   ModuleNotFoundError: No module named 'tests'
+=========================== short test summary info ===========================
+ERROR tests/contract/test_cli_approvals.py
+ERROR: found no collectors for C:\\Users\\29119\\Desktop\\AI4SE\\.worktrees\\m1-r4-01-bootstrap\\tests\\contract\\test_cli_approvals.py::test_specialized_approval_commands_bind_exact_revision
+
+ERROR: found no collectors for C:\\Users\\29119\\Desktop\\AI4SE\\.worktrees\\m1-r4-01-bootstrap\\tests\\contract\\test_cli_approvals.py::test_replayed_approval_is_side_effect_free
+```
+
+- **Changed paths at red checkpoint**: `tests/contract/test_cli_approvals.py`.
+- **No implementation, provider, credential, network, or live API call occurred.**
+
+## 2026-08-06 / R4-01B implementation
+
+- **Task**: deliver revision approval CLI and previews through `CrewControl`.
+- **Implementation**: added `approve-policy`, `approve-budget`, and `approve-model` preview/submission commands. Preview reads the current exact revision digest and derives the same six-character confirmation code subject used by the typed state handlers without dispatching a command. Submission constructs only the matching typed approval payload, binds it to the currently approved revision set, and uses a deterministic payload request id so replay returns the durable idempotency conflict without a second state mutation. The legacy generic `approve` form now returns bounded `UNSUPPORTED_COMMAND` without opening state.
+- **Observed green evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py::test_specialized_approval_commands_bind_exact_revision tests/contract/test_cli_approvals.py::test_replayed_approval_is_side_effect_free -q` -> `2 passed`.
+  - `uv run --python 3.12 pytest tests/contract/test_cli_approvals.py tests/contract/test_repository_bootstrap.py -q` -> `19 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 57 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_cli_approvals.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests/contract/test_cli_approvals.py` -> `58 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Changed paths**: `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_approvals.py`, and `AGENT_LOG.md`.
+- **Review status**: no spec-compliance or quality review was performed, as explicitly requested.
+- **No model, credential, network, live API, push, or PR action occurred.**
