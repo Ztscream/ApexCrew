@@ -1816,3 +1816,10 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A final quality SHA`.
+
+## 2026-08-06 / R4-01A Gibbs final spec review
+
+- **Task**: final fresh spec-compliance review of HEAD `2f46b96` and implementation `47b9d63`.
+- **Reviewer**: Gibbs; verdict `PASS`.
+- **Observed result**: Gibbs confirmed pre-materialization root/ancestor preflight, stable repeated state binding, complete cleanup after close failure, POSIX no-follow/fd opening, Windows delete/rename denial, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
+- **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
