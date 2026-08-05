@@ -30328,7 +30328,7 @@ depth/known boundary used for the claim.
 | S15 mechanism demo | REAL | COMPLETED | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` + correction `ee15003` | two bound ScriptedMockLLM calls and deterministic trace observed |
 | S16 replay / read-only WebUI | SKELETON | COMPLETED | `fafbd369019455087a529f54cdee1683d37f7389` | projection/read route green |
 | S17 secret scan | REAL | COMPLETED | `8793268462a3f47b1b244eabee6353690354b666` | tracked tree/history clean |
-| S18 packaging / CI | REAL | COMPLETED | `ed22d3cd3a7d733a945567150ab9d0dd2402ba56` + correction `7bec4386f7cf0b1d9f2948993f325486afe1c800` | `make build` and restricted image runtime verified; hosted CI remains owner-gated |
+| S18 packaging / CI | REAL | COMPLETED | `ed22d3cd3a7d733a945567150ab9d0dd2402ba56` + correction `7bec4386f7cf0b1d9f2948993f325486afe1c800` + acceptance `1fac0a38da0b51a5bb67950116c1585c58aa466b` | `make build` and restricted image runtime verified; hosted CI remains owner-gated |
 | S19 README / SECURITY / debt | REAL | COMPLETED | `9434715cd86fd42657fa3f11580faa7eb71b987e` | documentation contract green |
 | S20 OpenAI adapter | SKELETON | COMPLETED | `2b71a8cbfee82814cb49b664b6452d55e4cb9ece` | offline call denied |
 | S21 static WebUI deployment | SKELETON | COMPLETED | `5feb82f8c21ef40331b4336e65dce7b307239bb4` | bundle generated |
