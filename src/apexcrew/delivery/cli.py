@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 from pathlib import Path
 
 import typer
@@ -10,16 +11,23 @@ from apexcrew.adapters.credentials.model_key import (
     DEEPSEEK_PROFILE,
     KeyringModelCredentialStore,
 )
-from apexcrew.adapters.repository.bootstrap import RepositoryBootstrapAuthorityService
+from apexcrew.adapters.repository.bootstrap import (
+    RepositoryBootstrapAuthorityService,
+    RepositoryBootstrapError,
+)
 from apexcrew.adapters.state.sqlite import SqliteStateStore
-from apexcrew.application.configuration import RunOptions, build_create_run_payload
+from apexcrew.application.configuration import (
+    ConfigurationError,
+    RunOptions,
+    build_create_run_payload,
+)
 from apexcrew.application.control import (
     ControlCommandService,
     CrewControlService,
     TargetAuthorityDigestService,
 )
 from apexcrew.domain.commands import ApplicableRevisionDigests, CommandEnvelope, CreateRunPayload
-from apexcrew.domain.effects import canonical_json
+from apexcrew.domain.effects import StateConflict, canonical_json
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import RunId
 
@@ -36,6 +44,45 @@ def _config_path(root: Path) -> Path:
     return root / ".apexcrew" / "config.json"
 
 
+def _validate_control_path(path: Path, *, directory: bool) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if path.is_symlink() or stat.S_ISLNK(metadata.st_mode):
+        raise OSError("control path is a symlink")
+    if directory and not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("control path is not a directory")
+    if not directory and not stat.S_ISREG(metadata.st_mode):
+        raise OSError("control path is not a regular file")
+    return True
+
+
+def _validate_control_paths(root: Path) -> tuple[Path, Path]:
+    control_dir = root / ".apexcrew"
+    config = control_dir / "config.json"
+    database = control_dir / "state.db"
+    _validate_control_path(control_dir, directory=True)
+    _validate_control_path(config, directory=False)
+    _validate_control_path(database, directory=False)
+    return config, database
+
+
+def _failed_invariant(error: BaseException) -> str:
+    if isinstance(error, ConfigurationError):
+        return "CONFIGURATION_INVALID"
+    if isinstance(error, RepositoryBootstrapError):
+        return "REPOSITORY_BOOTSTRAP_REJECTED"
+    if isinstance(error, OSError):
+        return "CONTROL_PATH_UNSAFE"
+    return "STATE_CONFLICT"
+
+
+def _reject(status: str, error: BaseException) -> None:
+    _emit(status, failed_invariant=_failed_invariant(error))
+    raise typer.Exit(code=1)
+
+
 class _SqliteTargetAuthorityDigestService(TargetAuthorityDigestService):
     def __init__(self, store: SqliteStateStore) -> None:
         self._store = store
@@ -47,16 +94,20 @@ class _SqliteTargetAuthorityDigestService(TargetAuthorityDigestService):
 @app.command()
 def init(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Create non-sensitive local ApexCrew configuration."""
-    root = root.resolve()
-    repository_authority = RepositoryBootstrapAuthorityService()
     try:
-        repository_authority.validate_repository(root)
-    finally:
-        repository_authority.close()
-    config = _config_path(root)
-    config.parent.mkdir(parents=True, exist_ok=True)
-    if not config.exists():
-        config.write_text('{"schema_version":"cli-config-v1"}\n', encoding="utf-8")
+        root = root.resolve()
+        config, _ = _validate_control_paths(root)
+        repository_authority = RepositoryBootstrapAuthorityService()
+        try:
+            repository_authority.validate_repository(root)
+        finally:
+            repository_authority.close()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        _validate_control_paths(root)
+        if not _validate_control_path(config, directory=False):
+            config.write_text('{"schema_version":"cli-config-v1"}\n', encoding="utf-8")
+    except (ConfigurationError, RepositoryBootstrapError, OSError, StateConflict) as error:
+        _reject("INIT_REJECTED", error)
     _emit("INITIALIZED", path=str(config))
 
 
@@ -69,40 +120,45 @@ def run_create(
     acceptance: list[str] = typer.Option([], "--acceptance"),  # noqa: B008
 ) -> None:
     """Create and persist one DRAFT Run without dispatching a model request."""
-    root = root.resolve()
-    options = RunOptions(
-        goal=goal,
-        constraints=tuple(constraints),
-        acceptance_criteria=tuple(acceptance),
-        repository_root=root,
-        target_ref=target_ref,
-    )
-    repository_authority = RepositoryBootstrapAuthorityService()
     try:
-        authority = repository_authority.inspect(str(options.repository_root), target_ref)
-        payload = build_create_run_payload(options, target_oid=authority.target_oid)
-        command = CommandEnvelope(
-            request_id=_run_create_request_id(payload),
-            expected_sequence=None,
-            applicable_revision_digests=ApplicableRevisionDigests(),
-            payload=payload,
+        root = root.resolve()
+        _validate_control_paths(root)
+        options = RunOptions(
+            goal=goal,
+            constraints=tuple(constraints),
+            acceptance_criteria=tuple(acceptance),
+            repository_root=root,
+            target_ref=target_ref,
         )
-        database = _config_path(root).with_name("state.db")
-        database.parent.mkdir(parents=True, exist_ok=True)
-        store = SqliteStateStore(database)
+        repository_authority = RepositoryBootstrapAuthorityService()
         try:
-            control = CrewControlService(
-                ControlCommandService(
-                    state=store,
-                    target_authority=_SqliteTargetAuthorityDigestService(store),
-                    repository_authority=repository_authority,
-                )
+            authority = repository_authority.inspect(str(options.repository_root), target_ref)
+            payload = build_create_run_payload(options, target_oid=authority.target_oid)
+            command = CommandEnvelope(
+                request_id=_run_create_request_id(payload),
+                expected_sequence=None,
+                applicable_revision_digests=ApplicableRevisionDigests(),
+                payload=payload,
             )
-            outcome = control.handle(command)
+            database = _config_path(root).with_name("state.db")
+            database.parent.mkdir(parents=True, exist_ok=True)
+            _validate_control_paths(root)
+            store = SqliteStateStore(database)
+            try:
+                control = CrewControlService(
+                    ControlCommandService(
+                        state=store,
+                        target_authority=_SqliteTargetAuthorityDigestService(store),
+                        repository_authority=repository_authority,
+                    )
+                )
+                outcome = control.handle(command)
+            finally:
+                store.close()
         finally:
-            store.close()
-    finally:
-        repository_authority.close()
+            repository_authority.close()
+    except (ConfigurationError, RepositoryBootstrapError, OSError, StateConflict) as error:
+        _reject("RUN_CREATE_REJECTED", error)
     if outcome.status != "ACCEPTED" or outcome.run_id is None:
         _emit(
             "RUN_CREATE_REJECTED",

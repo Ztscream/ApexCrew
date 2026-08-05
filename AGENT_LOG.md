@@ -1714,3 +1714,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex applied this correction; the implementation subagent remains Einstein.
 - **Changed paths**: `src/apexcrew/adapters/repository/bootstrap.py`, `src/apexcrew/adapters/repository/git.py`, `src/apexcrew/delivery/cli.py`, `tests/contract/test_repository_bootstrap.py`, `tests/unit/test_cli.py`, `tests/integration/test_git_preflight.py`, `AGENT_LOG.md`.
 - **Commit action**: create a clearly named correction commit; do not amend the prior docs-bearing commit.
+
+## 2026-08-05 / R4-01A Schrodinger quality correction
+
+- **Task**: bounded R4-01A CLI quality correction at `bb70f75`; scope limited to CLI delivery, CLI tests, and this log.
+- **Schrodinger findings**: `init` and `run-create` could expose raw bootstrap/configuration/filesystem/state failures as traceback or empty output; pre-existing `.apexcrew`, `config.json`, or `state.db` links and non-regular nodes were not rejected before directory creation, configuration writes, or SQLite open.
+- **Fix**: both commands now emit only bounded JSON `INIT_REJECTED` or `RUN_CREATE_REJECTED` responses with fixed `CONFIGURATION_INVALID`, `REPOSITORY_BOOTSTRAP_REJECTED`, `CONTROL_PATH_UNSAFE`, or `STATE_CONFLICT` invariant codes and exit 1. A small `lstat`/`is_symlink` validator rejects unsafe control paths before mutation/open and is repeated immediately before the config write or database open.
+- **Evidence**: focused selectors returned `4 passed, 2 skipped` (the two symlink tests were skipped because symlink creation is unavailable on this Windows host); the focused CLI/bootstrap suite returned `14 passed, 2 skipped`; strict mypy reported `Success: no issues found in 56 source files`; Ruff check reported `All checks passed!`; Ruff format check and `git diff --check` passed. The valid init and durable run-create workflow remained green, and outside sentinels were unchanged in the symlink-capable test path.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending`. This entry does not claim either review passed.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/delivery/cli.py`, `tests/unit/test_cli.py`, `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with no amend, push, PR, live call, or runtime/composition/provider change.
