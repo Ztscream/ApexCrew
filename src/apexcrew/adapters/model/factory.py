@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from apexcrew.adapters.credentials.model_key import KeyringModelCredentialStore, ModelCredentialPort
+from apexcrew.adapters.credentials.model_key import (
+    KeyringModelCredentialStore,
+    ModelCredentialPort,
+)
 from apexcrew.adapters.model.deepseek_responses import (
     ClientFactory,
     DeepSeekResponsesAdapter,
 )
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.domain.actions import ACTION_ADAPTER
 from apexcrew.domain.model import ModelPort
 from apexcrew.domain.revisions import BudgetRevisionDocument, ModelConfigurationRevisionDocument
 
@@ -35,15 +39,18 @@ def build_model_port(
 
     if model_configuration.provider != "deepseek_responses":
         raise ModelFactoryError("MODEL_PROVIDER_UNSUPPORTED")
-    if response_schemas is None:
-        raise ModelFactoryError("MODEL_TOOL_SCHEMA_REGISTRY_REQUIRED")
+    schemas = (
+        {str(model_configuration.tool_schema_digest): ACTION_ADAPTER.json_schema()}
+        if response_schemas is None
+        else response_schemas
+    )
     credentials = KeyringModelCredentialStore() if credential_source is None else credential_source
     try:
         return DeepSeekResponsesAdapter.from_approved_configuration(
             model_configuration=model_configuration,
             budget=budget,
             credential_source=credentials,
-            response_schemas=response_schemas,
+            response_schemas=schemas,
             client_factory=client_factory,
         )
     except ValueError as error:

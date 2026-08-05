@@ -39,3 +39,23 @@ def test_scripted_selection_never_calls_network(tmp_path: Path) -> None:
 
     assert selected is scripted
     assert scripted.call_count == 0
+
+
+def test_default_deepseek_selection_does_not_resolve_credential(tmp_path: Path) -> None:
+    del tmp_path
+    module = importlib.import_module("apexcrew.adapters.model.factory")
+    factory = module.build_model_port
+    revisions = default_revision_documents()
+
+    class ExplodingCredentialStore:
+        def resolve(self, profile: str) -> str:
+            raise AssertionError(f"credential resolved during composition: {profile}")
+
+    selected = factory(
+        model_configuration=revisions.model_configuration,
+        budget=revisions.budget,
+        credential_source=ExplodingCredentialStore(),
+        client_factory=ExplodingClientFactory(),
+    )
+
+    assert selected is not None

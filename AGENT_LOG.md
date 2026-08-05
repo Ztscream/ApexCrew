@@ -2130,3 +2130,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Document review finding**: Popper accepted the A/B split but blocked ownership/task precision because R4-04 owns planning/snapshot/executor adapter implementation while R4-02B did not explicitly require replacing every deferred boundary or assert that no deferred boundary remained.
 - **Documentation correction**: R4-02B now owns concrete composition graph replacement and a no-deferred integration assertion; R4-04 owns adapter implementation and hardening consumed through those seams. The final R4-02 module requirement remains unchanged.
 - **Review status**: this refinement requires a fresh independent document review before further source correction. No provider, credential, network, push, or PR action occurred.
+
+## 2026-08-06 / R4-02A schema correction
+
+- **Document review**: Locke returned `PASS` for the R4-02 A/B ownership correction at PLAN commit `bcb07b6`.
+- **Correction**: default DeepSeek selection now derives the closed `ACTION_ADAPTER` JSON schema registry from the configured tool-schema digest when no registry is injected. Construction remains offline and request-time credential resolution is preserved; scripted selection remains the deterministic no-network path.
+- **Observed correction evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_composition.py::test_bundle_shares_one_state_store tests/integration/test_provider_selection.py -q` -> `3 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests/contract/test_composition.py tests/integration/test_provider_selection.py` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests/contract/test_composition.py tests/integration/test_provider_selection.py` -> `61 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, push, or PR action occurred.
