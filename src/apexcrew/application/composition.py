@@ -118,7 +118,7 @@ class _DeferredRuntimeDriver:
 class ApplicationBundle:
     """The only concrete object exposed by the application composition root."""
 
-    __slots__ = ("_closeables", "_closed", "control", "queries", "runtime")
+    __slots__ = ("_closeables", "_closed", "_closed_indices", "control", "queries", "runtime")
 
     def __init__(
         self,
@@ -133,12 +133,16 @@ class ApplicationBundle:
         self.queries = queries
         self._closeables = closeables
         self._closed = False
+        self._closed_indices: set[int] = set()
 
     def close(self) -> None:
         if self._closed:
             return
         first_error: BaseException | None = None
-        for closeable in reversed(self._closeables):
+        for index in range(len(self._closeables) - 1, -1, -1):
+            if index in self._closed_indices:
+                continue
+            closeable = self._closeables[index]
             close = getattr(closeable, "close", None)
             if callable(close):
                 try:
@@ -146,6 +150,10 @@ class ApplicationBundle:
                 except BaseException as error:  # noqa: BLE001 - cleanup must continue
                     if first_error is None:
                         first_error = error
+                else:
+                    self._closed_indices.add(index)
+            else:
+                self._closed_indices.add(index)
         if first_error is not None:
             raise first_error
         self._closed = True

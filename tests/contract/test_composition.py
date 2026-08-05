@@ -95,19 +95,24 @@ def test_bundle_close_attempts_all_resources_after_failure() -> None:
     closed: list[str] = []
 
     class FailingClose:
+        attempts = 0
+
         def close(self) -> None:
+            self.attempts += 1
             closed.append("failing")
-            raise RuntimeError("close failed")
+            if self.attempts == 1:
+                raise RuntimeError("close failed")
 
     class RecordingClose:
         def close(self) -> None:
             closed.append("recording")
 
+    failing = FailingClose()
     bundle = bundle_type(
         control=object(),
         runtime=object(),
         queries=object(),
-        closeables=(RecordingClose(), FailingClose()),
+        closeables=(RecordingClose(), failing),
     )
 
     try:
@@ -118,3 +123,7 @@ def test_bundle_close_attempts_all_resources_after_failure() -> None:
         raise AssertionError("bundle cleanup should report the first close failure")
 
     assert closed == ["failing", "recording"]
+    bundle.close()
+    assert closed == ["failing", "recording", "failing"]
+    bundle.close()
+    assert closed == ["failing", "recording", "failing"]
