@@ -1611,3 +1611,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality review**: PASS — expected strict xfail and scoped Ruff/diff checks pass.
 - **Human changes**: None.
 - **Intended commit**: `test(acceptance): drive timestamp unit drift end to end`.
+
+## 2026-08-05 / M1-R4 independent plan review 1
+
+- **Task**: R4 plan gate — independent document review of `codex/m1-r4-independent-review` at `32edac8e2505c36f695e1531362a03ac5b013bf0`.
+- **Implementation subagent**: none; review subagent `Arendt`.
+- **Observed review**: verdict `BLOCKED`; reviewed `AGENTS.md`, frozen `SPEC.md`, complete `PLAN.md`, course briefs, and `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md` without editing implementation files.
+- **Critical findings**: R4 was not declared as superseding execution authority; the CLI sequence skipped required Policy/Budget/Model approvals; end-to-end evidence stopped before Worker/Grant/final integration/reopen; credential lifecycle omitted status/clear/replacement; provider/executor security assertions were not pinned to observed requirements; and task dependencies/worktree/PR/commit mechanics were incomplete.
+- **Correction**: expanded `PLAN.md` and the R4 plan with explicit R4 authority/cut-line precedence, serial task dependency and branch/worktree/PR matrix, complete typed approval/runtime CLI sequence, Worker/Grant/Integrate/reopen assertions, credential operations, exact DeepSeek settlement and executor containment assertions, and a corrected task ledger.
+- **Review digest**: first review used `PLAN.md` SHA-256 `FBE56410DEA8B26512A1ABF467169FC0D548C8455B000F1CA05240F996408FC2`; corrected plan SHA-256 is pending commit and second review.
+- **Human changes**: none.
+- **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): correct M1-R4 review blockers`.

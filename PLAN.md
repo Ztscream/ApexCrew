@@ -30438,3 +30438,82 @@ Each R4 task gets its own worktree, failing test, observed red output, minimum i
 | Verdict | pending |
 | Owner decision | pending `M1 GO` or `HOLD` |
 | Reviewed documentation commit | pending |
+
+### R4-01 Authority, Dependency, and Delivery Correction
+
+After an independent zero-blocker review and an owner `M1 GO`, this R4 section supersedes the M1-R3 execution cut line at lines 30263-30271 **only for the R4 final-user-runtime work**. The R3 ledger remains historical evidence; its unstarted rows are not silently marked complete. R4 becomes the current execution authority for its own labels, and the R4 ledger below is the only place where R4 implementation SHAs may be recorded. No R4 source task starts before the reviewed documentation commit containing this section.
+
+The required linear dependency is:
+
+```text
+R4-01A -> R4-01B -> R4-02A -> R4-02B -> R4-03A -> R4-03B
+       -> R4-04A -> R4-04B -> R4-05A -> R4-05B -> R4-CLOSE
+```
+
+The state store, application composition, and CLI contracts intentionally stay serial. Each row is one subagent-sized task with one implementation commit; each module PR may contain only the completed rows assigned to that module, plus its required `AGENT_LOG.md` entries. Proposed branch/worktree/PR ownership is:
+
+| Tasks | Branch | Worktree | PR title | Depends on |
+| --- | --- | --- | --- | --- |
+| R4-01A/R4-01B | `codex/m1-r4-01-bootstrap` | `.worktrees/m1-r4-01-bootstrap` | `feat(cli): bootstrap approved DeepSeek runs` | reviewed R4 docs |
+| R4-02A/R4-02B | `codex/m1-r4-02-composition` | `.worktrees/m1-r4-02-composition` | `feat(runtime): compose production Run services` | R4-01 module PR |
+| R4-03A/R4-03B | `codex/m1-r4-03-cli-lifecycle` | `.worktrees/m1-r4-03-cli-lifecycle` | `feat(cli): deliver Permit-gated Run lifecycle` | R4-02 module PR |
+| R4-04A/R4-04B | `codex/m1-r4-04-execution` | `.worktrees/m1-r4-04-execution` | `feat(executor): run scoped Worker actions safely` | R4-03 module PR |
+| R4-05A/R4-05B | `codex/m1-r4-05-provider-delivery` | `.worktrees/m1-r4-05-provider-delivery` | `test(delivery): verify live DeepSeek path` | R4-04 module PR |
+
+Every implementation task has its own red/green evidence and one Conventional Commit with `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers. The module closeout commit updates only this R4 ledger and the corresponding `AGENT_LOG.md` audit rows. No push, PR creation, credential entry, or live API call is implied by the plan.
+
+### R4-02 Complete Human-Approval and Runtime Sequence
+
+`run-create` creates a `DRAFT` containing the exact Policy, Budget, and Model Configuration revisions from the typed `CreateRunPayload`; it does not approve them and does not call DeepSeek. The supported CLI sequence is:
+
+```text
+apexcrew init --root <repo>
+apexcrew credentials set
+apexcrew credentials status
+apexcrew run-create --root <repo> --target-ref refs/heads/main --goal "..." --acceptance "..."
+apexcrew show <run-id> --root <repo>
+apexcrew approve-policy <run-id> --root <repo> --digest <policy-digest> --confirmation-code <code>
+apexcrew approve-budget <run-id> --root <repo> --digest <budget-digest> --confirmation-code <code>
+apexcrew approve-model <run-id> --root <repo> --digest <model-digest> --confirmation-code <code>
+apexcrew begin-planning <run-id> --root <repo>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew approve-plan <run-id> --root <repo> --digest <plan-digest> --confirmation-code <code>
+apexcrew start <run-id> --root <repo> --plan-digest <plan-digest>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew grant <run-id> --root <repo> --pending-action-id <id> --action-digest <digest> --confirmation-code <code>
+apexcrew run <run-id> --root <repo>
+apexcrew integrate <run-id> --root <repo> --candidate-id <id> --prepared-oid <oid> --expected-target-oid <oid> --evidence-digest <digest> --confirmation-code <code>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew credentials clear
+```
+
+`show` is the only source for the next exact digest, pending action ID, candidate ID, evidence digest, and confirmation code preview; it never exposes the nonce itself. Each approval command is a typed `CommandEnvelope` through `CrewControl`; each accepted begin/start/grant/integrate command issues at most one Runtime Permit, and `run` consumes it before recovery, model, tool, or ref effects. `continue`, `resume`, `resolve-indeterminate`, `pause`, `cancel`, `prepare-purge`, and `confirm-purge` remain typed commands with the same sequence/revision rules. `status` reports only local initialization and credential source/presence; `credentials status` and `credentials clear` are required lifecycle commands.
+
+R4-03A's offline lifecycle test must observe, in order: `DRAFT` with zero model calls; three revision approvals with three exact digests; `begin-planning` issuing one Permit; `run` consuming it and either producing a deterministic planning request or pausing before dispatch; plan proposal and `AWAITING_PLAN_APPROVAL`; plan approval and `start` issuing a fresh Permit; a Worker attempt and one typed model action; `AWAITING_ACTION_APPROVAL` for a risky action; exact `grant`, Permit consumption, and one tool effect; a frozen Candidate with fresh Evidence Bundle; `AWAITING_FINAL_APPROVAL`; exact `integrate`, Permit consumption, one Admission-issued CAS, and a changed target OID. A sibling assertion records that the target OID remains unchanged through every earlier step. Reopen the SQLite bundle in a new process, replay every prior command, and assert no second model/tool/ref effect.
+
+### R4-03 Exact Provider and Executor Security Verification
+
+The DeepSeek contract tests must assert all of the following from observed calls/results, not only request construction: base URL `https://api.deepseek.com`; requested ID `deepseek-v4-flash`; exact returned-ID allowlist with no dated alias; `max_retries=0`; input/output caps `32_000`/`4_096`; `provider_storage_enabled=False`; exact tool-schema digest; completed status; non-empty response ID; observed usage including reasoning tokens; typed schema-conformant one-object action; pricing snapshot USD `0.28`/`0.56` per million; worst-case reservation USD `0.672`; full reservation charge when usage/status/model/schema is absent or unexpected; known-closed retry only for the specified transient rejection; and unknown transport outcome as `INDETERMINATE` with no released output. Tests must prove the credential is resolved only at request time and never enters the request payload, journal, executor environment, logs, or rendered projection. `credentials status`, `clear`, and replacement tests must prove no secret bytes appear in output.
+
+The executor contract must assert digest-pinned image, non-root UID/GID, read-only root filesystem, `network=none`, no Docker socket or host credential mount, dropped capabilities, `no-new-privileges`, CPU/memory/PID/scratch ceilings, minimal allowlisted environment, regular-file-only snapshot, no `.git`, no symlink/reparse, no secret path, and discard of command-created files. The argv test must reject shell metacharacter text as an executable command form, but must continue to pass only structured argv accepted by the frozen action schema. Unsupported host execution must return `RESTRICTED_EXECUTOR_RUNNER_NOT_CONNECTED` or an equivalent fail-closed result; no test may treat the current stub as a successful Worker action.
+
+### R4-04 Corrected Ledger
+
+| Task | Status | Implementation commit | Red/green and review evidence |
+| --- | --- | --- | --- |
+| R4-01A configuration/repository bootstrap | NOT STARTED | pending | pending |
+| R4-01B revision approval CLI and previews | NOT STARTED | pending | pending |
+| R4-02A production composition root/model factory | NOT STARTED | pending | pending |
+| R4-02B Coordinator/Worker/phase-driver wiring | NOT STARTED | pending | pending |
+| R4-03A create/approve/plan/start/run CLI | NOT STARTED | pending | pending |
+| R4-03B Worker/Grant/Integrate/reopen end-to-end lifecycle | NOT STARTED | pending | pending |
+| R4-04A OS runtime ownership and snapshot adapters | NOT STARTED | pending | pending |
+| R4-04B restricted executor and typed Worker tools | NOT STARTED | pending | pending |
+| R4-05A opt-in DeepSeek smoke and credential lifecycle | NOT STARTED | pending | pending |
+| R4-05B release docs, build, scan, and final walkthrough | NOT STARTED | pending | pending |
+| R4-CLOSE final offline/live/reopen audit | NOT STARTED | pending | pending |
+
+The independent review record remains `BLOCKED` until the reviewer confirms this correction and computes a new `PLAN.md` digest. The owner decision remains pending; this correction does not authorize source edits by itself.

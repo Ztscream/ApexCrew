@@ -137,3 +137,65 @@ uv run --python 3.12 apexcrew show <run-id> --root <repo>
 
 Each task is implemented in its own worktree with one Conventional Commit, an `AGENT_LOG.md` entry, and the required `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers. The spec-compliance review runs before the quality review. No live smoke, push, PR creation, or credential value is performed by default. The final claim requires observed command output for every success criterion.
 
+## Review Correction Addendum
+
+The first independent review found six blockers. This addendum is binding with the R4 section in `PLAN.md` and closes those gaps before the next review.
+
+### Authority and Worktree Matrix
+
+After a fresh independent zero-blocker review and owner `M1 GO`, R4 supersedes the old M1-R3 execution cut line only for final-user-runtime tasks. R3 remains historical evidence. The serial dependency is:
+
+```text
+R4-01A -> R4-01B -> R4-02A -> R4-02B -> R4-03A -> R4-03B
+       -> R4-04A -> R4-04B -> R4-05A -> R4-05B -> R4-CLOSE
+```
+
+| Tasks | Branch | Worktree | PR title |
+| --- | --- | --- | --- |
+| R4-01A/R4-01B | `codex/m1-r4-01-bootstrap` | `.worktrees/m1-r4-01-bootstrap` | `feat(cli): bootstrap approved DeepSeek runs` |
+| R4-02A/R4-02B | `codex/m1-r4-02-composition` | `.worktrees/m1-r4-02-composition` | `feat(runtime): compose production Run services` |
+| R4-03A/R4-03B | `codex/m1-r4-03-cli-lifecycle` | `.worktrees/m1-r4-03-cli-lifecycle` | `feat(cli): deliver Permit-gated Run lifecycle` |
+| R4-04A/R4-04B | `codex/m1-r4-04-execution` | `.worktrees/m1-r4-04-execution` | `feat(executor): run scoped Worker actions safely` |
+| R4-05A/R4-05B | `codex/m1-r4-05-provider-delivery` | `.worktrees/m1-r4-05-provider-delivery` | `test(delivery): verify live DeepSeek path` |
+
+Each row is split into one subagent-sized task and one implementation commit. Module closeout updates the R4 ledger and corresponding `AGENT_LOG.md` rows only.
+
+### Complete CLI Sequence
+
+`run-create` stores the exact Policy, Budget, and Model Configuration revisions in `DRAFT` and makes zero model calls. It does not approve them. The supported sequence is:
+
+```text
+apexcrew init --root <repo>
+apexcrew credentials set
+apexcrew credentials status
+apexcrew run-create --root <repo> --target-ref refs/heads/main --goal "..." --acceptance "..."
+apexcrew show <run-id> --root <repo>
+apexcrew approve-policy <run-id> --root <repo> --digest <policy-digest> --confirmation-code <code>
+apexcrew approve-budget <run-id> --root <repo> --digest <budget-digest> --confirmation-code <code>
+apexcrew approve-model <run-id> --root <repo> --digest <model-digest> --confirmation-code <code>
+apexcrew begin-planning <run-id> --root <repo>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew approve-plan <run-id> --root <repo> --digest <plan-digest> --confirmation-code <code>
+apexcrew start <run-id> --root <repo> --plan-digest <plan-digest>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew grant <run-id> --root <repo> --pending-action-id <id> --action-digest <digest> --confirmation-code <code>
+apexcrew run <run-id> --root <repo>
+apexcrew integrate <run-id> --root <repo> --candidate-id <id> --prepared-oid <oid> --expected-target-oid <oid> --evidence-digest <digest> --confirmation-code <code>
+apexcrew run <run-id> --root <repo>
+apexcrew show <run-id> --root <repo>
+apexcrew credentials clear
+```
+
+`show` is the only source for the next exact digest, pending action, candidate, evidence, and confirmation-code preview; it never exposes a nonce. `status` reports only initialization and credential source/presence. `continue`, `resume`, `resolve-indeterminate`, `pause`, `cancel`, and purge commands use the same typed `CommandEnvelope` and sequence/revision binding.
+
+### Required End-to-End Assertions
+
+`test_cli_run_lifecycle.py` must observe: DRAFT/zero calls; three revision approvals; `begin-planning` Permit issuance and `run` consumption; planning stop at `AWAITING_PLAN_APPROVAL`; plan approval plus `start` fresh Permit; Worker attempt and one typed model action; `AWAITING_ACTION_APPROVAL`; exact Grant and one tool effect; fresh Evidence Bundle/Candidate; `AWAITING_FINAL_APPROVAL`; exact Integrate Permit and one Admission CAS; changed target OID only at the final integration; and a new-process reopen where every old command replay produces zero second effect.
+
+### Provider and Executor Assertions
+
+The provider tests must observe exact DeepSeek base URL and model ID, no SDK retries, 32,000/4,096 token caps, storage off, schema digest, completed status, response ID, exact returned-ID allowlist, usage including reasoning tokens, typed one-object output, USD 0.28/0.56 pricing, USD 0.672 worst-case reservation, full charge for missing/unexpected settlement data, known-closed retry bounds, and `INDETERMINATE` for unknown transport outcome. Credential tests cover set/status/clear/replacement and prove no secret bytes enter prompts, journal, executor environment, logs, or projections.
+
+Executor tests must assert digest-pinned image, non-root UID/GID, read-only root, no network, no socket/credential mount, dropped capabilities, no-new-privileges, CPU/memory/PID/scratch ceilings, minimal environment, regular-file-only snapshots, no `.git`/symlink/reparse/secret paths, and discard of command-created files. Unsupported host execution remains fail closed and is never counted as a successful Worker action.
