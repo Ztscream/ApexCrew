@@ -1634,3 +1634,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: none.
 - **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): resolve M1-R4 task delivery ambiguity`.
+
+## 2026-08-05 / M1-R4 independent plan review 3
+
+- **Task**: R4 plan gate re-review of correction commit `7aece44b55681275df7c7eda640fb55cba435c5a`.
+- **Implementation subagent**: none; fresh review subagent `Copernicus`.
+- **Observed review**: verdict `BLOCKED`. The reviewer confirmed the prior delivery and generic-command corrections, then identified five remaining blockers: one generic `approve` mention in a test step; module-level rather than A/B task-level file/implementation/selector contracts; current authority references to SPEC revision 2; stale embedded final-sign-off text in frozen SPEC without governance clarification; and no explicit opt-in live CLI approval/Permit/runtime lifecycle through the real DeepSeek composition.
+- **Correction**: this commit replaces the generic approval test wording with specialized commands, adds exact task-level delivery matrices for `R4-01A` through `R4-05B` in both plans, binds current R4 execution to SPEC revision 3 while preserving revision-2 historical gates, records the external-owner authority over stale embedded SPEC status without editing `SPEC.md`, and adds the separately gated `test_live_cli_run_lifecycle.py` contract.
+- **Review digest**: reviewed `PLAN.md` SHA-256 `2DF53D79309A4B0D31CAC83BDAB68173F066657E4661ABE9D5B219E67F071B41`; corrected plan SHA-256 is pending commit and fresh re-review.
+- **Human changes**: none.
+- **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): close M1-R4 review blockers`.
