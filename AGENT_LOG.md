@@ -1944,6 +1944,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A context cleanup SHA`.
 
+## 2026-08-06 / R4-01A Ohm final spec review
+
+- **Task**: final fresh spec-compliance review of HEAD `fc174e6` and implementation `27d2230`.
+- **Reviewer**: Ohm; verdict `PASS`.
+- **Observed result**: Ohm confirmed root/object cleanup, retry ownership, primary security-error precedence through context exit, ancestor preflight, stable state binding, POSIX/Windows controls, SQLite cleanup, and final ledger/log evidence. No files were modified; no network, credential, provider, or live API call occurred.
+- **Ledger action**: mark R4-01A `PENDING QUALITY REVIEW`; quality review remains pending and must be performed by a different fresh reviewer.
+
 ## 2026-08-06 / R4-01A Aquinas final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.
