@@ -381,8 +381,8 @@ W1 卡所有者合并 PR #13
 
 | 任务 | 深度 | 关闭的债务 | 状态 | 实现提交 |
 | --- | --- | --- | --- | --- |
-| P1 模型凭据端口 | REAL | — | TODO | |
-| P2 CLI 凭据命令 | REAL | — | TODO | |
+| P1 模型凭据端口 | REAL | — | DONE | `11760316cde6bb35fd7fffc41e66aa2d6942750a` |
+| P2 CLI 凭据命令 | REAL | — | DONE | `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3` |
 | P3 定价换绑 | REAL | — | DONE | `a0eb48e6485ba8a1a87577687409117f1bb985a2` |
 | P4 DeepSeek adapter | REAL | `DEBT-M4-001` | TODO | |
 | P5 live smoke | REAL | — | BLOCKED(所有者授权) | |
