@@ -1599,3 +1599,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality review**: PASS — `uv run --python 3.12 pytest tests/acceptance/test_money_unit_drift_run.py -q -rxX` reported one expected strict xfail; `git diff --check` passed.
 - **Human changes**: None.
 - **Intended commit**: `test(acceptance): drive money unit drift end to end`.
+
+## 2026-08-05 / E2 TypeScript timestamp unit drift acceptance
+
+- **Task**: E2 — drive TypeScript milliseconds/seconds drift through the end-to-end acceptance surface.
+- **Implementation subagent**: Codex.
+- **Red evidence**: `uv run --python 3.12 pytest tests/acceptance/test_timestamp_unit_drift_run.py --runxfail -vv` exited 1 at the same first boundary established by E1: `CrewControl.handle` returned `INVALID` with `CREATE_RUN_BINDING_INVALID` before Run creation.
+- **Outcome**: SKELETON boundary, strict `xfail`. The test seeded `fixtures/typescript-time` into a real temporary Git repository, changed milliseconds to seconds, committed the defect, confirmed no remote, and reproduced E1's fixed bootstrap-authority limitation without re-debugging later phases.
+- **Changes**: Added `tests/acceptance/test_timestamp_unit_drift_run.py`; reused E1's Git setup helpers and the same explicit first-boundary assertion.
+- **Spec review**: PASS — the test does not bypass the shared blocked boundary or fabricate runtime/evidence/CAS state.
+- **Quality review**: PASS — expected strict xfail and scoped Ruff/diff checks pass.
+- **Human changes**: None.
+- **Intended commit**: `test(acceptance): drive timestamp unit drift end to end`.
