@@ -2,6 +2,20 @@
 
 This chronological log records material agent work and human decisions. Future implementation entries must include the `PLAN.md` task, Superpowers skill, red/green evidence, commit or PR, and any manual correction. Never record credentials, private prompt text, or secret-bearing command output.
 
+## 2026-08-05 / P1 - Model credential port
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `5708f75dcf8ed445477e40618c6a02378e194907`.
+- **Task/skill**: P1; karpathy-guidelines.
+- **Prompt/context**: establish the request-time model credential boundary for the DeepSeek profile without loading repository `.env` files or exposing credential values.
+- **Observed red**: `uv run --python 3.12 pytest tests/contract/test_model_credentials.py -q` failed during collection with `ModuleNotFoundError: apexcrew.adapters.credentials.model_key`.
+- **Implementation**: added `ModelCredentialPort`, `KeyringModelCredentialStore`, `MemoryCredentialStore`, explicit keyring/env source resolution, management `set/clear/source`, and fail-closed model credential errors.
+- **Green evidence**: the focused contract selector passed with `5 passed`; `uv run --python 3.12 mypy src` passed with no issues in 54 source files; scoped Ruff check/format and `git diff --check` passed.
+- **Spec-Review**: Codex self-check passed: keyring is first, only `APEXCREW_DEEPSEEK_API_KEY` is an environment fallback, `.env` is never loaded, and resolved values are not cached or represented.
+- **Quality-Review**: Codex self-check passed after fixing import ordering and formatter output; no critical issues remain.
+- **Subagent/Human-Changes**: Codex; none.
+- **Changed paths**: `src/apexcrew/adapters/credentials/model_key.py`, `tests/contract/test_model_credentials.py`, `AGENT_LOG.md`.
+- **Intended commit**: `feat(credentials): add model credential boundary`.
+
 ## 2026-08-04 / M1-FIX-004 - random Target Reservation identity
 
 - **Skill**: `tdd`; the exact public store/control seams were recorded before adding the two required test nodes, and the failing selector preceded production changes.
