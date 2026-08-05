@@ -1405,3 +1405,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the REAL S18 correction; implementation commit follows.
 - **Human intervention**: none; no credentials, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
 - **Lesson**: release contracts must validate executable command semantics, not only target names; the remaining failure is the external Docker daemon boundary.
+
+## 2026-08-05 / S18 Docker acceptance amendment
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `396596a`.
+- **Task/skill**: S18 acceptance amendment; karpathy-guidelines.
+- **Prompt/context**: rerun the real image build after Docker Desktop became available and verify the restricted runtime boundary.
+- **Observed red**: the prior acceptance was blocked while Docker Desktop could not start; no source or Dockerfile change was needed after the daemon recovered.
+- **Implementation**: none; the existing digest-pinned Dockerfile and corrected `make build` target were exercised unchanged.
+- **Green evidence**: `docker info` succeeded; `make build` exited `0`; image `sha256:1ae51ac9741cda3337a5ec3abb640dcbc79122e340fbaca7191ce908b44186a9` was created; inspection showed user `1000:1000`, `org.apexcrew.network=none`, and `org.apexcrew.docker_socket=denied`; `docker run --rm --network=none apexcrew-executor:local --help` exited `0`.
+- **Subagent output/commit**: Codex self-checked the REAL S18 acceptance amendment; documentation commit follows.
+- **Human intervention**: none; no credentials, provider call, push, PR, Pages enablement, or `SPEC.md` edit occurred.
+- **Lesson**: image security claims are stronger when the built image configuration and networkless CLI startup are observed, not only declared in a Dockerfile.
