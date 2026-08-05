@@ -882,7 +882,10 @@ class _CompositionPlanningContext:
         return model_configuration, budget
 
     def build_planning_request(
-        self, run_id: RunId, authorization: PlanningAuthorization
+        self,
+        run_id: RunId,
+        authorization: PlanningAuthorization,
+        manifest: PlanningManifest,
     ) -> ModelRequest:
         model_configuration, budget = self._documents(run_id)
         self._requested_model_id = model_configuration.requested_model_id
@@ -893,6 +896,22 @@ class _CompositionPlanningContext:
         self._max_output_tokens = model_configuration.inference_settings.max_output_tokens
         self._tool_schema_digest = model_configuration.tool_schema_digest
         self._reserved_cost_usd = _worst_case_reservation(model_configuration, budget)
+        inputs = self._store.bootstrap_inputs(run_id)
+        prompt_document = {
+            "acceptance_criteria": list(inputs.acceptance_criteria),
+            "constraints": list(inputs.constraints),
+            "goal": inputs.goal,
+            "manifest": [
+                {"path": str(path), "digest": str(digest), "size": size}
+                for path, digest, size in manifest.entries
+            ],
+            "instructions": (
+                "Return exactly one planning action object. Use submit_plan with a complete "
+                "plan_document, or use one bounded read/search action before submitting. "
+                "Do not return a Worker action."
+            ),
+        }
+        prompt = canonical_json(prompt_document)
         current = authorization.applicable_revision_digests
         if (
             current.policy_digest is None
@@ -904,6 +923,7 @@ class _CompositionPlanningContext:
             canonical_json(
                 {
                     "run_id": run_id,
+                    "prompt": prompt,
                     "snapshot_digest": authorization.turn_binding.snapshot_digest
                     if authorization.turn_binding is not None
                     else None,
@@ -918,7 +938,7 @@ class _CompositionPlanningContext:
             model_configuration_digest=current.model_configuration_digest,
             requested_model_id=self._requested_model_id,
             allowed_model_ids=self._allowed_model_ids,
-            prompt=({"role": "user", "content": "planning"},),
+            prompt=({"role": "user", "content": prompt},),
             tool_schema_digest=str(self._tool_schema_digest),
             request_digest=request_digest,
             idempotency_key=f"planning-request:{run_id}:{request_digest}",
@@ -939,8 +959,7 @@ class _CompositionPlanningRequests:
         authorization: PlanningAuthorization,
         manifest: PlanningManifest,
     ) -> ModelRequest:
-        del manifest
-        return self._context.build_planning_request(run_id, authorization)
+        return self._context.build_planning_request(run_id, authorization, manifest)
 
 
 class _RuntimeIds:

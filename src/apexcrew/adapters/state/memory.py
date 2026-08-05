@@ -135,6 +135,7 @@ from apexcrew.domain.effects import (
     EffectResult,
     PlanApproval,
     ReservationObservation,
+    RunBootstrapInputs,
     RunRecord,
     RunRefRecord,
     StateCommitFault,
@@ -856,6 +857,14 @@ class InMemoryStateStore:
                 return self._runs[run_id]
             except KeyError as error:
                 raise StateConflict("RUN_NOT_FOUND") from error
+
+    def bootstrap_inputs(self, run_id: RunId) -> RunBootstrapInputs:
+        with self._lock:
+            try:
+                goal, constraints, acceptance = self._bootstrap_inputs[run_id]
+            except KeyError as error:
+                raise StateConflict("RUN_BOOTSTRAP_INPUTS_NOT_FOUND") from error
+        return RunBootstrapInputs(goal, tuple(constraints), tuple(acceptance))
 
     def target_reservation(self, reservation_id: str) -> TargetReservation:
         with self._lock:

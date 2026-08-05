@@ -157,6 +157,7 @@ from apexcrew.domain.effects import (
     EffectResult,
     PlanApproval,
     ReservationObservation,
+    RunBootstrapInputs,
     RunRecord,
     RunRefRecord,
     StateCommitFault,
@@ -1889,6 +1890,32 @@ class SqliteStateStore:
         if row is None:
             raise StateConflict("RUN_NOT_FOUND")
         return self._run_record_from_row(row)
+
+    def bootstrap_inputs(self, run_id: RunId) -> RunBootstrapInputs:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT goal_json, constraints_json, acceptance_json "
+                "FROM run_bootstrap_inputs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("RUN_BOOTSTRAP_INPUTS_NOT_FOUND")
+        try:
+            goal_document = json.loads(str(row["goal_json"]))
+            constraints = json.loads(str(row["constraints_json"]))
+            acceptance = json.loads(str(row["acceptance_json"]))
+            goal = goal_document["goal"]
+            if (
+                not isinstance(goal, str)
+                or not isinstance(constraints, list)
+                or not all(isinstance(item, str) for item in constraints)
+                or not isinstance(acceptance, list)
+                or not all(isinstance(item, str) for item in acceptance)
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StateConflict("RUN_BOOTSTRAP_INPUTS_INVALID") from error
+        return RunBootstrapInputs(goal, tuple(constraints), tuple(acceptance))
 
     def final_candidate(self, run_id: RunId) -> FrozenRunCandidate:
         with self._read_transaction() as connection:

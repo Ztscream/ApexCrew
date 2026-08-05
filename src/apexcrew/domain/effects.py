@@ -169,6 +169,13 @@ class RunRecord:
     current_model_configuration_digest: RevisionDigest | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RunBootstrapInputs:
+    goal: str
+    constraints: tuple[str, ...]
+    acceptance_criteria: tuple[str, ...]
+
+
 class StateConflict(RuntimeError):
     """A durable compare-and-set or invariant violation."""
 

@@ -119,3 +119,56 @@ def test_default_deepseek_selection_parses_one_fake_response() -> None:
 
     assert result.kind == "COMPLETED"
     assert captured[0]["store"] is False
+
+
+def test_default_deepseek_selection_accepts_a_planning_action() -> None:
+    module = importlib.import_module("apexcrew.adapters.model.factory")
+    revisions = default_revision_documents()
+
+    class Client:
+        responses = None
+
+        def __init__(self) -> None:
+            self.responses = self
+
+        def create(self, **_: object) -> object:
+            return SimpleNamespace(
+                id="response-planning-schema",
+                model="deepseek-v4-flash",
+                status="completed",
+                output_parsed={"kind": "submit_plan", "plan_document": {}},
+                usage=SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=2,
+                    output_tokens_details=SimpleNamespace(reasoning_tokens=0),
+                ),
+            )
+
+    selected = module.build_model_port(
+        model_configuration=revisions.model_configuration,
+        budget=revisions.budget,
+        credential_source=MemoryCredentialStore({"deepseek": "test-key"}),
+        client_factory=lambda **_: Client(),
+    )
+    request = ModelRequest(
+        run_id=RunId("run-planning-schema"),
+        plan_digest=None,
+        policy_digest="sha256:" + "1" * 64,
+        budget_digest="sha256:" + "2" * 64,
+        model_configuration_digest="sha256:" + "3" * 64,
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
+        prompt=({"role": "user", "content": "planning"},),
+        tool_schema_digest=revisions.model_configuration.tool_schema_digest,
+        request_digest="sha256:" + "4" * 64,
+        idempotency_key="planning-schema-request",
+        max_input_tokens=100,
+        max_output_tokens=100,
+        reserved_cost_usd=Decimal("0.01"),
+    )
+
+    result = selected.complete(request)
+
+    assert result.kind == "COMPLETED"
+    assert result.completion is not None
+    assert result.completion.normalized_action["kind"] == "submit_plan"

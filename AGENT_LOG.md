@@ -2260,4 +2260,19 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Review status**: implementation-side spec and quality review are pending the
   independent review branch. No credential, provider request, push, or PR action
   occurred.
+
+## 2026-08-06 / R4-05 live lifecycle correction
+
+- **Independent review finding**: the default DeepSeek response schema covered
+  Worker actions only, while the planning loop accepts a distinct `submit_plan` /
+  bounded read action set; the planned live CLI lifecycle test was also absent.
+- **Correction**: the production model factory now publishes one strict combined
+  planning/Worker schema with the duplicate `fail` branch removed. Planning requests
+  now carry persisted goal, constraints, acceptance criteria, and the bounded regular
+  file manifest. The live CLI test drives `init`, `run-create`, three typed approvals,
+  `begin-planning`, and one `run` delivery under the explicit gate, with a counting
+  client proving one request. Missing credentials still fail before client creation.
+- **Evidence**: the focused provider/composition/live selectors, Ruff check/format,
+  mypy, and `git diff --check` are green. The live lifecycle remains default-skipped;
+  no credential or provider request was used in this correction.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.

@@ -51,8 +51,10 @@ def _approval_code(command_kind: str, run_id: str, revision_class: str, digest: 
 class _LifecycleModel(ScriptedMockLLM):
     def __init__(self) -> None:
         super().__init__(())
+        self.requests = []
 
     def complete(self, request):  # type: ignore[no-untyped-def]
+        self.requests.append(request)
         if request.owner_kind == "PLANNING":
             action = {
                 "kind": "submit_plan",
@@ -127,10 +129,11 @@ def test_composed_runtime_reaches_plan_approval_with_real_git_reservation(tmp_pa
         model_configuration_revision=model_configuration,
     )
     secret_policy = SecretPathPolicy.from_host_rules((), b"k" * 32)
+    model = _LifecycleModel()
     bundle = build_application_bundle(
         root,
         model_configuration=model_configuration,
-        scripted_model=_LifecycleModel(),
+        scripted_model=model,
         secret_policy=secret_policy,
     )
     try:
@@ -214,6 +217,9 @@ def test_composed_runtime_reaches_plan_approval_with_real_git_reservation(tmp_pa
         assert planning_stop.pending is not None
         assert bundle.queries.get(run_id).state == "AWAITING_PLAN_APPROVAL"
         assert planning_stop.last_sequence == bundle.queries.get(run_id).sequence
+        prompt = model.requests[0].prompt[0]["content"]
+        assert "complete the task" in prompt
+        assert "src/task.py" in prompt
     finally:
         bundle.close()
 

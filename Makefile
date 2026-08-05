@@ -17,7 +17,7 @@ demo:
 	$(UV_RUN) python -m apexcrew.demo
 
 live-smoke:
-	$(UV_RUN) pytest tests/integration/test_live_provider_smoke.py -q
+	$(UV_RUN) pytest tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q
 
 secret-scan:
 	$(UV_RUN) python scripts/secret_scan.py .
