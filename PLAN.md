@@ -30526,7 +30526,7 @@ The executor contract must assert digest-pinned image, non-root UID/GID, read-on
 
 | Task | Status | Implementation commit | Red/green and review evidence |
 | --- | --- | --- | --- |
-| R4-01A configuration/repository bootstrap | PENDING FINAL REVIEW | `b843888` | Initial red/green evidence and subsequent corrections are recorded in `AGENT_LOG.md`; final correction keeps the no-follow state database binding stable across repeated guard entry, opens SQLite from the bound handle, denies Windows delete/rename sharing, and closes injected connections on migration or post-open identity failure. Full offline pytest, mypy, Ruff check/format, and diff check are green; symlink cases remain skipped only where this Windows host cannot create symlinks. `Spec-Review: pending`; `Quality-Review: pending`. |
+| R4-01A configuration/repository bootstrap | PENDING FINAL REVIEW | `82bf23d` | Initial red/green evidence and subsequent corrections are recorded in `AGENT_LOG.md`; final correction keeps the no-follow state database binding stable across repeated guard entry, verifies canonical root/ancestor identities, opens SQLite from the bound handle, denies Windows delete/rename sharing, and closes injected connections on migration or post-open identity failure. Full offline pytest, mypy, Ruff check/format, and diff check are green; symlink cases remain skipped only where this Windows host cannot create symlinks. `Spec-Review: pending`; `Quality-Review: pending`. |
 | R4-01B revision approval CLI and previews | NOT STARTED | pending | pending |
 | R4-02A production composition root/model factory | NOT STARTED | pending | pending |
 | R4-02B Coordinator/Worker/phase-driver wiring | NOT STARTED | pending | pending |
