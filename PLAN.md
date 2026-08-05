@@ -30526,7 +30526,7 @@ The executor contract must assert digest-pinned image, non-root UID/GID, read-on
 
 | Task | Status | Implementation commit | Red/green and review evidence |
 | --- | --- | --- | --- |
-| R4-01A configuration/repository bootstrap | PENDING REVIEW | `a3a89c3b6d495d5c2d6a4b3cdc6c687db58a7597` | Sartre correction red selector `3 failed` -> green `3 passed`; focused bootstrap/preflight/configuration/CLI suite `64 passed, 4 skipped`; mypy clean over 56 source files; Ruff check/format and diff check clean. Correction rejects symbolic and malformed loose refs through no-follow handles, owns a private default Git config directory, validates `init` roots before config writes, and preserves injected directories. `Spec-Review: pending`; `Quality-Review: pending`. |
+| R4-01A configuration/repository bootstrap | PENDING FINAL REVIEW | `b843888` | Initial red/green evidence and subsequent corrections are recorded in `AGENT_LOG.md`; final correction keeps the no-follow state database binding stable across repeated guard entry, opens SQLite from the bound handle, denies Windows delete/rename sharing, and closes injected connections on migration or post-open identity failure. Full offline pytest, mypy, Ruff check/format, and diff check are green; symlink cases remain skipped only where this Windows host cannot create symlinks. `Spec-Review: pending`; `Quality-Review: pending`. |
 | R4-01B revision approval CLI and previews | NOT STARTED | pending | pending |
 | R4-02A production composition root/model factory | NOT STARTED | pending | pending |
 | R4-02B Coordinator/Worker/phase-driver wiring | NOT STARTED | pending | pending |

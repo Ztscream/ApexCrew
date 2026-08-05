@@ -1759,3 +1759,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex correction; implementation subagent remains Einstein.
 - **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
 - **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
+## 2026-08-06 / R4-01A final ledger correction
+
+- **Task**: record the stable R4-01A implementation SHA after the final control-path correction.
+- **Review finding**: Galileo confirmed the implementation behavior was clear but blocked the review because the R4 ledger still pointed to `a3a89c3`, the log stopped at `cfe7f28`, and `b843888` trailers were still pending.
+- **Correction**: update the R4-01A ledger to `b843888` with final offline verification and mark it `PENDING FINAL REVIEW`; preserve pending review trailers until fresh spec and quality reviews complete.
+- **Observed verification**: ledger correction is documentation-only; the implementation SHA's full pytest, mypy, Ruff check/format, and diff-check evidence is recorded above. No source, provider, credential, network, push, PR, or live API change.
+- **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
+- **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): record R4-01A task commits`.
