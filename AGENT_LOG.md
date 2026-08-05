@@ -1854,3 +1854,12 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex correction; implementation subagent remains Einstein.
 - **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
 - **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
+## 2026-08-06 / R4-01A final guard-probe ledger correction
+
+- **Task**: record final implementation correction SHA `12ca604` before re-running reviews touched by guard temporary-handle ownership.
+- **Correction**: update the R4-01A ledger to `12ca604`; prior Gibbs PASS, Chandrasekhar BLOCKED, and Hegel BLOCKED findings remain historical, while this final correction is pending fresh ordered review.
+- **Observed verification**: full offline pytest, mypy, Ruff check/format, and `git diff --check` passed on `12ca604`. No provider, credential, network, push, PR, or live API call.
+- **Human changes**: Codex documentation correction; implementation subagent remains Einstein.
+- **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): record R4-01A guard probe SHA`.
