@@ -53,6 +53,38 @@ def test_bootstrap_observes_repository_identity_and_target_oid(tmp_path: Path) -
     assert observed.target_oid == expected_oid
 
 
+def test_bootstrap_rejects_symbolic_direct_local_ref(tmp_path: Path) -> None:
+    from apexcrew.adapters.repository.bootstrap import (
+        RepositoryBootstrapAuthorityService,
+        RepositoryBootstrapError,
+    )
+
+    root = make_git_repository(tmp_path)
+    (root / "README.md").write_text("bootstrap\n", encoding="utf-8")
+    commit_repository(root, "bootstrap")
+    symbolic_ref = root / ".git" / "refs" / "heads" / "alias"
+    symbolic_ref.write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    with pytest.raises(RepositoryBootstrapError, match="symbolic"):
+        RepositoryBootstrapAuthorityService().inspect(str(root), "refs/heads/alias")
+
+
+@pytest.mark.parametrize("content", (b"not-an-oid\n", b"1" * 40))
+def test_bootstrap_rejects_malformed_loose_direct_local_ref(tmp_path: Path, content: bytes) -> None:
+    from apexcrew.adapters.repository.bootstrap import (
+        RepositoryBootstrapAuthorityService,
+        RepositoryBootstrapError,
+    )
+
+    root = make_git_repository(tmp_path)
+    (root / "README.md").write_text("bootstrap\n", encoding="utf-8")
+    commit_repository(root, "bootstrap")
+    (root / ".git" / "refs" / "heads" / "alias").write_bytes(content)
+
+    with pytest.raises(RepositoryBootstrapError, match="malformed"):
+        RepositoryBootstrapAuthorityService().inspect(str(root), "refs/heads/alias")
+
+
 def test_bootstrap_rejects_checked_out_target_ref(tmp_path: Path) -> None:
     from apexcrew.adapters.repository.bootstrap import (
         RepositoryBootstrapAuthorityService,

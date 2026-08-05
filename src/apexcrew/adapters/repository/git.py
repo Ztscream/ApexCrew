@@ -5,6 +5,7 @@ import hmac
 import os
 import struct
 import subprocess
+import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -1067,14 +1068,30 @@ class GitCommandRunner:
     def __init__(
         self,
         git_executable: Path,
-        trusted_empty_dir: Path,
+        trusted_empty_dir: Path | None = None,
         spawner: GitSpawner | None = None,
     ) -> None:
         if not git_executable.is_absolute():
             raise ValueError("ABSOLUTE_GIT_EXECUTABLE_REQUIRED")
         self._git = git_executable
-        self._trusted_empty_dir = trusted_empty_dir
+        self._owned_trusted_empty_dir = (
+            tempfile.TemporaryDirectory(prefix="apexcrew-git-")
+            if trusted_empty_dir is None
+            else None
+        )
+        trusted_config_dir = (
+            Path(self._owned_trusted_empty_dir.name)
+            if self._owned_trusted_empty_dir is not None
+            else trusted_empty_dir
+        )
+        assert trusted_config_dir is not None
+        self._trusted_empty_dir = trusted_config_dir
         self._spawner = SubprocessGitSpawner() if spawner is None else spawner
+
+    def close(self) -> None:
+        if self._owned_trusted_empty_dir is not None:
+            self._owned_trusted_empty_dir.cleanup()
+            self._owned_trusted_empty_dir = None
 
     def run(
         self, repository: RepositoryInstance, operation: GitOperation

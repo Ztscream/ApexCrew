@@ -1702,3 +1702,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Observed verification**: focused configuration/bootstrap/CLI/preflight tests passed; mypy reported no issues in 56 source files; Ruff check and `ruff format --check` passed; `git diff --check` passed. No provider, credential, network, or live API call was made.
 - **Human changes**: Codex applied the USD 10 correction and formatting cleanup; implementation subagent remains Einstein.
 - **Commit action**: amend the single R4-01A implementation commit before final ordered spec and quality review.
+
+## 2026-08-05 / R4-01A Sartre security correction
+
+- **Task**: bounded correction of the R4-01A bootstrap implementation at `ea4716f`; no composition, runtime, or provider changes.
+- **Fresh Sartre findings**: bootstrap accepted Git's resolved OID without inspecting the no-follow loose `refs/heads/<branch>` storage, so symbolic `ref:` content was not rejected at the direct-local-ref boundary; the default `GitCommandRunner` reused the shared `tempfile.gettempdir()` as its trusted config directory; and `apexcrew init --root` wrote configuration without repository preflight.
+- **Fix**: bootstrap now reads the held no-follow loose ref handle before accepting the OID, rejects symbolic and malformed content, and fails closed on unsafe storage; the default runner owns a newly-created empty `TemporaryDirectory` and exposes idempotent cleanup while injected directories remain caller-owned; `RepositoryBootstrapAuthorityService.validate_repository` preflights roots and CLI `init` calls it before any config mutation, with CLI authority cleanup in `finally` blocks.
+- **Red evidence**: `uv run --python 3.12 pytest tests/contract/test_repository_bootstrap.py::test_bootstrap_rejects_symbolic_direct_local_ref tests/unit/test_cli.py::test_cli_init_rejects_invalid_root_before_writing_config tests/integration/test_git_preflight.py::test_runner_owns_private_default_config_dir_and_preserves_injected_dir -q` returned `3 failed` before the correction.
+- **Green evidence**: the same selector returned `3 passed` after the correction. Broader required checks are pending; no provider request, credential lookup, network call, push, or PR was performed.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending`. This entry does not claim either review passed.
+- **Human changes**: Codex applied this correction; the implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/bootstrap.py`, `src/apexcrew/adapters/repository/git.py`, `src/apexcrew/delivery/cli.py`, `tests/contract/test_repository_bootstrap.py`, `tests/unit/test_cli.py`, `tests/integration/test_git_preflight.py`, `AGENT_LOG.md`.
+- **Commit action**: create a clearly named correction commit; do not amend the prior docs-bearing commit.

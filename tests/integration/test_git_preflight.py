@@ -2,6 +2,7 @@ import os
 import shutil
 import struct
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from hashlib import sha1
 from pathlib import Path
@@ -351,6 +352,33 @@ def test_closed_operation_emits_no_caller_controlled_git_route_tokens(
             "--untracked-files=no",
         )
     ]
+
+
+def test_runner_owns_private_default_config_dir_and_preserves_injected_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_dir = tmp_path / "shared-temp"
+    shared_dir.mkdir()
+    (shared_dir / "global.gitconfig").write_text(
+        "[core]\n\thooksPath = C:/outside\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(shared_dir))
+
+    owned_runner = GitCommandRunner(absolute_git())
+    owned_dir = owned_runner._trusted_empty_dir  # type: ignore[attr-defined]
+    assert owned_dir.is_dir()
+    assert owned_dir != shared_dir
+    assert tuple(owned_dir.iterdir()) == ()
+    assert not (owned_dir / "global.gitconfig").exists()
+    owned_runner.close()
+    assert not owned_dir.exists()
+
+    injected_dir = tmp_path / "trusted-empty"
+    injected_dir.mkdir()
+    injected_runner = GitCommandRunner(absolute_git(), injected_dir)
+    injected_runner.close()
+    assert injected_dir.is_dir()
+    assert tuple(injected_dir.iterdir()) == ()
 
 
 @pytest.mark.parametrize(

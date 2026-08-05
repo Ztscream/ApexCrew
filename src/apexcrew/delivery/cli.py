@@ -47,6 +47,12 @@ class _SqliteTargetAuthorityDigestService(TargetAuthorityDigestService):
 @app.command()
 def init(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Create non-sensitive local ApexCrew configuration."""
+    root = root.resolve()
+    repository_authority = RepositoryBootstrapAuthorityService()
+    try:
+        repository_authority.validate_repository(root)
+    finally:
+        repository_authority.close()
     config = _config_path(root)
     config.parent.mkdir(parents=True, exist_ok=True)
     if not config.exists():
@@ -72,28 +78,31 @@ def run_create(
         target_ref=target_ref,
     )
     repository_authority = RepositoryBootstrapAuthorityService()
-    authority = repository_authority.inspect(str(options.repository_root), target_ref)
-    payload = build_create_run_payload(options, target_oid=authority.target_oid)
-    command = CommandEnvelope(
-        request_id=_run_create_request_id(payload),
-        expected_sequence=None,
-        applicable_revision_digests=ApplicableRevisionDigests(),
-        payload=payload,
-    )
-    database = _config_path(root).with_name("state.db")
-    database.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStateStore(database)
     try:
-        control = CrewControlService(
-            ControlCommandService(
-                state=store,
-                target_authority=_SqliteTargetAuthorityDigestService(store),
-                repository_authority=repository_authority,
-            )
+        authority = repository_authority.inspect(str(options.repository_root), target_ref)
+        payload = build_create_run_payload(options, target_oid=authority.target_oid)
+        command = CommandEnvelope(
+            request_id=_run_create_request_id(payload),
+            expected_sequence=None,
+            applicable_revision_digests=ApplicableRevisionDigests(),
+            payload=payload,
         )
-        outcome = control.handle(command)
+        database = _config_path(root).with_name("state.db")
+        database.parent.mkdir(parents=True, exist_ok=True)
+        store = SqliteStateStore(database)
+        try:
+            control = CrewControlService(
+                ControlCommandService(
+                    state=store,
+                    target_authority=_SqliteTargetAuthorityDigestService(store),
+                    repository_authority=repository_authority,
+                )
+            )
+            outcome = control.handle(command)
+        finally:
+            store.close()
     finally:
-        store.close()
+        repository_authority.close()
     if outcome.status != "ACCEPTED" or outcome.run_id is None:
         _emit(
             "RUN_CREATE_REJECTED",

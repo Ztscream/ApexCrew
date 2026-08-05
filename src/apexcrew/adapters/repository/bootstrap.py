@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Protocol
 
@@ -44,8 +43,19 @@ class RepositoryBootstrapAuthorityService:
             self._runner = runner
         else:
             executable = git_executable or _find_git_executable()
-            empty_dir = trusted_empty_dir or Path(tempfile.gettempdir())
-            self._runner = GitCommandRunner(executable, empty_dir)
+            self._runner = GitCommandRunner(executable, trusted_empty_dir)
+
+    def close(self) -> None:
+        close = getattr(self._runner, "close", None)
+        if callable(close):
+            close()
+
+    def validate_repository(self, root: str | Path) -> None:
+        try:
+            repository = self._preflight.inspect(Path(root))
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise RepositoryBootstrapError("repository preflight rejected root") from error
+        repository.close()
 
     def inspect(self, repository_root: str, target_ref: str) -> BootstrapRepositoryAuthority:
         _require_direct_target_ref(target_ref)
@@ -64,6 +74,7 @@ class RepositoryBootstrapAuthorityService:
                 raise RepositoryBootstrapError("worktree observation failed") from error
             if any(record.branch == target_ref for record in records):
                 raise RepositoryBootstrapError("target ref is checked out")
+            _validate_loose_target_ref(repository, target_ref)
             result = self._runner.run(repository, GitShowRefVerify(target_ref))
             if result.returncode != 0:
                 raise RepositoryBootstrapError("target ref does not resolve")
@@ -103,6 +114,25 @@ def _require_direct_target_ref(value: str) -> None:
         or any(character.isspace() or character == "\x00" for character in value)
     ):
         raise RepositoryBootstrapError("direct target ref is required")
+
+
+def _validate_loose_target_ref(repository: RepositoryInstance, target_ref: str) -> None:
+    try:
+        repository.assert_stable()
+        node = repository.handles.try_open(".git/" + target_ref, "file")
+        if node is None:
+            return
+        content = repository.handles.read_bytes(node, 128)
+    except (OSError, RepositoryUnsafeError, ValueError) as error:
+        raise RepositoryBootstrapError("target ref storage is unsafe") from error
+    if content.startswith(b"ref:"):
+        raise RepositoryBootstrapError("symbolic direct local ref is not allowed")
+    if (
+        len(content) != 41
+        or content[-1:] != b"\n"
+        or any(character not in b"0123456789abcdef" for character in content[:-1])
+    ):
+        raise RepositoryBootstrapError("target ref storage is malformed")
 
 
 def _parse_target_oid(stdout: str) -> GitOid:
