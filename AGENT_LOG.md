@@ -1555,3 +1555,13 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent/Human-Changes**: Claude (assisting agent); the owner authorized the push and approved these three corrections.
 - **Changed paths**: `AGENT_LOG.md`, `README.md`, `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
 - **Lesson**: a self-reported green count is not evidence until someone re-runs it; and a credential boundary that exists in code but not in the README is invisible to the person it protects.
+## 2026-08-05 / A1 coverage gate
+
+- **Task**: A1 — measure test coverage without enforcing a threshold.
+- **Implementation subagent**: Codex.
+- **Observed verification**: `make coverage` passed with 491 passed, 8 skipped, and 1 existing warning in 48.39s. Total coverage was 77% (12,741 statements; 2,888 missed). Package distribution from `coverage.xml`: `src.apexcrew` 91% (39/43), `adapters` 68% (1,308/1,931), `adapters.state` 72% (4,173/5,791), `application` 83% (336/406), `delivery` 93% (67/72), and `domain` 88% (3,643/4,125); other adapter subpackages were `credentials` 76%, `executor` 80%, and `model` 74%.
+- **Changes**: Added `pytest-cov` to the dev group and refreshed `uv.lock`; added `make coverage` with terminal-missing and XML reports; added the quality-job coverage step and `coverage.xml` artifact upload. No threshold was set.
+- **Spec review**: PASS — measurement-only behavior, no `--cov-fail-under`, and CI artifact is produced by the quality job.
+- **Quality review**: PASS — `git diff --check` passed; no source behavior changed.
+- **Human changes**: None.
+- **Intended commit**: `build(ci): measure test coverage`.

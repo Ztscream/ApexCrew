@@ -21,6 +21,11 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy src
+      - run: make coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
 
   unit-ubuntu:
     runs-on: ubuntu-24.04

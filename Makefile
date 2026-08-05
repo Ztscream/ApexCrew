@@ -1,9 +1,12 @@
-.PHONY: test lint demo secret-scan web-build build
+.PHONY: test coverage lint demo secret-scan web-build build
 
 UV_RUN := uv run --python 3.12
 
 test:
 	$(UV_RUN) pytest -q
+
+coverage:
+	$(UV_RUN) pytest --cov=apexcrew --cov-report=term-missing --cov-report=xml
 
 lint:
 	$(UV_RUN) ruff format --check .
