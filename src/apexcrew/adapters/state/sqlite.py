@@ -1451,13 +1451,18 @@ class SqliteStateStore:
         database: Path,
         monotonic_clock: MonotonicClock | None = None,
         *,
+        connection: sqlite3.Connection | None = None,
         target_reservation_id_source: Callable[[], object] | None = None,
     ) -> None:
         self._database = database
         self._data_root = database.parent / "data"
-        connection = sqlite3.connect(database, isolation_level=None, check_same_thread=False)
+        opened_connection = (
+            sqlite3.connect(database, isolation_level=None, check_same_thread=False)
+            if connection is None
+            else connection
+        )
         try:
-            self._connection = connection
+            self._connection = opened_connection
             self._connection.row_factory = sqlite3.Row
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._lock = RLock()
@@ -1470,7 +1475,7 @@ class SqliteStateStore:
             )
             self._apply_migrations()
         except BaseException:
-            connection.close()
+            opened_connection.close()
             raise
 
     def _apply_migrations(self) -> None:

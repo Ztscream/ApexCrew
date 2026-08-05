@@ -1737,3 +1737,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex applied this correction; the implementation subagent remains Einstein.
 - **Changed paths**: `src/apexcrew/adapters/repository/bootstrap.py`, `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/adapters/repository/no_follow.py`, `src/apexcrew/adapters/repository/no_follow_posix.py`, `src/apexcrew/adapters/repository/no_follow_windows.py`, `src/apexcrew/adapters/state/sqlite.py`, `src/apexcrew/application/configuration.py`, `src/apexcrew/delivery/cli.py`, focused tests, this plan, and `AGENT_LOG.md`.
 - **Commit action**: create one clearly named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
+## 2026-08-06 / R4-01A Raman quality correction
+
+- **Task**: bounded R4-01A state-opening correction at `4bc23d5`; scope remains control-path and SQLite bootstrap only.
+- **Quality-review finding**: Raman blocked because `state.db` was validated through a no-follow handle and then reopened by pathname, leaving a replacement window; ancestor replacement was not fully contained.
+- **Correction**: `ControlPathGuard` retains the bound database node and opens SQLite through its stable POSIX descriptor reference; Windows no-follow handles default to deny delete/rename sharing. `SqliteStateStore` accepts and owns a guarded connection, with cleanup on migration and post-open identity failures.
+- **Observed verification**: full offline `uv run --python 3.12 pytest -q` returned exit code 0 with the repository's expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call was performed.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered review of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/adapters/repository/no_follow_windows.py`, `src/apexcrew/adapters/state/sqlite.py`, `src/apexcrew/delivery/cli.py`, `tests/unit/test_cli.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.

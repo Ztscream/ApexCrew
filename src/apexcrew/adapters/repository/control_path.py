@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -36,6 +37,7 @@ class ControlPathGuard:
         self._control: OpenedNode | None = None
         self._config_identity: HandleIdentity | None = None
         self._database_identity: HandleIdentity | None = None
+        self._database_node: OpenedNode | None = None
         self.state = ControlPathState(
             root / ".apexcrew" / "config.json", root / ".apexcrew" / "state.db"
         )
@@ -84,14 +86,47 @@ class ControlPathGuard:
 
     def prepare_database(self) -> Path:
         self.ensure()
-        if self._database_identity is None:
+        if self._database_node is None:
             node = self._backend.create_child_file(self._require_control(), "state.db")
-            try:
-                self._database_identity = node.identity
-            finally:
-                self._backend.close(node)
+            self._database_node = node
+            self._database_identity = node.identity
         self.assert_current()
         return self.state.database
+
+    def open_database(self) -> sqlite3.Connection:
+        """Open SQLite through the already-bound state database handle."""
+        self.prepare_database()
+        node = self._database_node
+        if node is None:
+            raise RepositoryUnsafeError("CONTROL_PATH_NOT_BOUND")
+        if os.name == "posix":
+            for descriptor_root in ("/proc/self/fd", "/dev/fd"):
+                descriptor = os.path.join(descriptor_root, str(node.handle))
+                if os.path.exists(descriptor):
+                    connection = sqlite3.connect(
+                        f"file:{descriptor}?mode=rwc",
+                        uri=True,
+                        isolation_level=None,
+                        check_same_thread=False,
+                    )
+                    try:
+                        self.assert_current()
+                    except BaseException:
+                        connection.close()
+                        raise
+                    return connection
+            raise RepositoryUnsafeError("POSIX_SQLITE_HANDLE_REFERENCE_REQUIRED")
+        connection = sqlite3.connect(
+            self.state.database,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        try:
+            self.assert_current()
+        except BaseException:
+            connection.close()
+            raise
+        return connection
 
     def assert_current(self) -> None:
         control = self._backend.open_child(self._tree.root_node, ".apexcrew", "directory")
@@ -104,6 +139,9 @@ class ControlPathGuard:
             self._backend.close(control)
 
     def close(self) -> None:
+        if self._database_node is not None:
+            self._backend.close(self._database_node)
+            self._database_node = None
         if self._control is not None:
             self._backend.close(self._control)
             self._control = None
@@ -113,6 +151,9 @@ class ControlPathGuard:
         node = self._backend.try_open_child(self._require_control(), name, "file")
         if node is None:
             return None
+        if name == "state.db":
+            self._database_node = node
+            return node.identity
         self._backend.close(node)
         return node.identity
 

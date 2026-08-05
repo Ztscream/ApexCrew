@@ -135,7 +135,7 @@ def run_create(
             )
             with ControlPathGuard(root) as control_paths:
                 database = control_paths.prepare_database()
-                store = SqliteStateStore(database)
+                store = SqliteStateStore(database, connection=control_paths.open_database())
                 control = CrewControlService(
                     ControlCommandService(
                         state=store,

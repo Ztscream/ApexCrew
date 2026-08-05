@@ -109,9 +109,10 @@ class BY_HANDLE_FILE_INFORMATION(Structure):
 
 
 class WindowsNoFollowBackend:
-    def __init__(self) -> None:
+    def __init__(self, *, allow_delete_share: bool = False) -> None:
         if WinDLL is None:
             raise RepositoryUnsafeError("WINDOWS_NT_REQUIRED")
+        self._allow_delete_share = allow_delete_share
         self._kernel32: CDLL = WinDLL("kernel32", use_last_error=True)
         self._ntdll: CDLL = WinDLL("ntdll")
         self._last_ntstatus: int | None = None
@@ -241,6 +242,9 @@ class WindowsNoFollowBackend:
         access |= FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA
         if create and kind == "file":
             access |= FILE_WRITE_DATA
+        share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE
+        if getattr(self, "_allow_delete_share", False):
+            share_mode |= FILE_SHARE_DELETE
         status = self._ntdll.NtCreateFile(
             byref(handle),
             access,
@@ -248,7 +252,7 @@ class WindowsNoFollowBackend:
             byref(io),
             None,
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share_mode,
             FILE_CREATE if create else FILE_OPEN,
             options,
             None,
@@ -282,10 +286,13 @@ class WindowsNoFollowBackend:
             raise
 
     def _open_volume_root(self, root: str) -> OpenedNode:
+        share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE
+        if getattr(self, "_allow_delete_share", False):
+            share_mode |= FILE_SHARE_DELETE
         handle = self._kernel32.CreateFileW(
             root,
             FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share_mode,
             None,
             OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,

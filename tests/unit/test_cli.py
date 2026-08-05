@@ -243,3 +243,14 @@ def test_sqlite_store_closes_connection_when_migration_fails(
         SqliteStateStore(tmp_path / "state.db")
 
     assert connection.closed
+
+
+def test_sqlite_store_accepts_a_guarded_connection(tmp_path: Path) -> None:
+    database = tmp_path / "state.db"
+    connection = sqlite3.connect(database)
+
+    store = SqliteStateStore(database, connection=connection)
+    store.close()
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
