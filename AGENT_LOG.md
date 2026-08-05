@@ -1565,3 +1565,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Quality review**: PASS — `git diff --check` passed; no source behavior changed.
 - **Human changes**: None.
 - **Intended commit**: `build(ci): measure test coverage`.
+
+## 2026-08-05 / Z0 granted-action read definition
+
+- **Task**: Z0 — define `_read_oldest_unsettled_granted_action` in `PLAN.md`.
+- **Implementation subagent**: Codex.
+- **Observed verification**: the documented helper name and call site were located at the Task 17 recovery protocol; `git diff --check` passed.
+- **Changes**: Added prose specifying exact-Run filtering, the two recoverable states, deterministic oldest ordering, full binding revalidation, `None` behavior, read-only semantics, and memory/SQLite parity.
+- **Spec review**: PASS — the definition is consistent with the surrounding Granted Action recovery contract and does not add a mutation path.
+- **Quality review**: PASS — documentation-only, scoped to `PLAN.md` and this evidence entry.
+- **Human changes**: None.
+- **Intended commit**: `docs(plan): define granted action read helper`.

@@ -21656,6 +21656,15 @@ def next_unsettled_granted_action(
 ) -> GrantedActionIntent | None:
     return self._read_oldest_unsettled_granted_action(run_id)
 
+`_read_oldest_unsettled_granted_action(run_id)` is a read-only journal lookup. It
+selects only rows for the exact Run whose state is `INTENT_RECORDED` or
+`DISPATCHED`, orders them by the durable `recorded_sequence` and then
+`intent_id`, and returns the oldest row after revalidating its Run, consumed
+Grant, Pending Action, normalized action, and frozen binding. It returns `None`
+when no such row exists. The helper does not claim, consume, dispatch, settle,
+or rewrite an intent, Permit, Grant, Run, or Audit sequence; both the memory and
+SQLite adapters must provide the same ordering and validation behavior.
+
 
 class GrantedActionRuntime(GrantedActionDriver):
     def __init__(
