@@ -15,7 +15,7 @@ def completion(
     model_id: str,
     action: dict[str, str],
     *,
-    requested_model_id: str = "gpt-5.6-terra",
+    requested_model_id: str = "deepseek-v4-flash",
 ) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
@@ -33,7 +33,7 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id="deepseek-v4-flash",
         allowed_model_ids=frozenset(allowed_model_ids),
         prompt=({"role": "user", "content": "finish the bounded task"},),
         tool_schema_digest="sha256:" + "1" * 64,
@@ -46,7 +46,7 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
 
 
 def test_unapproved_returned_model_is_charged_but_not_released() -> None:
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     model = ScriptedMockLLM(
         [
             ScriptedModelStep.for_request(
@@ -68,13 +68,13 @@ def test_unapproved_returned_model_is_charged_but_not_released() -> None:
 
 
 def test_mismatched_response_requested_model_is_charged_but_not_released() -> None:
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     model = ScriptedMockLLM(
         [
             ScriptedModelStep.for_request(
                 request,
                 completion(
-                    model_id="gpt-5.6-terra",
+                    model_id="deepseek-v4-flash",
                     action={"kind": "finish"},
                     requested_model_id="gpt-5.6-mini",
                 ),

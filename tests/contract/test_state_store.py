@@ -116,7 +116,7 @@ def make_model_request(allowed_model_ids: set[str]) -> ModelRequest:
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id="deepseek-v4-flash",
         allowed_model_ids=frozenset(allowed_model_ids),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
@@ -139,12 +139,12 @@ def make_authority(store: SqliteStateStore, run_id: str) -> AuthorityService:
         output_token_ceiling=200_000,
         cost_reserve_usd=Decimal(10),
         concurrent_worker_ceiling=3,
-        pricing_observed_on=datetime(2026, 7, 26, tzinfo=UTC).date(),
+        pricing_observed_on=datetime(2026, 8, 5, tzinfo=UTC).date(),
         pricing_entries=(
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal("15.00"),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     )
@@ -158,7 +158,7 @@ def planning_reservation_request(
 ) -> ModelReservationRequest:
     budget_digest, _ = store.current_approved_budget(run_id)
     request = replace(
-        make_model_request({"gpt-5.6-terra"}),
+        make_model_request({"deepseek-v4-flash"}),
         run_id=run_id,
         budget_digest=budget_digest,
         request_digest="sha256:" + ("a" if run_id == "run-a" else "b") * 64,
@@ -197,7 +197,7 @@ def test_sqlite_authority_model_reservation_is_run_bound_and_stale_safe(
         calls=1,
         input_tokens=1_000,
         output_tokens=200,
-        cost_usd=Decimal("0.0055"),
+        cost_usd=Decimal("0.000392"),
     )
     assert stale.decision == "DENY"
     assert stale.reason == "STALE_SEQUENCE"
@@ -238,8 +238,8 @@ def test_sqlite_authorized_model_attempt_retries_preserve_requested_model_anchor
         ProviderAttemptResult.completed(
             ModelCompletion(
                 response_id="response-2",
-                requested_model_id="gpt-5.6-terra",
-                returned_model_id="gpt-5.6-terra",
+                requested_model_id="deepseek-v4-flash",
+                returned_model_id="deepseek-v4-flash",
                 usage=ModelUsage(120, 12, Decimal("0.00048")),
                 normalized_action={"kind": "finish"},
             )
@@ -258,8 +258,8 @@ def test_sqlite_authorized_model_attempt_retries_preserve_requested_model_anchor
     )
 
     assert [attempt.request.requested_model_id for attempt in attempts] == [
-        "gpt-5.6-terra",
-        "gpt-5.6-terra",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash",
     ]
     assert recovered.outcome == "COMPLETED"
     assert recovered.normalized_action == {"kind": "finish"}
@@ -391,7 +391,7 @@ def test_task_stop_cap_is_not_caller_selectable(
 
 def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.db"
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     first = SqliteStateStore(database)
     before = first.audit_sequence(request.run_id)
     intent = first.reserve_model_request(request, expected_sequence=before)
@@ -402,13 +402,13 @@ def test_sqlite_model_reservation_survives_restart(tmp_path: Path) -> None:
     assert restored.intent_id == intent.intent_id
     assert restored.logical_turn_id == intent.logical_turn_id
     assert restored.request.request_digest == request.request_digest
-    assert restored.request.allowed_model_ids == frozenset({"gpt-5.6-terra"})
+    assert restored.request.allowed_model_ids == frozenset({"deepseek-v4-flash"})
     assert reopened.reserved_call_count(request.run_id) == 1
 
 
 def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
     request = replace(
-        make_model_request(allowed_model_ids={"gpt-5.6-terra"}),
+        make_model_request(allowed_model_ids={"deepseek-v4-flash"}),
         owner_kind="WORKER",
         task_id=TaskId("task-1"),
         attempt_id=AttemptId("attempt-1"),
@@ -429,7 +429,7 @@ def test_sqlite_worker_model_owner_survives_restart(tmp_path: Path) -> None:
 def test_sqlite_model_backoff_survives_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.db"
     store = SqliteStateStore(database)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     turn, intent = store.begin_model_turn_and_reserve(
         request, expected_sequence=store.audit_sequence(request.run_id)
     )
@@ -458,11 +458,11 @@ def test_requested_model_mismatch_round_trips_for_each_state_store(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     completion = ModelCompletion(
         response_id="response-requested-model-mismatch",
         requested_model_id="gpt-5.6-mini",
-        returned_model_id="gpt-5.6-terra",
+        returned_model_id="deepseek-v4-flash",
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action={"kind": "finish"},
     )
@@ -480,7 +480,7 @@ def test_requested_model_mismatch_round_trips_for_each_state_store(
     assert len(attempts) == 1
     assert attempts[0].request.requested_model_id == request.requested_model_id
     assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
-    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.returned_model_id == "deepseek-v4-flash"
     assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
     assert attempts[0].reported_usage == completion.usage
 
@@ -491,7 +491,7 @@ def test_model_attempt_cannot_be_settled_twice(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     _, intent = store.begin_model_turn_and_reserve(
         request, expected_sequence=store.audit_sequence(request.run_id)
     )
@@ -513,7 +513,7 @@ def test_unjournaled_model_attempt_cannot_be_settled(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     turn = LogicalModelTurn.new(request)
     intent = ModelRequestIntent.reserve(turn, request)
     with pytest.raises(StateConflict, match="MODEL_ATTEMPT_BINDING_MISMATCH"):
@@ -531,7 +531,7 @@ def test_model_reservation_and_counters_roll_back_together(
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
 ) -> None:
     store = store_factory(tmp_path)
-    request = make_model_request(allowed_model_ids={"gpt-5.6-terra"})
+    request = make_model_request(allowed_model_ids={"deepseek-v4-flash"})
     before = store.audit_sequence(request.run_id)
     store.fail_next_commit_after_state_write_for_test()
     with pytest.raises(StateCommitFault, match="TEST_FAULT_AFTER_STATE_WRITE"):

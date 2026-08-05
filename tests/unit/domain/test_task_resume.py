@@ -68,12 +68,12 @@ def make_budget(**overrides: object) -> BudgetRevisionDocument:
         "output_token_ceiling": 200_000,
         "cost_reserve_usd": Decimal(10),
         "concurrent_worker_ceiling": 3,
-        "pricing_observed_on": date(2026, 7, 26),
+        "pricing_observed_on": date(2026, 8, 5),
         "pricing_entries": (
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal("15.00"),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     }

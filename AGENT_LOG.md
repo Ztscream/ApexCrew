@@ -1504,3 +1504,15 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent/Human-Changes**: Codex; none.
 - **Changed paths**: `src/apexcrew/delivery/cli.py`, `tests/contract/test_cli_credentials.py`, `AGENT_LOG.md`.
 - **Intended commit**: `feat(cli): add credential commands and doctor check`.
+## 2026-08-05 / P3 - bind DeepSeek model pricing snapshot
+
+- **Base and task**: `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3`, P3 from `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
+- **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
+- **Human-Changes**: none.
+- **Red evidence**: `uv run --python 3.12 pytest tests/contract/test_model_configuration.py -q` exited `1` with 2 failures: default fixtures remained `mock-model`/old pricing and reservation failed with `MODEL_PRICING_MISSING`.
+- **Implementation**: default model/budget fixtures and all former `gpt-5.6-terra` test bindings now use `deepseek-v4-flash`; pricing is USD 0.28/0.56 per million, observed 2026-08-05, with a USD 1 default reserve. Added the focused model-configuration contract.
+- **Green evidence**: focused P3 selector `3 passed`; full offline suite passed with 7 skips; mypy passed for 54 source files; Ruff format/check passed; `git diff --check` passed.
+- **Spec-Review**: self-review PASS. P3's single-member identity, revision 3 pricing/date, USD 1 operational reserve, missing-price denial, and USD 0.000672 worst-case reservation are all asserted; no source hardcoding or dated alias was introduced.
+- **Quality-Review**: self-review PASS. Changes are limited to test configuration/fixtures and cost assertions, preserve intentional mismatch/legacy rejection cases, add no dependency or production behavior, and pass the complete regression/static checks.
+- **Implementation commit**: pending creation; no publication action.
+- **Lesson**: model identity and pricing must be changed together because reservation validates every allowed returned-model ID before dispatch.
