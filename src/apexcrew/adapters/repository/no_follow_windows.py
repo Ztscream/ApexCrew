@@ -192,17 +192,22 @@ class WindowsNoFollowBackend:
         information = BY_HANDLE_FILE_INFORMATION()
         native_handle = wintypes.HANDLE(handle)
         if not self._kernel32.GetFileInformationByHandle(native_handle, byref(information)):
-            self._kernel32.CloseHandle(native_handle)
-            raise RepositoryUnsafeError("HANDLE_IDENTITY_QUERY_FAILED")
+            error = RepositoryUnsafeError("HANDLE_IDENTITY_QUERY_FAILED")
+            self._close_rejected(native_handle, error)
         if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT:
-            self._kernel32.CloseHandle(native_handle)
-            raise RepositoryUnsafeError("SYMLINK_OR_REPARSE_DENIED")
+            error = RepositoryUnsafeError("SYMLINK_OR_REPARSE_DENIED")
+            self._close_rejected(native_handle, error)
         file_id = (information.nFileIndexHigh << 32) | information.nFileIndexLow
         return OpenedNode(
             components,
             handle,
             HandleIdentity("windows", information.dwVolumeSerialNumber, file_id, kind),
         )
+
+    def _close_rejected(self, handle: wintypes.HANDLE, error: BaseException) -> None:
+        if not self._kernel32.CloseHandle(handle):
+            error.add_note("rejected handle cleanup failed")
+        raise error
 
     def _open_relative(
         self,
@@ -399,9 +404,16 @@ class WindowsNoFollowBackend:
                 components += (name,)
                 chain.append(self._open_relative(chain[-1].handle, name, components, "directory"))
             return tuple(chain)
-        except BaseException:
+        except Exception as error:
+            cleanup_error: RepositoryUnsafeError | None = None
             for node in reversed(chain):
-                self.close(node)
+                try:
+                    self.close(node)
+                except RepositoryUnsafeError as close_error:
+                    if cleanup_error is None:
+                        cleanup_error = close_error
+            if cleanup_error is not None:
+                error.add_note(f"root chain cleanup failed: {cleanup_error}")
             raise
 
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:

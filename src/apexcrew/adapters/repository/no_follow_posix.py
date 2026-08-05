@@ -27,18 +27,24 @@ def _required_open_flags() -> tuple[int, int, int]:
 
 class PosixNoFollowBackend:
     def _node(self, components: tuple[str, ...], handle: int, expected: NodeKind) -> OpenedNode:
-        observed = os.fstat(handle)
+        try:
+            observed = os.fstat(handle)
+        except OSError as fstat_error:
+            self._close_rejected(handle, fstat_error)
+            raise AssertionError("unreachable")
         kind: NodeKind
         if stat.S_ISREG(observed.st_mode):
             kind = "file"
         elif stat.S_ISDIR(observed.st_mode):
             kind = "directory"
         else:
-            os.close(handle)
-            raise RepositoryUnsafeError("UNSUPPORTED_GIT_STORAGE_KIND")
+            rejection = RepositoryUnsafeError("UNSUPPORTED_GIT_STORAGE_KIND")
+            self._close_rejected(handle, rejection)
+            raise AssertionError("unreachable")
         if kind != expected:
-            os.close(handle)
-            raise RepositoryUnsafeError("GIT_STORAGE_KIND_CHANGED")
+            rejection = RepositoryUnsafeError("GIT_STORAGE_KIND_CHANGED")
+            self._close_rejected(handle, rejection)
+            raise AssertionError("unreachable")
         return OpenedNode(
             components,
             handle,
@@ -60,10 +66,25 @@ class PosixNoFollowBackend:
                 handle = os.open(name, flags, dir_fd=chain[-1].handle)
                 chain.append(self._node(components, handle, "directory"))
             return tuple(chain)
-        except BaseException:
+        except Exception as error:
+            cleanup_error: OSError | None = None
             for node in reversed(chain):
-                os.close(node.handle)
+                try:
+                    os.close(node.handle)
+                except OSError as close_error:
+                    if cleanup_error is None:
+                        cleanup_error = close_error
+            if cleanup_error is not None:
+                error.add_note(f"root chain cleanup failed: {cleanup_error}")
             raise
+
+    @staticmethod
+    def _close_rejected(handle: int, error: BaseException) -> None:
+        try:
+            os.close(handle)
+        except OSError as cleanup_error:
+            error.add_note(f"rejected handle cleanup failed: {cleanup_error}")
+        raise error
 
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         close_on_exec, directory, no_follow = _required_open_flags()

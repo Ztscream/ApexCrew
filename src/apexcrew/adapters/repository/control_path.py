@@ -138,14 +138,25 @@ class ControlPathGuard:
     def assert_current(self) -> None:
         self._tree.assert_name_bindings()
         control = self._backend.open_child(self._tree.root_node, ".apexcrew", "directory")
+        primary_error: Exception | None = None
         try:
             if self._control is None or control.identity != self._control.identity:
                 raise RepositoryUnsafeError("CONTROL_PATH_IDENTITY_CHANGED")
             self._assert_entry(control, "config.json", self._config_identity)
             self._assert_entry(control, "state.db", self._database_identity)
+        except (OSError, RepositoryUnsafeError) as error:
+            primary_error = error
         finally:
-            self._close_node(control)
+            try:
+                self._close_node(control)
+            except (OSError, RepositoryUnsafeError) as cleanup_error:
+                if primary_error is None:
+                    primary_error = cleanup_error
+                else:
+                    primary_error.add_note(f"control probe cleanup failed: {cleanup_error}")
         self._tree.assert_name_bindings()
+        if primary_error is not None:
+            raise primary_error
 
     def close(self) -> None:
         first_error: Exception | None = None
@@ -191,16 +202,31 @@ class ControlPathGuard:
         node = self._backend.try_open_child(control, name, "file")
         if expected is None:
             if node is not None:
-                self._close_node(node)
+                try:
+                    self._close_node(node)
+                except (OSError, RepositoryUnsafeError) as cleanup_error:
+                    cleanup_error.add_note("unexpected control entry was observed")
+                    raise
                 raise RepositoryUnsafeError("CONTROL_PATH_APPEARED")
             return
         if node is None:
             raise RepositoryUnsafeError("CONTROL_PATH_DISAPPEARED")
+        primary_error: Exception | None = None
         try:
             if node.identity != expected:
                 raise RepositoryUnsafeError("CONTROL_PATH_IDENTITY_CHANGED")
+        except (OSError, RepositoryUnsafeError) as error:
+            primary_error = error
         finally:
-            self._close_node(node)
+            try:
+                self._close_node(node)
+            except (OSError, RepositoryUnsafeError) as cleanup_error:
+                if primary_error is None:
+                    primary_error = cleanup_error
+                else:
+                    primary_error.add_note(f"entry probe cleanup failed: {cleanup_error}")
+        if primary_error is not None:
+            raise primary_error
 
     def _close_node(self, node: OpenedNode) -> None:
         self._close_many((node,))

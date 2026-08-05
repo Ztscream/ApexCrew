@@ -1884,6 +1884,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Changed paths**: `PLAN.md` and `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): record R4-01A control probe SHA`.
 
+## 2026-08-06 / R4-01A Mencius backend cleanup correction
+
+- **Task**: bounded R4-01A backend early-failure correction after Mencius quality review of `fbf17fe`; scope remains no-follow adapter cleanup and exception semantics.
+- **Quality-review findings**: Mencius found root-chain construction and final object identity rejection could stop after a close failure without retry ownership, and cleanup errors could mask the primary security rejection.
+- **Correction**: backend root-chain cleanup now attempts every handle and annotates the primary error; POSIX/Windows rejected-handle paths preserve the primary denial while recording cleanup failure; `StableHandleTree.assert_name_bindings()` and guard probes preserve the primary identity error while retaining cleanup failures for retry.
+- **Observed verification**: adapter/CLI tests passed; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed. No provider, credential, network, push, PR, or live API call.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending` pending fresh ordered reviews of this correction.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/no_follow.py`, `src/apexcrew/adapters/repository/no_follow_posix.py`, `src/apexcrew/adapters/repository/no_follow_windows.py`, `src/apexcrew/adapters/repository/control_path.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
 ## 2026-08-06 / R4-01A Aquinas final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `bf2dd35` and implementation `41b156d`.

@@ -117,6 +117,7 @@ class StableHandleTree:
     def assert_name_bindings(self) -> None:
         self._retry_pending_closes()
         probes = self._backend.open_root_chain(self.root)
+        primary_error: Exception | None = None
         try:
             if tuple(node.identity for node in probes) != tuple(
                 node.identity for node in self._root_chain
@@ -135,8 +136,18 @@ class StableHandleTree:
                 if probe.identity != expected.identity:
                     raise RepositoryUnsafeError("GIT_STORAGE_IDENTITY_CHANGED")
                 probe_by_parts[parts] = probe
+        except (OSError, RepositoryUnsafeError) as error:
+            primary_error = error
         finally:
-            self._close_many(reversed(probes))
+            try:
+                self._close_many(reversed(probes))
+            except (OSError, RepositoryUnsafeError) as cleanup_error:
+                if primary_error is None:
+                    primary_error = cleanup_error
+                else:
+                    primary_error.add_note(f"probe cleanup failed: {cleanup_error}")
+        if primary_error is not None:
+            raise primary_error
 
     def close(self) -> None:
         owned = {node.handle: node for node in (*self._nodes.values(), *self._root_chain)}
