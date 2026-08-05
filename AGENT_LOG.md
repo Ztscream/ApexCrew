@@ -1979,6 +1979,12 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Final status**: R4-01A is `COMPLETED` in the ledger. The implementation commit trailers are to be finalized as `Spec-Review: Euclid; PASS` and `Quality-Review: Lorentz; PASS`.
 - **Human changes**: Codex corrections and audit closeout; implementation subagent remains Einstein.
 
+## 2026-08-06 / R4-01A final metadata normalization
+
+- **Task**: finalize the implementation commit metadata after the ordered Euclid spec PASS and Lorentz quality PASS.
+- **Final implementation commit**: `36170cf`, with `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: Euclid; PASS`, and `Quality-Review: Lorentz; PASS` trailers. Its tree is unchanged from the reviewed implementation; only the commit message was normalized.
+- **Final status**: R4-01A remains `COMPLETED`; `PLAN.md` now records `36170cf`. No source behavior, test result, provider, credential, network, push, PR, or live API state changed.
+
 ## 2026-08-06 / R4-01A Euclid final spec review
 
 - **Task**: final fresh spec-compliance review of HEAD `2f48aca` and implementation `f136374`.
