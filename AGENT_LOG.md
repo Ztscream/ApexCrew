@@ -1681,3 +1681,24 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: none.
 - **Changed paths**: `src/apexcrew/application/configuration.py`, `src/apexcrew/adapters/repository/bootstrap.py`, `src/apexcrew/delivery/cli.py`, `tests/unit/application/test_configuration.py`, `tests/contract/test_repository_bootstrap.py`, `AGENT_LOG.md`.
 - **Commit action**: amend the single R4-01A implementation commit; no second implementation commit, push, PR, or live API call.
+
+## 2026-08-05 / R4-01A Planck review correction
+
+- **Task**: Fresh Planck spec-review correction after implementation commit `b9c68fd`; final implementation commit `6a2a14ea516d31a03a6831e202613428e442a5ad`.
+- **Implementation subagent**: Einstein.
+- **Fresh blocker**: `RepositoryBootstrapAuthorityService.inspect` accepted a direct target ref checked out in the primary worktree and did not observe the required structured worktree-list boundary.
+- **Correction red evidence**: `uv run --python 3.12 pytest tests/contract/test_repository_bootstrap.py::test_bootstrap_rejects_checked_out_target_ref tests/contract/test_repository_bootstrap.py::test_bootstrap_fails_closed_on_worktree_observation -q` returned `3 failed` before the correction.
+- **Correction green evidence**: the same selector returned `3 passed` after `GitWorktreeListPorcelain` plus `parse_worktree_porcelain_nul` were added; checked-out target refs, nonzero output, and malformed output now fail closed.
+- **Successful-path correction**: the real repository success tests and durable CLI test now target a non-checked-out direct `refs/heads/feature` branch; checked-out `main` is explicitly rejected.
+- **Observed verification**: the mandated selector returned `2 passed`; focused bootstrap/preflight/configuration/CLI tests returned `63 passed, 4 skipped`; mypy returned `Success: no issues found in 56 source files`; Ruff returned `All checks passed!`; `git diff --check` passed.
+- **Spec-review**: Planck blocker fixed; the implementation commit trailer now reads `Subagent: Einstein`, with `Human-Changes: none` retained. The R4-01A PLAN ledger row is `COMPLETED` with the stable implementation SHA and red/green/review evidence.
+- **Human changes**: none.
+- **Documentation commit**: this ledger/evidence update is separate from the single R4-01A implementation commit; no push, PR, or live API call.
+
+## 2026-08-05 / R4-01A final review correction
+
+- **Task**: R4-01A correction after Curie spec review of implementation `6a2a14e` and ledger closeout `36dd59b`.
+- **Finding/fix**: Curie found the default Budget `cost_reserve_usd` was `1` instead of the SPEC-required initial reserve of `10`, and `ruff format --check` failed on three changed files. The reserve is now `Decimal(10)` and Ruff formatted the changed Python paths.
+- **Observed verification**: focused configuration/bootstrap/CLI/preflight tests passed; mypy reported no issues in 56 source files; Ruff check and `ruff format --check` passed; `git diff --check` passed. No provider, credential, network, or live API call was made.
+- **Human changes**: Codex applied the USD 10 correction and formatting cleanup; implementation subagent remains Einstein.
+- **Commit action**: amend the single R4-01A implementation commit before final ordered spec and quality review.

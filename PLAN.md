@@ -30526,7 +30526,7 @@ The executor contract must assert digest-pinned image, non-root UID/GID, read-on
 
 | Task | Status | Implementation commit | Red/green and review evidence |
 | --- | --- | --- | --- |
-| R4-01A configuration/repository bootstrap | NOT STARTED | pending | pending |
+| R4-01A configuration/repository bootstrap | COMPLETED | `6a2a14ea516d31a03a6831e202613428e442a5ad` | Original selector red `2 failed` for missing symbols -> green `2 passed`; correction red `3 failed` for checked-out target/nonzero or malformed worktree observation -> green `3 passed`; focused bootstrap/preflight/configuration/CLI suite `63 passed, 4 skipped`; mypy clean over 56 source files, Ruff clean, diff check clean; Planck review findings fixed; implementation trailer corrected to `Subagent: Einstein`, no human changes. |
 | R4-01B revision approval CLI and previews | NOT STARTED | pending | pending |
 | R4-02A production composition root/model factory | NOT STARTED | pending | pending |
 | R4-02B Coordinator/Worker/phase-driver wiring | NOT STARTED | pending | pending |

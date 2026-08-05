@@ -58,9 +58,7 @@ def test_run_options_and_payload_are_immutable_and_non_sensitive() -> None:
         "model-configuration-revision-v1"
     )
     assert payload.model_configuration_revision.provider == "deepseek_responses"
-    assert payload.model_configuration_revision.provider_base_origin == (
-        "https://api.deepseek.com"
-    )
+    assert payload.model_configuration_revision.provider_base_origin == ("https://api.deepseek.com")
     assert payload.model_configuration_revision.inference_settings.max_input_tokens == 32_000
     assert payload.model_configuration_revision.inference_settings.max_output_tokens == 4_096
     assert "credential" not in payload.model_dump_json().lower()

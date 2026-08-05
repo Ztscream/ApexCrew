@@ -150,7 +150,7 @@ def default_revision_documents() -> RevisionDocuments:
             model_call_ceiling=240,
             input_token_ceiling=2_000_000,
             output_token_ceiling=200_000,
-            cost_reserve_usd=Decimal(1),
+            cost_reserve_usd=Decimal(10),
             concurrent_worker_ceiling=3,
             pricing_observed_on=date(2026, 8, 5),
             pricing_entries=(

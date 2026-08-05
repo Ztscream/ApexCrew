@@ -87,7 +87,9 @@ def test_bootstrap_fails_closed_on_worktree_observation(
     subprocess.run(["git", "-C", str(root), "branch", "feature"], check=True)
 
     class FakeRunner:
-        def run_bytes(self, repository: object, operation: object) -> subprocess.CompletedProcess[bytes]:
+        def run_bytes(
+            self, repository: object, operation: object
+        ) -> subprocess.CompletedProcess[bytes]:
             del repository
             assert isinstance(operation, GitWorktreeListPorcelain)
             return subprocess.CompletedProcess(("git",), returncode, stdout, b"")

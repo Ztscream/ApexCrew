@@ -72,8 +72,7 @@ class RepositoryBootstrapAuthorityService:
             return BootstrapRepositoryAuthority(
                 repository_root=str(repository.root),
                 repository_id=RepositoryId(
-                    "sha256:"
-                    + hashlib.sha256(_canonical_bytes(repository_identity)).hexdigest()
+                    "sha256:" + hashlib.sha256(_canonical_bytes(repository_identity)).hexdigest()
                 ),
                 repository_instance_digest=sha256_digest(
                     canonical_json(
@@ -118,7 +117,9 @@ def _repository_identity(repository: RepositoryInstance) -> dict[str, object]:
         "root": _identity(repository.root_identity),
         "git_dir": _identity(repository.git_dir_identity),
         "config": _identity(repository.config_identity),
-        "index": None if repository.index_identity is None else _identity(repository.index_identity),
+        "index": None
+        if repository.index_identity is None
+        else _identity(repository.index_identity),
     }
 
 
