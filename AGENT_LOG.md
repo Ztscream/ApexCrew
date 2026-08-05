@@ -2096,4 +2096,9 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `uv run --python 3.12 ruff check src tests/contract/test_cli_approvals.py` -> `All checks passed!`.
   - `uv run --python 3.12 ruff format --check src tests/contract/test_cli_approvals.py` -> `58 files already formatted`.
   - `git diff --check` -> exit code 0.
-- **Review status**: the spec result remains `PASS`; quality review is pending fresh review of this correction. No provider, credential, network, live API, push, or PR action occurred.
+- **Review status**: `Spec-Review: Hubble; PASS`; fresh `Quality-Review: Laplace; PASS`. No provider, credential, network, live API, push, or PR action occurred.
+
+## 2026-08-06 / R4-01B closeout
+
+- **Final implementation**: `9a97ea1` (`fix(cli): close R4-01B review findings`) carries `PLAN-Task: R4-01B`, `Subagent: Codex correction`, `Human-Changes: Codex correction`, `Spec-Review: Hubble; PASS`, and `Quality-Review: Laplace; PASS` trailers.
+- **Ledger**: `PLAN.md` now records R4-01B as `COMPLETED`. R4-02A remains pending and no provider, credential, network, push, or PR action was performed.
