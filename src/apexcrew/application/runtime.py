@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import secrets
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -17,8 +19,21 @@ from apexcrew.domain.admission import (
     TargetReservationBootstrapAdmissionService,
     private_ref,
 )
-from apexcrew.domain.authority import ActiveRunTimeBoundaryDecision, GrantedActionIntent
-from apexcrew.domain.commands import RunStop, RuntimeDecision, RuntimePermit, RuntimeState
+from apexcrew.domain.authority import (
+    ActiveRunTimeBoundaryDecision,
+    GrantedActionIntent,
+    PendingAction,
+)
+from apexcrew.domain.commands import (
+    ActionApprovalPending,
+    ApprovalPending,
+    FinalApprovalPending,
+    PlanApprovalPending,
+    RunStop,
+    RuntimeDecision,
+    RuntimePermit,
+    RuntimeState,
+)
 from apexcrew.domain.effects import EffectIntent, RecoveryOutcome, StateConflict, canonical_json
 from apexcrew.domain.model import (
     CommittedModelTurn,
@@ -45,7 +60,9 @@ class RuntimeOwner:
 
 
 class RunOwnership(Protocol):
-    def acquire(self, run_id: RunId) -> AbstractContextManager[RuntimeOwner | None]:
+    def acquire(
+        self, run_id: RunId, permit: RuntimePermit | None | object = None
+    ) -> AbstractContextManager[RuntimeOwner | None]:
         raise NotImplementedError
 
 
@@ -57,6 +74,54 @@ class FileLockBackend(Protocol):
 class RuntimeOwnerIdSource(Protocol):
     def next_runtime_owner_id(self) -> RuntimeOwnerId:
         raise NotImplementedError
+
+
+class LocalFileLockBackend:
+    """Use an OS advisory lock for one Run's cross-process runtime interval."""
+
+    @contextmanager
+    def try_lock(self, path: Path) -> Iterator[bool]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+b") as handle:
+            handle.seek(0)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(  # type: ignore[attr-defined]
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                    )
+            except (ImportError, OSError):
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                except (ImportError, OSError):
+                    pass
+
+
+class ProcessRuntimeOwnerIds:
+    def next_runtime_owner_id(self) -> RuntimeOwnerId:
+        return RuntimeOwnerId(f"runtime-{os.getpid()}-{secrets.token_hex(8)}")
 
 
 _UNSET = object()
@@ -72,7 +137,6 @@ class FileRunOwnership:
     def acquire(
         self, run_id: RunId, permit: RuntimePermit | None | object = _UNSET
     ) -> Iterator[RuntimeOwner | None]:
-        # DEBT-M1-006: cross-process mutex and concrete OS file-lock ownership remain deferred.
         if permit is not _UNSET and (
             permit is None
             or not isinstance(permit, RuntimePermit)
@@ -92,7 +156,10 @@ class InMemoryRunOwnership:
         self._next = 0
 
     @contextmanager
-    def acquire(self, run_id: RunId) -> Iterator[RuntimeOwner | None]:
+    def acquire(
+        self, run_id: RunId, permit: RuntimePermit | None | object = None
+    ) -> Iterator[RuntimeOwner | None]:
+        del permit
         if run_id in self._held:
             yield None
             return
@@ -448,6 +515,10 @@ class RuntimeFaultDisposition:
 class RuntimeStateStore(Protocol):
     def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
     def load_runtime_state(self, run_id: RunId) -> RuntimeState: ...
+    def unconsumed_permit(self, run_id: RunId) -> RuntimePermit: ...
+    def proposed_plan(self, run_id: RunId): ...  # type: ignore[no-untyped-def]
+    def final_candidate(self, run_id: RunId): ...  # type: ignore[no-untyped-def]
+    def pending_actions(self, run_id: RunId) -> tuple[PendingAction, ...]: ...
     def consume_current_runtime_permit(
         self, run_id: RunId, owner_id: RuntimeOwnerId, expected_sequence: AuditSequence
     ) -> RuntimePermit | None: ...
@@ -532,12 +603,18 @@ def _stop_reason_for_decision(reason: str | None) -> RunStopReason:
     }.get(reason, RunStopReason.PAUSED)
 
 
-def _stop_for_state(run_id: RunId, state: RuntimeState, reason: RunStopReason) -> RunStop:
+def _stop_for_state(
+    run_id: RunId,
+    state: RuntimeState,
+    reason: RunStopReason,
+    pending: ApprovalPending | None = None,
+) -> RunStop:
     return RunStop(
         run_id=run_id,
         state=state.state,
         reason=reason,
         last_sequence=state.sequence,
+        pending=pending,
     )
 
 
@@ -570,9 +647,31 @@ class RuntimeService:
         self._tools = tools
         self._phase_drivers = phase_drivers
 
+    def _pending_for_reason(self, run_id: RunId, reason: RunStopReason) -> ApprovalPending | None:
+        if reason == RunStopReason.AWAITING_PLAN_APPROVAL:
+            return PlanApprovalPending(plan_digest=self._store.proposed_plan(run_id).plan_digest)
+        if reason == RunStopReason.AWAITING_ACTION_APPROVAL:
+            pending_ids = tuple(
+                item.pending_id
+                for item in self._store.pending_actions(run_id)
+                if item.state == "WAITING_APPROVAL"
+            )
+            return ActionApprovalPending(pending_action_ids=pending_ids)
+        if reason == RunStopReason.AWAITING_FINAL_APPROVAL:
+            return FinalApprovalPending(
+                candidate_id=self._store.final_candidate(run_id).candidate_id
+            )
+        return None
+
     def run_until_blocked(self, run_id: RunId) -> RunStop:
-        with self._ownership.acquire(run_id) as owner:
-            state = self._store.load_runtime_state(run_id)
+        state = self._store.load_runtime_state(run_id)
+        try:
+            pending_permit = self._store.unconsumed_permit(run_id)
+        except StateConflict as error:
+            if str(error) != "RUNTIME_PERMIT_NOT_FOUND":
+                raise
+            return _stop_for_state(run_id, state, RunStopReason.NO_RUNTIME_PERMIT)
+        with self._ownership.acquire(run_id, pending_permit) as owner:
             if owner is None:
                 return _stop_for_state(run_id, state, RunStopReason.ALREADY_RUNNING)
             permit = self._store.consume_current_runtime_permit(
@@ -695,7 +794,8 @@ class RuntimeService:
         if decision.code in {"CONTINUE", "MALFORMED_ACTION", "ACTION_RECORDED"}:
             return self._drive_permitted_phase(run_id, permit, context)
         state = self._store.load_runtime_state(run_id)
-        return _stop_for_state(run_id, state, _stop_reason_for_decision(decision.stop_reason))
+        reason = _stop_reason_for_decision(decision.stop_reason)
+        return _stop_for_state(run_id, state, reason, self._pending_for_reason(run_id, reason))
 
     def _resume_recovered(
         self,
@@ -711,13 +811,13 @@ class RuntimeService:
         if decision.code in {"CONTINUE", "MALFORMED_ACTION", "ACTION_RECORDED"}:
             return self._drive_permitted_phase(run_id, permit, context)
         state = self._store.load_runtime_state(run_id)
-        return _stop_for_state(run_id, state, _stop_reason_for_decision(decision.stop_reason))
+        reason = _stop_reason_for_decision(decision.stop_reason)
+        return _stop_for_state(run_id, state, reason, self._pending_for_reason(run_id, reason))
 
     def _drive_permitted_phase(
         self, run_id: RunId, permit: RuntimePermit, context: RuntimeFaultContext
     ) -> RunStop:
         draft_initialized = False
-        private_ref_initialized = False
         while True:
             context.phase = "POST_BARRIER"
             owner_id = permit.consumed_owner_id
@@ -731,10 +831,13 @@ class RuntimeService:
             )
             if pending is not None:
                 state = self._store.load_runtime_state(run_id)
+                reason = _stop_reason_for_decision(pending.stop_reason)
                 return _stop_for_state(
-                    run_id, state, _stop_reason_for_decision(pending.stop_reason)
+                    run_id, state, reason, self._pending_for_reason(run_id, reason)
                 )
             state = self._store.load_runtime_state(run_id)
+            if state.state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+                return _stop_for_state(run_id, state, RunStopReason.TERMINAL)
             allowed = state.state.value == permit.allowed_phase
             allowed = allowed or (
                 permit.allowed_phase == "DRAFT"
@@ -742,9 +845,7 @@ class RuntimeService:
                 and state.state == RunState.PLANNING
             )
             allowed = allowed or (
-                permit.allowed_phase == "READY_TO_START"
-                and private_ref_initialized
-                and state.state == RunState.ACTIVE
+                permit.allowed_phase == "READY_TO_START" and state.state == RunState.ACTIVE
             )
             if not allowed:
                 return _stop_for_state(run_id, state, RunStopReason.PAUSED)
@@ -761,7 +862,6 @@ class RuntimeService:
             elif state.state == RunState.READY_TO_START:
                 context.phase = "PHASE_DRIVER"
                 decision = self._phase_drivers.initialize_private_ref(run_id, permit)
-                private_ref_initialized = decision.phase_transition == "PRIVATE_REF_INITIALIZED"
             elif state.state in {RunState.ACTIVE, RunState.PAUSED}:
                 context.phase = "WORKER_SCHEDULING"
                 decision = self._coordinator.schedule(run_id)
@@ -778,6 +878,7 @@ class RuntimeService:
                 return budget
             if decision.code not in {"CONTINUE", "MALFORMED_ACTION", "ACTION_RECORDED"}:
                 current = self._store.load_runtime_state(run_id)
+                reason = _stop_reason_for_decision(decision.stop_reason)
                 return _stop_for_state(
-                    run_id, current, _stop_reason_for_decision(decision.stop_reason)
+                    run_id, current, reason, self._pending_for_reason(run_id, reason)
                 )

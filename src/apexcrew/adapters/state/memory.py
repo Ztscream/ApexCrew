@@ -3589,6 +3589,17 @@ class InMemoryStateStore:
             except KeyError as error:
                 raise StateConflict("PLAN_PROPOSAL_NOT_FOUND") from error
 
+    def proposed_plan(self, run_id: RunId) -> PlanProposal:
+        with self._lock:
+            proposals = tuple(
+                proposal
+                for (proposal_run_id, _), proposal in self._plan_proposals.items()
+                if proposal_run_id == run_id
+            )
+        if not proposals:
+            raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+        return proposals[-1]
+
     def task_contracts(self, plan_digest: RevisionDigest) -> tuple[TaskContract, ...]:
         with self._lock:
             try:
@@ -6995,6 +7006,7 @@ class InMemoryStateStore:
                 for turn in self._model_turns.values()
                 if isinstance(turn, CommittedModelTurn)
                 and turn.run_id == run_id
+                and turn.owner_kind == "WORKER"
                 and turn.state == "COMPLETION_COMMITTED"
                 and turn.downstream_intent_id is None
             ),

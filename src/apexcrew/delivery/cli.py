@@ -5,6 +5,7 @@ import json
 import sqlite3
 import subprocess
 from base64 import b32encode
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +22,7 @@ from apexcrew.adapters.repository.bootstrap import (
 from apexcrew.adapters.repository.control_path import ControlPathGuard
 from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.application.composition import ApplicationBundle, build_application_bundle
 from apexcrew.application.configuration import (
     ConfigurationError,
     RunOptions,
@@ -35,14 +37,28 @@ from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     ApproveBudgetPayload,
     ApproveModelConfigurationPayload,
+    ApprovePlanPayload,
     ApprovePolicyPayload,
+    BeginPlanningPayload,
     CommandEnvelope,
+    CommandOutcome,
     CommandPayload,
     CreateRunPayload,
+    GrantPayload,
+    IntegratePayload,
+    StartPayload,
 )
 from apexcrew.domain.effects import StateConflict, canonical_json
 from apexcrew.domain.revisions import Sha256DigestText
-from apexcrew.domain.types import RevisionDigest, RunId
+from apexcrew.domain.types import (
+    AuditSequence,
+    CandidateId,
+    EvidenceBundleDigest,
+    GitOid,
+    PendingActionId,
+    RevisionDigest,
+    RunId,
+)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 credentials_app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -74,6 +90,165 @@ def _failed_invariant(error: BaseException) -> str:
 def _reject(status: str, error: BaseException) -> None:
     _emit(status, failed_invariant=_failed_invariant(error))
     raise typer.Exit(code=1)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunCommandContext:
+    run_id: RunId
+    sequence: AuditSequence
+    current: ApplicableRevisionDigests
+    approved: ApplicableRevisionDigests
+    proposed_plan_digest: RevisionDigest | None
+    candidate_id: CandidateId | None = None
+    evidence_bundle_digest: EvidenceBundleDigest | None = None
+    candidate_head_oid: GitOid | None = None
+    prepared_oid: GitOid | None = None
+
+
+def _read_run_context(root: Path, run_id: RunId) -> _RunCommandContext:
+    with ControlPathGuard(root.resolve()) as control_paths:
+        connection = control_paths.open_existing_database_read_only()
+        try:
+            row = connection.execute(
+                "SELECT runs.current_plan_digest, runs.current_policy_digest, "
+                "runs.current_budget_digest, runs.current_model_configuration_digest, "
+                "run_sequences.current_sequence FROM runs "
+                "JOIN run_sequences USING(run_id) WHERE runs.run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            approved_rows = connection.execute(
+                "SELECT revision_class, revision_digest FROM revision_approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            approved_classes = {str(item[0]): str(item[1]) for item in approved_rows}
+            current = ApplicableRevisionDigests(
+                plan_digest=None if row[0] is None else RevisionDigest(str(row[0])),
+                policy_digest=RevisionDigest(str(row[1])),
+                budget_digest=RevisionDigest(str(row[2])),
+                model_configuration_digest=RevisionDigest(str(row[3])),
+            )
+            approved = ApplicableRevisionDigests(
+                plan_digest=(
+                    current.plan_digest
+                    if approved_classes.get("PLAN") == str(current.plan_digest)
+                    else None
+                ),
+                policy_digest=(
+                    current.policy_digest
+                    if approved_classes.get("POLICY") == str(current.policy_digest)
+                    else None
+                ),
+                budget_digest=(
+                    current.budget_digest
+                    if approved_classes.get("BUDGET") == str(current.budget_digest)
+                    else None
+                ),
+                model_configuration_digest=(
+                    current.model_configuration_digest
+                    if approved_classes.get("MODEL_CONFIGURATION")
+                    == str(current.model_configuration_digest)
+                    else None
+                ),
+            )
+            proposal = connection.execute(
+                "SELECT plan_digest FROM plans WHERE run_id = ? AND state = 'PROPOSED' "
+                "ORDER BY rowid DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            candidate = connection.execute(
+                "SELECT candidate_id, evidence_bundle_digest, candidate_json, prepared_oid "
+                "FROM run_candidates WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            candidate_id: CandidateId | None = None
+            evidence: EvidenceBundleDigest | None = None
+            head_oid: GitOid | None = None
+            prepared: GitOid | None = None
+            if candidate is not None:
+                candidate_id = CandidateId(str(candidate[0]))
+                evidence = EvidenceBundleDigest(str(candidate[1]))
+                candidate_json = json.loads(str(candidate[2]))
+                head_oid = GitOid(str(candidate_json["head_oid"]))
+                if candidate[3] is not None:
+                    prepared = GitOid(str(candidate[3]))
+            return _RunCommandContext(
+                run_id=run_id,
+                sequence=AuditSequence(int(row[4])),
+                current=current,
+                approved=approved,
+                proposed_plan_digest=(
+                    None if proposal is None else RevisionDigest(str(proposal[0]))
+                ),
+                candidate_id=candidate_id,
+                evidence_bundle_digest=evidence,
+                candidate_head_oid=head_oid,
+                prepared_oid=prepared,
+            )
+        finally:
+            connection.close()
+
+
+def _open_delivery_bundle(root: Path) -> tuple[ControlPathGuard, ApplicationBundle]:
+    guard = ControlPathGuard(root.resolve())
+    try:
+        connection = guard.open_existing_database_read_only()
+        connection.close()
+        bundle = build_application_bundle(root.resolve())
+    except BaseException:
+        guard.close()
+        raise
+    return guard, bundle
+
+
+def _command_request_id(payload: CommandPayload) -> str:
+    digest = hashlib.sha256(canonical_json(payload.model_dump(mode="json")).encode("utf-8"))
+    return "cli-command-" + digest.hexdigest()
+
+
+def _handle_run_command(
+    root: Path,
+    payload: CommandPayload,
+    *,
+    bindings: Literal["current", "approved"],
+) -> CommandOutcome:
+    payload_run_id = getattr(payload, "run_id", None)
+    if not isinstance(payload_run_id, str):
+        raise TypeError("RUN_ID_REQUIRED")
+    run_id = RunId(payload_run_id)
+    context = _read_run_context(root, run_id)
+    guard, bundle = _open_delivery_bundle(root)
+    try:
+        command = CommandEnvelope(
+            request_id=_command_request_id(payload),
+            expected_sequence=context.sequence,
+            applicable_revision_digests=(
+                context.current if bindings == "current" else context.approved
+            ),
+            payload=payload,
+        )
+        outcome = bundle.control.handle(command)
+        guard.assert_current()
+        return outcome
+    finally:
+        bundle.close()
+        guard.close()
+
+
+def _emit_outcome(outcome: CommandOutcome) -> None:
+    status = str(outcome.status)
+    fields: dict[str, object] = {
+        "run_id": outcome.run_id,
+        "resulting_sequence": outcome.resulting_sequence,
+    }
+    failed = outcome.failed_invariant
+    if failed is not None:
+        fields["failed_invariant"] = failed
+    if status != "ACCEPTED":
+        _emit("COMMAND_REJECTED", command_status=status, **fields)
+        raise typer.Exit(code=1)
+    _emit("COMMAND_ACCEPTED", command_status=status, **fields)
 
 
 class _SqliteTargetAuthorityDigestService(TargetAuthorityDigestService):
@@ -196,8 +371,298 @@ def _run_create_request_id(payload: CreateRunPayload) -> str:
 @app.command()
 def run(run_id: str, root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Deliver one run through the Permit-gated runtime."""
-    del root
-    _emit("NO_RUNTIME_PERMIT", run_id=run_id)
+    guard = None
+    bundle = None
+    try:
+        guard, bundle = _open_delivery_bundle(root)
+        stop = bundle.runtime.run_until_blocked(RunId(run_id))
+        guard.assert_current()
+    except RepositoryUnsafeError as error:
+        if str(error) == "CONTROL_DATABASE_NOT_FOUND":
+            _emit("NO_RUNTIME_PERMIT", run_id=run_id)
+            return
+        _reject("RUN_REJECTED", error)
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        sqlite3.Error,
+        subprocess.TimeoutExpired,
+        TimeoutError,
+        UnicodeError,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("RUN_REJECTED", error)
+    finally:
+        if bundle is not None:
+            bundle.close()
+        if guard is not None:
+            guard.close()
+    fields: dict[str, object] = {
+        "run_id": stop.run_id,
+        "state": stop.state,
+        "reason": stop.reason,
+        "last_sequence": stop.last_sequence,
+    }
+    if stop.pending is not None:
+        fields["pending"] = stop.pending.model_dump(mode="json")
+    _emit(str(stop.reason), **fields)
+
+
+@app.command()
+def show(run_id: str, root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
+    """Render the sanitized RunQueries projection."""
+    guard = None
+    bundle = None
+    try:
+        guard, bundle = _open_delivery_bundle(root)
+        view = bundle.queries.get(RunId(run_id))
+        guard.assert_current()
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("SHOW_REJECTED", error)
+    finally:
+        if bundle is not None:
+            bundle.close()
+        if guard is not None:
+            guard.close()
+    _emit("RUN_VIEW", **view.model_dump(mode="json"))
+
+
+@app.command("begin-planning")
+def begin_planning(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Issue one planning Runtime Permit after bootstrap approvals."""
+    try:
+        outcome = _handle_run_command(
+            root,
+            BeginPlanningPayload(run_id=RunId(run_id)),
+            bindings="current",
+        )
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("BEGIN_PLANNING_REJECTED", error)
+    _emit_outcome(outcome)
+
+
+@app.command("approve-plan")
+def approve_plan(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+    digest: str | None = typer.Option(None, "--digest"),
+    confirmation_code: str | None = typer.Option(None, "--confirmation-code"),
+    preview: bool = typer.Option(False, "--preview"),
+) -> None:
+    """Preview or approve the exact proposed Plan revision."""
+    try:
+        context = _read_run_context(root, RunId(run_id))
+        plan_digest = context.proposed_plan_digest
+        if plan_digest is None:
+            raise StateConflict("PLAN_PROPOSAL_NOT_FOUND")
+        if digest is not None and RevisionDigest(digest) != plan_digest:
+            _emit("APPROVAL_REJECTED", failed_invariant="REVISION_DIGEST_MISMATCH")
+            raise typer.Exit(code=1)
+        expected_code = _approval_confirmation_code(
+            "approve_plan", RunId(run_id), "PLAN", plan_digest
+        )
+        if preview:
+            _emit(
+                "APPROVAL_PREVIEW",
+                confirmation_code=expected_code,
+                revision_digest=plan_digest,
+                revision_kind="plan",
+                run_id=run_id,
+            )
+            return
+        if digest is None or confirmation_code is None:
+            _emit("APPROVAL_REJECTED", failed_invariant="APPROVAL_ARGUMENTS_REQUIRED")
+            raise typer.Exit(code=2)
+        outcome = _handle_run_command(
+            root,
+            ApprovePlanPayload(
+                run_id=RunId(run_id),
+                plan_digest=plan_digest,
+                confirmation_code=confirmation_code,
+            ),
+            bindings="current",
+        )
+    except typer.Exit:
+        raise
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("APPROVE_PLAN_REJECTED", error)
+    _emit_outcome(outcome)
+
+
+@app.command("start")
+def start(
+    run_id: str,
+    plan_digest: str = typer.Option(..., "--plan-digest"),
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Issue one start Runtime Permit for an approved plan."""
+    try:
+        outcome = _handle_run_command(
+            root,
+            StartPayload(run_id=RunId(run_id), plan_digest=RevisionDigest(plan_digest)),
+            bindings="current",
+        )
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("START_REJECTED", error)
+    _emit_outcome(outcome)
+
+
+@app.command("grant")
+def grant(
+    run_id: str,
+    pending_action_id: str = typer.Option(..., "--pending-action-id"),
+    pending_action_digest: str = typer.Option(..., "--pending-action-digest"),
+    confirmation_code: str = typer.Option(..., "--confirmation-code"),
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Consume the exact one-use Grant for a pending risky action."""
+    try:
+        outcome = _handle_run_command(
+            root,
+            GrantPayload(
+                run_id=RunId(run_id),
+                pending_action_id=PendingActionId(pending_action_id),
+                pending_action_digest=Sha256DigestText(pending_action_digest),
+                confirmation_code=confirmation_code,
+            ),
+            bindings="current",
+        )
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("GRANT_REJECTED", error)
+    _emit_outcome(outcome)
+
+
+@app.command("integrate")
+def integrate(
+    run_id: str,
+    candidate_id: str | None = typer.Option(None, "--candidate-id"),
+    evidence_bundle_digest: str | None = typer.Option(None, "--evidence-bundle-digest"),
+    expected_target_oid: str | None = typer.Option(None, "--expected-target-oid"),
+    prepared_oid: str | None = typer.Option(None, "--prepared-oid"),
+    confirmation_code: str | None = typer.Option(None, "--confirmation-code"),
+    preview: bool = typer.Option(False, "--preview"),
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Preview or submit the exact frozen Candidate integration command."""
+    try:
+        context = _read_run_context(root, RunId(run_id))
+        if (
+            context.candidate_id is None
+            or context.evidence_bundle_digest is None
+            or context.candidate_head_oid is None
+        ):
+            raise StateConflict("FINAL_CANDIDATE_NOT_FOUND")
+        expected_code = _approval_confirmation_code(
+            "integrate",
+            RunId(run_id),
+            "FINAL_CANDIDATE",
+            RevisionDigest(str(context.evidence_bundle_digest)),
+        )
+        if preview:
+            _emit(
+                "INTEGRATION_PREVIEW",
+                candidate_id=context.candidate_id,
+                evidence_bundle_digest=context.evidence_bundle_digest,
+                expected_target_oid=context.candidate_head_oid,
+                prepared_oid=context.prepared_oid or context.candidate_head_oid,
+                confirmation_code=expected_code,
+                run_id=run_id,
+            )
+            return
+        if any(
+            value is None
+            for value in (
+                candidate_id,
+                evidence_bundle_digest,
+                expected_target_oid,
+                prepared_oid,
+                confirmation_code,
+            )
+        ):
+            _emit("INTEGRATION_REJECTED", failed_invariant="INTEGRATION_ARGUMENTS_REQUIRED")
+            raise typer.Exit(code=2)
+        assert candidate_id is not None
+        assert evidence_bundle_digest is not None
+        assert expected_target_oid is not None
+        assert prepared_oid is not None
+        assert confirmation_code is not None
+        outcome = _handle_run_command(
+            root,
+            IntegratePayload(
+                run_id=RunId(run_id),
+                candidate_id=CandidateId(candidate_id),
+                evidence_bundle_digest=EvidenceBundleDigest(evidence_bundle_digest),
+                expected_target_oid=GitOid(expected_target_oid),
+                prepared_oid=GitOid(prepared_oid),
+                confirmation_code=confirmation_code,
+            ),
+            bindings="current",
+        )
+    except typer.Exit:
+        raise
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("INTEGRATE_REJECTED", error)
+    _emit_outcome(outcome)
 
 
 @app.command()

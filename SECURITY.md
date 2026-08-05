@@ -43,13 +43,18 @@ closed but its process runner remains a debt.
 
 ## Known Runtime Debt
 
-`DEBT-M1-006`: runtime ownership currently provides only the in-process ownership
-path. The production process mutex plus POSIX/Windows OS file-lock backend is not
-implemented in this sprint. `FileRunOwnership.acquire` fails closed for an explicit
-invalid Permit and never creates a lock path; a missing pre-provisioned lock path
-does not grant ownership. Multi-process exclusivity is therefore not claimed.
-
 `DEBT-M2-001`: multiple unresolved effects are represented as `INDETERMINATE`
 because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
 Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
 builds a restricted digest-pinned argv but does not launch a Docker process.
+
+The production runtime now checks the unconsumed Runtime Permit before acquiring
+the per-Run OS lock. The lock is cross-process and platform-backed; an absent,
+stale, or already-consumed Permit cannot create ownership. This control is covered
+by the runtime lock and Permit lifecycle tests.
+
+Real DeepSeek dispatch is an explicit operator action. The offline suite never
+resolves a provider credential. `tests/integration/test_live_provider_smoke.py`
+requires `APEXCREW_LIVE_SMOKE=1`, performs at most one provider request, and does
+not print credential or prompt bytes. The CLI remains the writable control surface;
+WebUI and Pages replay remain read-only projections.

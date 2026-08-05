@@ -12,6 +12,7 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CreateRunPayload,
 )
+from apexcrew.domain.tools import ScopedToolRuntime
 from apexcrew.domain.types import GitOid, RepositoryId
 
 
@@ -174,5 +175,67 @@ def test_bundle_exposes_only_public_interfaces_and_no_deferred_graph(tmp_path: P
         _assert_no_deferred_boundary(bundle.control)
         _assert_no_deferred_boundary(bundle.runtime)
         _assert_no_deferred_boundary(bundle.queries)
+    finally:
+        bundle.close()
+
+
+def test_bundle_uses_selected_model_configuration_for_runtime_requests(tmp_path: Path) -> None:
+    factory = _bundle_factory()
+    revisions = default_revision_documents()
+    model = revisions.model_configuration.model_copy(
+        update={
+            "provider": "scripted_mock",
+            "provider_base_origin": "mock://scripted",
+            "requested_model_id": "offline-model",
+            "returned_model_aliases": (
+                revisions.model_configuration.returned_model_aliases[0].model_copy(
+                    update={
+                        "returned_model_id": "offline-model",
+                        "canonical_model_id": "offline-model",
+                    }
+                ),
+            ),
+        }
+    )
+    budget = revisions.budget.model_copy(
+        update={
+            "pricing_entries": (
+                revisions.budget.pricing_entries[0].model_copy(
+                    update={"returned_model_id": "offline-model"}
+                ),
+            )
+        }
+    )
+    bundle = factory(
+        tmp_path,
+        repository_authority=FixtureRepositoryAuthority(),
+        model_configuration=model,
+        budget=budget,
+        scripted_model=ScriptedMockLLM(()),
+    )
+    try:
+        requests = bundle.runtime._coordinator._workers._requests  # type: ignore[attr-defined]
+        assert requests.requested_model_id == "offline-model"
+        assert requests.allowed_model_ids == frozenset({"offline-model"})
+    finally:
+        bundle.close()
+
+
+def test_bundle_uses_scoped_worker_tools_and_concrete_phase_drivers(tmp_path: Path) -> None:
+    factory = _bundle_factory()
+    bundle = factory(
+        tmp_path,
+        repository_authority=FixtureRepositoryAuthority(),
+        model_configuration=_create_command(tmp_path).payload.model_configuration_revision,
+        scripted_model=ScriptedMockLLM(()),
+    )
+    try:
+        tools = bundle.runtime._coordinator._workers._tools  # type: ignore[attr-defined]
+        drivers = bundle.runtime._phase_drivers  # type: ignore[attr-defined]
+        assert isinstance(tools, ScopedToolRuntime)
+        assert type(drivers._resolution).__name__ == "_CompositionResolutionDriver"
+        assert type(drivers._integration).__name__ == "_CompositionIntegrationDriver"
+        assert type(drivers._cleanup).__name__ == "_CompositionCleanupDriver"
+        assert "NOT_IMPLEMENTED" not in repr(drivers)
     finally:
         bundle.close()

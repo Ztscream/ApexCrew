@@ -2154,6 +2154,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4-02B Task 1 final-user runtime
+
+- **Red evidence**: the public-interface lifecycle selector initially failed before plan approval with `PAUSED`; the pre-existing lifecycle test also reached into `bundle.runtime._store` for revisions and sequences.
+- **Implementation**: normal planning submissions keep recovery marker, Permit, and recovered logical turn unset; planning and Worker requests, manifest policy, and authorization load current persisted Run revision documents; repository identity/storage is checked before Git adapters are built and the existing reservation storage guard remains active.
+- **Test correction**: `test_composed_runtime_reaches_plan_approval_with_real_git_reservation` now drives approvals using `CrewControl`, observes state/sequence through `RunQueries`, and asserts the normal planning stop through `CrewRuntime` without private store access. The later final-approval assertion remains Task 2 scope because the phase driver is intentionally deferred.
+- **Green evidence**: `uv run --python 3.12 pytest tests/integration/test_composed_runtime_lifecycle.py tests/contract/test_composition.py -q` -> `5 passed`.
+- **Quality evidence**: focused `mypy` -> `Success: no issues found in 3 source files`; focused Ruff check -> `All checks passed!`. No provider, credential, network, push, or commit action occurred.
+- **Review status**: Task 1 spec-compliance check passed: current Run revision bindings, normal planning recovery arguments, real Git reservation binding, and public-interface lifecycle boundary are covered. Code-quality check passed for Task 1 files. Full `ruff format --check src tests` remains blocked only by the pre-existing unallowed `src/apexcrew/adapters/repository/target_cas.py`; owned files are formatted. No provider, credential, network, push, or commit action occurred.
+
 ## 2026-08-06 / R4-02A closeout
 
 - **Final implementation**: `fcab0fe` (`fix(runtime): make bundle cleanup retry-safe`), with the R4-02A implementation/correction chain `47cbe7e`, `8a50a37`, `88fe78c`, `8fa2c86`, `b1cfc66`, `e7b259a`, `aa1412b`, and `fcab0fe`.
@@ -2234,4 +2243,21 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `uv run --python 3.12 ruff check src tests/contract/test_deepseek_responses_adapter.py tests/integration/test_provider_selection.py` -> `All checks passed!`.
   - `uv run --python 3.12 ruff format --check src tests` -> `134 files already formatted`.
   - `git diff --check` -> exit code 0.
+
+## 2026-08-06 / R4-05 delivery boundary
+
+- **Implementation**: added the explicit `APEXCREW_LIVE_SMOKE=1` provider gate test,
+  a `live-smoke` Make target outside the default test target, and documentation for
+  the CLI approval/Permit sequence, read-only WebUI boundary, credential timing,
+  and current runtime debt. The live test performs at most one DeepSeek request and
+  never prints credentials, prompts, or raw provider output.
+- **Offline evidence**: `uv run --python 3.12 pytest -q` -> full suite passed with
+  the repository's existing xfail/skip set; the live selector is one passed opt-in
+  contract and one default skip. Ruff check, Ruff format check, mypy, and
+  `git diff --check` all passed.
+- **Security evidence**: `uv run --python 3.12 python scripts/secret_scan.py .` ->
+  `secret-scan: clean`.
+- **Review status**: implementation-side spec and quality review are pending the
+  independent review branch. No credential, provider request, push, or PR action
+  occurred.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.

@@ -20,3 +20,10 @@ def test_release_artifacts_are_declared() -> None:
     assert "uv run pytest" in gitlab
     assert "build:" in workflow
     assert "uv build" in workflow
+
+
+def test_live_smoke_is_not_in_default_targets() -> None:
+    makefile = Path("Makefile").read_text()
+    assert "live-smoke:" in makefile
+    assert "tests/integration/test_live_provider_smoke.py" in makefile
+    assert "live-smoke" not in makefile.split("test:", 1)[1].split("\n\n", 1)[0]

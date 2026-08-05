@@ -25,6 +25,12 @@ uv run --python 3.12 python -m apexcrew.demo
 
 The demo is deterministic and local-only. The CLI refuses runtime or approval actions when no composed authority/Permit exists.
 
+The supported end-user path is the CLI. `run-create` is offline and does not call
+DeepSeek; after the three revision approvals, `begin-planning` issues a Runtime
+Permit and `run` consumes it before planning, Worker, or repository effects. Use
+`show` for the next exact digest, pending action, Candidate, and confirmation
+code preview. The read-only WebUI and Pages replay never execute a Run.
+
 ## 凭据安全配置
 
 The offline suite, the demo, and every delivery command run without a provider credential. A credential is required only to drive the real DeepSeek adapter.
@@ -42,12 +48,26 @@ Resolution order is keyring first, then the single environment variable `APEXCRE
 
 The credential is read at request time and never cached on an instance, never written to logs, never included in `repr`/`str`, never passed to a child process, and never mounted into the restricted executor. Missing or unreadable credentials fail closed with `MODEL_CREDENTIAL_MISSING` rather than degrading to an unauthenticated call. `SECURITY.md` documents the full trust boundary.
 
+To authorize the one-request live smoke explicitly, configure a credential and set
+the gate in the current shell. The smoke is skipped by default and is excluded
+from `make test` and ordinary CI:
+
+```text
+$env:APEXCREW_LIVE_SMOKE="1"       # PowerShell
+make live-smoke
+```
+
+On POSIX shells use `APEXCREW_LIVE_SMOKE=1 make live-smoke`. The smoke records
+only response status, response ID, returned model ID, usage, and structured-action
+validity in test assertions; it never prints the prompt or credential.
+
 ## 分发命令
 
 ```text
 make test
 make lint
 make demo
+make live-smoke             # explicit opt-in only; normally skipped
 make secret-scan
 make web-build
 make build
@@ -124,4 +144,4 @@ The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python 
 
 ## 已知债务
 
-The following markers are intentionally fail-closed and are not production claims: `DEBT-M1-006` (cross-process runtime/OS lock), `DEBT-M2-001` (multi-intent precedence), `DEBT-M2-002` (Tier 2 export), `DEBT-M2-003` (retention export), `DEBT-M2-004` (durable eviction), and `DEBT-M2-005` (Docker process runner). Their exact source locations are generated with `rg -n "DEBT-" src`.
+The following markers are intentionally fail-closed and are not production claims: `DEBT-M2-001` (multi-intent precedence), `DEBT-M2-002` (Tier 2 export), `DEBT-M2-003` (retention export), `DEBT-M2-004` (durable eviction), and `DEBT-M2-005` (Docker process runner). Their exact source locations are generated with `rg -n "DEBT-" src`.

@@ -1,4 +1,4 @@
-.PHONY: test coverage lint demo secret-scan web-build build
+.PHONY: test coverage lint demo live-smoke secret-scan web-build build
 
 UV_RUN := uv run --python 3.12
 
@@ -15,6 +15,9 @@ lint:
 
 demo:
 	$(UV_RUN) python -m apexcrew.demo
+
+live-smoke:
+	$(UV_RUN) pytest tests/integration/test_live_provider_smoke.py -q
 
 secret-scan:
 	$(UV_RUN) python scripts/secret_scan.py .

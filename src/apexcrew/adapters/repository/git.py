@@ -162,7 +162,10 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
         private = self._runner.run(self._repository, GitShowRefVerify(private_name))
         if private.returncode == 0:
             return StartGuardDecision(ok=False, reason="PRIVATE_REF_CONFLICT")
-        if private.returncode != 1:
+        absent_ref = private.returncode == 1 or (
+            private.returncode == 128 and private.stderr.strip().endswith("not a valid ref")
+        )
+        if not absent_ref:
             return StartGuardDecision(ok=False, reason="PRIVATE_REF_UNOBSERVABLE")
         try:
             effect_binding = self._effect_binding(run_id)
@@ -745,7 +748,9 @@ def inspect_no_follow_git_layout(root: Path) -> GitLayout:
         raise
 
 
-def reject_unsafe_layout(layout: GitLayout) -> None:
+def reject_unsafe_layout(
+    layout: GitLayout, *, allowed_worktree_admin_entries: tuple[str, ...] = ()
+) -> None:
     raw_config = layout.handles.read_bytes(layout.config, MAX_GIT_CONFIG_BYTES)
     config_entries = parse_git_config(raw_config)
     reject_unsafe_config(config_entries)
@@ -798,7 +803,8 @@ def reject_unsafe_layout(layout: GitLayout) -> None:
             layout.handles.read_bytes(layout.index, MAX_GIT_INDEX_BYTES),
             object_hash,
         )
-    if layout.worktree_admin_entries:
+    unexpected_worktrees = set(layout.worktree_admin_entries) - set(allowed_worktree_admin_entries)
+    if unexpected_worktrees:
         raise RepositoryUnsafeError("UNSUPPORTED_LINKED_WORKTREE")
 
 
@@ -882,10 +888,14 @@ class RepositoryInstance:
 
 
 class GitRepositoryPreflight:
-    def inspect(self, root: Path) -> RepositoryInstance:
+    def inspect(
+        self, root: Path, *, allowed_worktree_admin_entries: tuple[str, ...] = ()
+    ) -> RepositoryInstance:
         layout = inspect_no_follow_git_layout(root)
         try:
-            reject_unsafe_layout(layout)
+            reject_unsafe_layout(
+                layout, allowed_worktree_admin_entries=allowed_worktree_admin_entries
+            )
             layout.handles.assert_name_bindings()
             return RepositoryInstance.from_layout(layout)
         except BaseException:
@@ -931,6 +941,14 @@ class GitCreatePrivateRef:
 
 
 @dataclass(frozen=True, slots=True)
+class GitUpdateRefCas:
+    direct_ref: str
+    prepared_oid: GitOid
+    expected_old_oid: GitOid
+    reflog_message: str
+
+
+@dataclass(frozen=True, slots=True)
 class GitWorktreeAddNoCheckout:
     reservation_path: Path
     target_ref: str
@@ -968,6 +986,7 @@ type GitOperation = (
     | GitWorktreeListPorcelain
     | GitShowRefVerify
     | GitCreatePrivateRef
+    | GitUpdateRefCas
     | GitWorktreeAddNoCheckout
     | GitWorktreeLock
     | GitLsTreeRecursive
@@ -1117,6 +1136,7 @@ class GitCommandRunner:
                 GitWorktreeListPorcelain,
                 GitShowRefVerify,
                 GitCreatePrivateRef,
+                GitUpdateRefCas,
                 GitWorktreeAddNoCheckout,
                 GitWorktreeLock,
                 GitLsTreeRecursive,
@@ -1168,6 +1188,22 @@ class GitCommandRunner:
                     target,
                     self._require_oid(oid),
                     "",
+                )
+            case GitUpdateRefCas(
+                direct_ref=target,
+                prepared_oid=new_oid,
+                expected_old_oid=old_oid,
+                reflog_message=message,
+            ):
+                self._require_direct_ref(target)
+                self._require_reason(message)
+                return (
+                    "update-ref",
+                    "-m",
+                    message,
+                    target,
+                    self._require_oid(new_oid),
+                    self._require_oid(old_oid),
                 )
             case GitWorktreeAddNoCheckout(reservation_path=path, target_ref=target):
                 self._require_direct_ref(target)

@@ -26,7 +26,9 @@ class RepositoryBootstrapError(ValueError):
 
 
 class RepositoryPreflightPort(Protocol):
-    def inspect(self, root: Path) -> RepositoryInstance: ...
+    def inspect(
+        self, root: Path, *, allowed_worktree_admin_entries: tuple[str, ...] = ()
+    ) -> RepositoryInstance: ...
 
 
 class RepositoryBootstrapAuthorityService:
@@ -56,6 +58,27 @@ class RepositoryBootstrapAuthorityService:
         except (OSError, RepositoryUnsafeError, ValueError) as error:
             raise RepositoryBootstrapError("repository preflight rejected root") from error
         repository.close()
+
+    def open_repository(
+        self,
+        root: str | Path,
+        *,
+        allowed_worktree_admin_entries: tuple[str, ...] = (),
+    ) -> RepositoryInstance:
+        """Open a preflight-bound repository for internal runtime adapters."""
+        try:
+            if allowed_worktree_admin_entries:
+                return self._preflight.inspect(
+                    Path(root),
+                    allowed_worktree_admin_entries=allowed_worktree_admin_entries,
+                )
+            return self._preflight.inspect(Path(root))
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise RepositoryBootstrapError("repository preflight rejected root") from error
+
+    @property
+    def git_runner(self) -> GitCommandRunner:
+        return self._runner
 
     def inspect(self, repository_root: str, target_ref: str) -> BootstrapRepositoryAuthority:
         _require_direct_target_ref(target_ref)
@@ -98,6 +121,25 @@ class RepositoryBootstrapAuthorityService:
             )
         finally:
             repository.close()
+
+
+def repository_binding(
+    repository: RepositoryInstance, *, allowed_worktree_admin_entries: tuple[str, ...] = ()
+) -> tuple[RepositoryId, str]:
+    """Return the identity and storage binding used when a Run is created."""
+    repository_identity = _repository_identity(repository)
+    repository_id = RepositoryId(
+        "sha256:" + hashlib.sha256(_canonical_bytes(repository_identity)).hexdigest()
+    )
+    instance_digest = sha256_digest(
+        canonical_json(
+            {
+                "identity": repository_identity,
+                "storage": _storage_snapshot(repository, allowed_worktree_admin_entries),
+            }
+        )
+    )
+    return repository_id, instance_digest
 
 
 def _find_git_executable() -> Path:
@@ -156,15 +198,30 @@ def _repository_identity(repository: RepositoryInstance) -> dict[str, object]:
     }
 
 
-def _storage_snapshot(repository: RepositoryInstance) -> list[dict[str, object]]:
-    return [
-        {
-            "relative": node.relative,
-            "identity": _identity(node.identity),
-            "names": node.names,
-        }
-        for node in repository.storage_snapshot.nodes
-    ]
+def _storage_snapshot(
+    repository: RepositoryInstance, allowed_worktree_admin_entries: tuple[str, ...] = ()
+) -> list[dict[str, object]]:
+    allowed_prefixes = (".git/worktrees",) + tuple(
+        f".git/worktrees/{entry}" for entry in allowed_worktree_admin_entries
+    )
+    result: list[dict[str, object]] = []
+    for node in repository.storage_snapshot.nodes:
+        if any(
+            node.relative == prefix or node.relative.startswith(prefix + "/")
+            for prefix in allowed_prefixes
+        ):
+            continue
+        names = node.names
+        if node.relative == ".git" and names is not None:
+            names = tuple(name for name in names if name != "worktrees")
+        result.append(
+            {
+                "relative": node.relative,
+                "identity": _identity(node.identity),
+                "names": names,
+            }
+        )
+    return result
 
 
 def _identity(value: HandleIdentity) -> dict[str, object]:
