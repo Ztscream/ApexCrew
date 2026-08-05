@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 import pytest
 
+from apexcrew.adapters.repository.control_path import ControlPathGuard
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
     GitLayout,
@@ -64,6 +65,7 @@ class _RecordingBackend:
         self.git_executable = Path("C:/git.exe").resolve()
         self.empty_dir = Path("C:/empty")
         self._replacement_ids: dict[tuple[str, ...], int] = {}
+        self.closed_handles: list[int] = []
 
     @property
     def opened_components(self) -> list[tuple[int, str]]:
@@ -88,8 +90,14 @@ class _RecordingBackend:
             (self.volume_handle, "repo"): ("repo",),
             (self.repo_handle, ".git"): ("repo", ".git"),
             (self.git_handle, "config"): ("repo", ".git", "config"),
+            (self.repo_handle, ".apexcrew"): ("repo", ".apexcrew"),
         }.get((parent, name), (name,))
-        file_id = self._replacement_ids.get(binding, handle)
+        stable_ids = {
+            ("repo", ".apexcrew"): 60,
+            ("config.json",): 61,
+            ("state.db",): 62,
+        }
+        file_id = self._replacement_ids.get(binding, stable_ids.get(binding, handle))
         components = () if name == "repo" else (name,)
         return OpenedNode(
             components,
@@ -127,7 +135,7 @@ class _RecordingBackend:
         return ()
 
     def close(self, node: OpenedNode) -> None:
-        return None
+        self.closed_handles.append(node.handle)
 
     def every_open_has(self, flags: int) -> bool:
         return all(item.flags & flags == flags for item in self.opens)
@@ -158,6 +166,19 @@ def recording_windows_backend() -> _RecordingBackend:
 
 def recording_posix_backend() -> _RecordingBackend:
     return recording_backend("posix", ("repo", ".git", "config"))
+
+
+def test_control_path_guard_does_not_rebind_database_on_repeated_ensure() -> None:
+    backend = recording_posix_backend()
+    guard = ControlPathGuard(backend.absolute_root, backend)
+
+    guard.ensure()
+    database_node = guard._database_node
+    guard.ensure()
+
+    assert guard._database_node is database_node
+    guard.close()
+    assert backend.closed_handles.count(database_node.handle if database_node else -1) == 1
 
 
 def bound_repository_from_backend(backend: _RecordingBackend) -> RepositoryInstance:

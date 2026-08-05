@@ -1748,3 +1748,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: Codex correction; implementation subagent remains Einstein.
 - **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `src/apexcrew/adapters/repository/no_follow_windows.py`, `src/apexcrew/adapters/state/sqlite.py`, `src/apexcrew/delivery/cli.py`, `tests/unit/test_cli.py`, and `AGENT_LOG.md`.
 - **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.
+
+## 2026-08-06 / R4-01A Lovelace spec correction
+
+- **Task**: bounded R4-01A control-path binding correction at `cfe7f28`; scope remains control-path and SQLite bootstrap only.
+- **Spec-review finding**: Lovelace found that repeated `ControlPathGuard.ensure()` calls reopened and replaced the retained `state.db` node, allowing a rebind race and leaking the previous handle. The implementation was blocked against the PLAN no-follow binding and cleanup contract.
+- **Correction red evidence**: the fresh reviewer identified the rebind path at `control_path.py:57-58` and `open_database:98`; the new guard regression selector failed on the pre-fix behavior before the recording backend was made stable for repeated identity probes.
+- **Correction green evidence**: `test_control_path_guard_does_not_rebind_database_on_repeated_ensure` passes; full offline `uv run --python 3.12 pytest -q` returned exit code 0 with expected xfail/skip markers and one existing Starlette deprecation warning; mypy, Ruff check, Ruff format check, and `git diff --check` passed.
+- **Review status**: `Spec-Review: pending` pending fresh ordered review of this correction; `Quality-Review: pending` and must follow spec review.
+- **Human changes**: Codex correction; implementation subagent remains Einstein.
+- **Changed paths**: `src/apexcrew/adapters/repository/control_path.py`, `tests/unit/adapters/repository/test_no_follow_handles.py`, and `AGENT_LOG.md`.
+- **Commit action**: create one named correction commit with trailers `PLAN-Task: R4-01A`, `Subagent: Einstein`, `Human-Changes: Codex correction`, `Spec-Review: pending`, and `Quality-Review: pending`; no amend, push, PR, live call, or runtime/composition/provider change.

@@ -49,6 +49,9 @@ class ControlPathGuard:
         self.close()
 
     def ensure(self) -> None:
+        if self._control is not None:
+            self.assert_current()
+            return
         if self._control is None:
             control = self._backend.try_open_child(self._tree.root_node, ".apexcrew", "directory")
             if control is None:
