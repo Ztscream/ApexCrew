@@ -384,7 +384,7 @@ W1 卡所有者合并 PR #13
 | P1 模型凭据端口 | REAL | — | DONE | `11760316cde6bb35fd7fffc41e66aa2d6942750a` |
 | P2 CLI 凭据命令 | REAL | — | DONE | `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3` |
 | P3 定价换绑 | REAL | — | DONE | `a0eb48e6485ba8a1a87577687409117f1bb985a2` |
-| P4 DeepSeek adapter | REAL | `DEBT-M4-001` | DONE | `932ad3f3b126011f4218b8e158a7b5bfda98877d` |
+| P4 DeepSeek adapter | REAL | `DEBT-M4-001` | DONE | `932ad3fbc9e5ee689ae618ed87fad2005647c4b3` |
 | P5 live smoke | REAL | — | BLOCKED(所有者授权) | |
 | R1 跨进程锁 | REAL | `DEBT-M1-006` | TODO | |
 | T1 多意图消解 | REAL | `DEBT-M2-001` | TODO | |
