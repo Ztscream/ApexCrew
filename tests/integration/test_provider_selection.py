@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+import importlib
+import importlib.util
+from pathlib import Path
+
+from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.application.configuration import default_revision_documents
+
+
+class ExplodingClientFactory:
+    def __call__(self, **_: object) -> object:
+        raise AssertionError("scripted provider must not construct a network client")
+
+
+def test_scripted_selection_never_calls_network(tmp_path: Path) -> None:
+    module = (
+        importlib.import_module("apexcrew.adapters.model.factory")
+        if importlib.util.find_spec("apexcrew.adapters.model.factory") is not None
+        else None
+    )
+    assert module is not None, "model factory module is missing"
+    factory = getattr(module, "build_model_port", None)
+    assert factory is not None, "model factory entry point is missing"
+
+    model_configuration = default_revision_documents().model_configuration.model_copy(
+        update={
+            "provider": "scripted_mock",
+            "provider_base_origin": "mock://scripted",
+        }
+    )
+    scripted = ScriptedMockLLM(())
+    selected = factory(
+        model_configuration=model_configuration,
+        budget=default_revision_documents().budget,
+        scripted_model=scripted,
+        client_factory=ExplodingClientFactory(),
+    )
+
+    assert selected is scripted
+    assert scripted.call_count == 0

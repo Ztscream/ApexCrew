@@ -2102,3 +2102,19 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 
 - **Final implementation**: `9a97ea1` (`fix(cli): close R4-01B review findings`) carries `PLAN-Task: R4-01B`, `Subagent: Codex correction`, `Human-Changes: Codex correction`, `Spec-Review: Hubble; PASS`, and `Quality-Review: Laplace; PASS` trailers.
 - **Ledger**: `PLAN.md` now records R4-01B as `COMPLETED`. R4-02A remains pending and no provider, credential, network, push, or PR action was performed.
+
+## 2026-08-06 / R4-02A red selector
+
+- **Task**: begin the production composition root and approved model factory.
+- **Required red command**: `uv run --python 3.12 pytest tests/contract/test_composition.py::test_bundle_shares_one_state_store tests/integration/test_provider_selection.py::test_scripted_selection_never_calls_network -q`.
+- **Observed result**: `2 failed`; the composition module/factory and model factory entry point were absent. No provider, credential, network, push, PR, or live API call occurred.
+- **Changed paths at red checkpoint**: `tests/contract/test_composition.py`, `tests/integration/test_provider_selection.py`, and `AGENT_LOG.md`.
+
+## 2026-08-06 / R4-02A implementation
+
+- **Base**: `8909fb45a74ae7c4c6e6795b1d5fe02c238d6d59`; **Subagent**: fresh implementation agent; **Human intervention**: none.
+- **Red correction**: the named tests and a draft model factory were already present in the worktree; the exact selector observed `1 failed, 1 passed` because `composition.py` was missing.
+- **Implementation**: added the shared SQLite `ApplicationBundle`, existing Coordinator/WorkerLoop wiring, lifecycle cleanup, and approved provider selection/construction with request-time credentials.
+- **Green evidence**: exact selector -> `2 passed`; focused Ruff -> `All checks passed`; focused mypy -> `Success: no issues found in 3 source files`; `git diff --check` -> exit code 0.
+- **Review status**: `Spec-Review: pending`; `Quality-Review: pending`.
+- **No provider, credential, network, live API, push, or PR action occurred.**

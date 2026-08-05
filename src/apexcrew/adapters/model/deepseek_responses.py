@@ -16,6 +16,7 @@ from apexcrew.domain.model import (
     ModelUsage,
     ProviderAttemptResult,
 )
+from apexcrew.domain.revisions import BudgetRevisionDocument, ModelConfigurationRevisionDocument
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL_ID = "deepseek-v4-flash"
@@ -159,6 +160,10 @@ class DeepSeekResponsesAdapter:
         instructions: str = DEFAULT_INSTRUCTIONS,
         temperature: float = DEFAULT_TEMPERATURE,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        allowed_returned_model_ids: frozenset[str] | None = None,
+        max_input_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+        provider_storage_enabled: bool = False,
     ) -> None:
         self._credentials = credential_source
         self._response_schemas = dict(response_schemas)
@@ -170,6 +175,59 @@ class DeepSeekResponsesAdapter:
         self._instructions = instructions
         self._temperature = temperature
         self._reasoning_effort = reasoning_effort
+        self._allowed_returned_model_ids = allowed_returned_model_ids
+        self._max_input_tokens = max_input_tokens
+        self._max_output_tokens = max_output_tokens
+        self._provider_storage_enabled = provider_storage_enabled
+
+    @classmethod
+    def from_approved_configuration(
+        cls,
+        *,
+        model_configuration: ModelConfigurationRevisionDocument,
+        budget: BudgetRevisionDocument,
+        credential_source: ModelCredentialPort,
+        response_schemas: Mapping[str, Mapping[str, object]],
+        client_factory: ClientFactory | None = None,
+    ) -> DeepSeekResponsesAdapter:
+        """Build only from a complete, already validated revision pair."""
+        if model_configuration.provider != "deepseek_responses":
+            raise ValueError("MODEL_PROVIDER_MISMATCH")
+        if model_configuration.provider_base_origin != DEEPSEEK_BASE_URL:
+            raise ValueError("MODEL_PROVIDER_ORIGIN_MISMATCH")
+        if model_configuration.requested_model_id != DEEPSEEK_MODEL_ID:
+            raise ValueError("MODEL_REQUESTED_MODEL_UNSUPPORTED")
+        settings = model_configuration.inference_settings
+        if settings.provider_storage_enabled:
+            raise ValueError("MODEL_PROVIDER_STORAGE_MUST_BE_DISABLED")
+
+        allowed = frozenset(
+            alias.returned_model_id for alias in model_configuration.returned_model_aliases
+        )
+        pricing = {
+            entry.returned_model_id: (
+                entry.input_usd_per_million,
+                entry.output_usd_per_million,
+            )
+            for entry in budget.pricing_entries
+        }
+        if not allowed or not allowed <= pricing.keys():
+            raise ValueError("MODEL_RETURNED_MODEL_PRICING_INCOMPLETE")
+        schema = response_schemas.get(model_configuration.tool_schema_digest)
+        if schema is None or not schema:
+            raise ValueError("MODEL_TOOL_SCHEMA_MISSING")
+
+        return cls(
+            credential_source=credential_source,
+            response_schemas={model_configuration.tool_schema_digest: schema},
+            pricing_usd_per_million=pricing,
+            client_factory=client_factory,
+            profile=DEEPSEEK_PROFILE,
+            allowed_returned_model_ids=allowed,
+            max_input_tokens=settings.max_input_tokens,
+            max_output_tokens=settings.max_output_tokens,
+            provider_storage_enabled=settings.provider_storage_enabled,
+        )
 
     def complete(self, request: ModelRequest) -> ProviderAttemptResult:
         schema = self._response_schemas.get(request.tool_schema_digest)
@@ -179,6 +237,18 @@ class DeepSeekResponsesAdapter:
             return ProviderAttemptResult.unknown("MODEL_CONFIGURATION_UNSUPPORTED")
         if not request.allowed_model_ids <= self._pricing.keys():
             return ProviderAttemptResult.unknown("APPROVED_MODEL_PRICING_MISSING")
+        if (
+            self._allowed_returned_model_ids is not None
+            and request.allowed_model_ids != self._allowed_returned_model_ids
+        ):
+            return ProviderAttemptResult.unknown("RETURNED_MODEL_ALLOWLIST_MISMATCH")
+        if (
+            self._max_input_tokens is not None and request.max_input_tokens > self._max_input_tokens
+        ) or (
+            self._max_output_tokens is not None
+            and request.max_output_tokens > self._max_output_tokens
+        ):
+            return ProviderAttemptResult.unknown("INFERENCE_SETTINGS_EXCEEDED")
 
         api_key = self._credentials.resolve(self._profile)
         client = self._client_factory(
@@ -219,6 +289,11 @@ class DeepSeekResponsesAdapter:
             return ProviderAttemptResult.unknown("MISSING_RESPONSE_ID")
         if not isinstance(returned_model_id, str) or not returned_model_id:
             return ProviderAttemptResult.unknown("MISSING_RETURNED_MODEL_ID")
+        if (
+            self._allowed_returned_model_ids is not None
+            and returned_model_id not in self._allowed_returned_model_ids
+        ):
+            return ProviderAttemptResult.known_closed(response_id, "RETURNED_MODEL_NOT_ALLOWED")
         if status == "incomplete":
             return ProviderAttemptResult.known_closed(
                 response_id,
