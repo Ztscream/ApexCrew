@@ -25,7 +25,7 @@ flowchart LR
     MODELREQ --> AUTH
     MODELREQ --> JOURNAL
     MODEL --> SCRIPTED["ScriptedMockLLM"]
-    MODEL --> OPENAI["OpenAI Responses"]
+    MODEL --> DEEPSEEK["DeepSeek Responses"]
     TOOLS --> HOSTGIT["Trusted Host Git Adapter"]
     TOOLS --> DOCKER["Restricted Docker Adapter"]
     HOSTGIT -->|"Observed object/effect result"| ADMIT["Admission: Freshness + Evidence"]
@@ -84,7 +84,7 @@ flowchart LR
 ## Accepted Seams
 
 - `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get` are the only Run-facing application interfaces. CLI may use all three; control/runtime composition crosses an internal one-use Runtime Permit, while Web/static delivery receives only `RunQueries`. Doctor/configuration/credential/UI-server bootstrap flows cannot mutate Run or repository state or dispatch model/tool effects.
-- `ModelPort` is a true external seam with deterministic scripted and OpenAI adapters.
+- `ModelPort` is a true external seam with deterministic scripted and DeepSeek adapters.
 - Repository command execution is a containment seam with restricted Docker and test-fake adapters; Git object/ref work stays in a sanitized host adapter, and only Admission may issue its ref effects.
 - Durable state is exercised through one domain-facing transaction/event interface with SQLite and in-memory test adapters.
 - Clocks/IDs, keyring, and other local-substitutable dependencies remain internal seams; pure rules and state machines receive no speculative adapter.

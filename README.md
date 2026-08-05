@@ -71,7 +71,7 @@ The frozen specification, reviewed M1 plan amendment, and Stage 4 cold-start gat
 - Python and TypeScript micro-repositories as acceptance fixtures.
 - Revision-bound context, checks, approvals, and integration evidence.
 - Coordinator-scheduled, Admission-owned candidate preparation/CAS through a sanitized host Git adapter, with repository commands confined to a restricted networkless executor.
-- OpenAI Responses API with `gpt-5.6-terra` as the sole real adapter; deterministic core tests use `ScriptedMockLLM`.
+- DeepSeek Responses API with `deepseek-v4-flash` as the sole real adapter; deterministic core tests use `ScriptedMockLLM`.
 - CLI-only commands, a read-only loopback WebUI, and a sanitized fixture replay published through GitHub Pages.
 - Required checks run offline from sanitized regular-file snapshots; symlinks and fixed plus host-local secret paths are hard denied.
 - A locked Git-native Target Reservation is reused for the Run and removed by exact journaled terminal cleanup before purge.
@@ -82,7 +82,7 @@ The target user is a developer who needs long-running agent collaboration to rem
 
 ## Repository Map
 
-- `SPEC.md`: frozen normative design, revision 2, signed at SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`. Revision 1 (`2F1434AB…663BC`) was signed 2026-07-27 and superseded 2026-07-31 by approved proposal 0001. Approval is recorded externally so the bytes remain unchanged between revisions.
+- `SPEC.md`: frozen normative design, revision 3, signed at SHA-256 `E4385008CD75E4E3B0E70B25A6EBDFD976F3E1031F2ACD81FF0B6284EF6668AB`. Revision 1 (`2F1434AB…663BC`) was signed 2026-07-27 and superseded 2026-07-31 by approved proposal 0001; revision 2 (`97E9652D…E26D6`) was signed 2026-07-31 and superseded 2026-08-05 by approved proposal 0002, which replaced the model provider. Approval is recorded externally so the bytes remain unchanged between revisions.
 - `docs/proposals/`: specification amendment proposals and their disposition.
 - `INITIALIZATION.md`: accepted scope, prerequisites, stages, and remaining inputs.
 - `CONTEXT.md`: canonical domain vocabulary.

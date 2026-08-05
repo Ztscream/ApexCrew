@@ -1452,3 +1452,27 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent output/commit**: Codex self-checked the final acceptance; documentation update follows.
 - **Human intervention**: owner explicitly authorized push and PR creation; no credentials, provider call, or Pages enablement occurred.
 - **Lesson**: the final claim is tied to a concrete reviewed HEAD and both event types, not to an earlier failed run.
+
+## 2026-08-05 / Specification revision 3 - model provider replacement
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `a7c743f`.
+- **Task/skill**: proposal 0002 and its application; writing-plans; verification-before-completion.
+- **Prompt/context**: the owner elected to change the model provider to DeepSeek `deepseek-v4-flash`, drafted proposal 0002, and authorized the `SPEC.md` edit in the same instruction.
+- **Observed evidence**: provider identity was frozen in seven normative places (lines 25, 61, 137, 469, 473, 493, 569), so no Model Configuration or Budget Revision could reach it; line 469's in-band alias clause covers only aliases of the approved model, not a different vendor. External verification of the provider established that it serves a Responses API with `deepseek-v4-flash` as the only supported model there, fixes `store` to `false`, reports `input_tokens`/`output_tokens`/`reasoning_tokens`, silently ignores unsupported request parameters, and prices at USD 0.14/0.28 per million standard with a planned 2x peak-hour multiplier.
+- **Implementation**: applied proposal 0002 to `SPEC.md`, producing revision 3 at SHA-256 `E4385008CD75E4E3B0E70B25A6EBDFD976F3E1031F2ACD81FF0B6284EF6668AB`, 131,813 bytes, 636 lines. The diff was 7 insertions and 7 deletions, every one an in-line substitution, so the line count is unchanged and every existing line-number citation in this log, `SPEC_PROCESS.md`, and `PLAN.md` remains valid. Three substantive changes: provider identity; a pricing snapshot pinned at the peak-hour rate with reasoning tokens declared as output tokens; and a new fail-closed rule that no safety property may rest on a request parameter alone because this provider silently ignores unsupported ones.
+- **Green evidence**: `pytest` reported 472 passed and 8 skipped, identical to the pre-edit run, because no `src/` file hardcodes a model ID or price — both already travel as data through `allowed_model_ids` and `BudgetRevisionDocument.pricing_entries`. `verify.py` passes the SPEC identity check against the new digest.
+- **Subagent output/commit**: Claude (assisting agent) drafted the proposal, applied the edit, and backfilled `SPEC_PROCESS.md`, `README.md`, `SECURITY.md`, `docs/architecture/system-overview.md`, and the external `baseline.json`.
+- **Human intervention**: the owner approved the provider replacement and explicitly authorized the `SPEC.md` edit; this is the first `SPEC.md` change since revision 2. No credential was touched and no provider call was made.
+- **Lesson**: a frozen specification makes vendor identity a revision rather than a setting, and keeping the amendment line-count-neutral preserves every citation that depends on it.
+
+## 2026-08-05 / M1-M4 completion plan
+
+- **Timestamp/base SHA**: 2026-08-05 Asia/Singapore; `a7c743f`.
+- **Task/skill**: M1-M4 completion planning; writing-plans.
+- **Prompt/context**: the owner asked for a complete M1-M4 development plan to hand to Codex, covering provider integration and the elimination of every remaining debt marker.
+- **Observed evidence**: `grep -rn "DEBT-" src/` returned seven markers (`DEBT-M1-006`, `DEBT-M2-001` through `005`, `DEBT-M4-001`). No credential path existed anywhere in `src/`, and `PLAN.md` Task 28's sample code imports a `MemoryCredentialStore` that does not exist. `PLAN.md:99` and `PLAN.md:323` establish that M2-M4 need no separate reviewed revision or owner `GO`, while `PLAN.md:359` still requires a separately authorized live smoke.
+- **Implementation**: wrote `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md` — 17 tasks in five modules at the `PLAN.md:99` granularity, each carrying goal, files, implementation points, the failing test to write first, and its commit message, plus a dependency graph for parallel worktrees and a debt-closure ledger.
+- **Green evidence**: none required; this is a planning artifact producing no source change.
+- **Subagent output/commit**: Claude (assisting agent) authored the plan; execution is delegated to Codex.
+- **Human intervention**: the owner requested the plan and will hand it to Codex. Tasks P5 and W1 are marked `BLOCKED` because they depend on owner-only actions.
+- **Lesson**: writing the failing test into the plan rather than the implementation keeps a delegated agent honest about observing red first.
