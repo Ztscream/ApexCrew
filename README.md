@@ -33,7 +33,7 @@ code preview. The read-only WebUI and Pages replay never execute a Run.
 
 ## 凭据安全配置
 
-The offline suite, the demo, and every delivery command run without a provider credential. A credential is required only to drive the real DeepSeek adapter.
+The offline suite, the demo, and ordinary delivery commands run without a provider credential. The explicitly gated `live-smoke` target is the only delivery path that drives the real DeepSeek adapter.
 
 ```text
 uv run --python 3.12 apexcrew credentials set      # hidden interactive input
