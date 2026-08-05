@@ -49,14 +49,34 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
-def _schema_matches(value: object, schema: Mapping[str, object]) -> bool:
+def _schema_matches(
+    value: object,
+    schema: Mapping[str, object],
+    definitions: Mapping[str, object] | None = None,
+) -> bool:
+    if definitions is None:
+        raw_definitions = schema.get("$defs", {})
+        definitions = raw_definitions if isinstance(raw_definitions, Mapping) else {}
+    reference = schema.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/$defs/"):
+        target = definitions.get(reference.removeprefix("#/$defs/"))
+        return isinstance(target, Mapping) and _schema_matches(value, target, definitions)
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list):
+        return (
+            sum(
+                isinstance(option, Mapping) and _schema_matches(value, option, definitions)
+                for option in one_of
+            )
+            == 1
+        )
     enum = schema.get("enum")
     if isinstance(enum, list) and value not in enum:
         return False
     alternatives = schema.get("anyOf")
     if isinstance(alternatives, list):
         return any(
-            isinstance(option, Mapping) and _schema_matches(value, option)
+            isinstance(option, Mapping) and _schema_matches(value, option, definitions)
             for option in alternatives
         )
     kind = schema.get("type")
@@ -76,7 +96,9 @@ def _schema_matches(value: object, schema: Mapping[str, object]) -> bool:
         ):
             return False
         return all(
-            isinstance(name, str) and isinstance(child, Mapping) and _schema_matches(item, child)
+            isinstance(name, str)
+            and isinstance(child, Mapping)
+            and _schema_matches(item, child, definitions)
             for name, item in value.items()
             if name in properties
             for child in (properties[name],)
@@ -84,7 +106,8 @@ def _schema_matches(value: object, schema: Mapping[str, object]) -> bool:
     if kind == "array":
         items = schema.get("items")
         return isinstance(value, list) and (
-            not isinstance(items, Mapping) or all(_schema_matches(item, items) for item in value)
+            not isinstance(items, Mapping)
+            or all(_schema_matches(item, items, definitions) for item in value)
         )
     if kind == "string":
         return isinstance(value, str)

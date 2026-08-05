@@ -40,7 +40,14 @@ def build_model_port(
     if model_configuration.provider != "deepseek_responses":
         raise ModelFactoryError("MODEL_PROVIDER_UNSUPPORTED")
     schemas = (
-        {str(model_configuration.tool_schema_digest): ACTION_ADAPTER.json_schema()}
+        {
+            str(model_configuration.tool_schema_digest): {
+                "type": "json_schema",
+                "name": "apexcrew_action",
+                "strict": True,
+                "schema": ACTION_ADAPTER.json_schema(),
+            }
+        }
         if response_schemas is None
         else response_schemas
     )

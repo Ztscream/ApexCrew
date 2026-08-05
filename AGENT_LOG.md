@@ -2142,3 +2142,14 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `uv run --python 3.12 ruff format --check src tests/contract/test_composition.py tests/integration/test_provider_selection.py` -> `61 files already formatted`.
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, push, or PR action occurred.
+
+## 2026-08-06 / R4-02A schema correction completion
+
+- **Correction**: the default DeepSeek factory now wraps the closed action schema in the Responses API `json_schema` envelope. Response validation now follows `$defs`/`$ref` and `oneOf` branches, preserving fail-closed parsing for structured actions. The integration selector adds an offline fake-client request that proves a valid default-schema `finish` response is accepted and `store=False` is sent.
+- **Observed correction evidence**:
+  - `uv run --python 3.12 pytest tests/contract/test_composition.py::test_bundle_shares_one_state_store tests/integration/test_provider_selection.py -q` -> `4 passed`.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `134 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
