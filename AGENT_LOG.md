@@ -2154,6 +2154,18 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4-02A mismatch retry correction
+
+- **Independent spec finding**: `DurableModelClient` still retried a settled `RETURNED_MODEL_MISMATCH` because it retried every known-closed rejection. The provider mismatch contract requires no automatic retry.
+- **Correction**: both the Coordinator and DurableModelClient retry gates now exclude a settled `RETURNED_MODEL_MISMATCH`; a regression test proves one provider call and no backoff.
+- **Observed green evidence**:
+  - `uv run --python 3.12 pytest tests/unit/domain/test_model_retry.py tests/contract/test_deepseek_responses_adapter.py tests/contract/test_composition.py tests/integration/test_provider_selection.py tests/unit/domain/test_model_requests.py tests/contract/test_state_store.py tests/integration/test_model_restart.py -q` -> exit code 0.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 59 source files`.
+  - `uv run --python 3.12 ruff check src tests` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `134 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
+
 ## 2026-08-06 / R4-02A provenance and cleanup correction
 
 - **Independent review findings**: returned-model mismatch closures discarded observed requested/returned model metadata and usable token usage; `ApplicationBundle.close()` stopped at the first close failure and construction cleanup could skip the repository close.

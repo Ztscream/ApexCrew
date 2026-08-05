@@ -133,3 +133,31 @@ def test_timeout_after_possible_dispatch_is_fully_charged_without_retry() -> Non
     assert journal.model_counters(result.run_id).calls == 1
     assert model.call_count == 1
     assert backoff.seconds == []
+
+
+def test_returned_model_mismatch_does_not_retry() -> None:
+    journal = InMemoryStateStore()
+    request = make_model_request()
+    model = ScriptedMockLLM(
+        [
+            ScriptedModelStep.for_request(
+                request,
+                ProviderAttemptResult.known_closed(
+                    "response-mismatch",
+                    "RETURNED_MODEL_MISMATCH",
+                    ModelUsage(120, 12, request.reserved_cost_usd),
+                    response_requested_model_id=request.requested_model_id,
+                    returned_model_id="deepseek-v4-flash-0731",
+                ),
+            )
+        ]
+    )
+    backoff = RecordingBackoff()
+
+    result = DurableModelClient(model=model, journal=journal, backoff=backoff).complete(request)
+
+    attempts = journal.model_attempts(result.run_id, result.logical_turn_id)
+    assert result.outcome == "RETURNED_MODEL_MISMATCH"
+    assert len(attempts) == 1
+    assert model.call_count == 1
+    assert backoff.seconds == []
