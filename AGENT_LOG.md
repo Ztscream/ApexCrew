@@ -1645,3 +1645,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: none.
 - **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): close M1-R4 review blockers`.
+
+## 2026-08-05 / M1-R4 independent plan review 4
+
+- **Task**: R4 plan gate re-review of correction commit `5fd6dc2da563aff0240e9259f635b42e13ec7fa6`.
+- **Implementation subagent**: none; fresh review subagent `Boyle`.
+- **Observed review**: verdict `BLOCKED`. The reviewer found three residual documentation blockers: the binding R4 matrix still used vague file groups for several A/B tasks; R4-05A did not state a red result and its selector-prefix wording duplicated `-q`; and the root Tech Stack retained an unmarked OpenAI Responses API declaration after the current provider moved to DeepSeek.
+- **Correction**: this commit replaces every vague R4 matrix file group with concrete paths, defines R4-05A red/default-green/gated-green outcomes with exactly one live request, makes each selector a complete command with one `-q`, and changes the current Tech Stack provider to DeepSeek Responses API.
+- **Review digest**: reviewed `PLAN.md` SHA-256 `A9E45827E96DCC933A9BAB24F8C87A4451F2465C075B5934045E1CD3463ECF7C`; corrected plan SHA-256 is pending commit and fresh re-review.
+- **Human changes**: none.
+- **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): make R4 task contracts exact`.
