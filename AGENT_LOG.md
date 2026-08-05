@@ -1623,3 +1623,14 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: none.
 - **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
 - **Intended commit**: `docs(plan): correct M1-R4 review blockers`.
+
+## 2026-08-05 / M1-R4 independent plan review 2
+
+- **Task**: R4 plan gate re-review of correction commit `fabf46e35e2fe141a5d27a02f32a38e3469d7005`.
+- **Implementation subagent**: none; fresh review subagent `Bohr`.
+- **Observed review**: first five blockers were confirmed corrected; verdict remained `BLOCKED` because the plan contradicted itself about task-level versus module-level worktrees/commits, and retained a generic `approve` ambiguity.
+- **Correction**: R4 now explicitly gives each module one worktree/branch/PR while each A/B task gets a fresh subagent, distinct implementation commit, distinct reviewers, and its own ledger row. The generic `approve` command was removed from the supported R4 workflow; only typed approval commands remain.
+- **Review digest**: reviewed `PLAN.md` SHA-256 `05360C7D97A573C8EB686C5A7FC24706C8EF0BCF57FE12E1BA53B2FEB1215A41`; corrected plan SHA-256 is pending commit and third review.
+- **Human changes**: none.
+- **Changed paths**: `PLAN.md`, `docs/superpowers/plans/2026-08-05-apexcrew-final-user-runtime.md`, `AGENT_LOG.md`.
+- **Intended commit**: `docs(plan): resolve M1-R4 task delivery ambiguity`.

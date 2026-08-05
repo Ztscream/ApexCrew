@@ -22,7 +22,7 @@ The frozen `SPEC.md` is not edited. Before source, fixture, test, or CI changes,
 2. `apexcrew run-create --root <repo> --target-ref refs/heads/main ...` creates a durable Run with DeepSeek model configuration but makes no provider call.
 3. `apexcrew run <run_id> --root <repo>` consumes exactly one current Runtime Permit and reaches an observable stop state; without a Permit it performs zero runtime mutation.
 4. An opt-in live integration test can make one DeepSeek request when `APEXCREW_LIVE_SMOKE=1` and a credential is available; normal tests never use the network.
-5. `apexcrew approve <run_id> ...` submits only the exact pending approval and cannot create a Grant for a different revision, action, or Run.
+5. Specialized approval commands (`approve-policy`, `approve-budget`, `approve-model`, `approve-plan`, `grant`, and `integrate`) submit only their exact typed pending approval and cannot create authority for a different revision, action, or Run. The old generic `approve` stub is removed from the supported R4 CLI.
 6. `apexcrew status` and `apexcrew show <run_id>` expose sanitized Run projections and never expose credentials, restricted transcripts, Grants, or quarantined content.
 7. The offline composition uses `ScriptedMockLLM` with the same production composition root and proves the same Permit/approval lifecycle.
 
@@ -135,7 +135,7 @@ uv run --python 3.12 apexcrew show <run-id> --root <repo>
 
 ## Review and Delivery Protocol
 
-Each task is implemented in its own worktree with one Conventional Commit, an `AGENT_LOG.md` entry, and the required `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers. The spec-compliance review runs before the quality review. No live smoke, push, PR creation, or credential value is performed by default. The final claim requires observed command output for every success criterion.
+Each module owns one worktree, branch, and corresponding PR. Within that module worktree, every A/B task uses a fresh implementation subagent, one distinct Conventional Commit, an `AGENT_LOG.md` entry, and the required `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review` trailers. The paired tasks never share a commit or reviewer identity. The spec-compliance review runs before the quality review. No live smoke, push, PR creation, or credential value is performed by default. The final claim requires observed command output for every success criterion.
 
 ## Review Correction Addendum
 
@@ -158,7 +158,7 @@ R4-01A -> R4-01B -> R4-02A -> R4-02B -> R4-03A -> R4-03B
 | R4-04A/R4-04B | `codex/m1-r4-04-execution` | `.worktrees/m1-r4-04-execution` | `feat(executor): run scoped Worker actions safely` |
 | R4-05A/R4-05B | `codex/m1-r4-05-provider-delivery` | `.worktrees/m1-r4-05-provider-delivery` | `test(delivery): verify live DeepSeek path` |
 
-Each row is split into one subagent-sized task and one implementation commit. Module closeout updates the R4 ledger and corresponding `AGENT_LOG.md` rows only.
+Each A/B row is one subagent-sized task and one implementation commit. The two tasks in a module share that module's worktree/branch and one PR, but have distinct fresh subagents, commits, reviews, and ledger rows. Module closeout updates the R4 ledger and corresponding `AGENT_LOG.md` rows only.
 
 ### Complete CLI Sequence
 

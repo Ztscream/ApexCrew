@@ -30411,11 +30411,10 @@ uv run --python 3.12 apexcrew init --root <repo>
 uv run --python 3.12 apexcrew credentials set
 uv run --python 3.12 apexcrew run-create --root <repo> --target-ref refs/heads/main --goal "..."
 uv run --python 3.12 apexcrew run <run-id> --root <repo>
-uv run --python 3.12 apexcrew approve <run-id> --root <repo> --approval-id <exact-id>
 uv run --python 3.12 apexcrew show <run-id> --root <repo>
 ```
 
-`run` must refuse with zero mutation when no current Permit exists; a valid control command must issue exactly one Permit bound to the current phase and revision, and Runtime must consume it before any mutation. `approve` must validate Run, approval identity, revision binding, nonce/generation, and expected sequence through `CrewControl`; it must never fabricate a Grant. `show` exposes only the sanitized `RunQueries` projection.
+`run` must refuse with zero mutation when no current Permit exists; a valid specialized control command must issue exactly one Permit bound to the current phase and revision, and Runtime must consume it before any mutation. `approve-policy`, `approve-budget`, `approve-model`, `approve-plan`, `grant`, and `integrate` each validate their exact typed approval through `CrewControl`; the old generic `approve` stub is removed from the supported R4 CLI and no command may fabricate a Grant. `show` exposes only the sanitized `RunQueries` projection.
 
 ### R4-04 Execution Contract
 
@@ -30427,7 +30426,7 @@ The concrete runtime owner must validate the Permit before creating lock state. 
 
 ### R4 Required Verification
 
-Each R4 task gets its own worktree, failing test, observed red output, minimum implementation, focused green output, `mypy`, Ruff, diff check, ordered spec-compliance review, ordered quality review, Conventional Commit, and concise `AGENT_LOG.md` evidence. R4 closes only after the complete offline suite, opt-in live-smoke evidence or an explicitly recorded owner-authorized skip, secret scan over tracked tree and reachable history, wheel/build checks, and a reopened-process end-to-end lifecycle are observed green. The final release claim must list every remaining debt; no SKELETON/STUB is described as production-ready.
+Each R4 module owns one worktree, branch, and PR. Within that module worktree, every A/B task gets a fresh implementation subagent, its own failing test/red output, minimum implementation/green output, `mypy`, Ruff, diff check, ordered spec-compliance review, ordered quality review, distinct Conventional Commit, and concise `AGENT_LOG.md` evidence. The paired tasks never share a commit or reviewer identity. R4 closes only after the complete offline suite, opt-in live-smoke evidence or an explicitly recorded owner-authorized skip, secret scan over tracked tree and reachable history, wheel/build checks, and a reopened-process end-to-end lifecycle are observed green. The final release claim must list every remaining debt; no SKELETON/STUB is described as production-ready.
 
 ### R4 Independent Review Record
 
@@ -30450,7 +30449,7 @@ R4-01A -> R4-01B -> R4-02A -> R4-02B -> R4-03A -> R4-03B
        -> R4-04A -> R4-04B -> R4-05A -> R4-05B -> R4-CLOSE
 ```
 
-The state store, application composition, and CLI contracts intentionally stay serial. Each row is one subagent-sized task with one implementation commit; each module PR may contain only the completed rows assigned to that module, plus its required `AGENT_LOG.md` entries. Proposed branch/worktree/PR ownership is:
+The state store, application composition, and CLI contracts intentionally stay serial. Each A/B row is one subagent-sized task with one implementation commit. The paired tasks share the module worktree/branch and one corresponding PR, but never share a commit or reviewer identity. Proposed branch/worktree/PR ownership is:
 
 | Tasks | Branch | Worktree | PR title | Depends on |
 | --- | --- | --- | --- | --- |
