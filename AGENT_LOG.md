@@ -2388,12 +2388,19 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
     image user `1000:1000`, labels `org.apexcrew.network=none` and
     `org.apexcrew.docker_socket=denied` observed.
   - `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q` -> `4 passed, 1 skipped`; the skip is the owner-authorized live boundary. The current user objective did not authorize credentials or network dispatch, so no real DeepSeek request was made.
-  - Secret-scan evidence for candidate `63397ae862ceecbbff5a7989a533279887c1395c`:
+  - Secret-scan evidence for the pre-commit verification candidate `63397ae862ceecbbff5a7989a533279887c1395c`:
     scanner SHA-256 `b88b3f12e29cdfc748c5cfe33113709ea2f20acfb8cbacf373ab0d84a487bd59`,
     rules SHA-256 `6d37723b541169b103d8238bea753f1b32af6a8b87ab41037a785f824f8e93c1`,
     33 local refs, 2545 reachable objects, result SHA-256
     `8acd5b960cf6933d3b2a487e068bae52ed14e9d11732d944d1f89af25080851f`,
     and `secret-scan: clean`.
+  - Post-implementation candidate `fb12878618cc4eb94fae8bbdb07f2e52d93c9b6f`:
+    `make secret-scan` -> `secret-scan: clean`; the same scanner digest
+    `b88b3f12e29cdfc748c5cfe33113709ea2f20acfb8cbacf373ab0d84a487bd59`, rules
+    digest `6d37723b541169b103d8238bea753f1b32af6a8b87ab41037a785f824f8e93c1`,
+    33 local refs, 2569 reachable objects, and result digest
+    `8acd5b960cf6933d3b2a487e068bae52ed14e9d11732d944d1f89af25080851f` were
+    observed.
   - Exact fresh-process command: create a detached temporary Git repository at
     `.verification-r41-05-final`, run `uv run --python 3.12 apexcrew init --root
     .verification-r41-05-final`, then `run-create --target-ref refs/heads/main
