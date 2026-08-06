@@ -2323,3 +2323,29 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   mypy, and `git diff --check` are green. The live lifecycle remains default-skipped;
   no credential or provider request was used in this correction.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
+
+## 2026-08-06 / R4.1-04 asymmetric terminal cleanup
+
+- **Implementation commit**: `27f1b81` on `codex/m1-r4-4-asymmetric-cleanup`, based on
+  final reviewed base `eff0d79`.
+- **Implementation**: terminal cleanup now classifies both-absent, exact locked/unlocked,
+  exact path-only, exact admin-only, and conflict states. PATH_ONLY and ADMIN_ONLY use
+  handle-bound identity/digest deletion; mixed, altered, malformed, and unobservable
+  states record `TARGET_RESERVATION_CLEANUP_CONFLICT` without settling or changing the
+  terminal Run. POSIX and Windows no-follow adapters close temporary delete handles on
+  every path, and force removal revalidates the bound reservation path in the Git adapter.
+  SQLite and in-memory stores both enforce consumed terminal-admin Permit bindings for
+  settle/conflict events.
+- **Observed red/green evidence**:
+  - `uv run --python 3.12 pytest tests/unit/adapters/repository/test_target_reservation_cleanup.py tests/integration/test_composed_runtime_lifecycle.py::test_cleanup_settlement_requires_exact_absence_after_reopen -q` -> `5 passed, 1 skipped`.
+  - `uv run --python 3.12 pytest -q` -> full suite reached 100% with exit code 0; repository warning/skip/xfail set unchanged.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 60 source files`.
+  - `uv run --python 3.12 ruff check src tests` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `145 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Independent review**: SPEC reviewer Confucius (`019fd4bd-25ed-7cf1-9106-2a30116e9596`)
+  and quality reviewer Ampere (`019fd4bd-2a35-7fd0-91bb-e721ade91332`) reported zero
+  Critical/High implementation findings after correction. One Medium test-quality note
+  remains: the unobservable adapter test does not instantiate the full TerminalCleanupRuntime;
+  the runtime path is covered by the concrete conflict branch and the composed lifecycle suite.
+- No credential, provider, network, live smoke, push, or PR action occurred.
