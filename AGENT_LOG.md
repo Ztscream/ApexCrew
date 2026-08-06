@@ -2163,6 +2163,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - Document digests: PLAN.md SHA-256 707912EE3DE4F7B4685413FECC93DEB148FE45A5F9F6DF72AA7F1877176E51E7; companion plan SHA-256 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
 - Boundary: no source implementation, provider credential, live API request, push, or remote PR action occurred during document review.
 
+## 2026-08-06 / R4.1-01 domain recovery classification closeout
+
+- **Worktree/branch**: `.worktrees/m1-r4-1-recovery-domain` / `codex/m1-r4-1-recovery-domain`, fixed base `e1d9aa4`.
+- **Implementation**: `4f41182`; independent-review corrections ended at `efc39f3`. Subagent: Codex main implementation pass. Human-Changes: none.
+- **SPEC review**: independent reviewer `019fd4ef-6224-7161-8def-81640752f95b` returned PASS after the correction chain. Quality reviewer `019fd4ce-6e42-7053-b18c-d772f70df951` returned PASS with no critical/high findings.
+- **Observed evidence**: focused recovery/indeterminate selectors passed; full `uv run --python 3.12 pytest -q` passed with the repository's existing xfail/skip set; mypy passed for 60 source files; Ruff check, format check, and `git diff --check` passed. No provider credential, DeepSeek request, push, or remote PR action occurred.
+- **Scope delivered**: typed action-class derivation, canonical observation/proof bindings, model unavailable/mismatch handling, exact read/patch/check/ref/CAS/reservation matrix, exact set member bindings, and fail-closed resolution decisions. Final reviewed code base for R4.1-02: `efc39f3`.
+- **Lesson**: completion decisions must preserve observer-owned result bytes and state bindings through the domain boundary; a digest or synthetic payload alone is not durable evidence.
+
 ## 2026-08-06 / R4-02B independent review and Windows cleanup correction
 
 - **Implementation commit**: `f68de44` (`feat(runtime): complete R4-02B phase composition`), cherry-picked from implementation commit `9e8dd3f`; Subagent: Codex independent-review correction; Human-Changes: none.
