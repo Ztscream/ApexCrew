@@ -497,6 +497,8 @@ def _validate_bounded_result(
         parsed = json.loads(bounded_result_json)
     except json.JSONDecodeError as exc:
         raise ValueError("READ_RESULT_NOT_JSON") from exc
+    if not isinstance(parsed, dict):
+        raise TypeError("READ_RESULT_OBJECT_REQUIRED")
     canonical_result = json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     if canonical_result != bounded_result_json:
         raise ValueError("READ_RESULT_NOT_CANONICAL")
@@ -920,6 +922,21 @@ class RecoveryObservation(FrozenDocument):
         if completed_state and self.kind is not RecoveryActionClass.READ_SEARCH:
             assert self.bounded_result_json is not None
             _validate_bounded_result(self.bounded_result_json, self.bounded_result_digest)
+        if self.kind is RecoveryActionClass.MODEL and self.state == "EXACT_COMPLETION":
+            assert self.normalized_completion_digest is not None
+            assert self.bounded_result_digest is not None
+            if self.normalized_completion_digest != self.bounded_result_digest:
+                raise ValueError("MODEL_COMPLETION_DIGEST_MISMATCH")
+        if self.kind is RecoveryActionClass.CHECK and self.state == "EXACT_RECEIPT":
+            assert self.receipt_digest is not None
+            assert self.bounded_result_digest is not None
+            if self.receipt_digest != self.bounded_result_digest:
+                raise ValueError("CHECK_RECEIPT_DIGEST_MISMATCH")
+        if self.kind is RecoveryActionClass.PATCH and self.state == "EXACT_POST":
+            assert self.observed_post_tree_digest is not None
+            assert self.bounded_result_digest is not None
+            if self.observed_post_tree_digest != self.bounded_result_digest:
+                raise ValueError("PATCH_POST_DIGEST_MISMATCH")
         payload = self.model_dump(mode="json", exclude={"observation_digest"}, exclude_none=True)
         expected = sha256_digest(canonical_json(payload))
         if self.observation_digest != expected:
@@ -1021,9 +1038,10 @@ def _completed_decision(
     result_digest: Sha256DigestText | None = None,
     bounded_result_json: str | None = None,
 ) -> RecoveryDecision:
-    del result_digest, bounded_result_json
     assert observation.bounded_result_json is not None
     assert observation.bounded_result_digest is not None
+    if result_digest is not None and result_digest != observation.bounded_result_digest:
+        raise ValueError("COMPLETION_RESULT_DIGEST_MISMATCH")
     result_digest = observation.bounded_result_digest
     bounded_result_json = observation.bounded_result_json
     assert observation.run_id is not None
@@ -1134,9 +1152,9 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                     prestate_digest=_exact_prestate_digest(observation),
                     idempotency_key=observation.idempotency_key,
                 )
-            return _completed_decision(observation, state, observation.observation_digest)
+            return _completed_decision(observation, state)
         if observation.reservation_operation == "CREATE" and state == "BOTH_PRESENT_LOCKED":
-            return _completed_decision(observation, state, observation.observation_digest)
+            return _completed_decision(observation, state)
         if observation.reservation_operation == "CLEANUP" and state in {
             "BOTH_PRESENT_LOCKED",
             "BOTH_PRESENT_UNLOCKED",
@@ -1163,7 +1181,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
     if observation.kind in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
         if state == "EXACT_POST":
-            return _completed_decision(observation, state, observation.observation_digest)
+            return _completed_decision(observation, state)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
@@ -1182,7 +1200,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
         RecoveryActionClass.GRANTED_ACTION,
     }:
         if state == "EXACT_POST":
-            return _completed_decision(observation, state, observation.observation_digest)
+            return _completed_decision(observation, state)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,

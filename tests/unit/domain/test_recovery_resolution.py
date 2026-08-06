@@ -97,6 +97,12 @@ def observation(
         completed_json = canonical_json({"state": state})
         defaults.setdefault("bounded_result_json", completed_json)
         defaults.setdefault("bounded_result_digest", sha256_digest(completed_json))
+        if action_class is RecoveryActionClass.MODEL and state == "EXACT_COMPLETION":
+            defaults["normalized_completion_digest"] = defaults["bounded_result_digest"]
+        if action_class is RecoveryActionClass.CHECK and state == "EXACT_RECEIPT":
+            defaults["receipt_digest"] = defaults["bounded_result_digest"]
+        if action_class is RecoveryActionClass.PATCH and state == "EXACT_POST":
+            defaults["observed_post_tree_digest"] = defaults["bounded_result_digest"]
     allowed = {
         RecoveryActionClass.MODEL: {
             "request_digest",
