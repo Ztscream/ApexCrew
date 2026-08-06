@@ -30568,7 +30568,7 @@ The R4.1 task chain is independently auditable through this required map. Each S
 
 | Task | PR | Worktree | Final-Reviewed-Base-SHA | Implementation-SHA | Spec-Review-SHA | Spec-Correction-SHAs | Quality-Review-SHA | Quality-Correction-SHAs | Ledger-SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | bc8f7e0 | pending | pending | pending | pending | pending | pending |
+| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | f601498 | pending | pending | pending | pending | pending | pending |
 | R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | pending | pending | pending | pending | pending | pending | pending |
