@@ -952,6 +952,9 @@ def _completed_decision(
     result_digest: Sha256DigestText,
     bounded_result_json: str = "{}",
 ) -> RecoveryDecision:
+    if sha256_digest(bounded_result_json) != result_digest:
+        bounded_result_json = canonical_json({"observation_digest": str(result_digest)})
+        result_digest = sha256_digest(bounded_result_json)
     assert observation.run_id is not None
     assert observation.settled_sequence is not None
     assert observation.applicable_revision_digests is not None
