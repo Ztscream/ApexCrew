@@ -1511,6 +1511,21 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M4-01 (2026-08-06)
+
+- **Base**: `7a9b219`.
+- **Red**: the updated workbench contract reported `2 failed` because the
+  document was explicitly marked `STUB` and lacked concrete catalogue sections.
+- **Green**: `uv run pytest tests/contract/test_design_workbench.py -q` -> `2 passed`.
+- **Implementation**: documented goal/constraints, candidate graph, evidence
+  requirements, UI state catalogue, and the non-executing CrewControl/
+  CrewRuntime/RunQueries boundary.
+- **Checks**: targeted Ruff and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M3-01 (2026-08-06)
 
 - **Base**: `dba8d12`.
