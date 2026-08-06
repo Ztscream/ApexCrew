@@ -63,6 +63,7 @@ from apexcrew.application.runtime import (
     ResolutionRuntime,
     RuntimePhaseDriverService,
     RuntimeService,
+    SnapshotResolutionObserver,
     TargetReservationDriver,
     TerminalCleanupRuntime,
 )
@@ -795,13 +796,19 @@ class _ProductionTargetReservationResolutionObserver:
 
         state = _reservation_recovery_state(observed)
         zero = Sha256DigestText("sha256:" + "0" * 64)
-        admin_digest = observed.admin_binding_digest or zero
-        path_identity = str(reservation.path)
-        gitfile_digest = observed.gitfile_digest or zero
-        if observed.path_present and gitfile_digest is None:
+        if observed.registration_present and observed.admin_binding_digest is None:
             from apexcrew.application.runtime import _unavailable_resolution_observation
 
             return _unavailable_resolution_observation(intent, recovery_generation)
+        if observed.path_present and (
+            observed.path_identity is None or observed.gitfile_digest is None
+        ):
+            from apexcrew.application.runtime import _unavailable_resolution_observation
+
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        admin_digest = observed.admin_binding_digest or zero
+        path_identity = observed.path_identity or str(reservation.path)
+        gitfile_digest = observed.gitfile_digest or zero
         values: dict[str, object] = {
             "kind": RecoveryActionClass.TARGET_RESERVATION,
             "intent_id": intent.intent_id,
@@ -1295,6 +1302,8 @@ def build_application_bundle(
         resolution_observers = ResolutionObservationRegistry(
             {
                 "granted_risky_action": GrantedActionResolutionObserver(store, worker_tools),
+                "read": SnapshotResolutionObserver(store, worker_tools),
+                "search": SnapshotResolutionObserver(store, worker_tools),
                 "target_reservation_creation": _ProductionTargetReservationResolutionObserver(
                     store, resources
                 ),

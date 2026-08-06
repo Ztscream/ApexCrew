@@ -64,7 +64,12 @@ from apexcrew.domain.model import (
     RecoveredModelAction,
 )
 from apexcrew.domain.revisions import Sha256DigestText
-from apexcrew.domain.tools import GrantedActionJournal, GrantedActionToolPort
+from apexcrew.domain.tools import (
+    GrantedActionJournal,
+    GrantedActionToolPort,
+    ToolIntent,
+    ToolResult,
+)
 from apexcrew.domain.types import (
     AuditSequence,
     IntentId,
@@ -357,6 +362,11 @@ class ResolutionObservationPort(Protocol):
         raise NotImplementedError
 
 
+class ResolutionToolPort(Protocol):
+    def execute(self, intent: ToolIntent) -> ToolResult:
+        raise NotImplementedError
+
+
 class ResolutionObservationRegistry(ResolutionObservationPort):
     """Dispatch action-class observers while retaining a fail-closed fallback."""
 
@@ -421,6 +431,51 @@ class GrantedActionResolutionObserver(ResolutionObservationPort):
                 }
             )
         return RecoveryObservation.create(**values)
+
+
+class SnapshotResolutionObserver(ResolutionObservationPort):
+    """Use the existing bounded tool runtime for read/search recovery only."""
+
+    def __init__(self, journal: ResolutionStateJournal, tools: ResolutionToolPort) -> None:
+        self._journal = journal
+        self._tools = tools
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        tool_intent = ToolIntent.from_effect_intent(intent)
+        if tool_intent.action.kind not in {"read", "search"}:
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        result = self._tools.execute(tool_intent)
+        if (
+            result.code not in {"READ_COMPLETED", "SEARCH_COMPLETED"}
+            or result.run_id not in {None, intent.run_id}
+            or result.intent_id not in {None, intent.intent_id}
+        ):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        bounded_result = canonical_json(
+            {
+                "action": tool_intent.action.model_dump(mode="json"),
+                "result": result.model_dump(mode="json"),
+            }
+        )
+        ordering_digest = sha256_digest(
+            canonical_json({"action": tool_intent.action.model_dump(mode="json")})
+        )
+        return RecoveryObservation.create(
+            kind=RecoveryActionClass.READ_SEARCH,
+            intent_id=intent.intent_id,
+            recovery_generation=recovery_generation,
+            source_payload_digest=intent.payload_digest,
+            state="EXACT_SNAPSHOT",
+            run_id=intent.run_id,
+            settled_sequence=AuditSequence(self._journal.audit_sequence(intent.run_id) + 1),
+            applicable_revision_digests=intent.applicable_revision_digests,
+            idempotency_key=intent.idempotency_key,
+            snapshot_digest=tool_intent.snapshot_digest,
+            scope_digest=tool_intent.scope_digest,
+            ordering_digest=ordering_digest,
+            bounded_result_json=bounded_result,
+            bounded_result_digest=sha256_digest(bounded_result),
+        )
 
 
 def _unavailable_resolution_observation(

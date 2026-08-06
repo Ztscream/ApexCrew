@@ -86,6 +86,8 @@ def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: 
         assert type(resolution._observer).__name__ == "ResolutionObservationRegistry"
         assert set(resolution._observer._observers) == {  # type: ignore[attr-defined]
             "granted_risky_action",
+            "read",
+            "search",
             "target_reservation_creation",
         }
     finally:
