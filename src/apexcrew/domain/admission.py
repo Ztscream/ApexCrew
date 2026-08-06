@@ -294,7 +294,7 @@ class TargetReservationOperation(FrozenDocument):
     intent_id: IntentId
     run_id: RunId
     reservation_id: str
-    kind: Literal["ADD_NO_CHECKOUT", "LOCK"]
+    kind: Literal["ADD_NO_CHECKOUT", "LOCK", "UNLOCK", "REMOVE_FORCE"]
     repository_id: RepositoryId
     repository_instance_digest: Sha256DigestText
     target_ref: str
@@ -309,7 +309,7 @@ class TargetReservationOperation(FrozenDocument):
 
 class TargetReservationOperationResult(FrozenDocument):
     intent_id: IntentId
-    kind: Literal["ADD_NO_CHECKOUT", "LOCK"]
+    kind: Literal["ADD_NO_CHECKOUT", "LOCK", "UNLOCK", "REMOVE_FORCE"]
 
 
 class TargetReservationGitPort(Protocol):
@@ -406,6 +406,15 @@ class TargetReservationWorktreeGuard(Protocol):
         raise NotImplementedError
 
     def require_exact_post_operation(self, operation: TargetReservationOperation) -> None:
+        raise NotImplementedError
+
+    def release_cached_admin_entry(self, reservation: TargetReservation) -> None:
+        raise NotImplementedError
+
+    def release_cached_reservation(self, reservation: TargetReservation) -> None:
+        raise NotImplementedError
+
+    def refresh_after_git_transition(self) -> None:
         raise NotImplementedError
 
 

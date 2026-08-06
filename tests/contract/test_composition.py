@@ -233,9 +233,9 @@ def test_bundle_uses_scoped_worker_tools_and_concrete_phase_drivers(tmp_path: Pa
         tools = bundle.runtime._coordinator._workers._tools  # type: ignore[attr-defined]
         drivers = bundle.runtime._phase_drivers  # type: ignore[attr-defined]
         assert isinstance(tools, ScopedToolRuntime)
-        assert type(drivers._resolution).__name__ == "_CompositionResolutionDriver"
+        assert type(drivers._resolution).__name__ == "ResolutionRuntime"
         assert type(drivers._integration).__name__ == "_CompositionIntegrationDriver"
-        assert type(drivers._cleanup).__name__ == "_CompositionCleanupDriver"
+        assert type(drivers._cleanup).__name__ == "TerminalCleanupRuntime"
         assert "NOT_IMPLEMENTED" not in repr(drivers)
     finally:
         bundle.close()

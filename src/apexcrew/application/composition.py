@@ -58,9 +58,11 @@ from apexcrew.application.runtime import (
     PrivateRefInitializer,
     ProcessRuntimeOwnerIds,
     RecoveredActionRouter,
+    ResolutionRuntime,
     RuntimePhaseDriverService,
     RuntimeService,
     TargetReservationDriver,
+    TerminalCleanupRuntime,
 )
 from apexcrew.domain.admission import (
     RuntimeStartBinding,
@@ -752,17 +754,6 @@ class _ProductionPrivateRefDriver:
         return decision
 
 
-class _CompositionResolutionDriver:
-    def __init__(self, store: SqliteStateStore) -> None:
-        self._store = store
-
-    def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
-        del permit
-        return RuntimeDecision.pause("INDETERMINATE", self._store.audit_sequence(run_id))
-
-    resume = initialize
-
-
 class _CompositionIntegrationDriver:
     def __init__(self, store: SqliteStateStore, resources: _CompositionRepositoryResources) -> None:
         self._store = store
@@ -803,15 +794,46 @@ class _CompositionIntegrationDriver:
         )
 
 
-class _CompositionCleanupDriver:
-    def __init__(self, store: SqliteStateStore) -> None:
+class _CompositionReservationCleanup:
+    def __init__(self, store: SqliteStateStore, resources: _CompositionRepositoryResources) -> None:
         self._store = store
+        self._resources = resources
 
-    def reconcile(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
-        del permit
-        return RuntimeDecision.pause(
-            "TERMINAL_CLEANUP_UNAVAILABLE", self._store.audit_sequence(run_id)
+    def reconcile(self, reservation: TargetReservation) -> None:
+        run = self._store.run_record(reservation.run_id)
+        observer, git = self._resources.reservation_adapters(
+            reservation,
+            run.repository_id,
+            run.repository_instance_digest,
+            self._store.target_authority_digest(reservation.run_id),
         )
+        observed = observer.observe(reservation)
+        if not observed.observable or observed.registration_present != observed.path_present:
+            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        if not observed.registration_present and not observed.path_present:
+            return
+        if (
+            not observed.exact_identity
+            or not observed.registration_present
+            or not observed.path_present
+        ):
+            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        if observed.locked:
+            git.unlock(reservation)
+            observed = observer.observe(reservation)
+        if (
+            not observed.observable
+            or not observed.exact_identity
+            or not observed.registration_present
+            or not observed.path_present
+            or observed.locked
+        ):
+            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        git.remove_force(reservation)
+        observed = observer.observe(reservation)
+        if not observed.observable or observed.registration_present or observed.path_present:
+            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        self._resources.refresh()
 
 
 class _ProductionStartGuard:
@@ -1166,13 +1188,14 @@ def build_application_bundle(
             )
         )
         target_reservations = _ProductionTargetReservationDriver(store, resources)
+        recovery = RecoveryService(store)
         phase_drivers = RuntimePhaseDriverService(
             recovered_actions=RecoveredActionRouter(coordinator, worker),
             target_reservations=target_reservations,
             private_refs=_ProductionPrivateRefDriver(store, resources),
-            resolution=_CompositionResolutionDriver(store),
+            resolution=ResolutionRuntime(recovery, store),
             integration=_CompositionIntegrationDriver(store, resources),
-            cleanup=_CompositionCleanupDriver(store),
+            cleanup=TerminalCleanupRuntime(store, _CompositionReservationCleanup(store, resources)),
             granted_actions=GrantedActionRuntime(store, worker_tools),
         )
         runtime = RuntimeService(
@@ -1184,7 +1207,7 @@ def build_application_bundle(
             ),
             journal=store,
             authority=authority,
-            recovery=RecoveryService(store),
+            recovery=recovery,
             coordinator=coordinator,
             model_client=DurableModelClient(model=model, journal=store),
             tools=_ToolSchema(selected_model_configuration.tool_schema_digest),

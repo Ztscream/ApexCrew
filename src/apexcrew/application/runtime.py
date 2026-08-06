@@ -34,7 +34,13 @@ from apexcrew.domain.commands import (
     RuntimePermit,
     RuntimeState,
 )
-from apexcrew.domain.effects import EffectIntent, RecoveryOutcome, StateConflict, canonical_json
+from apexcrew.domain.effects import (
+    EffectIntent,
+    RecoveryOutcome,
+    StateConflict,
+    TargetReservation,
+    canonical_json,
+)
 from apexcrew.domain.model import (
     CommittedModelTurn,
     DurableModelClient,
@@ -331,6 +337,28 @@ class ResolutionDriver(Protocol):
         raise NotImplementedError
 
 
+class ResolutionRuntime(ResolutionDriver):
+    """Re-project unresolved effects without guessing an external outcome."""
+
+    def __init__(self, recovery: RuntimeRecoveryService, journal: RuntimeRecoveryJournal) -> None:
+        self._recovery = recovery
+        self._journal = journal
+
+    def resume(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        if (
+            permit.run_id != run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "INDETERMINATE"
+        ):
+            raise ValueError("INDETERMINATE_RESOLUTION_PERMIT_PHASE_MISMATCH")
+        outcome = self._recovery.reconcile(run_id)
+        if outcome.requires_human_resolution:
+            return RuntimeDecision.pause("INDETERMINATE", self._journal.audit_sequence(run_id))
+        return RuntimeDecision.pause(
+            "INDETERMINATE_RESOLUTION_REQUIRED", self._journal.audit_sequence(run_id)
+        )
+
+
 class FinalIntegrationDriver(Protocol):
     def integrate(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         raise NotImplementedError
@@ -339,6 +367,56 @@ class FinalIntegrationDriver(Protocol):
 class TerminalCleanupDriver(Protocol):
     def reconcile(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         raise NotImplementedError
+
+
+class TerminalCleanupState(Protocol):
+    def target_reservation_for_run(self, run_id: RunId) -> TargetReservation:
+        raise NotImplementedError
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        raise NotImplementedError
+
+    def settle_terminal_cleanup(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+
+class TargetReservationCleanup(Protocol):
+    def reconcile(self, reservation: TargetReservation) -> None:
+        raise NotImplementedError
+
+
+class TerminalCleanupRuntime(TerminalCleanupDriver):
+    """Run the exact terminal reservation cleanup under its administrative Permit."""
+
+    def __init__(self, state: TerminalCleanupState, cleanup: TargetReservationCleanup) -> None:
+        self._state = state
+        self._cleanup = cleanup
+
+    def reconcile(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        owner_id = permit.consumed_owner_id
+        if (
+            permit.run_id != run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "TERMINAL_ADMINISTRATION"
+            or owner_id is None
+        ):
+            raise ValueError("TERMINAL_CLEANUP_PERMIT_PHASE_MISMATCH")
+        reservation = self._state.target_reservation_for_run(run_id)
+        self._cleanup.reconcile(reservation)
+        sequence = self._state.settle_terminal_cleanup(
+            run_id=run_id,
+            owner_id=owner_id,
+            permit_generation=permit.generation,
+            expected_sequence=self._state.audit_sequence(run_id),
+        )
+        return RuntimeDecision.pause("TERMINAL", sequence)
 
 
 class GrantedActionDriver(Protocol):
@@ -559,6 +637,8 @@ class RuntimeStateStore(Protocol):
 
 
 class RuntimeRecoveryJournal(Protocol):
+    def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
+
     def next_recovered_model_action(self, run_id: RunId) -> RecoveredModelAction | None: ...
     def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None: ...
     def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None: ...
@@ -730,6 +810,8 @@ class RuntimeService:
         granted = self._journal.next_unsettled_granted_action(run_id)
         if granted is not None:
             return self._drive_granted_action(run_id, permit, granted.intent_id, context)
+        if permit.allowed_phase == "TERMINAL_ADMINISTRATION":
+            return self._drive_permitted_phase(run_id, permit, context)
         context.phase = "EFFECT_RECOVERY"
         recovery = self._recovery.reconcile(run_id)
         if recovery.requires_human_resolution:
@@ -836,9 +918,17 @@ class RuntimeService:
                     run_id, state, reason, self._pending_for_reason(run_id, reason)
                 )
             state = self._store.load_runtime_state(run_id)
-            if state.state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+            terminal_state = state.state in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }
+            if terminal_state and permit.allowed_phase != "TERMINAL_ADMINISTRATION":
                 return _stop_for_state(run_id, state, RunStopReason.TERMINAL)
             allowed = state.state.value == permit.allowed_phase
+            allowed = allowed or (
+                terminal_state and permit.allowed_phase == "TERMINAL_ADMINISTRATION"
+            )
             allowed = allowed or (
                 permit.allowed_phase == "DRAFT"
                 and draft_initialized
@@ -871,6 +961,9 @@ class RuntimeService:
             elif state.state == RunState.READY_FOR_APPROVAL:
                 context.phase = "PHASE_DRIVER"
                 decision = self._phase_drivers.integrate_candidate(run_id, permit)
+            elif terminal_state and permit.allowed_phase == "TERMINAL_ADMINISTRATION":
+                context.phase = "PHASE_DRIVER"
+                decision = self._phase_drivers.reconcile_terminal_cleanup(run_id, permit)
             else:
                 return _stop_for_state(run_id, state, RunStopReason.TERMINAL)
             budget = self._boundary(run_id)

@@ -46,6 +46,7 @@ from apexcrew.domain.commands import (
     CreateRunPayload,
     GrantPayload,
     IntegratePayload,
+    ReconcileCleanupPayload,
     StartPayload,
 )
 from apexcrew.domain.effects import StateConflict, canonical_json
@@ -409,6 +410,32 @@ def run(run_id: str, root: Path = typer.Option(Path("."), exists=True, file_okay
     if stop.pending is not None:
         fields["pending"] = stop.pending.model_dump(mode="json")
     _emit(str(stop.reason), **fields)
+
+
+@app.command("reconcile-cleanup")
+def reconcile_cleanup(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Issue the terminal-administrative Permit for exact target cleanup."""
+    try:
+        outcome = _handle_run_command(
+            root,
+            ReconcileCleanupPayload(run_id=RunId(run_id)),
+            bindings="current",
+        )
+    except (
+        ConfigurationError,
+        RepositoryBootstrapError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("RECONCILE_CLEANUP_REJECTED", error)
+    _emit_outcome(outcome)
 
 
 @app.command()

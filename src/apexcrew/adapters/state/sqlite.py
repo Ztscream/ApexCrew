@@ -123,6 +123,7 @@ from apexcrew.domain.commands import (
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
     PublicRunSnapshot,
+    ReconcileCleanupPayload,
     ResumePayload,
     RunStop,
     RuntimeAllowedPhase,
@@ -8605,9 +8606,14 @@ class SqliteStateStore:
             "WHERE run_id = ?",
             (run_id,),
         ).fetchone()
+        terminal_match = (
+            allowed_phase == "TERMINAL_ADMINISTRATION"
+            and row is not None
+            and row["state"] in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
+        )
         if (
             row is None
-            or row["state"] != allowed_phase
+            or (row["state"] != allowed_phase and not terminal_match)
             or current != applicable_revision_digests
             or current_target != target_authority_digest
         ):
@@ -10091,6 +10097,51 @@ class SqliteStateStore:
             mutate,
         )
 
+    def _apply_reconcile_cleanup(
+        self,
+        command: CommandEnvelope,
+        run_id: RunId,
+        target_authority: TargetAuthorityDigestService,
+    ) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, ReconcileCleanupPayload):
+            raise TypeError("reconcile cleanup command required")
+        expected = command.expected_sequence
+        if expected is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        current = self.current_revision_digests(run_id)
+        target_digest = self.target_authority_digest(run_id)
+        if (
+            command.applicable_revision_digests != current
+            or target_authority.current_for(run_id) != target_digest
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "TERMINAL_CLEANUP_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._issue_runtime_permit_in_transaction(
+                connection,
+                command,
+                "TERMINAL_ADMINISTRATION",
+                current,
+                target_digest,
+                AuditSequence(expected + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_PERMIT_ISSUED",
+            mutate,
+        )
+
     def apply_control_command(
         self,
         command: CommandEnvelope,
@@ -10138,6 +10189,16 @@ class SqliteStateStore:
             if grant_outcome is None:
                 raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
             return grant_outcome
+        if isinstance(command.payload, ReconcileCleanupPayload):
+            if state not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "TERMINAL_CLEANUP_REQUIRES_TERMINAL_RUN",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            return self._apply_reconcile_cleanup(command, run_id, target_authority)
         if isinstance(command.payload, IntegratePayload):
             replay = self._replay_completed_integration(command, run_id, target_authority)
             if replay is not None:
@@ -10249,6 +10310,39 @@ class SqliteStateStore:
         if row is None:
             raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
         return self._target_reservation_from_row(row)
+
+    def settle_terminal_cleanup(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit, run = self._require_consumed_runtime_owner(
+                connection, run_id, owner_id, permit_generation
+            )
+            if permit.allowed_phase != "TERMINAL_ADMINISTRATION" or run["state"] not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }:
+                raise StateConflict("TERMINAL_CLEANUP_PERMIT_BINDING_MISMATCH")
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            if reservation.phase not in {"REGISTERED_LOCKED", "CLEANUP_SETTLED"}:
+                raise StateConflict("TARGET_RESERVATION_CLEANUP_PHASE_INVALID")
+            connection.execute(
+                "UPDATE target_reservations SET phase = 'CLEANUP_SETTLED' WHERE run_id = ?",
+                (run_id,),
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_SETTLED"),
+            mutate=mutate,
+        )
 
     def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
         row = self._connection.execute(

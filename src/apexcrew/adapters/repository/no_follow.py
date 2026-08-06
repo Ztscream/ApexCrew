@@ -162,6 +162,32 @@ class StableHandleTree:
                 node for node in self._root_chain if node.handle in pending_handles
             )
 
+    def release_cached(self, relative: str) -> None:
+        parts = tuple(relative.split("/"))
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            raise RepositoryUnsafeError("INVALID_HANDLE_RELATIVE_PATH")
+        selected = {
+            key: node
+            for key, node in self._nodes.items()
+            if len(key) >= len(parts) and key[: len(parts)] == parts
+        }
+        if not selected:
+            return
+        try:
+            self._close_many(
+                node
+                for _key, node in sorted(
+                    selected.items(), key=lambda item: len(item[0]), reverse=True
+                )
+            )
+        finally:
+            pending_handles = set(self._pending_closes)
+            self._nodes = {
+                key: node
+                for key, node in self._nodes.items()
+                if key not in selected or node.handle in pending_handles
+            }
+
     def _retry_pending_closes(self) -> None:
         if self._pending_closes:
             self._close_many(tuple(self._pending_closes.values()))

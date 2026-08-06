@@ -824,12 +824,22 @@ class GitStorageSnapshot:
     nodes: tuple[BoundGitStorageNode, ...]
 
     @classmethod
-    def capture(cls, handles: StableHandleTree) -> GitStorageSnapshot:
+    def capture(
+        cls,
+        handles: StableHandleTree,
+        *,
+        excluded_prefixes: tuple[str, ...] = (),
+    ) -> GitStorageSnapshot:
         captured: list[BoundGitStorageNode] = []
 
         def visit(relative: str, depth: int) -> None:
             if depth > MAX_GIT_STORAGE_DEPTH or len(captured) >= MAX_GIT_STORAGE_PATHS:
                 raise RepositoryUnsafeError("GIT_STORAGE_INVENTORY_LIMIT_EXCEEDED")
+            if any(
+                relative == prefix or relative.startswith(prefix + "/")
+                for prefix in excluded_prefixes
+            ):
+                return
             node = handles.try_open_any(relative)
             if node is None:
                 return
@@ -844,9 +854,25 @@ class GitStorageSnapshot:
         visit(".git", 0)
         return cls(tuple(captured))
 
-    def assert_current(self, handles: StableHandleTree) -> None:
+    def assert_current(
+        self,
+        handles: StableHandleTree,
+        *,
+        excluded_prefixes: tuple[str, ...] = (),
+    ) -> None:
         handles.assert_name_bindings()
-        if GitStorageSnapshot.capture(handles) != self:
+        expected = tuple(
+            node
+            for node in self.nodes
+            if not any(
+                node.relative == prefix or node.relative.startswith(prefix + "/")
+                for prefix in excluded_prefixes
+            )
+        )
+        if (
+            GitStorageSnapshot.capture(handles, excluded_prefixes=excluded_prefixes).nodes
+            != expected
+        ):
             raise RepositoryUnsafeError("GIT_TRAVERSED_STORAGE_CHANGED")
 
 
@@ -876,7 +902,12 @@ class RepositoryInstance:
         self.storage_snapshot.assert_current(self.handles)
 
     def assert_stable_for(self, operation: object) -> None:
-        del operation
+        if isinstance(operation, (GitWorktreeUnlock, GitWorktreeRemoveForce)):
+            self.storage_snapshot.assert_current(
+                self.handles,
+                excluded_prefixes=(f".git/worktrees/{operation.admin_entry_name}",),
+            )
+            return
         self.assert_stable()
 
     def refresh_after_verified_owned_transition(self) -> RepositoryInstance:
@@ -960,6 +991,18 @@ class GitWorktreeLock:
     reason: str
 
 
+@dataclass(frozen=True)
+class GitWorktreeUnlock:
+    reservation_path: Path
+    admin_entry_name: str
+
+
+@dataclass(frozen=True)
+class GitWorktreeRemoveForce:
+    reservation_path: Path
+    admin_entry_name: str
+
+
 @dataclass(frozen=True, slots=True)
 class GitLsTreeRecursive:
     tree_oid: GitOid
@@ -989,6 +1032,8 @@ type GitOperation = (
     | GitUpdateRefCas
     | GitWorktreeAddNoCheckout
     | GitWorktreeLock
+    | GitWorktreeUnlock
+    | GitWorktreeRemoveForce
     | GitLsTreeRecursive
     | GitLsTreePath
     | GitCatFileBlob
@@ -1139,6 +1184,8 @@ class GitCommandRunner:
                 GitUpdateRefCas,
                 GitWorktreeAddNoCheckout,
                 GitWorktreeLock,
+                GitWorktreeUnlock,
+                GitWorktreeRemoveForce,
                 GitLsTreeRecursive,
                 GitLsTreePath,
                 GitCatFileBlob,
@@ -1214,6 +1261,12 @@ class GitCommandRunner:
                 self._require_operand_path(path)
                 self._require_reason(reason)
                 return ("worktree", "lock", "--reason", reason, "--", str(path))
+            case GitWorktreeUnlock(reservation_path=path):
+                self._require_operand_path(path)
+                return ("worktree", "unlock", "--", str(path))
+            case GitWorktreeRemoveForce(reservation_path=path):
+                self._require_operand_path(path)
+                return ("worktree", "remove", "--force", "--", str(path))
             case GitLsTreeRecursive(tree_oid=tree_oid):
                 return ("ls-tree", "-r", "-z", self._require_oid(tree_oid))
             case GitLsTreePath(tree_oid=tree_oid, path=path):
@@ -1406,6 +1459,21 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
             or record.locked != expected_locked
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_POSTSTATE_NOT_EXACT")
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+
+    def release_cached_admin_entry(self, reservation: TargetReservation) -> None:
+        self.require_safe_before_list(reservation)
+        self._repository.handles.release_cached(
+            ".git/worktrees/" + _target_reservation_component(reservation.reservation_id)
+        )
+
+    def release_cached_reservation(self, reservation: TargetReservation) -> None:
+        self.release_cached_admin_entry(reservation)
+        self._data_handles.release_cached(
+            "reservations/" + _target_reservation_component(reservation.reservation_id)
+        )
+
+    def refresh_after_git_transition(self) -> None:
         self._repository = self._repository.refresh_after_verified_owned_transition()
 
     def _worktree_admin_names(self) -> tuple[str, ...]:
@@ -1688,6 +1756,63 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             admin_entry_name=admin_after.admin_entry_name,
             admin_binding_digest=admin_after.admin_binding_digest,
         )
+
+    def unlock(self, reservation: TargetReservation) -> None:
+        expected = self._data_root / "reservations" / reservation.reservation_id
+        if reservation.path != expected:
+            raise RepositoryEffectError("TARGET_RESERVATION_CLEANUP_PATH_INVALID")
+        before = self.observe_registration(reservation)
+        if (
+            not before.observable
+            or not before.registration_present
+            or not before.exact_identity
+            or not before.locked
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_UNLOCK_PRESTATE_NOT_EXACT")
+        self._worktree_guard.release_cached_admin_entry(reservation)
+        result = self._runner.run(
+            self._repository,
+            GitWorktreeUnlock(expected, _target_reservation_component(reservation.reservation_id)),
+        )
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+        self._worktree_guard.refresh_after_git_transition()
+        if result.returncode != 0:
+            raise RepositoryEffectError("TARGET_RESERVATION_UNLOCK_FAILED")
+        after = self.observe_registration(reservation)
+        if (
+            not after.observable
+            or not after.registration_present
+            or not after.exact_identity
+            or after.locked
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_UNLOCK_POSTSTATE_NOT_EXACT")
+
+    def remove_force(self, reservation: TargetReservation) -> None:
+        expected = self._data_root / "reservations" / reservation.reservation_id
+        if reservation.path != expected:
+            raise RepositoryEffectError("TARGET_RESERVATION_CLEANUP_PATH_INVALID")
+        before = self.observe_registration(reservation)
+        if (
+            not before.observable
+            or not before.registration_present
+            or not before.exact_identity
+            or before.locked
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_PRESTATE_NOT_EXACT")
+        self._worktree_guard.release_cached_reservation(reservation)
+        result = self._runner.run(
+            self._repository,
+            GitWorktreeRemoveForce(
+                expected, _target_reservation_component(reservation.reservation_id)
+            ),
+        )
+        self._repository = self._repository.refresh_after_verified_owned_transition()
+        self._worktree_guard.refresh_after_git_transition()
+        if result.returncode != 0:
+            raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_FAILED")
+        after = self.observe_registration(reservation)
+        if not after.observable or after.registration_present or after.unexpected_registration:
+            raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_POSTSTATE_NOT_EXACT")
 
     def _require_pinned_target(
         self, operation: TargetReservationOperation, *, post_operation: bool

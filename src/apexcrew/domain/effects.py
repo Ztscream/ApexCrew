@@ -453,5 +453,42 @@ class RecoveryService:
         unsettled = self._journal.unsettled_intents(run_id)
         if not unsettled:
             return RecoveryOutcome.empty()
-        kinds = ",".join(sorted(intent.kind for intent in unsettled))
-        raise RuntimeError(f"RECOVERY_STRATEGY_NOT_REGISTERED:{kinds}")
+        members = tuple(
+            UnresolvedIntentMember(
+                intent_id=intent.intent_id,
+                recovery_generation=1,
+                intent_digest=intent.payload_digest,
+            )
+            for intent in unsettled
+        )
+        set_digest = UnresolvedSetDigest(
+            str(
+                sha256_digest(
+                    canonical_json(
+                        {
+                            "members": [
+                                {
+                                    "intent_id": str(member.intent_id),
+                                    "recovery_generation": member.recovery_generation,
+                                    "intent_digest": str(member.intent_digest),
+                                }
+                                for member in members
+                            ]
+                        }
+                    )
+                )
+            )
+        )
+        return RecoveryOutcome(
+            recoveries=tuple(
+                IntentRecovery(
+                    intent_id=member.intent_id,
+                    recovery_generation=member.recovery_generation,
+                    disposition=RecoveryDisposition.INDETERMINATE,
+                    reason="AUTHORITATIVE_RECOVERY_REQUIRED",
+                )
+                for member in members
+            ),
+            unresolved_members=members,
+            unresolved_set_digest=set_digest,
+        )

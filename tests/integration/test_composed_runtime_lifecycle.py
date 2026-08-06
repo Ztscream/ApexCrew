@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.composition import build_application_bundle
 from apexcrew.application.configuration import default_revision_documents
+from apexcrew.delivery.cli import _handle_run_command
 from apexcrew.delivery.cli import app as cli_app
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -21,6 +22,7 @@ from apexcrew.domain.commands import (
     BeginPlanningPayload,
     CommandEnvelope,
     CreateRunPayload,
+    ReconcileCleanupPayload,
     StartPayload,
 )
 from apexcrew.domain.model import ModelCompletion, ModelUsage, ProviderAttemptResult
@@ -399,6 +401,16 @@ def test_composed_runtime_integrates_frozen_candidate_once(tmp_path: Path) -> No
         integrated = bundle.runtime.run_until_blocked(run_id)
         assert integrated.reason == "TERMINAL"
         assert bundle.queries.get(run_id).state == "COMPLETED"
+        cleanup_outcome = _handle_run_command(
+            root,
+            ReconcileCleanupPayload(run_id=run_id),
+            bindings="current",
+        )
+        assert cleanup_outcome.status == "ACCEPTED"
+        cleanup_stop = bundle.runtime.run_until_blocked(run_id)
+        assert cleanup_stop.reason == "TERMINAL"
+        assert bundle.queries.get(run_id).state == "COMPLETED"
+        assert bundle.runtime._store.target_reservation_for_run(run_id).phase == "CLEANUP_SETTLED"  # type: ignore[attr-defined]
         replay = runner.invoke(cli_app, command_args)
         assert replay.exit_code == 0, replay.stdout
         assert json.loads(replay.stdout)["status"] == "COMMAND_ACCEPTED"
