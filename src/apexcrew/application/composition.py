@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ from apexcrew.adapters.credentials.keyring import (
     SecretPolicyConfigurationError,
 )
 from apexcrew.adapters.credentials.model_key import ModelCredentialPort
+from apexcrew.adapters.executor.restricted import RestrictedDockerExecutor
 from apexcrew.adapters.model.deepseek_responses import ClientFactory
 from apexcrew.adapters.model.factory import build_model_port
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
@@ -25,6 +27,7 @@ from apexcrew.adapters.repository.bootstrap import (
 from apexcrew.adapters.repository.bootstrap import (
     repository_binding,
 )
+from apexcrew.adapters.repository.detached_workspace import DetachedWorkspace
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
     GitPrivateRefStartGuard,
@@ -33,7 +36,6 @@ from apexcrew.adapters.repository.git import (
     NoFollowTargetReservationWorktreeGuard,
     RepositoryInstance,
 )
-from apexcrew.adapters.repository.granted_workspace import GrantedWorkspaceAdapter
 from apexcrew.adapters.repository.no_follow import StableHandleTree
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
@@ -70,6 +72,7 @@ from apexcrew.application.runtime import (
     TerminalCleanupRuntime,
     ToolActionResolutionObserver,
 )
+from apexcrew.domain.actions import ToolActionEnvelope
 from apexcrew.domain.admission import (
     RefCasIntent,
     RefEffectBinding,
@@ -117,7 +120,7 @@ from apexcrew.domain.effects import (
 )
 from apexcrew.domain.evidence import ContextCapsule
 from apexcrew.domain.model import DurableModelClient, ModelRequest, RecoveredModelAction
-from apexcrew.domain.plan import CanonicalPath
+from apexcrew.domain.plan import CanonicalPath, CheckDefinition, TaskContract
 from apexcrew.domain.policy import PlanningPathPolicy, SecretPathPolicy
 from apexcrew.domain.projection import ProjectionService
 from apexcrew.domain.reservation_cleanup import CleanupObservation, CleanupObservationKind
@@ -130,7 +133,11 @@ from apexcrew.domain.revisions import (
 )
 from apexcrew.domain.tools import (
     ActionPreState,
+    DeclaredCheckRegistry,
+    ExecutorPort,
     GrantedActionObservation,
+    SanitizedSnapshot,
+    SanitizedSnapshotEntry,
     ScopedToolRuntime,
     ToolIntent,
     ToolResult,
@@ -138,13 +145,14 @@ from apexcrew.domain.tools import (
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    GitOid,
     IntentId,
     RepositoryId,
     RevisionDigest,
     RunId,
     TaskId,
 )
-from apexcrew.domain.worker import WorkerActionCodec, WorkerLoopService
+from apexcrew.domain.worker import WorkerActionCodec, WorkerLoopService, WorkerTurnBinding
 
 
 class _TargetAuthority(TargetAuthorityDigestService):
@@ -155,18 +163,57 @@ class _TargetAuthority(TargetAuthorityDigestService):
         return self._store.target_authority_digest(run_id)
 
 
+def _check_aliases(task_id: TaskId, ordinal: int) -> tuple[str, ...]:
+    number = ordinal + 1
+    return (
+        f"{task_id}:check-{number}",
+        f"{task_id}-check-{number}",
+        f"check-{number}",
+        f"task-check-{number}",
+    )
+
+
+def _declared_check_definitions(
+    task_id: TaskId, checks: tuple[CheckDefinition, ...]
+) -> dict[str, CheckDefinition]:
+    definitions: dict[str, CheckDefinition] = {}
+    for ordinal, definition in enumerate(checks):
+        for alias in _check_aliases(task_id, ordinal):
+            definitions.setdefault(alias, definition)
+    return definitions
+
+
 class _CompositionWorkerContext:
     def __init__(self, store: SqliteStateStore) -> None:
         self._store = store
 
     def build_current(self, attempt_id: AttemptId) -> ContextCapsule:
         binding = self._store.current_worker_turn_binding(attempt_id)
+        contract = next(
+            (
+                item
+                for item in self._store.task_contracts(binding.plan_digest)
+                if item.task_id == str(binding.task_id)
+            ),
+            None,
+        )
+        if contract is None:
+            raise RuntimeError("WORKER_TASK_CONTRACT_NOT_FOUND")
         return ContextCapsule.create(
             run_id=str(binding.run_id),
             task_id=str(binding.task_id),
             revision_digest=str(binding.plan_digest),
             dependencies=(str(binding.dependency_fingerprint_basis),),
-            content="ApexCrew worker context is bounded to the persisted attempt binding.",
+            content=canonical_json(
+                {
+                    "check_ids": [
+                        alias
+                        for ordinal, _definition in enumerate(contract.checks)
+                        for alias in _check_aliases(binding.task_id, ordinal)[:1]
+                    ],
+                    "message": "ApexCrew worker context is bounded to the persisted attempt binding.",
+                }
+            ),
         )
 
 
@@ -351,6 +398,21 @@ class _CompositionRepositoryResources:
             _CompositionPlanningPathGate(policy),
         )
 
+    def worker_workspace(
+        self,
+        reservation: TargetReservation,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        tree_oid: GitOid,
+        secret_policy: SecretPathPolicy,
+    ) -> DetachedWorkspace:
+        self.validate_repository_binding(repository_id, repository_instance_digest)
+        repository, runner, _ = self._ensure()
+        workspace_root = self._data_root / "workspaces" / reservation.reservation_id
+        workspace = DetachedWorkspace(repository, runner, workspace_root, secret_policy)
+        workspace.ensure_materialized(tree_oid)
+        return workspace
+
     def refresh(self) -> None:
         if self._repository is None:
             return
@@ -476,10 +538,14 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         store: SqliteStateStore,
         resources: _CompositionRepositoryResources,
         secret_policy: SecretPathPolicy,
+        authority: AuthorityService,
+        executor: ExecutorPort | None = None,
     ) -> None:
         self._store = store
         self._resources = resources
         self._secret_policy = secret_policy
+        self._authority = authority
+        self._executor = executor
         zero = Sha256DigestText("sha256:" + "0" * 64)
         super().__init__(
             snapshot=FilesystemRepositorySnapshot(resources._root),
@@ -492,6 +558,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             scope_digest=zero,
             dependency_fingerprint_basis=zero,
         )
+        self._executor = executor
 
     def _runtime(self, intent: ToolIntent | GrantedActionIntent) -> ScopedToolRuntime:
         if isinstance(intent, ToolIntent):
@@ -521,8 +588,29 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         )
         if contract is None:
             raise RuntimeError("WORKER_TASK_CONTRACT_NOT_FOUND")
+        workspace = self._resources.worker_workspace(
+            reservation,
+            RepositoryId(binding.repository_id),
+            self._store.run_record(binding.run_id).repository_instance_digest,
+            GitOid(binding.admissible_head),
+            self._secret_policy,
+        )
+        policy = cast(
+            PolicyRevisionDocument,
+            self._store.current_revision_document(binding.run_id, "POLICY"),
+        )
+        check_definitions = _declared_check_definitions(binding.task_id, contract.checks)
+        declared_checks = DeclaredCheckRegistry(check_definitions)
+        check_snapshot = self._build_sanitized_snapshot(
+            workspace.root,
+            binding.repository_id,
+            binding.snapshot_digest,
+            binding.dependency_fingerprint_basis,
+            contract,
+            policy.executor_profile.scratch_limit_bytes,
+        )
         return ScopedToolRuntime(
-            snapshot=FilesystemRepositorySnapshot(reservation.path),
+            snapshot=workspace.snapshot(),
             read_globs=tuple(pattern.value for pattern in contract.read_globs),
             secret_paths=self._secret_policy,
             authorization_binding_digest=Sha256DigestText(str(authorization_binding_digest)),
@@ -533,8 +621,77 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
             denial_journal=self._store,
             denial_expected_sequence=self._store.audit_sequence(binding.run_id),
+            executor=(
+                self._executor
+                if self._executor is not None
+                else RestrictedDockerExecutor(policy.executor_profile, self._secret_policy)
+            ),
+            declared_checks=declared_checks,
+            sanitized_snapshot=check_snapshot,
+            patch_executor=workspace,
+            deadline_journal=self._store,
+            deadline_authority=self._authority,
             workspace_lease=lease,
-            granted_workspace=GrantedWorkspaceAdapter(reservation.path, self._secret_policy),
+            granted_workspace=workspace.granted_workspace(),
+        )
+
+    def capture_expected_prestate(
+        self, binding: WorkerTurnBinding, action: ToolActionEnvelope
+    ) -> ActionPreState:
+        worker_binding = binding
+        typed_action = action
+        reservation = self._store.target_reservation_for_run(worker_binding.run_id)
+        workspace = self._resources.worker_workspace(
+            reservation,
+            RepositoryId(worker_binding.repository_id),
+            self._store.run_record(worker_binding.run_id).repository_instance_digest,
+            GitOid(worker_binding.admissible_head),
+            self._secret_policy,
+        )
+        return workspace.expected_prestate(typed_action)
+
+    def _build_sanitized_snapshot(
+        self,
+        root: Path,
+        repository_id: str,
+        tree_digest: Sha256DigestText,
+        dependency_fingerprint_digest: Sha256DigestText,
+        contract: TaskContract,
+        maximum_bytes: int,
+    ) -> SanitizedSnapshot:
+        filesystem = FilesystemRepositorySnapshot(root)
+        entries: list[SanitizedSnapshotEntry] = []
+        total_bytes = 0
+        input_globs = tuple(pattern for check in contract.checks for pattern in check.input_globs)
+        for observed in filesystem.entries():
+            path = CanonicalPath.parse(observed.path)
+            if not any(pattern.matches(path) for pattern in input_globs):
+                continue
+            if self._secret_policy.inspect(path).code != "ALLOW":
+                raise RuntimeError("SANITIZED_SNAPSHOT_DENIED")
+            remaining = maximum_bytes - total_bytes
+            if remaining < 0:
+                raise RuntimeError("SANITIZED_SNAPSHOT_TOO_LARGE")
+            content = filesystem.read(path, remaining + 1)
+            if len(content) > remaining:
+                raise RuntimeError("SANITIZED_SNAPSHOT_TOO_LARGE")
+            entries.append(
+                SanitizedSnapshotEntry(
+                    path=str(path),
+                    kind="regular",
+                    content_digest=Sha256DigestText(
+                        "sha256:" + hashlib.sha256(content).hexdigest()
+                    ),
+                )
+            )
+            total_bytes += len(content)
+        return SanitizedSnapshot.from_regular_files(
+            root=root,
+            repository_id=repository_id,
+            tree_digest=tree_digest,
+            dependency_fingerprint_digest=dependency_fingerprint_digest,
+            entries=entries,
+            secret_paths=self._secret_policy,
         )
 
     def execute(self, intent: ToolIntent) -> ToolResult:
@@ -1531,6 +1688,7 @@ def build_application_bundle(
     secret_policy: SecretPathPolicy | None = None,
     response_schemas: Mapping[str, Mapping[str, object]] | None = None,
     client_factory: ClientFactory | None = None,
+    executor: ExecutorPort | None = None,
     allow_live_provider: bool = False,
 ) -> ApplicationBundle:
     """Build one shared, closeable application object graph."""
@@ -1557,17 +1715,20 @@ def build_application_bundle(
             client_factory=client_factory,
             allow_live_provider=allow_live_provider,
         )
-        authority = AuthorityService(store)
+        runtime_secret_policy = (
+            _secret_policy_for_runtime(secret_policy)
+            if secret_policy is not None
+            else SecretPathPolicy.from_host_rules((), b"k" * 32)
+        )
+        authority = AuthorityService(store, secret_paths=runtime_secret_policy)
         worker_model = AuthorityModelClient(model, store, authority, SystemUtcClock())
         ids = _RuntimeIds()
         worker_tools = _CompositionWorkerTools(
             store,
             resources,
-            (
-                _secret_policy_for_runtime(secret_policy)
-                if secret_policy is not None
-                else SecretPathPolicy.from_host_rules((), b"k" * 32)
-            ),
+            runtime_secret_policy,
+            authority,
+            executor,
         )
         planning_revisions = _CompositionPlanningRevisionContext(store)
         worker = WorkerLoopService(
@@ -1577,7 +1738,7 @@ def build_application_bundle(
                 store, selected_model_configuration, selected_budget
             ),
             models=worker_model,
-            actions=WorkerActionCodec(lambda _binding, _action: ActionPreState()),
+            actions=WorkerActionCodec(worker_tools.capture_expected_prestate),
             authority=authority,
             tools=worker_tools,
             journal=store,

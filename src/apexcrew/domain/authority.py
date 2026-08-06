@@ -23,7 +23,7 @@ from apexcrew.domain.model import (
     ModelRequestIntent,
 )
 from apexcrew.domain.plan import CanonicalPath, GlobPattern, TaskContract
-from apexcrew.domain.policy import ActionPolicy
+from apexcrew.domain.policy import ActionPolicy, SecretPathPolicy
 from apexcrew.domain.revisions import BudgetRevisionDocument, Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
@@ -1099,6 +1099,11 @@ class Authority(Protocol):
     def reserve_model_attempt(self, request: ModelReservationRequest) -> ModelReservation:
         raise NotImplementedError
 
+    def open_action_deadline(
+        self, run_id: RunId, intent_id: IntentId, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceLease:
@@ -1726,9 +1731,15 @@ def _resume_revision_binding_matches(
 
 
 class AuthorityService:
-    def __init__(self, journal: AuthorityState, utc_clock: UtcClock | None = None) -> None:
+    def __init__(
+        self,
+        journal: AuthorityState,
+        utc_clock: UtcClock | None = None,
+        secret_paths: SecretPathPolicy | None = None,
+    ) -> None:
         self._journal = journal
         self._utc_clock = utc_clock or SystemUtcClock()
+        self._secret_paths = secret_paths
 
     def _utc_now(self) -> datetime:
         now = self._utc_clock.now()
@@ -2169,7 +2180,7 @@ class AuthorityService:
         }:
             policy_decision = "REQUIRE_APPROVAL"
         else:
-            policy_decision = ActionPolicy.default().classify(request.action)
+            policy_decision = ActionPolicy.default(self._secret_paths).classify(request.action)
         action_classes: dict[str, AuthorizedActionClass] = {
             "read": "READ",
             "search": "SEARCH",

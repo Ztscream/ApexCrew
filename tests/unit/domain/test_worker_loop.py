@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
 from apexcrew.domain.authority import (
+    ActionClass,
+    ActionDeadline,
     AuthorizationDecision,
     AuthorizationRequest,
     ModelReservation,
@@ -206,6 +208,7 @@ class SequencedCompletions:
 @dataclass
 class AllowAuthority:
     authorization_count: int = 0
+    deadline_count: int = 0
     request: AuthorizationRequest | None = None
 
     def authorize_action(self, request: AuthorizationRequest) -> AuthorizationDecision:
@@ -227,6 +230,24 @@ class AllowAuthority:
             effect_intent_id=None,
             pending_action_id=None,
             resulting_sequence=None,
+        )
+
+    def open_action_deadline(
+        self, run_id: RunId, intent_id: IntentId, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        self.deadline_count += 1
+        started = datetime(2026, 8, 2, tzinfo=UTC)
+        return ActionDeadline(
+            run_id=run_id,
+            intent_id=intent_id,
+            budget_digest=SHA,
+            applicable_revision_digests=binding().applicable_revision_digests,
+            action_class=ActionClass.DECLARED_CHECK,
+            started_at=started,
+            expires_at=started + timedelta(seconds=600),
+            recorded_sequence=AuditSequence(expected_sequence + 1),
+            check_id="unit",
+            snapshot_digest=SHA,
         )
 
 

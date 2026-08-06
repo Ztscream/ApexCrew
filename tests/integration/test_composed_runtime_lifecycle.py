@@ -27,6 +27,7 @@ from apexcrew.domain.commands import (
 from apexcrew.domain.model import ModelCompletion, ModelUsage, ProviderAttemptResult
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.revisions import revision_digest
+from apexcrew.domain.tools import ExecutionResult, SanitizedSnapshot
 from apexcrew.domain.types import GitOid
 
 
@@ -50,9 +51,10 @@ def _approval_code(command_kind: str, run_id: str, revision_class: str, digest: 
 
 
 class _LifecycleModel(ScriptedMockLLM):
-    def __init__(self) -> None:
+    def __init__(self, worker_actions: tuple[dict[str, object], ...] = ()) -> None:
         super().__init__(())
         self.requests = []
+        self.worker_actions = list(worker_actions)
 
     def complete(self, request):  # type: ignore[no-untyped-def]
         self.requests.append(request)
@@ -81,7 +83,11 @@ class _LifecycleModel(ScriptedMockLLM):
                 },
             }
         else:
-            action = {"kind": "finish", "summary": "task complete"}
+            action = (
+                self.worker_actions.pop(0)
+                if self.worker_actions
+                else {"kind": "finish", "summary": "task complete"}
+            )
         completion = ModelCompletion(
             response_id="lifecycle-response",
             requested_model_id=request.requested_model_id,
@@ -90,6 +96,25 @@ class _LifecycleModel(ScriptedMockLLM):
             normalized_action=action,
         )
         return ProviderAttemptResult.completed(completion)
+
+
+class _SuccessfulExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], SanitizedSnapshot, int]] = []
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        snapshot: SanitizedSnapshot,
+        timeout_seconds: int,
+    ) -> ExecutionResult:
+        self.calls.append((argv, snapshot, timeout_seconds))
+        return ExecutionResult.from_output(
+            exit_code=0,
+            timed_out=False,
+            timing_ms=1,
+            secret_paths=SecretPathPolicy.from_host_rules((), b"k" * 32),
+        )
 
 
 def _envelope(request_id: str, sequence: int | None, payload) -> CommandEnvelope:  # type: ignore[no-untyped-def]
@@ -254,11 +279,23 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         model_configuration_revision=model_configuration,
     )
     secret_policy = SecretPathPolicy.from_host_rules((), b"k" * 32)
+    executor = _SuccessfulExecutor()
     bundle = build_application_bundle(
         root,
         model_configuration=model_configuration,
-        scripted_model=_LifecycleModel(),
+        scripted_model=_LifecycleModel(
+            worker_actions=(
+                {
+                    "kind": "patch",
+                    "path": "src/task.py",
+                    "unified_diff": "@@ -1 +1 @@\n-value = 1\n+value = 2\n",
+                },
+                {"kind": "check", "check_id": "task-01:check-1"},
+                {"kind": "finish", "summary": "task complete"},
+            )
+        ),
         secret_policy=secret_policy,
+        executor=executor,
     )
     runner = CliRunner()
     try:
@@ -371,6 +408,27 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         assert final_stop.reason == "AWAITING_FINAL_APPROVAL", final_stop.model_dump(mode="json")
         assert final_stop.pending is not None
         assert bundle.queries.get(run_id).state == "READY_FOR_APPROVAL"
+        assert len(executor.calls) == 1
+        argv, check_snapshot, timeout_seconds = executor.calls[0]
+        assert argv == ("python", "-m", "pytest")
+        assert check_snapshot.materialized_paths == ("src/task.py",)
+        assert timeout_seconds == 600
+        reservation = bundle.runtime._store.target_reservation_for_run(run_id)
+        workspace_file = (
+            root
+            / ".apexcrew"
+            / "data"
+            / "workspaces"
+            / reservation.reservation_id
+            / "src"
+            / "task.py"
+        )
+        assert workspace_file.read_text(encoding="utf-8") == "value = 2\n"
+        assert tuple(path.name for path in reservation.path.iterdir()) == (".git",)
+        deadline_row = bundle.runtime._store._connection.execute(  # type: ignore[attr-defined]
+            "SELECT intent_id FROM action_deadlines"
+        ).fetchone()
+        assert deadline_row is not None
 
         preview = runner.invoke(
             cli_app,

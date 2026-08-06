@@ -227,6 +227,7 @@ class WindowsNoFollowBackend:
         *,
         create: bool = False,
         delete_access: bool = False,
+        write_access: bool = False,
     ) -> OpenedNode:
         encoded_name = name.encode("utf-16-le")
         if len(encoded_name) > 65_532:
@@ -257,7 +258,7 @@ class WindowsNoFollowBackend:
         access |= FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA
         if delete_access:
             access |= DELETE
-        if create and kind == "file":
+        if (create or write_access) and kind == "file":
             access |= FILE_WRITE_DATA
         share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE
         if getattr(self, "_allow_delete_share", False):
@@ -430,6 +431,15 @@ class WindowsNoFollowBackend:
 
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self._open_relative(parent.handle, name, parent.components + (name,), kind)
+
+    def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode:
+        return self._open_relative(
+            parent.handle,
+            name,
+            parent.components + (name,),
+            "file",
+            write_access=True,
+        )
 
     def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self._open_relative(

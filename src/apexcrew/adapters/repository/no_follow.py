@@ -32,6 +32,7 @@ class OpenedNode:
 class NoFollowBackend(Protocol):
     def open_root_chain(self, root: Path) -> tuple[OpenedNode, ...]: ...
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode: ...
+    def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode: ...
     def open_child_for_delete(
         self, parent: OpenedNode, name: str, kind: NodeKind
     ) -> OpenedNode: ...
@@ -118,8 +119,41 @@ class StableHandleTree:
             parent = node
         return parent
 
+    def ensure_directory(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative) if relative else ()
+        if not parts:
+            return self.root_node
+        existing = self.try_open("/".join(parts), "directory")
+        if existing is not None:
+            return existing
+        parent = self.ensure_directory("/".join(parts[:-1]))
+        node = self._backend.create_child_directory(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def create_file(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        existing = self.try_open("/".join(parts), "file")
+        if existing is not None:
+            raise RepositoryUnsafeError("NO_FOLLOW_FILE_ALREADY_EXISTS")
+        parent = self.ensure_directory("/".join(parts[:-1]))
+        node = self._backend.create_child_file(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def open_for_write(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        self.release_cached(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        node = self._backend.open_child_for_write(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._backend.read_bytes(node, maximum)
+
+    def write_bytes(self, node: OpenedNode, value: bytes) -> None:
+        self._backend.write_bytes(node, value)
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._backend.list_names(node, maximum)

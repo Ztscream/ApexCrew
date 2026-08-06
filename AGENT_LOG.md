@@ -1527,6 +1527,40 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex.
 - **Human-Changes**: none.
 
+## 2026-08-06 / M2-M4 detached worker production wiring
+
+- **Base**: `a1772f8` on `codex/m2-m4-final-production`.
+- **PLAN-Task**: M2-01, M2-04, M4-03 final snapshot/runner hardening.
+- **Subagent**: Codex implementation and independent branch review.
+- **Human-Changes**: none.
+- **Red evidence**: the composed patch selector initially failed with
+  `NO_FOLLOW_WRITE_DENIED` because an existing file was opened read-only; the
+  detached workspace selector also exposed that an incomplete materialization
+  could be reused without checking required pinned-tree paths.
+- **Correction**: production Worker tools now materialize a pinned Git tree into
+  a detached workspace, omit secret paths, reject non-regular entries, reject
+  incomplete reuse, and route patch/prestate/granted actions through that root.
+  The restricted executor now materializes a sanitized regular-file snapshot,
+  runs structured argv through the closed Docker command, bounds output, kills
+  timed-out process trees, and reports daemon/process absence as typed
+  `EXECUTOR_UNAVAILABLE`.
+- **Green evidence**:
+  - `uv run pytest tests/unit/adapters/repository/test_detached_workspace.py tests/integration/test_composed_runtime_lifecycle.py -q` -> `6 passed`.
+  - `uv run pytest tests/integration/test_production_wiring.py tests/unit/adapters/executor/test_runner.py tests/unit/adapters/executor/test_restricted.py -q` -> passed.
+  - `make test` -> full suite passed; existing platform/live skips remained explicit.
+  - `make lint` -> Ruff format/check and mypy passed.
+  - `make demo` -> deterministic guard, feedback, and freshness outputs passed.
+  - `make secret-scan` -> `secret-scan: clean`.
+  - `uv run python scripts/check_static_replay.py` -> `static-replay: clean`.
+  - `uv run python scripts/measure_performance.py --output .tmp/reference-performance.json` -> bounded report, `0.21 ms` observed.
+  - `git diff --check` -> exit code 0.
+- **Docker boundary**: `tests/integration/test_restricted_executor_docker.py` was
+  explicitly skipped because the Docker Desktop daemon pipe was unavailable.
+  `make build` built the wheel and sdist, then stopped at that same unavailable
+  daemon; no image success is claimed.
+- **Spec-Review**: Codex independent pass, PASS; no Critical/High.
+- **Quality-Review**: Codex independent pass, PASS; no Critical/High.
+
 ## PLAN-Task M3-02 (2026-08-06)
 
 - **Base**: `2a6326e`.

@@ -10,6 +10,11 @@ from apexcrew.domain.commands import ApplicableRevisionDigests, CommandEnvelope,
 from apexcrew.domain.types import GitOid, RepositoryId
 
 
+class SentinelExecutor:
+    def run(self, argv, snapshot, timeout_seconds):  # type: ignore[no-untyped-def]
+        raise AssertionError("sentinel executor must only be inspected in this test")
+
+
 class FixtureRepositoryAuthority:
     def inspect(self, repository_root: str, target_ref: str) -> BootstrapRepositoryAuthority:
         return BootstrapRepositoryAuthority(
@@ -101,5 +106,25 @@ def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: 
             observer is not resolution._observer  # type: ignore[attr-defined]
             for observer in resolution._observer._observers.values()  # type: ignore[attr-defined]
         )
+    finally:
+        bundle.close()
+
+
+def test_production_bundle_keeps_injected_executor_on_worker_graph(tmp_path: Path) -> None:
+    sentinel = SentinelExecutor()
+    options = {
+        "repository_authority": FixtureRepositoryAuthority(),
+        "model_configuration": default_revision_documents().model_configuration.model_copy(
+            update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
+        ),
+        "scripted_model": ScriptedMockLLM(()),
+        "executor": sentinel,
+    }
+    bundle = build_application_bundle(tmp_path, **options)
+    try:
+        coordinator = bundle.runtime._coordinator  # type: ignore[attr-defined]
+        worker = coordinator._workers  # type: ignore[attr-defined]
+        tools = worker._tools  # type: ignore[attr-defined]
+        assert tools._executor is sentinel  # type: ignore[attr-defined]
     finally:
         bundle.close()

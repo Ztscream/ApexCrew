@@ -734,6 +734,12 @@ class WorkerLoopService:
         )
         if recorded != intent:
             raise AssertionError("RECORDED_WORKER_TOOL_INTENT_MISMATCH")
+        if action.kind == "check":
+            self._authority.open_action_deadline(
+                intent.run_id,
+                intent.intent_id,
+                self._journal.audit_sequence(intent.run_id),
+            )
         return self._execute_and_settle(intent, decision)
 
     def _execute_and_settle(
@@ -748,7 +754,11 @@ class WorkerLoopService:
             result=result,
             expected_sequence=self._journal.audit_sequence(intent.run_id),
         )
-        if result.code in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}:
+        if result.code in {
+            "INDETERMINATE",
+            "EXECUTOR_UNAVAILABLE",
+            "INFRASTRUCTURE_UNCERTAINTY",
+        }:
             return RuntimeDecision.pause(result.code, sequence)
         return RuntimeDecision(
             code="ACTION_RECORDED",

@@ -45,6 +45,7 @@ ToolResultCode = Literal[
     "PATCH_APPLIED",
     "CHECK_PASSED",
     "CHECK_FAILED",
+    "EXECUTOR_UNAVAILABLE",
     "FINISHED",
     "FAILED",
     "DELETED",
@@ -204,7 +205,12 @@ def _bounded_chunks(chunks: Iterable[bytes], remaining: int) -> tuple[bytes, int
 
 
 class ExecutionResult(FrozenDocument):
-    code: Literal["CHECK_PASSED", "CHECK_FAILED", "INFRASTRUCTURE_UNCERTAINTY"]
+    code: Literal[
+        "CHECK_PASSED",
+        "CHECK_FAILED",
+        "EXECUTOR_UNAVAILABLE",
+        "INFRASTRUCTURE_UNCERTAINTY",
+    ]
     passed: bool | None
     timed_out: bool
     output_digest: Sha256DigestText | None = None
@@ -218,6 +224,7 @@ class ExecutionResult(FrozenDocument):
         expected = {
             "CHECK_PASSED": (True, False),
             "CHECK_FAILED": (False, False),
+            "EXECUTOR_UNAVAILABLE": (None, False),
             "INFRASTRUCTURE_UNCERTAINTY": (None, True),
         }[self.code]
         if (self.passed, self.timed_out) != expected:
@@ -236,8 +243,11 @@ class ExecutionResult(FrozenDocument):
         stderr_chunks: Iterable[bytes] = (),
         timing_ms: int,
         secret_paths: SecretPathPolicy,
+        executor_unavailable: bool = False,
     ) -> ExecutionResult:
-        if exit_code is None and not timed_out:
+        if executor_unavailable and timed_out:
+            raise ValueError("EXECUTOR_OUTCOME_BINDING_INVALID")
+        if exit_code is None and not timed_out and not executor_unavailable:
             raise ValueError("EXECUTOR_OUTCOME_UNOBSERVABLE")
         stdout, remaining, stdout_truncated = _bounded_chunks(
             stdout_chunks, MAX_EXECUTOR_OUTPUT_BYTES
@@ -248,9 +258,17 @@ class ExecutionResult(FrozenDocument):
         encoded = output.encode("utf-8")
         if len(encoded) > MAX_EXECUTOR_OUTPUT_BYTES:
             output = encoded[:MAX_EXECUTOR_OUTPUT_BYTES].decode("utf-8", errors="ignore")
-        code: Literal["CHECK_PASSED", "CHECK_FAILED", "INFRASTRUCTURE_UNCERTAINTY"]
+        code: Literal[
+            "CHECK_PASSED",
+            "CHECK_FAILED",
+            "EXECUTOR_UNAVAILABLE",
+            "INFRASTRUCTURE_UNCERTAINTY",
+        ]
         if timed_out:
             code = "INFRASTRUCTURE_UNCERTAINTY"
+            passed = None
+        elif executor_unavailable or exit_code == 125:
+            code = "EXECUTOR_UNAVAILABLE"
             passed = None
         elif exit_code == 0:
             code = "CHECK_PASSED"
@@ -581,6 +599,7 @@ class ToolResult(FrozenDocument):
         expected = {
             "CHECK_PASSED": (True, False),
             "CHECK_FAILED": (False, False),
+            "EXECUTOR_UNAVAILABLE": (None, False),
             "INFRASTRUCTURE_UNCERTAINTY": (None, True),
         }.get(self.code)
         if expected is not None and (self.passed, self.timed_out) != expected:
@@ -596,7 +615,11 @@ class ToolResult(FrozenDocument):
             raise ValueError("TOOL_RESULT_OWNERSHIP_MISSING")
         payload = canonical_json(self.model_dump(mode="json", exclude_none=True))
         outcome: Literal["COMPLETED", "FAILED", "STALE", "CONFLICT", "INDETERMINATE"]
-        if self.code in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}:
+        if self.code in {
+            "INDETERMINATE",
+            "EXECUTOR_UNAVAILABLE",
+            "INFRASTRUCTURE_UNCERTAINTY",
+        }:
             outcome = "INDETERMINATE"
         elif self.code in {
             "SECRET_PATH_DENIED",
@@ -680,11 +703,14 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
         if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in {
             "CHECK_PASSED",
             "CHECK_FAILED",
+            "EXECUTOR_UNAVAILABLE",
             "INFRASTRUCTURE_UNCERTAINTY",
         }:
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
         expected_outcome = (
-            "INDETERMINATE" if tool_result.code == "INFRASTRUCTURE_UNCERTAINTY" else "COMPLETED"
+            "INDETERMINATE"
+            if tool_result.code in {"EXECUTOR_UNAVAILABLE", "INFRASTRUCTURE_UNCERTAINTY"}
+            else "COMPLETED"
         )
         output = tool_result.bounded_payload.get("output", "")
         output_bytes = tool_result.bounded_payload.get("output_bytes", 0)

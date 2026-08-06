@@ -97,6 +97,18 @@ class PosixNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_OPEN_DENIED") from error
         return self._node(parent.components + (name,), handle, kind)
 
+    def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode:
+        close_on_exec, _directory, no_follow = _required_open_flags()
+        try:
+            handle = os.open(
+                name,
+                os.O_RDWR | close_on_exec | no_follow,
+                dir_fd=parent.handle,
+            )
+        except OSError as error:
+            raise RepositoryUnsafeError("NO_FOLLOW_WRITE_OPEN_DENIED") from error
+        return self._node(parent.components + (name,), handle, "file")
+
     def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self.open_child(parent, name, kind)
 
