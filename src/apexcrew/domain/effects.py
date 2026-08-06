@@ -414,6 +414,117 @@ class RecoveryDisposition(StrEnum):
     INDETERMINATE = "INDETERMINATE"
 
 
+class RecoveryActionClass(StrEnum):
+    MODEL = "MODEL"
+    READ_SEARCH = "READ_SEARCH"
+    PATCH = "PATCH"
+    CHECK = "CHECK"
+    PRIVATE_REF = "PRIVATE_REF"
+    TARGET_CAS = "TARGET_CAS"
+    TARGET_RESERVATION = "TARGET_RESERVATION"
+    GRANTED_ACTION = "GRANTED_ACTION"
+
+
+class RecoveryDecisionKind(StrEnum):
+    COMPLETED = "COMPLETED"
+    RETRY_SAME_INTENT = "RETRY_SAME_INTENT"
+    ABANDONED = "ABANDONED"
+    STALE = "STALE"
+    CONFLICT = "CONFLICT"
+    INDETERMINATE = "INDETERMINATE"
+
+
+class RecoveryObservation(FrozenDocument):
+    kind: RecoveryActionClass
+    intent_id: IntentId
+    recovery_generation: int
+    source_payload_digest: Sha256DigestText
+    state: str
+    observation_digest: Sha256DigestText
+    request_digest: Sha256DigestText | None = None
+    provider_response_id: str | None = None
+    normalized_completion_digest: Sha256DigestText | None = None
+    reservation_charge: Literal["FULL"] | None = None
+    snapshot_digest: Sha256DigestText | None = None
+    scope_digest: Sha256DigestText | None = None
+    bounded_result_json: str | None = None
+    bounded_result_digest: Sha256DigestText | None = None
+    check_id: str | None = None
+    argv_digest: Sha256DigestText | None = None
+    receipt_digest: Sha256DigestText | None = None
+    repository_id: str | None = None
+    registration_digest: Sha256DigestText | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryDecision:
+    kind: RecoveryDecisionKind
+    action_class: RecoveryActionClass
+    reason: str
+    bounded_result_json: str | None = None
+    full_reservation_required: bool = False
+
+
+def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
+    state = observation.state
+    if observation.kind is RecoveryActionClass.MODEL:
+        if state == "EXACT_COMPLETION" and observation.normalized_completion_digest is not None:
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                "EXACT_NORMALIZED_COMPLETION",
+            )
+        return RecoveryDecision(
+            RecoveryDecisionKind.INDETERMINATE,
+            observation.kind,
+            state,
+            full_reservation_required=observation.reservation_charge == "FULL"
+            or state == "RETURNED_MODEL_MISMATCH",
+        )
+    if observation.kind is RecoveryActionClass.READ_SEARCH:
+        if state == "EXACT_SNAPSHOT" and observation.bounded_result_json is not None:
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                "EXACT_SNAPSHOT",
+                bounded_result_json=observation.bounded_result_json,
+            )
+        if state == "STALE":
+            return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
+        return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
+    if (
+        observation.kind is RecoveryActionClass.CHECK
+        and state == "EXACT_RECEIPT"
+        and observation.receipt_digest is not None
+    ):
+        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
+    if state == "EXACT_POST":
+        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
+    if state == "EXACT_PRE":
+        return RecoveryDecision(RecoveryDecisionKind.RETRY_SAME_INTENT, observation.kind, state)
+    if state == "TARGET_UNSAFE":
+        return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
+    if state == "THIRD_STATE":
+        return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
+    if observation.kind is RecoveryActionClass.TARGET_RESERVATION and state == "BOTH_ABSENT":
+        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
+    if (
+        observation.kind is RecoveryActionClass.TARGET_RESERVATION
+        and state == "BOTH_PRESENT_LOCKED"
+    ):
+        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, "EXACT_LOCKED")
+    if (
+        observation.kind is RecoveryActionClass.TARGET_RESERVATION
+        and state == "BOTH_PRESENT_UNLOCKED"
+    ):
+        return RecoveryDecision(
+            RecoveryDecisionKind.RETRY_SAME_INTENT, observation.kind, "EXACT_UNLOCKED"
+        )
+    if state == "MIXED":
+        return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
+    return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
+
+
 @dataclass(frozen=True, slots=True)
 class IntentRecovery:
     intent_id: IntentId

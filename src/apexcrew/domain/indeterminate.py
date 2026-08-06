@@ -7,10 +7,38 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
+from apexcrew.domain.types import IntentId, UnresolvedSetDigest
 
 
 class IndeterminateResolution(RuntimeError):
     pass
+
+
+class ResolutionSelection(FrozenDocument):
+    resolution: Literal[
+        "RECONCILE_OBSERVED",
+        "RETRY_SAME_INTENT",
+        "ABANDON_INTENT",
+        "FAIL_RUN",
+        "CANCEL_RUN",
+    ]
+    unresolved_set_digest: UnresolvedSetDigest
+    intent_id: IntentId | None = None
+    recovery_generation: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        member_bound = {
+            "RECONCILE_OBSERVED",
+            "RETRY_SAME_INTENT",
+            "ABANDON_INTENT",
+        }
+        if self.resolution in member_bound:
+            if self.intent_id is None or self.recovery_generation is None:
+                raise ValueError("MEMBER_RESOLUTION_BINDING_REQUIRED")
+        elif self.intent_id is not None or self.recovery_generation is not None:
+            raise ValueError("SET_RESOLUTION_FORBIDS_MEMBER_BINDING")
+        return self
 
 
 class UnresolvedIntentSet(FrozenDocument):
