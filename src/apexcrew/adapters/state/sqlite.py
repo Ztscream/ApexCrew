@@ -4723,6 +4723,15 @@ class SqliteStateStore:
         with self._read_transaction() as connection:
             return self._granted_action_in_transaction(connection, intent_id)
 
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._read_transaction() as connection:
+            intent = self._granted_action_in_transaction(
+                connection, intent_id, require_unsettled=False
+            )
+        if intent.state != "INDETERMINATE":
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        return intent
+
     def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
         with self._read_transaction() as connection:
             row = connection.execute(

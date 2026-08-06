@@ -2620,16 +2620,25 @@ class InMemoryStateStore:
 
     @staticmethod
     def _validated_granted_action(
-        store: InMemoryStateStore, intent_id: IntentId
+        store: InMemoryStateStore,
+        intent_id: IntentId,
+        *,
+        recovery: bool = False,
     ) -> GrantedActionIntent:
         intent = store._granted_action_intents.get(intent_id)
-        if intent is None or intent.state not in {"INTENT_RECORDED", "DISPATCHED"}:
+        allowed_states = {"INDETERMINATE"} if recovery else {"INTENT_RECORDED", "DISPATCHED"}
+        if intent is None or intent.state not in allowed_states:
             raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
         pending = store._validated_pending_action(store._pending_actions[intent.pending_id])
         grant_entry = store._approval_grants.get(intent.grant_id)
-        effect = store._require_unsettled_effect_intent(intent.bindings.run_id, intent.intent_id)
+        effect = (
+            store._effect_intents.get(intent.intent_id)
+            if recovery
+            else store._require_unsettled_effect_intent(intent.bindings.run_id, intent.intent_id)
+        )
         if (
-            grant_entry is None
+            effect is None
+            or grant_entry is None
             or pending.state != "GRANT_CONSUMED"
             or pending.action != intent.action
             or pending.normalized_action_json != intent.normalized_action_json
@@ -2648,6 +2657,10 @@ class InMemoryStateStore:
     def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent:
         with self._lock:
             return self._validated_granted_action(self, intent_id)
+
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._lock:
+            return self._validated_granted_action(self, intent_id, recovery=True)
 
     def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
         candidates = sorted(

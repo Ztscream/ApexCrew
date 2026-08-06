@@ -4,7 +4,7 @@ from hashlib import sha256
 
 import pytest
 
-from apexcrew.application.runtime import ResolutionRuntime
+from apexcrew.application.runtime import ResolutionRuntime, _stop_reason_for_decision
 from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import (
     ApplyResolutionRequest,
@@ -204,3 +204,23 @@ def test_abandon_returns_class_specific_successor() -> None:
     decision = runtime.resume(RUN_ID, _permit(_selection("ABANDON_INTENT", unresolved)))
 
     assert decision.stop_reason == "PAUSED/READ_ABANDONED"
+
+
+def test_ready_for_approval_successor_has_public_final_approval_stop() -> None:
+    assert _stop_reason_for_decision("READY_FOR_APPROVAL").value == "AWAITING_FINAL_APPROVAL"
+
+
+def test_set_resolution_rejects_unabandonable_observation_before_store_apply() -> None:
+    intent = _intent()
+    unresolved = _set(intent)
+    selection = ResolutionSelection(
+        resolution="FAIL_RUN",
+        unresolved_set_digest=unresolved.set_digest,
+    )
+
+    with pytest.raises(StateConflict, match="SET_RESOLUTION_OBSERVATION_NOT_ABANDONABLE"):
+        ResolutionRuntime._validate_member_strategy(
+            selection,
+            (_observation(intent, "UNAVAILABLE"),),
+            expected_sequence=AuditSequence(1),
+        )

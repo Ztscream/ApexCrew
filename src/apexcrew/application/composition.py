@@ -53,6 +53,7 @@ from apexcrew.application.control import (
 from apexcrew.application.queries import RunQueryService
 from apexcrew.application.runtime import (
     FileRunOwnership,
+    GrantedActionResolutionObserver,
     GrantedActionRuntime,
     LocalFileLockBackend,
     PrivateRefInitializer,
@@ -70,6 +71,7 @@ from apexcrew.domain.admission import (
     StartGuardDecision,
     TargetReservationAdmissionService,
     TargetReservationBootstrapAdmissionService,
+    TargetReservationCreationIntent,
     TargetReservationObservationService,
 )
 from apexcrew.domain.authority import (
@@ -96,6 +98,9 @@ from apexcrew.domain.coordination import (
     planning_snapshot_digest,
 )
 from apexcrew.domain.effects import (
+    EffectIntent,
+    RecoveryActionClass,
+    RecoveryObservation,
     RecoveryService,
     RunRecord,
     StateConflict,
@@ -755,6 +760,103 @@ class _ProductionPrivateRefDriver:
         return decision
 
 
+class _ProductionTargetReservationResolutionObserver:
+    """Project the existing reservation observer into bounded recovery evidence."""
+
+    def __init__(self, store: SqliteStateStore, resources: _CompositionRepositoryResources) -> None:
+        self._store = store
+        self._resources = resources
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        try:
+            creation = TargetReservationCreationIntent.from_effect_intent(intent)
+            run = self._store.run_record(intent.run_id)
+            if creation.run_id != intent.run_id:
+                raise StateConflict("RESERVATION_OBSERVATION_RUN_BINDING_MISMATCH")
+            reservation = TargetReservation(
+                reservation_id=creation.reservation_id,
+                run_id=creation.run_id,
+                target_ref=creation.target_ref,
+                pinned_target_oid=creation.pinned_target_oid,
+                path=Path(creation.reservation_path),
+                phase="CREATION_INTENT_RECORDED",
+            )
+            observer, _ = self._resources.reservation_adapters(
+                reservation,
+                run.repository_id,
+                run.repository_instance_digest,
+                creation.target_authority_digest,
+            )
+            observed = observer.observe(reservation)
+        except (OSError, RuntimeError, StateConflict, ValueError, KeyError):
+            from apexcrew.application.runtime import _unavailable_resolution_observation
+
+            return _unavailable_resolution_observation(intent, recovery_generation)
+
+        state = _reservation_recovery_state(observed)
+        zero = Sha256DigestText("sha256:" + "0" * 64)
+        admin_digest = observed.admin_binding_digest or zero
+        path_identity = str(reservation.path)
+        gitfile_digest = observed.gitfile_digest or zero
+        if observed.path_present and gitfile_digest is None:
+            from apexcrew.application.runtime import _unavailable_resolution_observation
+
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        values: dict[str, object] = {
+            "kind": RecoveryActionClass.TARGET_RESERVATION,
+            "intent_id": intent.intent_id,
+            "recovery_generation": recovery_generation,
+            "source_payload_digest": intent.payload_digest,
+            "state": state,
+            "idempotency_key": intent.idempotency_key,
+            "registration_identity": reservation.reservation_id,
+            "reservation_operation": "CREATE",
+            "admin_binding_digest": admin_digest,
+            "path_identity": path_identity,
+            "gitfile_digest": gitfile_digest,
+        }
+        if state == "BOTH_PRESENT_LOCKED":
+            proof = {
+                "state": state,
+                "registration_identity": reservation.reservation_id,
+                "reservation_operation": "CREATE",
+                "admin_binding_digest": admin_digest,
+                "path_identity": path_identity,
+                "gitfile_digest": gitfile_digest,
+            }
+            proof_json = canonical_json(proof)
+            values.update(
+                {
+                    "run_id": intent.run_id,
+                    "settled_sequence": AuditSequence(
+                        self._store.audit_sequence(intent.run_id) + 1
+                    ),
+                    "applicable_revision_digests": intent.applicable_revision_digests,
+                    "completion_proof_json": proof_json,
+                    "completion_proof_digest": sha256_digest(proof_json),
+                }
+            )
+        return RecoveryObservation.create(**values)
+
+
+def _reservation_recovery_state(observed: object) -> str:
+    if not getattr(observed, "observable", False):
+        return "UNAVAILABLE"
+    registration_present = bool(getattr(observed, "registration_present", False))
+    path_present = bool(getattr(observed, "path_present", False))
+    if not registration_present and not path_present:
+        return "BOTH_ABSENT"
+    if registration_present and path_present and getattr(observed, "exact_identity", False):
+        return (
+            "BOTH_PRESENT_LOCKED" if getattr(observed, "locked", False) else "BOTH_PRESENT_UNLOCKED"
+        )
+    if registration_present and not path_present:
+        return "ADMIN_ONLY"
+    if path_present and not registration_present:
+        return "PATH_ONLY"
+    return "MIXED"
+
+
 class _CompositionIntegrationDriver:
     def __init__(self, store: SqliteStateStore, resources: _CompositionRepositoryResources) -> None:
         self._store = store
@@ -1190,11 +1292,19 @@ def build_application_bundle(
         )
         target_reservations = _ProductionTargetReservationDriver(store, resources)
         recovery = RecoveryService(store)
+        resolution_observers = ResolutionObservationRegistry(
+            {
+                "granted_risky_action": GrantedActionResolutionObserver(store, worker_tools),
+                "target_reservation_creation": _ProductionTargetReservationResolutionObserver(
+                    store, resources
+                ),
+            }
+        )
         phase_drivers = RuntimePhaseDriverService(
             recovered_actions=RecoveredActionRouter(coordinator, worker),
             target_reservations=target_reservations,
             private_refs=_ProductionPrivateRefDriver(store, resources),
-            resolution=ResolutionRuntime(store, ResolutionObservationRegistry()),
+            resolution=ResolutionRuntime(store, resolution_observers),
             integration=_CompositionIntegrationDriver(store, resources),
             cleanup=TerminalCleanupRuntime(store, _CompositionReservationCleanup(store, resources)),
             granted_actions=GrantedActionRuntime(store, worker_tools),

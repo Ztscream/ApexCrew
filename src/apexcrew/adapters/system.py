@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from hashlib import sha256
 from pathlib import Path
 
 from apexcrew.adapters.repository.no_follow import (
@@ -12,6 +13,7 @@ from apexcrew.adapters.repository.no_follow import (
 from apexcrew.domain.admission import ReservationPathObservation, TargetReservationPathReader
 from apexcrew.domain.authority import MonotonicInstant
 from apexcrew.domain.effects import TargetReservation
+from apexcrew.domain.revisions import Sha256DigestText
 
 
 class SystemMonotonicClock:
@@ -50,6 +52,7 @@ class ReservationPathInspector(TargetReservationPathReader):
                 gitfile_only=True,
                 exact_back_reference=raw == self._expected_gitfile(reservation),
                 observable=True,
+                gitfile_digest=Sha256DigestText("sha256:" + sha256(raw).hexdigest()),
             )
         except RepositoryUnsafeError:
             return ReservationPathObservation(True, False, False, False)

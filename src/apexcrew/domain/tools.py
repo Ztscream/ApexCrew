@@ -442,6 +442,8 @@ class GrantedActionJournal(Protocol):
 
     def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent: ...
 
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent: ...
+
     def mark_granted_action_dispatched(
         self,
         *,

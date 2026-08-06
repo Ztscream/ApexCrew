@@ -4,7 +4,7 @@ import os
 import secrets
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal, Protocol
@@ -48,6 +48,7 @@ from apexcrew.domain.effects import (
     observation_set_digest,
     recover_observation,
     recovery_action_class_for_intent,
+    sha256_digest,
 )
 from apexcrew.domain.indeterminate import (
     ResolutionApplication,
@@ -372,6 +373,56 @@ class ResolutionObservationRegistry(ResolutionObservationPort):
         return _unavailable_resolution_observation(intent, recovery_generation)
 
 
+class GrantedActionResolutionObserver(ResolutionObservationPort):
+    """Adapt the existing granted-workspace observer to resolution evidence."""
+
+    def __init__(self, journal: GrantedActionJournal, tools: GrantedActionToolPort) -> None:
+        self._journal = journal
+        self._tools = tools
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        granted = self._journal.require_granted_action_for_recovery(intent.intent_id)
+        if granted.bindings.run_id != intent.run_id:
+            raise StateConflict("GRANTED_OBSERVATION_RUN_BINDING_MISMATCH")
+        observed = self._tools.observe_granted_action(granted)
+        values: dict[str, object] = {
+            "kind": RecoveryActionClass.GRANTED_ACTION,
+            "intent_id": intent.intent_id,
+            "recovery_generation": recovery_generation,
+            "source_payload_digest": intent.payload_digest,
+            "state": {
+                "EXACT_PRE": "EXACT_PRE",
+                "EXACT_POST": "EXACT_POST",
+                "THIRD": "THIRD_STATE",
+                "UNAVAILABLE": "UNAVAILABLE",
+            }[observed.state],
+            "idempotency_key": intent.idempotency_key,
+            "pending_action_id": str(granted.pending_id),
+            "grant_id": str(granted.grant_id),
+            "expected_prestate_digest": sha256_digest(granted.expected_pre_state.canonical_json()),
+            "action_binding_digest": sha256_digest(canonical_json(asdict(granted.bindings))),
+        }
+        if observed.state == "EXACT_POST":
+            proof = {
+                "state": "EXACT_POST",
+                "pending_action_id": str(granted.pending_id),
+                "grant_id": str(granted.grant_id),
+                "expected_prestate_digest": values["expected_prestate_digest"],
+                "action_binding_digest": values["action_binding_digest"],
+            }
+            proof_json = canonical_json(proof)
+            values.update(
+                {
+                    "run_id": intent.run_id,
+                    "settled_sequence": AuditSequence(intent.recorded_sequence + 1),
+                    "applicable_revision_digests": intent.applicable_revision_digests,
+                    "completion_proof_json": proof_json,
+                    "completion_proof_digest": sha256_digest(proof_json),
+                }
+            )
+        return RecoveryObservation.create(**values)
+
+
 def _unavailable_resolution_observation(
     intent: EffectIntent, recovery_generation: int
 ) -> RecoveryObservation:
@@ -532,6 +583,13 @@ class ResolutionRuntime(ResolutionDriver):
         expected_sequence: AuditSequence,
     ) -> None:
         if selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+            if len(observations) == 0:
+                raise StateConflict("SET_RESOLUTION_OBSERVATION_REQUIRED")
+            try:
+                for observation in observations:
+                    abandon_observation(observation, abandon_successor_for(observation))
+            except (TypeError, ValueError) as error:
+                raise StateConflict("SET_RESOLUTION_OBSERVATION_NOT_ABANDONABLE") from error
             return
         if len(observations) != 1:
             raise StateConflict("OBSERVATION_SET_CARDINALITY_MISMATCH")
@@ -888,6 +946,7 @@ def _stop_reason_for_decision(reason: str | None) -> RunStopReason:
         "AWAITING_PLAN_APPROVAL": RunStopReason.AWAITING_PLAN_APPROVAL,
         "AWAITING_ACTION_APPROVAL": RunStopReason.AWAITING_ACTION_APPROVAL,
         "AWAITING_FINAL_APPROVAL": RunStopReason.AWAITING_FINAL_APPROVAL,
+        "READY_FOR_APPROVAL": RunStopReason.AWAITING_FINAL_APPROVAL,
         "BUDGET_STOP": RunStopReason.BUDGET_STOP,
         "INDETERMINATE": RunStopReason.INDETERMINATE,
         "TERMINAL": RunStopReason.TERMINAL,
@@ -1012,6 +1071,8 @@ class RuntimeService:
     ) -> RunStop:
         state = self._store.load_runtime_state(run_id)
         if state.state == RunState.DRAFT:
+            return self._drive_permitted_phase(run_id, permit, context)
+        if permit.allowed_phase == "INDETERMINATE":
             return self._drive_permitted_phase(run_id, permit, context)
         context.phase = "RECOVERED_ACTION"
         recovered = self._journal.next_recovered_model_action(run_id)

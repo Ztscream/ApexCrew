@@ -339,6 +339,7 @@ class ReservationPathObservation:
     gitfile_only: bool
     exact_back_reference: bool
     observable: bool
+    gitfile_digest: Sha256DigestText | None = None
 
 
 class TargetReservationRegistrationReader(Protocol):
@@ -381,6 +382,8 @@ class TargetReservationObservationService(TargetReservationObserver):
             gitfile_only=path.gitfile_only,
             admin_entry_name=registration.admin_entry_name,
             admin_binding_digest=registration.admin_binding_digest,
+            path_identity=str(reservation.path) if path.path_present else None,
+            gitfile_digest=path.gitfile_digest,
         )
 
 

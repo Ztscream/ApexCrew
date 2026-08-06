@@ -9,11 +9,13 @@ from helpers.application import (
     create_draft_with_three_proposals,
     make_application,
     make_create_run_command,
+    make_runtime_application,
 )
 
 from apexcrew.adapters.state.memory import InMemoryStateStore
 from apexcrew.adapters.system import SystemMonotonicClock
 from apexcrew.application.control import ControlCommandService, CrewControlService
+from apexcrew.application.runtime import ResolutionRuntime
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     CommandEnvelope,
@@ -286,6 +288,59 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
         == permit.resolution_selection
     )
     reopened.close()
+
+
+def test_runtime_routes_indeterminate_permit_to_resolution_before_recovery(
+    tmp_path: Path,
+) -> None:
+    app = make_runtime_application(tmp_path, monotonic_clock=SystemMonotonicClock())
+    run_id = app.run_id
+    before_intent = app.store.audit_sequence(run_id)
+    intent = _intent(run_id, "runtime-resolution-route", AuditSequence(before_intent + 1))
+    app.store.record_intent(intent, before_intent)
+    before_result = app.store.audit_sequence(run_id)
+    app.store.settle_intent(
+        run_id,
+        intent.intent_id,
+        _indeterminate_result(intent, AuditSequence(before_result + 1)),
+        ApplicableRevisionDigests(),
+        before_result,
+    )
+    unresolved = app.store.unresolved_intent_set(run_id)
+    assert unresolved is not None
+    member = unresolved.member_bindings[0]
+    accepted = app.control.handle(
+        _resolve_command(
+            run_id,
+            app.store.audit_sequence(run_id),
+            str(unresolved.set_digest),
+            intent_id=member.intent_id,
+            recovery_generation=member.recovery_generation,
+            bindings=app.store.current_revision_digests(run_id),
+        )
+    )
+    assert accepted.status == "ACCEPTED"
+
+    class UnexpectedRecoveryCall:
+        def reconcile(self, run_id: RunId) -> object:
+            raise AssertionError(f"generic recovery intercepted {run_id}")
+
+    class Observer:
+        def __init__(self) -> None:
+            self.observed: list[IntentId] = []
+
+        def observe(self, observed_intent: EffectIntent, generation: int) -> RecoveryObservation:
+            self.observed.append(observed_intent.intent_id)
+            return _abandon_observation(observed_intent, generation, run_id)
+
+    observer = Observer()
+    app.runtime._recovery = UnexpectedRecoveryCall()  # type: ignore[assignment]
+    app.runtime._phase_drivers._resolution = ResolutionRuntime(app.store, observer)  # type: ignore[attr-defined]
+
+    stop = app.runtime.run_until_blocked(run_id)
+
+    assert stop.reason == "PAUSED"
+    assert observer.observed == [intent.intent_id]
 
 
 def test_memory_resolution_matches_sqlite_member_cas() -> None:

@@ -112,6 +112,8 @@ class ReservationObservation(FrozenDocument):
     admin_entry_name: str | None = None
     admin_binding_digest: Sha256DigestText | None = None
     observable: bool = True
+    path_identity: str | None = None
+    gitfile_digest: Sha256DigestText | None = None
 
     def __init__(
         self,
@@ -123,6 +125,8 @@ class ReservationObservation(FrozenDocument):
         admin_entry_name: str | None = None,
         admin_binding_digest: Sha256DigestText | None = None,
         observable: bool = True,
+        path_identity: str | None = None,
+        gitfile_digest: Sha256DigestText | None = None,
     ) -> None:
         super().__init__(  # type: ignore[call-arg]
             registration_present=registration_present,
@@ -133,6 +137,8 @@ class ReservationObservation(FrozenDocument):
             admin_entry_name=admin_entry_name,
             admin_binding_digest=admin_binding_digest,
             observable=observable,
+            path_identity=path_identity,
+            gitfile_digest=gitfile_digest,
         )
 
 

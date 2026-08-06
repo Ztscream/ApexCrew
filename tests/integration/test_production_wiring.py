@@ -84,5 +84,9 @@ def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: 
         resolution = bundle.runtime._phase_drivers._resolution  # type: ignore[attr-defined]
         assert type(resolution).__name__ == "ResolutionRuntime"
         assert type(resolution._observer).__name__ == "ResolutionObservationRegistry"
+        assert set(resolution._observer._observers) == {  # type: ignore[attr-defined]
+            "granted_risky_action",
+            "target_reservation_creation",
+        }
     finally:
         bundle.close()
