@@ -24,8 +24,6 @@ DEEPSEEK_PROFILE = "deepseek"
 DEFAULT_INSTRUCTIONS = (
     "Return exactly one JSON object matching the supplied ApexCrew action schema."
 )
-DEFAULT_REASONING_EFFORT = "medium"
-DEFAULT_TEMPERATURE = 0.0
 _MISSING = object()
 
 
@@ -201,8 +199,6 @@ class DeepSeekResponsesAdapter:
         profile: str = DEEPSEEK_PROFILE,
         client_factory: ClientFactory | None = None,
         instructions: str = DEFAULT_INSTRUCTIONS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         allowed_returned_model_ids: frozenset[str] | None = None,
         max_input_tokens: int | None = None,
         max_output_tokens: int | None = None,
@@ -217,8 +213,6 @@ class DeepSeekResponsesAdapter:
             cast(ClientFactory, OpenAI) if client_factory is None else client_factory
         )
         self._instructions = instructions
-        self._temperature = temperature
-        self._reasoning_effort = reasoning_effort
         self._allowed_returned_model_ids = allowed_returned_model_ids
         self._max_input_tokens = max_input_tokens
         self._max_output_tokens = max_output_tokens
@@ -298,6 +292,8 @@ class DeepSeekResponsesAdapter:
             and request.max_output_tokens > self._max_output_tokens
         ):
             return ProviderAttemptResult.unknown("INFERENCE_SETTINGS_EXCEEDED")
+        if request.temperature is None or request.reasoning_effort not in {"low", "medium", "high"}:
+            return ProviderAttemptResult.unknown("INFERENCE_SETTINGS_MISSING")
 
         api_key = self._credentials.resolve(self._profile)
         client = self._client_factory(
@@ -311,9 +307,9 @@ class DeepSeekResponsesAdapter:
                 input=list(request.prompt),
                 instructions=self._instructions,
                 max_output_tokens=request.max_output_tokens,
-                temperature=self._temperature,
+                temperature=request.temperature,
                 text={"format": schema},
-                reasoning={"effort": self._reasoning_effort},
+                reasoning={"effort": request.reasoning_effort},
                 store=False,
             )
         except APIStatusError as error:

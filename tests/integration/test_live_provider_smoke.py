@@ -43,6 +43,8 @@ def _request() -> ModelRequest:
         max_input_tokens=revisions.model_configuration.inference_settings.max_input_tokens,
         max_output_tokens=revisions.model_configuration.inference_settings.max_output_tokens,
         reserved_cost_usd=Decimal("0.672"),
+        temperature=revisions.model_configuration.inference_settings.temperature,
+        reasoning_effort=revisions.model_configuration.inference_settings.reasoning_effort,
     )
 
 

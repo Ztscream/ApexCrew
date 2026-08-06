@@ -216,6 +216,8 @@ class _CompositionWorkerRequests:
             max_input_tokens=model_configuration.inference_settings.max_input_tokens,
             max_output_tokens=model_configuration.inference_settings.max_output_tokens,
             reserved_cost_usd=_worst_case_reservation(model_configuration, budget),
+            temperature=model_configuration.inference_settings.temperature,
+            reasoning_effort=model_configuration.inference_settings.reasoning_effort,
             owner_kind="WORKER",
             task_id=binding.task_id,
             attempt_id=binding.attempt_id,
@@ -1390,6 +1392,8 @@ class _CompositionPlanningContext:
             max_input_tokens=self._max_input_tokens,
             max_output_tokens=self._max_output_tokens,
             reserved_cost_usd=self._reserved_cost_usd,
+            temperature=model_configuration.inference_settings.temperature,
+            reasoning_effort=model_configuration.inference_settings.reasoning_effort,
         )
 
 

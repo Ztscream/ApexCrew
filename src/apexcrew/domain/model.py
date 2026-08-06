@@ -65,6 +65,8 @@ class ModelRequest:
     max_input_tokens: int
     max_output_tokens: int
     reserved_cost_usd: Decimal
+    temperature: float | None = None
+    reasoning_effort: str | None = None
     owner_kind: Literal["PLANNING", "WORKER"] = "PLANNING"
     task_id: TaskId | None = None
     attempt_id: AttemptId | None = None
@@ -634,6 +636,8 @@ def model_request_to_json(request: ModelRequest) -> str:
             "request_digest": request.request_digest,
             "requested_model_id": request.requested_model_id,
             "reserved_cost_usd": str(request.reserved_cost_usd),
+            "temperature": request.temperature,
+            "reasoning_effort": request.reasoning_effort,
             "run_id": request.run_id,
             "task_id": request.task_id,
             "tranche_id": request.tranche_id,
@@ -665,6 +669,8 @@ def model_request_from_json(value: str) -> ModelRequest:
         max_input_tokens=data["max_input_tokens"],
         max_output_tokens=data["max_output_tokens"],
         reserved_cost_usd=Decimal(data["reserved_cost_usd"]),
+        temperature=data.get("temperature"),
+        reasoning_effort=data.get("reasoning_effort"),
         owner_kind=data["owner_kind"],
         task_id=None if data["task_id"] is None else TaskId(data["task_id"]),
         attempt_id=(None if data["attempt_id"] is None else AttemptId(data["attempt_id"])),

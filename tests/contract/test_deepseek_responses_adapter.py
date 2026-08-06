@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -104,6 +105,8 @@ def _request() -> ModelRequest:
         max_input_tokens=1_000,
         max_output_tokens=200,
         reserved_cost_usd=Decimal("0.01"),
+        temperature=0.0,
+        reasoning_effort="medium",
     )
 
 
@@ -174,6 +177,42 @@ def test_request_pins_no_sdk_retries_and_deepseek_parameters() -> None:
             "store": False,
         }
     ]
+
+
+def test_inference_parameters_follow_the_bound_model_request() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    result = adapter.complete(replace(_request(), temperature=0.7, reasoning_effort="high"))
+
+    assert result.kind == "COMPLETED"
+    assert client.requests[0]["temperature"] == 0.7
+    assert client.requests[0]["reasoning"] == {"effort": "high"}
+
+
+def test_missing_inference_parameters_fail_closed() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    result = adapter.complete(replace(_request(), temperature=None, reasoning_effort=None))
+
+    assert result.kind == "UNKNOWN_OUTCOME"
+    assert result.reason_code == "INFERENCE_SETTINGS_MISSING"
+    assert client.requests == []
+
+
+def test_effective_inference_parameters_remain_in_settled_attempt_request() -> None:
+    adapter, _, _ = _adapter(_response(usage=_usage()))
+    request = replace(_request(), temperature=0.3, reasoning_effort="low")
+    result = adapter.complete(request)
+    assert result.completion is not None
+
+    intent = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    settled = SettledModelAttempt.from_result(
+        intent,
+        result,
+    )
+
+    assert settled.request.temperature == 0.3
+    assert settled.request.reasoning_effort == "low"
 
 
 def test_returned_model_mismatch_releases_no_action() -> None:
@@ -322,6 +361,8 @@ def test_model_configuration_accepts_deepseek_origin() -> None:
         inference_settings=InferenceSettingsDocument(
             max_input_tokens=32_000,
             max_output_tokens=4_096,
+            temperature=0.0,
+            reasoning_effort="medium",
             provider_storage_enabled=False,
         ),
         tool_schema_digest=SCHEMA_DIGEST,

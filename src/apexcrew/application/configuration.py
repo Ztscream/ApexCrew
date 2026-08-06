@@ -175,6 +175,8 @@ def default_revision_documents() -> RevisionDocuments:
             inference_settings=InferenceSettingsDocument(
                 max_input_tokens=32_000,
                 max_output_tokens=4_096,
+                temperature=0.0,
+                reasoning_effort="medium",
                 provider_storage_enabled=False,
             ),
             tool_schema_digest=zero_digest,

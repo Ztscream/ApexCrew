@@ -51,6 +51,10 @@ Resolution order is keyring first, then the single environment variable `APEXCRE
 
 The credential is read at request time and never cached on an instance, never written to logs, never included in `repr`/`str`, never passed to a child process, and never mounted into the restricted executor. Missing or unreadable credentials fail closed with `MODEL_CREDENTIAL_MISSING` rather than degrading to an unauthenticated call. `SECURITY.md` documents the full trust boundary.
 
+The approved Model Configuration also binds the DeepSeek `temperature` and
+`reasoning_effort` values. They are copied into each typed model request and
+settled attempt; the adapter has no fallback inference parameters.
+
 To authorize the one-request live smoke explicitly, configure a credential and set
 the gate in the current shell. The smoke is skipped by default and is excluded
 from `make test` and ordinary CI:

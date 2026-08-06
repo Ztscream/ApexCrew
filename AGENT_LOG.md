@@ -1511,6 +1511,26 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M4-02 (2026-08-06)
+
+- **Base**: `c60cbb2`.
+- **Red/green**: provider contract selectors for request-bound inference values,
+  missing settings, and settled-attempt retention passed after the new request
+  binding was installed; the pre-change adapter used module-level defaults.
+- **Evidence**: DeepSeek/provider-selection selectors -> `7 passed`; the focused
+  configuration/model selectors -> `45 passed`; `mypy src` -> no issues for 60
+  source files; Ruff check -> passed.
+- **Implementation**: `InferenceSettingsDocument` now requires temperature and
+  reasoning effort; `ModelRequest` JSON and Settled Attempt retain them; the
+  composition root copies approved values; DeepSeek uses only request values and
+  returns `INFERENCE_SETTINGS_MISSING` before network dispatch when absent.
+- **Live boundary**: no real DeepSeek request was made. Live smoke remains
+  explicit `APEXCREW_LIVE_SMOKE=1` plus operator authorization.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M4-01 (2026-08-06)
 
 - **Base**: `7a9b219`.

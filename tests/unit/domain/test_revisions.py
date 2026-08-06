@@ -41,6 +41,8 @@ def test_revision_documents_reject_secret_globs_and_mismatched_origin() -> None:
             inference_settings=InferenceSettingsDocument(
                 max_input_tokens=32_000,
                 max_output_tokens=4_096,
+                temperature=0.0,
+                reasoning_effort="medium",
                 provider_storage_enabled=False,
             ),
             tool_schema_digest="sha256:" + "9" * 64,
