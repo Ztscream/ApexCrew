@@ -30541,3 +30541,23 @@ The executor contract must assert digest-pinned image, non-root UID/GID, read-on
 | R4-CLOSE final offline/live/reopen audit | NOT STARTED | pending | pending |
 
 The independent review record remains `BLOCKED`: the fixed point was `209f893` and the reviewed branch ended at `f68de44`. Standards review found workflow/ledger/test-seam findings; Spec review found class-specific recovery and mixed terminal-cleanup gaps. No final-user release claim is authorized until those findings are corrected or explicitly accepted by the owner.
+
+## M1-R4.1 Recovery and Asymmetric Cleanup Revision (2026-08-06)
+
+**Status: PROPOSED / DOCUMENT-REVIEW REQUIRED.** This revision is the execution authority for correcting the R4-02B blockers. It authorizes no source, fixture, test, or CI changes until this complete `PLAN.md` revision and the companion plan at `docs/superpowers/plans/2026-08-06-apexcrew-recovery-resolution.md` receive an independent zero-blocker document review, the reviewed digest is recorded, and the owner records `M1 GO`. `SPEC.md` remains frozen.
+
+**Objective:** Implement action-class recovery, exact member/set-bound `INDETERMINATE` resolution, and exact path-only/admin-only terminal reservation cleanup while preserving Permit gating, dispatch closure, and terminal Run semantics.
+
+**Execution plan:** The detailed files, red/green selectors, transaction boundaries, review order, and final verification are in `docs/superpowers/plans/2026-08-06-apexcrew-recovery-resolution.md`. The implementation is split into independent worktrees and commits for domain classification, state/control resolution, runtime wiring, and asymmetric cleanup. Each task must complete spec review before quality review, and each critical/high finding must be fixed before the next task.
+
+**M1-R4.1 Ledger:**
+
+| Task | Status | Implementation commit | Evidence |
+| --- | --- | --- | --- |
+| R4.1-01 domain recovery classification | NOT STARTED | pending | pending document review and red/green |
+| R4.1-02 atomic state/control resolution | NOT STARTED | pending | pending document review and red/green |
+| R4.1-03 runtime resolution/production wiring | NOT STARTED | pending | pending document review and red/green |
+| R4.1-04 asymmetric terminal cleanup | NOT STARTED | pending | pending document review and red/green |
+| R4.1-05 independent reviews/final verification | NOT STARTED | pending | offline green; live remains owner-authorized |
+
+**Document review gate:** pending independent reviewer, pending reviewed `PLAN.md` digest, pending owner `M1 GO`.
