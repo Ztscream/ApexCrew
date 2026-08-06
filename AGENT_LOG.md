@@ -2612,3 +2612,30 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Quality-Review**: Codex independent pass; PASS, no Critical/High.
 - **Subagent**: Codex.
 - **Human-Changes**: none.
+
+## PLAN-Task M4-02/M4-03 provider correction and authorized smoke (2026-08-06)
+
+- **Base**: `1ad2220`; branch/worktree: `codex/m2-m4-final-production` /
+  `.worktrees/m2-m4-final-production`.
+- **Red evidence**: the first owner-authorized DeepSeek request rejected the
+  generated root schema; after adding a root object type, properties, and a
+  DeepSeek-compatible `anyOf` union, the provider accepted the request. The
+  first accepted planning response then exposed a plan-shape mismatch, so the
+  planning prompt was tightened to the exact ApexCrew `submit_plan` contract.
+- **Implementation commit**: `a623137` (`fix(provider): align DeepSeek planning
+  schema`). It changes only the model schema/prompt and their focused contract/
+  lifecycle assertions.
+- **Authorized live evidence**: the explicit `APEXCREW_LIVE_SMOKE=1` CLI test
+  completed the approval -> Runtime Permit -> CrewRuntime/Coordinator path with
+  exactly one real DeepSeek request and sanitized status `AWAITING_PLAN_APPROVAL`.
+  No key, prompt, or raw provider payload was printed or persisted by the test.
+- **Delivery evidence**: focused selectors -> `30 passed`; `make test`,
+  `make lint`, and `make secret-scan` passed; Docker image rebuild produced
+  `sha256:b3140d7c14c5e97a4b0b17e17c4cd20e13cc3605a724935d5f2715b33370afb7`,
+  and the digest-pinned restricted-executor test passed.
+- **Spec-Review**: Codex independent diff pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent diff pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+- **Owner-only actions not performed**: push, PR merge, hosted release, and
+  package publication.

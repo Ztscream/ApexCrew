@@ -10,7 +10,7 @@
 
 **Revision:** M2-M4 final-production amendment, prepared 2026-08-06 from base `9cc269f`; detailed execution authority is `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. `SPEC.md` remains frozen.
 
-**Current status:** **COMPLETE - M2-M4 LOCAL PRODUCTION VERIFIED.** The current branch is an isolated worktree. Local implementation, offline verification, and release evidence are complete; push, merge, hosted release, package publication, and live DeepSeek smoke remain owner-only actions and are not claimed here.
+**Current status:** **COMPLETE - M2-M4 LOCAL PRODUCTION VERIFIED.** The current branch is an isolated worktree. Local implementation, offline verification, Docker containment, and the explicitly authorized one-request DeepSeek lifecycle smoke are complete; push, merge, hosted release, and package publication remain owner-only actions and are not claimed here.
 
 **Historical R3 authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
 
@@ -18,7 +18,7 @@
 
 ## M2-M4 Final-Production Amendment (2026-08-06)
 
-The owner explicitly authorized completion of M2-M4 from base `9cc269f` on branch `codex/m2-m4-final-production`. The exact task map and completion contract are in `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. This amendment supersedes the old roadmap-only M2-M4 status for this branch, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, or owner-only external actions. The plan is docs-only until its SHA-256 is recorded in `AGENT_LOG.md` after independent spec and quality review.
+The owner explicitly authorized completion of M2-M4 from base `9cc269f` on branch `codex/m2-m4-final-production`. The exact task map and completion contract are in `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. This amendment supersedes the old roadmap-only M2-M4 status for this branch, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, or owner-only external actions. Final implementation and verification evidence is recorded in `AGENT_LOG.md`.
 
 The owner request and root `SPRINT.md` authorize a bounded implementation pass through M4. The detailed task map, file ownership, red/green selectors, and final checks are recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4.md`; its independent coverage review is recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4-review.md`. This amendment supersedes the historical roadmap-only status for this execution turn, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, no-push rule, or owner-only PR/Pages actions. SPRINT depth labels remain authoritative: REAL behavior is tested, SKELETON behavior covers the main path and rejects unsupported edges, and STUB behavior raises or returns `INDETERMINATE` with a `DEBT-` marker.
 
@@ -30581,3 +30581,19 @@ The R4.1 task chain is independently auditable through this required map. Each S
 The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 
 The resolution design is closed: typed action-class observations are constructed only by internal runtime adapters; CommandEnvelope carries only strategy and exact member/set bindings; RuntimePermit persists the exact resolution subject; member resolution and set-bound FAIL_RUN/CANCEL_RUN are separate atomic store operations; the complete set is re-observed before a set-bound close; Permit replay/crash cases, active-time ownership, Audit redaction, and RunQueries redaction are tested. Asymmetric cleanup owns both no-follow OS adapters and SQLite/memory settlement and deletes only exact PATH_ONLY or ADMIN_ONLY identity; all mixed/third/unobservable states preserve terminal Run state with zero deletion.
+
+## M2-M4 Final-Production Verification (2026-08-06)
+
+The final provider correction landed in `a623137` (`fix(provider): align DeepSeek planning schema`) for M4-02/M4-03. The DeepSeek structured-output schema now has a typed object root and `anyOf` union accepted by the live API; planning instructions require the exact `submit_plan` contract consumed by ApexCrew.
+
+Observed verification on `codex/m2-m4-final-production`:
+
+- `uv run --python 3.12 pytest tests/contract/test_deepseek_responses_adapter.py tests/contract/test_composition.py tests/integration/test_provider_selection.py tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q` -> `30 passed`.
+- Authorized live CLI lifecycle -> one real DeepSeek request, returned `AWAITING_PLAN_APPROVAL`, request count `1`; credentials were not written to output or audit artifacts.
+- `make test` -> exit code 0 with the existing explicit skip set.
+- `make lint` -> Ruff format/check and mypy passed; `mypy` reported no issues in 62 source files.
+- `make secret-scan` -> `secret-scan: clean`.
+- `docker build --tag apexcrew-executor:local .` -> image digest `sha256:b3140d7c14c5e97a4b0b17e17c4cd20e13cc3605a724935d5f2715b33370afb7`.
+- Digest-pinned Docker restriction test -> passed: UID/GID 1000, no network, read-only root, dropped capabilities, no-new-privileges, and discarded writes.
+
+The local `.env` remains ignored and untracked. Push, PR merge, hosted release, and package publication remain outside this verification claim.
