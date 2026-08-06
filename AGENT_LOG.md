@@ -1511,6 +1511,22 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M2-05 (2026-08-06)
+
+- **Base**: `5d8f086`.
+- **Red**: the former fixture selectors were strict xfails with explicit
+  `SKELETON_BOUNDARY` reasons and never reached production Git preflight.
+- **Green**: `uv run pytest tests/acceptance/test_money_unit_drift_run.py tests/acceptance/test_timestamp_unit_drift_run.py -q` -> `2 passed`.
+- **Implementation**: both fixtures now use a real detached `main` target and
+  `RepositoryBootstrapAuthorityService` through `build_application_bundle`; the
+  public control path creates a real `DRAFT` Run and query verifies it.
+- **Boundary**: this evidence covers production bootstrap/Run admission, not a
+  fabricated automatic repair or live model call.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M3-02 (2026-08-06)
 
 - **Base**: `2a6326e`.
