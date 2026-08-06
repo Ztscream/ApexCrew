@@ -301,6 +301,15 @@ def test_model_exact_pre_is_never_retryable() -> None:
     assert decision.kind == RecoveryDecisionKind.INDETERMINATE
 
 
+def test_model_unavailable_cannot_carry_normalized_output() -> None:
+    with pytest.raises(ValidationError, match="COMPLETION_PROOF_FORBIDDEN"):
+        observation(
+            RecoveryActionClass.MODEL,
+            "UNAVAILABLE",
+            normalized_completion_json='{"completion":"must-not-escape"}',
+        )
+
+
 def test_read_search_same_snapshot_returns_bounded_payload() -> None:
     decision = recover_observation(
         observation(

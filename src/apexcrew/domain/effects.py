@@ -938,7 +938,11 @@ class RecoveryObservation(FrozenDocument):
         if (
             self.kind is not RecoveryActionClass.READ_SEARCH
             and not completed_state
-            and (self.completion_proof_json is not None or self.completion_proof_digest is not None)
+            and (
+                self.completion_proof_json is not None
+                or self.completion_proof_digest is not None
+                or self.normalized_completion_json is not None
+            )
         ):
             raise ValueError("COMPLETION_PROOF_FORBIDDEN")
         if completed_state and self.kind is not RecoveryActionClass.READ_SEARCH:
