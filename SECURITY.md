@@ -58,10 +58,12 @@ registration/path sequence, but exact-admin-only and exact-path-only mixed crash
 states remain fail-closed and require operator repair before a new cleanup retry.
 The terminal Run state is preserved while cleanup is unresolved.
 
-The production runtime now checks the unconsumed Runtime Permit before acquiring
-the per-Run OS lock. The lock is cross-process and platform-backed; an absent,
-stale, or already-consumed Permit cannot create ownership. This control is covered
-by the runtime lock and Permit lifecycle tests.
+The production runtime requires an unconsumed Runtime Permit before attempting
+the per-Run OS lock, then validates and consumes that Permit in the SQLite
+transaction before installing durable owner state. The lock is cross-process and
+platform-backed; an absent, stale, or already-consumed Permit cannot create
+durable ownership. This control is covered by the runtime lock and Permit
+lifecycle tests.
 
 Real DeepSeek dispatch is an explicit operator action. The offline suite never
 resolves a provider credential. `tests/integration/test_live_provider_smoke.py`

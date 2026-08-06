@@ -2163,6 +2163,12 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Spec review**: Mencius found class-specific recovery and exact-admin-only/exact-path-only terminal cleanup recovery remain incomplete. These are recorded as `DEBT-R4-RECOVERY-001` and `DEBT-R4-CLEANUP-001` in `SECURITY.md`; R4-02B remains blocked and no final-user release claim is made.
 - **Permit ordering clarification**: the review concern about OS ownership ordering is not treated as a defect: runtime obtains the OS advisory handle first, then the SQLite transaction consumes the matching Permit and installs `runtime_owner_id`, matching SPEC section 3's stated ordering. No credential, provider request, push, or PR action occurred.
 
+## 2026-08-06 / R4-02B quality review disposition
+
+- **Quality reviewer**: Laplace reported high-risk Permit ordering, deferred recovery, asymmetric cleanup recovery, and a missing public assertion for durable cleanup settlement.
+- **Disposition**: the Permit ordering report is retained as a review concern but conflicts with SPEC section 3's explicit handle-first ordering; the implementation does not install durable owner state until the Permit-consuming SQLite transaction. Recovery and asymmetric cleanup remain confirmed blockers and are recorded in the ledger/security debt. The lifecycle test intentionally verifies public CLI/runtime behavior plus Git/data-root post-state; reservation phase remains an internal persistence fact not exposed by the minimal `RunQueries` projection.
+- **Current status**: `Spec-Review: BLOCKED`; `Quality-Review: BLOCKED` pending class-specific recovery and asymmetric cleanup implementation. No final-user release claim is made.
+
 ## 2026-08-06 / R4-02B Task 1 final-user runtime
 
 - **Red evidence**: the public-interface lifecycle selector initially failed before plan approval with `PAUSED`; the pre-existing lifecycle test also reached into `bundle.runtime._store` for revisions and sequences.
