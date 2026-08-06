@@ -476,6 +476,8 @@ def recovery_action_class_for_intent(intent: object) -> RecoveryActionClass:
         return RecoveryActionClass.GRANTED_ACTION
     if isinstance(intent, EffectIntent):
         effect_classes = {
+            "model": RecoveryActionClass.MODEL,
+            "model_request": RecoveryActionClass.MODEL,
             "private_ref_init": RecoveryActionClass.PRIVATE_REF,
             "private_ref_cas": RecoveryActionClass.PRIVATE_REF,
             "target_ref_cas": RecoveryActionClass.TARGET_CAS,

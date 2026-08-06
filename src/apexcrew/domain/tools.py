@@ -774,6 +774,62 @@ class ScopedToolRuntime:
             return ToolResult.approval_required(intent)
         return self._denied(intent, "LEASE_SCOPE_DENIED")
 
+    def observe_recovery(
+        self, intent: ToolIntent
+    ) -> tuple[
+        Literal["EXACT_POST", "EXACT_PRE", "EXACT_RECEIPT", "THIRD_STATE", "UNAVAILABLE"],
+        ToolResult | None,
+    ]:
+        """Return bounded recovery evidence without replaying a patch."""
+        if not self._current_authorization(intent):
+            return "UNAVAILABLE", None
+        if isinstance(intent.action, PatchAction):
+            expected_post = intent.expected_poststate_digest
+            if expected_post is not None and self._snapshot_digest == expected_post:
+                result = ToolResult(
+                    code="PATCH_APPLIED",
+                    run_id=intent.run_id,
+                    intent_id=intent.intent_id,
+                    bounded_payload={
+                        "post_tree_digest": expected_post,
+                        "pre_tree_digest": intent.snapshot_digest,
+                        "snapshot_digest": intent.snapshot_digest,
+                    },
+                    content_digest=expected_post,
+                )
+                return "EXACT_POST", result
+            if self._snapshot_digest == intent.snapshot_digest:
+                return "EXACT_PRE", None
+            return "THIRD_STATE", None
+        if isinstance(intent.action, CheckAction):
+            result = self.execute(intent)
+            if result.code not in {"CHECK_PASSED", "CHECK_FAILED"}:
+                return "UNAVAILABLE", None
+            definition = (
+                self._declared_checks.require(intent.action.check_id)
+                if self._declared_checks
+                else None
+            )
+            if definition is None:
+                return "UNAVAILABLE", None
+            argv_digest = sha256_digest(canonical_json({"argv": list(definition.argv)}))
+            receipt_digest = result.content_digest or sha256_digest(
+                canonical_json(result.model_dump(mode="json"))
+            )
+            bounded_payload = dict(result.bounded_payload)
+            bounded_payload.update(
+                {
+                    "argv_digest": argv_digest,
+                    "check_id": intent.action.check_id,
+                    "receipt_digest": receipt_digest,
+                    "snapshot_digest": intent.snapshot_digest,
+                }
+            )
+            return "EXACT_RECEIPT", result.model_copy(
+                update={"bounded_payload": bounded_payload, "content_digest": receipt_digest}
+            )
+        return "UNAVAILABLE", None
+
     def execute_granted(self, intent: GrantedActionIntent) -> ToolResult:
         if canonical_action_json(intent.action) != intent.normalized_action_json:
             raise ToolAuthorizationError("GRANTED_INTENT_MISMATCH")

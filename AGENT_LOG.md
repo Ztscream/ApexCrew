@@ -2154,6 +2154,13 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4.1-03 production observer correction
+
+- **Independent Spec finding:** the production resolution registry left MODEL, PATCH, CHECK, PRIVATE_REF, and TARGET_CAS on the unavailable fallback, so valid recovery permits could not reach their concrete evidence adapters.
+- **Correction:** production composition now routes provider completions through durable model-attempt lookup, patch/check through bounded tool recovery observation, private refs through the no-follow Git start guard, target refs through the typed target-CAS adapter, and includes every supported action-class key. Unknown or malformed evidence remains fail-closed.
+- **Observed green evidence:** `uv run --python 3.12 pytest -q` -> full suite passed with the existing xfail/skip set; `uv run --python 3.12 mypy src/apexcrew` -> `Success: no issues found in 60 source files`; `uv run --python 3.12 ruff check src tests` -> all checks passed; `uv run --python 3.12 ruff format --check src tests` -> all files formatted; `git diff --check` -> exit code 0.
+- **Review status:** fresh Spec and Quality reviews are required for the correction. No credential, provider, network, push, or PR action occurred.
+
 ## 2026-08-06 / M1-R4.1 document review and GO
 
 - Plan revision: M1-R4.1 recovery resolution and asymmetric cleanup plan, final document-review base e2785e3.

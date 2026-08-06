@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Mapping
@@ -56,6 +57,7 @@ from apexcrew.application.runtime import (
     GrantedActionResolutionObserver,
     GrantedActionRuntime,
     LocalFileLockBackend,
+    ModelResolutionObserver,
     PrivateRefInitializer,
     ProcessRuntimeOwnerIds,
     RecoveredActionRouter,
@@ -66,8 +68,11 @@ from apexcrew.application.runtime import (
     SnapshotResolutionObserver,
     TargetReservationDriver,
     TerminalCleanupRuntime,
+    ToolActionResolutionObserver,
 )
 from apexcrew.domain.admission import (
+    RefCasIntent,
+    RefEffectBinding,
     RuntimeStartBinding,
     StartGuardDecision,
     TargetReservationAdmissionService,
@@ -846,6 +851,179 @@ class _ProductionTargetReservationResolutionObserver:
         return RecoveryObservation.create(**values)
 
 
+class _ProductionRefResolutionObserver:
+    """Observe private and target refs through the repository-owned CAS adapters."""
+
+    def __init__(self, store: SqliteStateStore, resources: _CompositionRepositoryResources) -> None:
+        self._store = store
+        self._resources = resources
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        if intent.kind in {"private_ref_init", "private_ref_cas"}:
+            return self._observe_private(intent, recovery_generation)
+        if intent.kind == "target_ref_cas":
+            return self._observe_target(intent, recovery_generation)
+        from apexcrew.application.runtime import _unavailable_resolution_observation
+
+        return _unavailable_resolution_observation(intent, recovery_generation)
+
+    def _observe_private(
+        self, intent: EffectIntent, recovery_generation: int
+    ) -> RecoveryObservation:
+        from apexcrew.application.runtime import _unavailable_resolution_observation
+
+        try:
+            payload = json.loads(intent.normalized_payload_json)
+            if intent.kind == "private_ref_init":
+                typed = RefCasIntent.from_effect_intent(intent)
+                repository_id = typed.repository_id
+                ref_name = typed.ref_name
+                expected_old_oid = typed.expected_old_oid
+                prepared_oid = typed.prepared_oid
+                safety_digest = typed.target_safety_digest
+                binding = typed.ref_effect_binding
+                reservation_id = typed.target_reservation_id
+            else:
+                repository_id = RepositoryId(str(payload["repository_id"]))
+                ref_name = str(payload["ref_name"])
+                expected_old_oid = payload.get("expected_old_oid")
+                prepared_oid = payload["prepared_oid"]
+                safety_digest = Sha256DigestText(str(payload["target_safety_digest"]))
+                binding = RefEffectBinding.model_validate(payload["ref_effect_binding"])
+                reservation_id = str(payload["target_reservation_id"])
+            run = self._store.run_record(intent.run_id)
+            reservation = self._store.target_reservation(reservation_id)
+            guard = self._resources.private_ref_guard(
+                reservation=reservation,
+                repository_id=repository_id,
+                repository_instance_digest=run.repository_instance_digest,
+                target_safety_digest=safety_digest,
+            )
+            state, current, registration = guard.observe_resolution(
+                ref_name=ref_name,
+                expected_old_oid=expected_old_oid,
+                prepared_oid=prepared_oid,
+                expected_binding=binding,
+            )
+            old_oid = expected_old_oid or type(prepared_oid)("0" * 40)
+            current_oid = current or old_oid
+            return self._ref_observation(
+                intent=intent,
+                recovery_generation=recovery_generation,
+                state=state,
+                repository_id=repository_id,
+                repository_instance_digest=run.repository_instance_digest,
+                ref_name=ref_name,
+                registration_digest=registration,
+                safety_digest=safety_digest,
+                old_oid=old_oid,
+                prepared_oid=prepared_oid,
+                current_oid=current_oid,
+            )
+        except (OSError, KeyError, StateConflict, TypeError, ValueError, RuntimeError):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+
+    def _observe_target(
+        self, intent: EffectIntent, recovery_generation: int
+    ) -> RecoveryObservation:
+        from apexcrew.application.runtime import _unavailable_resolution_observation
+
+        try:
+            run = self._store.run_record(intent.run_id)
+            reservation = self._store.target_reservation_for_run(intent.run_id)
+            expected_old_oid = self._store.final_candidate(intent.run_id).head_oid
+            prepared_oid = self._store.final_candidate_prepared_oid(intent.run_id)
+            adapter = self._resources.target_cas(
+                reservation, run.repository_id, run.repository_instance_digest
+            )
+            observed = adapter.observe_resolution(
+                target_ref=run.target_ref,
+                expected_old_oid=expected_old_oid,
+                prepared_oid=prepared_oid,
+            )
+            return self._ref_observation(
+                intent=intent,
+                recovery_generation=recovery_generation,
+                state=observed.state,
+                repository_id=run.repository_id,
+                repository_instance_digest=run.repository_instance_digest,
+                ref_name=run.target_ref,
+                registration_digest=observed.registration_digest,
+                safety_digest=self._store.target_authority_digest(intent.run_id),
+                old_oid=expected_old_oid,
+                prepared_oid=prepared_oid,
+                current_oid=observed.observed_oid or expected_old_oid,
+            )
+        except (OSError, KeyError, StateConflict, TypeError, ValueError, RuntimeError):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+
+    @staticmethod
+    def _ref_observation(
+        *,
+        intent: EffectIntent,
+        recovery_generation: int,
+        state: str,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        ref_name: str,
+        registration_digest: Sha256DigestText | None,
+        safety_digest: Sha256DigestText,
+        old_oid: object,
+        prepared_oid: object,
+        current_oid: object,
+    ) -> RecoveryObservation:
+        from apexcrew.application.runtime import _unavailable_resolution_observation
+
+        if registration_digest is None or state not in {
+            "EXACT_POST",
+            "EXACT_PRE",
+            "THIRD_STATE",
+        }:
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        values: dict[str, object] = {
+            "kind": RecoveryActionClass.PRIVATE_REF
+            if intent.kind.startswith("private_ref")
+            else RecoveryActionClass.TARGET_CAS,
+            "intent_id": intent.intent_id,
+            "recovery_generation": recovery_generation,
+            "source_payload_digest": intent.payload_digest,
+            "state": state,
+            "idempotency_key": intent.idempotency_key,
+            "repository_id": str(repository_id),
+            "repository_instance_digest": repository_instance_digest,
+            "ref_name": ref_name,
+            "registration_digest": registration_digest,
+            "target_safety_digest": safety_digest,
+            "old_oid": old_oid,
+            "prepared_oid": prepared_oid,
+            "current_oid": current_oid,
+        }
+        if state == "EXACT_POST":
+            proof = canonical_json(
+                {
+                    "state": state,
+                    "repository_id": str(repository_id),
+                    "repository_instance_digest": repository_instance_digest,
+                    "ref_name": ref_name,
+                    "registration_digest": registration_digest,
+                    "target_safety_digest": safety_digest,
+                    "old_oid": old_oid,
+                    "prepared_oid": prepared_oid,
+                    "current_oid": current_oid,
+                }
+            )
+            values.update(
+                {
+                    "run_id": intent.run_id,
+                    "settled_sequence": AuditSequence(intent.recorded_sequence + 1),
+                    "applicable_revision_digests": intent.applicable_revision_digests,
+                    "completion_proof_json": proof,
+                    "completion_proof_digest": sha256_digest(proof),
+                }
+            )
+        return RecoveryObservation.create(**values)
+
+
 def _reservation_recovery_state(observed: object) -> str:
     if not getattr(observed, "observable", False):
         return "UNAVAILABLE"
@@ -1301,9 +1479,16 @@ def build_application_bundle(
         recovery = RecoveryService(store)
         resolution_observers = ResolutionObservationRegistry(
             {
+                "model": ModelResolutionObserver(store),
+                "model_request": ModelResolutionObserver(store),
                 "granted_risky_action": GrantedActionResolutionObserver(store, worker_tools),
                 "read": SnapshotResolutionObserver(store, worker_tools),
                 "search": SnapshotResolutionObserver(store, worker_tools),
+                "patch": ToolActionResolutionObserver(worker_tools),
+                "check": ToolActionResolutionObserver(worker_tools),
+                "private_ref_init": _ProductionRefResolutionObserver(store, resources),
+                "private_ref_cas": _ProductionRefResolutionObserver(store, resources),
+                "target_ref_cas": _ProductionRefResolutionObserver(store, resources),
                 "target_reservation_creation": _ProductionTargetReservationResolutionObserver(
                     store, resources
                 ),

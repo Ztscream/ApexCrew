@@ -280,6 +280,41 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             observed_oid=oid,
         )
 
+    def observe_resolution(
+        self,
+        *,
+        ref_name: str,
+        expected_old_oid: GitOid | None,
+        prepared_oid: GitOid,
+        expected_binding: RefEffectBinding,
+    ) -> tuple[
+        Literal["EXACT_POST", "EXACT_PRE", "THIRD_STATE", "UNAVAILABLE"],
+        GitOid | None,
+        Sha256DigestText | None,
+    ]:
+        try:
+            current_binding = self._effect_binding(self._reservation.run_id)
+            result = self._runner.run(self._repository, GitShowRefVerify(ref_name))
+            registration_digest = current_binding.checkout_registration_digest
+            if current_binding != expected_binding:
+                current_oid = None
+                if result.returncode == 0:
+                    current_oid = GitOid(result.stdout.strip())
+                return "THIRD_STATE", current_oid, registration_digest
+            if result.returncode == 0:
+                current_oid = GitOid(result.stdout.strip())
+                if current_oid == prepared_oid:
+                    return "EXACT_POST", current_oid, registration_digest
+                return "THIRD_STATE", current_oid, registration_digest
+            absent = result.returncode == 1 or (
+                result.returncode == 128 and result.stderr.strip().endswith("not a valid ref")
+            )
+            if absent and expected_old_oid is None:
+                return "EXACT_PRE", None, registration_digest
+            return "THIRD_STATE", None, registration_digest
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return "UNAVAILABLE", None, None
+
 
 RepositoryUnsafeError = _RepositoryUnsafeError
 

@@ -61,7 +61,10 @@ from apexcrew.domain.model import (
     DurableModelClient,
     LogicalTurnId,
     ModelRecoveryBinding,
+    ModelRequestIntent,
+    ProviderAttemptKind,
     RecoveredModelAction,
+    SettledModelAttempt,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
@@ -366,6 +369,27 @@ class ResolutionToolPort(Protocol):
     def execute(self, intent: ToolIntent) -> ToolResult:
         raise NotImplementedError
 
+    def observe_recovery(self, intent: ToolIntent) -> tuple[str, ToolResult | None]:
+        raise NotImplementedError
+
+
+class ModelResolutionJournal(Protocol):
+    def model_request(self, run_id: RunId, intent_id: IntentId) -> ModelRequestIntent:
+        raise NotImplementedError
+
+    def committed_model_turn(
+        self, run_id: RunId, logical_turn_id: str
+    ) -> CommittedModelTurn | None:
+        raise NotImplementedError
+
+    def model_attempts(
+        self, run_id: RunId, logical_turn_id: str
+    ) -> tuple[SettledModelAttempt, ...]:
+        raise NotImplementedError
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        raise NotImplementedError
+
 
 class ResolutionObservationRegistry(ResolutionObservationPort):
     """Dispatch action-class observers while retaining a fail-closed fallback."""
@@ -476,6 +500,134 @@ class SnapshotResolutionObserver(ResolutionObservationPort):
             bounded_result_json=bounded_result,
             bounded_result_digest=sha256_digest(bounded_result),
         )
+
+
+class ModelResolutionObserver(ResolutionObservationPort):
+    """Project a durable provider completion into recovery evidence."""
+
+    def __init__(self, journal: ModelResolutionJournal) -> None:
+        self._journal = journal
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        try:
+            request = self._journal.model_request(intent.run_id, intent.intent_id)
+            turn = self._journal.committed_model_turn(intent.run_id, request.logical_turn_id)
+            attempts = self._journal.model_attempts(intent.run_id, request.logical_turn_id)
+        except (AttributeError, KeyError, StateConflict, ValueError, TypeError):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        if turn is None or turn.recovery_binding.request_digest != request.request.request_digest:
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        completed = next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.kind is ProviderAttemptKind.COMPLETED
+                and attempt.dispatch_result == turn.dispatch_result
+            ),
+            None,
+        )
+        if completed is None or turn.state != "COMPLETION_COMMITTED":
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        completion_json = canonical_json(turn.normalized_payload)
+        usage = getattr(completed, "reported_usage", None)
+        values: dict[str, object] = {
+            "kind": RecoveryActionClass.MODEL,
+            "intent_id": intent.intent_id,
+            "recovery_generation": recovery_generation,
+            "source_payload_digest": intent.payload_digest,
+            "state": "EXACT_COMPLETION",
+            "request_digest": request.request.request_digest,
+            "idempotency_key": intent.idempotency_key,
+            "provider_response_id": completed.provider_response_id,
+            "returned_model_id": turn.returned_model_id,
+            "schema_digest": Sha256DigestText(request.request.tool_schema_digest),
+            "usage_json": None
+            if usage is None
+            else canonical_json(
+                {
+                    "cost_usd": str(usage.cost_usd),
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                }
+            ),
+            "normalized_completion_digest": Sha256DigestText(turn.normalized_output_digest),
+            "normalized_completion_json": completion_json,
+            "completion_proof_json": completion_json,
+            "completion_proof_digest": sha256_digest(completion_json),
+            "run_id": intent.run_id,
+            "settled_sequence": AuditSequence(self._journal.audit_sequence(intent.run_id) + 1),
+            "applicable_revision_digests": intent.applicable_revision_digests,
+        }
+        return RecoveryObservation.create(**values)
+
+
+class ToolActionResolutionObserver(ResolutionObservationPort):
+    """Use the bounded tool runtime's action-specific recovery observation."""
+
+    def __init__(self, tools: ResolutionToolPort) -> None:
+        self._tools = tools
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        try:
+            tool_intent = ToolIntent.from_effect_intent(intent)
+            state, result = self._tools.observe_recovery(tool_intent)
+        except (AttributeError, StateConflict, TypeError, ValueError):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        if tool_intent.action.kind == "patch":
+            if state not in {"EXACT_PRE", "EXACT_POST", "THIRD_STATE"}:
+                return _unavailable_resolution_observation(intent, recovery_generation)
+            assert result is None or result.code == "PATCH_APPLIED"
+            expected_post = tool_intent.expected_poststate_digest
+            if expected_post is None:
+                return _unavailable_resolution_observation(intent, recovery_generation)
+            values: dict[str, object] = {
+                "kind": RecoveryActionClass.PATCH,
+                "intent_id": intent.intent_id,
+                "recovery_generation": recovery_generation,
+                "source_payload_digest": intent.payload_digest,
+                "state": state,
+                "idempotency_key": intent.idempotency_key,
+                "expected_pre_tree_digest": tool_intent.snapshot_digest,
+                "observed_post_tree_digest": expected_post,
+                "snapshot_digest": tool_intent.snapshot_digest,
+            }
+            if state == "EXACT_POST" and result is not None:
+                proof = canonical_json(result.model_dump(mode="json"))
+                values.update(
+                    {
+                        "run_id": intent.run_id,
+                        "settled_sequence": AuditSequence(
+                            self._tools.audit_sequence(intent.run_id)
+                            if hasattr(self._tools, "audit_sequence")
+                            else intent.recorded_sequence + 1
+                        ),
+                        "applicable_revision_digests": intent.applicable_revision_digests,
+                        "completion_proof_json": proof,
+                        "completion_proof_digest": sha256_digest(proof),
+                    }
+                )
+            return RecoveryObservation.create(**values)
+        if tool_intent.action.kind == "check" and state == "EXACT_RECEIPT" and result is not None:
+            bounded = dict(result.bounded_payload)
+            proof = canonical_json(result.model_dump(mode="json"))
+            return RecoveryObservation.create(
+                kind=RecoveryActionClass.CHECK,
+                intent_id=intent.intent_id,
+                recovery_generation=recovery_generation,
+                source_payload_digest=intent.payload_digest,
+                state="EXACT_RECEIPT",
+                idempotency_key=intent.idempotency_key,
+                check_id=tool_intent.action.check_id,
+                argv_digest=Sha256DigestText(str(bounded["argv_digest"])),
+                snapshot_digest=tool_intent.snapshot_digest,
+                receipt_digest=Sha256DigestText(str(bounded["receipt_digest"])),
+                run_id=intent.run_id,
+                settled_sequence=AuditSequence(intent.recorded_sequence + 1),
+                applicable_revision_digests=intent.applicable_revision_digests,
+                completion_proof_json=proof,
+                completion_proof_digest=sha256_digest(proof),
+            )
+        return _unavailable_resolution_observation(intent, recovery_generation)
 
 
 def _unavailable_resolution_observation(
