@@ -149,6 +149,25 @@ def observation(
         }
         if action_class is RecoveryActionClass.MODEL:
             completed_json = defaults["normalized_completion_json"]
+        elif action_class is RecoveryActionClass.PATCH:
+            completed_json = canonical_json(
+                {
+                    "code": "PATCH_APPLIED",
+                    "run_id": defaults["run_id"],
+                    "intent_id": "intent-1",
+                    "bounded_payload": {},
+                }
+            )
+        elif action_class is RecoveryActionClass.CHECK:
+            completed_json = canonical_json(
+                {
+                    "code": "CHECK_PASSED",
+                    "run_id": defaults["run_id"],
+                    "intent_id": "intent-1",
+                    "passed": True,
+                    "bounded_payload": {},
+                }
+            )
         else:
             proof = {"state": state}
             proof.update({name: defaults[name] for name in proof_fields[action_class]})

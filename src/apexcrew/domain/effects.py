@@ -999,6 +999,21 @@ class RecoveryObservation(FrozenDocument):
                 assert self.normalized_completion_json is not None
                 if self.completion_proof_json != self.normalized_completion_json:
                     raise ValueError("MODEL_COMPLETION_OUTPUT_MISMATCH")
+            elif self.kind in {RecoveryActionClass.PATCH, RecoveryActionClass.CHECK}:
+                from apexcrew.domain.tools import ToolResult
+
+                try:
+                    tool_result = ToolResult.model_validate_json(self.completion_proof_json)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("TOOL_COMPLETION_PROOF_INVALID") from exc
+                if tool_result.run_id != self.run_id or tool_result.intent_id != self.intent_id:
+                    raise ValueError("TOOL_COMPLETION_PROOF_BINDING_MISMATCH")
+                expected_codes = {
+                    RecoveryActionClass.PATCH: {"PATCH_APPLIED"},
+                    RecoveryActionClass.CHECK: {"CHECK_PASSED", "CHECK_FAILED"},
+                }
+                if tool_result.code not in expected_codes[self.kind]:
+                    raise ValueError("TOOL_COMPLETION_PROOF_CODE_INVALID")
             else:
                 proof = {"state": self.state}
                 proof.update({name: getattr(self, name) for name in proof_fields[self.kind]})
