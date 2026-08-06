@@ -537,6 +537,10 @@ class RecoveryObservation(FrozenDocument):
     admin_binding_digest: Sha256DigestText | None = None
     path_identity: str | None = None
     gitfile_digest: Sha256DigestText | None = None
+    pending_action_id: str | None = None
+    grant_id: str | None = None
+    expected_prestate_digest: Sha256DigestText | None = None
+    action_binding_digest: Sha256DigestText | None = None
 
     @property
     def action_class(self) -> RecoveryActionClass:
@@ -609,13 +613,111 @@ class RecoveryObservation(FrozenDocument):
                 "path_identity",
                 "gitfile_digest",
             ),
-            RecoveryActionClass.GRANTED_ACTION: (),
+            RecoveryActionClass.GRANTED_ACTION: (
+                "pending_action_id",
+                "grant_id",
+                "expected_prestate_digest",
+                "action_binding_digest",
+            ),
+        }
+        allowed: dict[RecoveryActionClass, frozenset[str]] = {
+            RecoveryActionClass.MODEL: frozenset(
+                {
+                    "request_digest",
+                    "idempotency_key",
+                    "provider_response_id",
+                    "returned_model_id",
+                    "schema_digest",
+                    "usage_json",
+                    "normalized_completion_digest",
+                    "reservation_charge",
+                }
+            ),
+            RecoveryActionClass.READ_SEARCH: frozenset(
+                {
+                    "idempotency_key",
+                    "snapshot_digest",
+                    "scope_digest",
+                    "ordering_digest",
+                    "bounded_result_json",
+                    "bounded_result_digest",
+                }
+            ),
+            RecoveryActionClass.PATCH: frozenset(
+                {"idempotency_key", "expected_pre_tree_digest", "observed_post_tree_digest"}
+            ),
+            RecoveryActionClass.CHECK: frozenset(
+                {"idempotency_key", "check_id", "argv_digest", "snapshot_digest", "receipt_digest"}
+            ),
+            RecoveryActionClass.PRIVATE_REF: frozenset(
+                {
+                    "idempotency_key",
+                    "repository_id",
+                    "repository_instance_digest",
+                    "ref_name",
+                    "registration_digest",
+                    "old_oid",
+                    "prepared_oid",
+                    "current_oid",
+                }
+            ),
+            RecoveryActionClass.TARGET_CAS: frozenset(
+                {
+                    "idempotency_key",
+                    "repository_id",
+                    "repository_instance_digest",
+                    "ref_name",
+                    "registration_digest",
+                    "target_safety_digest",
+                    "old_oid",
+                    "prepared_oid",
+                    "current_oid",
+                }
+            ),
+            RecoveryActionClass.TARGET_RESERVATION: frozenset(
+                {
+                    "idempotency_key",
+                    "registration_identity",
+                    "reservation_operation",
+                    "admin_binding_digest",
+                    "path_identity",
+                    "gitfile_digest",
+                }
+            ),
+            RecoveryActionClass.GRANTED_ACTION: frozenset(
+                {
+                    "idempotency_key",
+                    "pending_action_id",
+                    "grant_id",
+                    "expected_prestate_digest",
+                    "action_binding_digest",
+                }
+            ),
         }
         if self.recovery_generation < 1:
             raise ValueError("RECOVERY_GENERATION_INVALID")
+        common = {
+            "kind",
+            "intent_id",
+            "recovery_generation",
+            "source_payload_digest",
+            "state",
+            "observation_digest",
+        }
+        for field_name in type(self).model_fields:
+            if (
+                field_name not in common
+                and field_name not in allowed[self.kind]
+                and getattr(self, field_name) is not None
+            ):
+                raise ValueError(f"{self.kind}_OBSERVATION_FIELD_FORBIDDEN:{field_name}")
         for field_name in required[self.kind]:
             if getattr(self, field_name) is None:
                 raise ValueError(f"{self.kind}_OBSERVATION_FIELD_REQUIRED:{field_name}")
+        if self.state in {"EXACT_PRE", "BOTH_PRESENT_UNLOCKED"} and (
+            self.kind is not RecoveryActionClass.MODEL and not self.idempotency_key
+        ):
+            raise ValueError("RETRY_IDEMPOTENCY_KEY_REQUIRED")
         if (
             self.kind is RecoveryActionClass.MODEL
             and self.state == "EXACT_COMPLETION"
@@ -671,6 +773,9 @@ class RecoveryDecision:
     successor: str | None = None
     prestate_digest: Sha256DigestText | None = None
     idempotency_key: str | None = None
+    effect_result: EffectResult | None = None
+    settled_sequence: AuditSequence | None = None
+    applicable_revision_digests: ApplicableRevisionDigests | None = None
 
     def __post_init__(self) -> None:
         if self.kind is RecoveryDecisionKind.COMPLETED and self.result_digest is None:
@@ -687,6 +792,46 @@ class RecoveryDecision:
             RecoveryDecisionKind.INDETERMINATE,
         } and (self.result_digest is not None or self.bounded_result_json is not None):
             raise ValueError("NON_RESULT_DECISION_CARRIES_RESULT")
+
+
+def _exact_prestate_digest(observation: RecoveryObservation) -> Sha256DigestText:
+    if observation.kind is RecoveryActionClass.PATCH:
+        assert observation.expected_pre_tree_digest is not None
+        return observation.expected_pre_tree_digest
+    if observation.kind is RecoveryActionClass.CHECK:
+        assert observation.snapshot_digest is not None
+        return observation.snapshot_digest
+    if observation.kind is RecoveryActionClass.GRANTED_ACTION:
+        assert observation.expected_prestate_digest is not None
+        return observation.expected_prestate_digest
+    if observation.kind in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
+        return sha256_digest(
+            canonical_json(
+                {
+                    "current_oid": observation.current_oid,
+                    "old_oid": observation.old_oid,
+                    "ref_name": observation.ref_name,
+                    "registration_digest": observation.registration_digest,
+                    "repository_id": observation.repository_id,
+                    "repository_instance_digest": observation.repository_instance_digest,
+                    "target_safety_digest": observation.target_safety_digest,
+                }
+            )
+        )
+    return observation.observation_digest
+
+
+def abandon_observation(observation: RecoveryObservation, successor: str) -> RecoveryDecision:
+    if observation.kind is RecoveryActionClass.MODEL:
+        raise ValueError("MODEL_ABANDON_REQUIRES_OWNER_FAILURE")
+    if observation.state not in {"EXACT_PRE", "BOTH_ABSENT", "EXACT_SNAPSHOT", "STALE"}:
+        raise ValueError("ABANDON_EFFECT_NOT_PROVEN")
+    return RecoveryDecision(
+        RecoveryDecisionKind.ABANDONED,
+        observation.kind,
+        "NO_AUTHORITATIVE_EFFECT",
+        successor=successor,
+    )
 
 
 def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
@@ -731,7 +876,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
                 observation.kind,
                 state,
-                prestate_digest=observation.observation_digest,
+                prestate_digest=_exact_prestate_digest(observation),
                 idempotency_key=observation.idempotency_key,
             )
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
@@ -742,7 +887,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                     RecoveryDecisionKind.RETRY_SAME_INTENT,
                     observation.kind,
                     "EXACT_PRE",
-                    prestate_digest=observation.observation_digest,
+                    prestate_digest=_exact_prestate_digest(observation),
                     idempotency_key=observation.idempotency_key,
                 )
             return RecoveryDecision(
@@ -751,19 +896,32 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 state,
                 result_digest=observation.observation_digest,
             )
-        if state in {"BOTH_PRESENT_LOCKED", "ADMIN_ONLY", "PATH_ONLY"}:
+        if observation.reservation_operation == "CREATE" and state == "BOTH_PRESENT_LOCKED":
             return RecoveryDecision(
                 RecoveryDecisionKind.COMPLETED,
                 observation.kind,
                 state,
                 result_digest=observation.observation_digest,
             )
+        if observation.reservation_operation == "CLEANUP" and state in {
+            "BOTH_PRESENT_LOCKED",
+            "BOTH_PRESENT_UNLOCKED",
+            "ADMIN_ONLY",
+            "PATH_ONLY",
+        }:
+            return RecoveryDecision(
+                RecoveryDecisionKind.RETRY_SAME_INTENT,
+                observation.kind,
+                "EXACT_CLEANUP_PRE",
+                prestate_digest=_exact_prestate_digest(observation),
+                idempotency_key=observation.idempotency_key,
+            )
         if state == "BOTH_PRESENT_UNLOCKED":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
                 observation.kind,
                 "EXACT_UNLOCKED",
-                prestate_digest=observation.observation_digest,
+                prestate_digest=_exact_prestate_digest(observation),
                 idempotency_key=observation.idempotency_key,
             )
         if state == "MIXED":
@@ -782,7 +940,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
                 observation.kind,
                 state,
-                prestate_digest=observation.observation_digest,
+                prestate_digest=_exact_prestate_digest(observation),
                 idempotency_key=observation.idempotency_key,
             )
         if state == "TARGET_UNSAFE":
@@ -806,7 +964,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
                 observation.kind,
                 state,
-                prestate_digest=observation.observation_digest,
+                prestate_digest=_exact_prestate_digest(observation),
                 idempotency_key=observation.idempotency_key,
             )
         if state == "THIRD_STATE":

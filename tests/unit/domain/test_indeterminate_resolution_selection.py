@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from apexcrew.domain.indeterminate import ResolutionSelection, UnresolvedIntentSet
+from apexcrew.domain.effects import sha256_digest
+from apexcrew.domain.indeterminate import (
+    ResolutionSelection,
+    UnresolvedIntentBinding,
+    UnresolvedIntentSet,
+)
 from apexcrew.domain.types import IntentId
 
 
@@ -38,3 +43,27 @@ def test_unresolved_set_rejects_duplicates_and_malformed_digest() -> None:
             resolution="FAIL_RUN",
             unresolved_set_digest="not-a-sha256-digest",
         )
+
+
+def test_unresolved_set_digest_includes_member_generation_and_payload() -> None:
+    first = UnresolvedIntentSet.from_members(
+        (
+            UnresolvedIntentBinding(
+                intent_id="intent-1", recovery_generation=1, intent_digest=sha256_digest("one")
+            ),
+            UnresolvedIntentBinding(
+                intent_id="intent-2", recovery_generation=1, intent_digest=sha256_digest("two")
+            ),
+        )
+    )
+    changed = UnresolvedIntentSet.from_members(
+        (
+            UnresolvedIntentBinding(
+                intent_id="intent-1", recovery_generation=2, intent_digest=sha256_digest("one")
+            ),
+            UnresolvedIntentBinding(
+                intent_id="intent-2", recovery_generation=1, intent_digest=sha256_digest("two")
+            ),
+        )
+    )
+    assert first.set_digest != changed.set_digest

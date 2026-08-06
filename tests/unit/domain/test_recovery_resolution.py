@@ -7,6 +7,7 @@ from apexcrew.domain.effects import (
     RecoveryActionClass,
     RecoveryDecisionKind,
     RecoveryObservation,
+    abandon_observation,
     recover_observation,
     sha256_digest,
 )
@@ -56,6 +57,69 @@ def observation(
         defaults.setdefault("bounded_result_digest", BOUNDED_DIGEST)
     if state == "EXACT_RECEIPT":
         defaults.setdefault("receipt_digest", RESULT)
+    allowed = {
+        RecoveryActionClass.MODEL: {
+            "request_digest",
+            "idempotency_key",
+            "provider_response_id",
+            "returned_model_id",
+            "schema_digest",
+            "usage_json",
+            "normalized_completion_digest",
+            "reservation_charge",
+        },
+        RecoveryActionClass.READ_SEARCH: {
+            "idempotency_key",
+            "snapshot_digest",
+            "scope_digest",
+            "ordering_digest",
+            "bounded_result_json",
+            "bounded_result_digest",
+        },
+        RecoveryActionClass.PATCH: {
+            "idempotency_key",
+            "expected_pre_tree_digest",
+            "observed_post_tree_digest",
+        },
+        RecoveryActionClass.CHECK: {
+            "idempotency_key",
+            "check_id",
+            "argv_digest",
+            "snapshot_digest",
+            "receipt_digest",
+        },
+        RecoveryActionClass.PRIVATE_REF: {
+            "idempotency_key",
+            "repository_id",
+            "repository_instance_digest",
+            "ref_name",
+            "registration_digest",
+            "old_oid",
+            "prepared_oid",
+            "current_oid",
+        },
+        RecoveryActionClass.TARGET_CAS: {
+            "idempotency_key",
+            "repository_id",
+            "repository_instance_digest",
+            "ref_name",
+            "registration_digest",
+            "target_safety_digest",
+            "old_oid",
+            "prepared_oid",
+            "current_oid",
+        },
+        RecoveryActionClass.TARGET_RESERVATION: {
+            "idempotency_key",
+            "registration_identity",
+            "reservation_operation",
+            "admin_binding_digest",
+            "path_identity",
+            "gitfile_digest",
+        },
+        RecoveryActionClass.GRANTED_ACTION: set(),
+    }
+    defaults = {key: value for key, value in defaults.items() if key in allowed[action_class]}
     return RecoveryObservation.create(
         kind=action_class,
         intent_id=IntentId("intent-1"),
@@ -176,6 +240,19 @@ def test_patch_third_state_is_conflict() -> None:
     )
 
 
+def test_abandon_requires_proven_no_authoritative_effect() -> None:
+    decision = abandon_observation(
+        observation(RecoveryActionClass.PATCH, "EXACT_PRE"), "PAUSED/PATCH_ABANDONED"
+    )
+    assert decision.kind == RecoveryDecisionKind.ABANDONED
+    assert decision.successor == "PAUSED/PATCH_ABANDONED"
+
+
+def test_model_abandon_is_owner_failure_not_generic_effect_abandon() -> None:
+    with pytest.raises(ValueError, match="MODEL_ABANDON_REQUIRES_OWNER_FAILURE"):
+        abandon_observation(observation(RecoveryActionClass.MODEL, "UNAVAILABLE"), "PAUSED")
+
+
 def test_check_exact_receipt_collapses_duplicate() -> None:
     decision = recover_observation(
         observation(
@@ -265,3 +342,14 @@ def test_reservation_cleanup_absence_is_already_complete() -> None:
         )
     )
     assert decision.kind == RecoveryDecisionKind.COMPLETED
+
+
+def test_reservation_cleanup_locked_state_requires_exact_cleanup_retry() -> None:
+    decision = recover_observation(
+        observation(
+            RecoveryActionClass.TARGET_RESERVATION,
+            "BOTH_PRESENT_LOCKED",
+            reservation_operation="CLEANUP",
+        )
+    )
+    assert decision.kind == RecoveryDecisionKind.RETRY_SAME_INTENT

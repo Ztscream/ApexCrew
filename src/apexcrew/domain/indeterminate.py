@@ -14,6 +14,18 @@ class IndeterminateResolution(RuntimeError):
     pass
 
 
+class UnresolvedIntentBinding(FrozenDocument):
+    intent_id: str = Field(min_length=1)
+    recovery_generation: int = Field(ge=1)
+    intent_digest: Sha256DigestText
+
+    @model_validator(mode="after")
+    def validate_member(self) -> Self:
+        if self.intent_id != self.intent_id.strip():
+            raise ValueError("UNRESOLVED_SET_MEMBER_INVALID")
+        return self
+
+
 class ResolutionSelection(FrozenDocument):
     resolution: Literal[
         "RECONCILE_OBSERVED",
@@ -49,6 +61,7 @@ class ResolutionSelection(FrozenDocument):
 class UnresolvedIntentSet(FrozenDocument):
     intents: tuple[str, ...] = Field(min_length=2)
     set_digest: Sha256DigestText
+    member_bindings: tuple[UnresolvedIntentBinding, ...] = ()
     status: Literal["INDETERMINATE"] = "INDETERMINATE"
 
     @classmethod
@@ -66,11 +79,42 @@ class UnresolvedIntentSet(FrozenDocument):
             set_digest=Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest()),
         )
 
+    @classmethod
+    def from_members(cls, members: tuple[UnresolvedIntentBinding, ...]) -> Self:
+        intents = tuple(member.intent_id for member in members)
+        if len(intents) < 2:
+            raise ValueError("MULTIPLE_INTENTS_REQUIRED")
+        payload = json.dumps(
+            [
+                member.model_dump(mode="json")
+                for member in sorted(members, key=lambda item: item.intent_id)
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        return cls(
+            intents=tuple(sorted(intents)),
+            member_bindings=tuple(sorted(members, key=lambda item: item.intent_id)),
+            set_digest=Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest()),
+        )
+
     @model_validator(mode="after")
     def validate_set(self) -> Self:
         if self.intents != tuple(sorted(set(self.intents))):
             raise ValueError("UNRESOLVED_SET_NOT_CANONICAL")
-        payload = json.dumps(self.intents, separators=(",", ":"), ensure_ascii=True)
+        if self.member_bindings:
+            binding_ids = tuple(member.intent_id for member in self.member_bindings)
+            if binding_ids != self.intents:
+                raise ValueError("UNRESOLVED_SET_BINDINGS_MISMATCH")
+            payload = json.dumps(
+                [member.model_dump(mode="json") for member in self.member_bindings],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        else:
+            payload = json.dumps(self.intents, separators=(",", ":"), ensure_ascii=True)
         expected = "sha256:" + sha256(payload.encode()).hexdigest()
         if self.set_digest != expected:
             raise ValueError("UNRESOLVED_SET_DIGEST_MISMATCH")
