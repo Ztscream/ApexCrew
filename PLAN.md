@@ -30548,7 +30548,7 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 
 **Objective:** Implement action-class recovery, exact member/set-bound `INDETERMINATE` resolution, and exact path-only/admin-only terminal reservation cleanup while preserving Permit gating, dispatch closure, and terminal Run semantics.
 
-**Execution plan:** The detailed files, red/green selectors, transaction boundaries, review order, and final verification are in `docs/superpowers/plans/2026-08-06-apexcrew-recovery-resolution.md`. The implementation is split into independent worktrees and commits for domain classification, state/control resolution, runtime wiring, and asymmetric cleanup. Each task must complete spec review before quality review, and each critical/high finding must be fixed before the next task.
+**Execution plan:** The detailed files, closed types, observer boundaries, crash/Permit bindings, red/green selectors, transaction boundaries, worktree topology, review order, and final verification are in docs/superpowers/plans/2026-08-06-apexcrew-recovery-resolution.md. The implementation uses the four named sequential branches/worktrees in that plan. Each task must complete SPEC review, all critical/high corrections, quality review, all critical/high corrections, and an immediate ledger update before the next task.
 
 **M1-R4.1 Ledger:**
 
@@ -30558,6 +30558,12 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 | R4.1-02 atomic state/control resolution | NOT STARTED | pending | pending document review and red/green |
 | R4.1-03 runtime resolution/production wiring | NOT STARTED | pending | pending document review and red/green |
 | R4.1-04 asymmetric terminal cleanup | NOT STARTED | pending | pending document review and red/green |
-| R4.1-05 independent reviews/final verification | NOT STARTED | pending | offline green; live remains owner-authorized |
+| R4.1-05 final verification and delivery evidence | NOT STARTED | pending | pending observed offline/build evidence; live remains owner-authorized |
 
 **Document review gate:** pending independent reviewer, pending reviewed `PLAN.md` digest, pending owner `M1 GO`.
+
+### M1-R4.1 Review Correction Authority
+
+The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, reviewed base, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include Plan-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
+
+The resolution design is closed: typed action-class observations are constructed only by internal runtime adapters; CommandEnvelope carries only strategy and exact member/set bindings; RuntimePermit persists the exact resolution subject; member resolution and set-bound FAIL_RUN/CANCEL_RUN are separate atomic store operations; the complete set is re-observed before a set-bound close; Permit replay/crash cases, active-time ownership, Audit redaction, and RunQueries redaction are tested. Asymmetric cleanup owns both no-follow OS adapters and SQLite/memory settlement and deletes only exact PATH_ONLY or ADMIN_ONLY identity; all mixed/third/unobservable states preserve terminal Run state with zero deletion.

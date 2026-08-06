@@ -14,7 +14,7 @@
 
 - Modify `src/apexcrew/domain/effects.py` to classify each intent by action class, compute a canonical unresolved set, and expose safe recovery decisions without guessing external outcomes.
 - Modify `src/apexcrew/domain/indeterminate.py` to validate member and set resolution bindings and precedence.
-- Modify `src/apexcrew/application/control.py` and `src/apexcrew/domain/commands.py` only where needed to validate `ResolveIndeterminatePayload` and issue its `INDETERMINATE` Runtime Permit.
+- Modify `src/apexcrew/application/control.py` and `src/apexcrew/domain/commands.py` to validate `ResolveIndeterminatePayload`, construct the exact resolution subject, and issue its `INDETERMINATE` Runtime Permit.
 - Modify `src/apexcrew/application/runtime.py` to execute one member resolution per consumed Permit and return the correct successor stop.
 - Modify `src/apexcrew/adapters/state/sqlite.py` and `src/apexcrew/adapters/state/memory.py` to settle, retry, or abandon one exact intent atomically, update owning task/ref/candidate state, and preserve the unresolved set digest.
 - Modify `src/apexcrew/application/composition.py` to install the concrete recovery strategy in the production bundle.
@@ -88,7 +88,7 @@ uv run --python 3.12 pytest tests/unit/application/test_runtime_resolution.py te
 ```
 
 Expected: FAIL because `ResolutionRuntime` currently only calls `reconcile()` and pauses.
-- [ ] **Step 3: Implement a concrete resolution port** that obtains the current unresolved set, asks the repository/model/tool observer for an authoritative observation, and delegates the validated transition to the store. Normal runtime recovery may settle observable effects automatically; only an accepted human strategy may retry or abandon a previously indeterminate effect.
+- [ ] **Step 3: Implement RecoveryObservationPort and a concrete resolution registry** that obtains the current unresolved set, dispatches to the named planning snapshot, tool, ref/CAS, reservation, or provider lookup adapter, and delegates the validated internal observation to the store. Normal runtime recovery may settle observable effects automatically; only an accepted human strategy may retry or abandon a previously indeterminate effect.
 - [ ] **Step 4: Wire the concrete strategy registry into `build_application_bundle`.** Remove the reachable deferred recovery adapter from the production graph while keeping test-only fail-closed fixtures explicit.
 - [ ] **Step 5: Re-run focused tests plus composition contracts**, then run mypy, Ruff, and `git diff --check`.
 - [ ] **Step 6: Commit** with `feat(runtime): execute exact indeterminate resolutions`.
@@ -122,7 +122,7 @@ Expected: FAIL because cleanup currently requires registration and path to coexi
 - Modify: `AGENT_LOG.md`
 - Modify: `README.md`
 - Modify: `SECURITY.md`
-- Test: `tests/integration/test_live_cli_run_lifecycle.py` only for the existing opt-in selector if present
+- Test: `tests/integration/test_live_cli_run_lifecycle.py` for the existing opt-in selector
 
 - [ ] **Step 1: Run spec-compliance review** against SPEC 5.8, 5.9, 10.2, and the R4.1 plan. Fix every critical/high finding in a separate correction commit.
 - [ ] **Step 2: Run quality review** after spec review is green. Fix every critical/high finding in a separate correction commit.
@@ -143,7 +143,27 @@ Expected: offline tests and static checks pass; secret scan prints `secret-scan:
 
 ## Self-Review
 
-- SPEC 5.8 coverage: Tasks 1-3 cover action-class recovery, exact set digest/generation, member resolution, safe retry/abandon, and precedence; Task 4 covers the reservation cleanup clause of SPEC 5.9.
+- SPEC 5.8 coverage: Tasks 1-3 cover action-class recovery, exact set digest/generation, member resolution, safe retry/abandon, and precedence; Task 4 covers the reservation cleanup clauses in SPEC 5.3, 6.1, and 10.4.
 - No automatic model retry is introduced. Model uncertainty remains indeterminate unless an authoritative provider lookup returns the exact response.
 - No generic Git cleanup or broad OS deletion is introduced. All deletion stays tied to one reservation identity and verified bytes.
 - The unresolved implementation boundary is intentionally the authorized real DeepSeek provider request; ordinary verification stays offline.
+
+## R4.1 Document Review Correction Addendum
+
+This addendum supersedes any less-specific wording above and is binding for execution.
+
+The four implementation tasks use these exact sequential worktrees: R4.1-01 uses branch codex/m1-r4-1-recovery-domain at .worktrees/m1-r4-1-recovery-domain from reviewed base 4ba13b8; R4.1-02 uses codex/m1-r4-2-resolution-state at .worktrees/m1-r4-2-resolution-state from the reviewed R4.1-01 correction commit; R4.1-03 uses codex/m1-r4-3-resolution-runtime at .worktrees/m1-r4-3-resolution-runtime from the reviewed R4.1-02 correction commit; R4.1-04 uses codex/m1-r4-4-asymmetric-cleanup at .worktrees/m1-r4-4-asymmetric-cleanup from the reviewed R4.1-03 correction commit. Each task has one implementation commit plus separate correction commits and one docs-only ledger commit. No push is authorized.
+
+Each task is blocked until this serial gate completes: implementation red/green evidence; implementation commit with Plan-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review body fields; independent SPEC review; correction commit for every critical/high issue; independent quality review; correction commit for every critical/high issue; immediate PLAN.md and AGENT_LOG.md ledger update. The next task worktree is created only after the gate.
+
+The closed domain boundary is explicit. RecoveryActionClass is derived from the persisted ModelRequestIntent, ToolIntent, RefCasIntent, TargetReservationCreationIntent, GrantedActionIntent, or typed effect payload. RecoveryObservation is a closed internal union for model normalized response/provider lookup, read/search snapshot and scope, patch pre/post tree, exact check receipt and argv, ref/CAS repository-registration-target-safety-OID tuple, and reservation registration/path identity. No CommandEnvelope field can construct an observation. The store accepts only an internal ApplyResolutionRequest carrying the consumed Permit subject and an observer-created observation.
+
+The Permit resolution subject is persisted and includes selection, intent_id when member-bound, recovery_generation when member-bound, and unresolved_set_digest. Control validates the complete current set for FAIL_RUN and CANCEL_RUN, stores the full envelope digest, and issues exactly one INDETERMINATE Permit. A different command cannot replace an unconsumed Permit; an identical replay can only deliver that original Permit; a consumed Permit cannot issue another. Crash tests cover both after-command-commit/before-consumption and after-consumption.
+
+FAIL_RUN and CANCEL_RUN are set-bound atomic store operations, not member shortcuts. The store re-observes every member internally and rejects the operation unless every member is proven abandonable. On success it closes the complete set in one expected-sequence transaction, applies objective target completion before persisted cancel/pause before class-specific successor, and preserves the unresolved set on denial. Member resolution updates only its owner and leaves dispatch closed until the last member closes.
+
+The action-class matrix is mandatory: model uncertainty is never automatic retry; read/search replays only an unchanged snapshot/scope with canonical bounded ordering and returns no stale content; patch uses exact pre/post tree digests; checks rerun the exact typed argv and collapse receipt idempotency; private-ref and target-CAS require repository identity, direct ref, registration digest, target-safety digest, and old/prepared/current OIDs; target reservation creation/cleanup requires exact reservation observations. Every matrix row has a named red/green test before implementation.
+
+Task 3 must test RuntimeService Permit consumption, owner retention, active-time interval closure, budget/interrupt barrier, sanitized Audit, and RunQueries redaction. Task 4 owns adapters/state for asymmetric cleanup: adapters/system.py, no_follow.py, no_follow_posix.py, no_follow_windows.py, repository/git.py, composition.py, runtime.py, sqlite.py, and memory.py. PATH_ONLY and ADMIN_ONLY use exact handle-bound deletion; MIXED, third, altered, and unobservable states delete nothing and preserve terminal Run state. No generic prune or recursive computed-path deletion is allowed.
+
+Task 5 includes uv sync --frozen --all-groups, make test, make lint, make build, make secret-scan, full pytest, mypy, Ruff, format check, diff check, and fresh-process CLI/reopen verification. Existing live selectors are recorded as skipped unless explicit owner authorization and APEXCREW_LIVE_SMOKE=1 produce observed one-request evidence; skipped live output never changes an offline or release status to green.
