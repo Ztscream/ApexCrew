@@ -30564,6 +30564,15 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 
 ### M1-R4.1 Review Correction Authority
 
-The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, reviewed base, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include Plan-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
+The R4.1 task chain is independently auditable through this required map. Each SHA is filled from observed commits before the next task worktree is created.
+
+| Task | PR | Worktree | Final-Reviewed-Base-SHA | Implementation-SHA | Spec-Review-SHA | Spec-Correction-SHAs | Quality-Review-SHA | Quality-Correction-SHAs | Ledger-SHA |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | bc8f7e0 | pending | pending | pending | pending | pending | pending |
+| R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
+| R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | pending | pending | pending | pending | pending | pending | pending |
+| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | pending | pending | pending | pending | pending | pending | pending |
+
+The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 
 The resolution design is closed: typed action-class observations are constructed only by internal runtime adapters; CommandEnvelope carries only strategy and exact member/set bindings; RuntimePermit persists the exact resolution subject; member resolution and set-bound FAIL_RUN/CANCEL_RUN are separate atomic store operations; the complete set is re-observed before a set-bound close; Permit replay/crash cases, active-time ownership, Audit redaction, and RunQueries redaction are tested. Asymmetric cleanup owns both no-follow OS adapters and SQLite/memory settlement and deletes only exact PATH_ONLY or ADMIN_ONLY identity; all mixed/third/unobservable states preserve terminal Run state with zero deletion.
