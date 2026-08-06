@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 from base64 import b32encode
@@ -85,6 +86,8 @@ def _failed_invariant(error: BaseException) -> str:
         return "CONTROL_PATH_UNSAFE"
     if isinstance(error, (subprocess.TimeoutExpired, TimeoutError, UnicodeError, ValueError)):
         return "REPOSITORY_BOOTSTRAP_REJECTED"
+    if isinstance(error, RuntimeError) and str(error) == "LIVE_PROVIDER_NOT_AUTHORIZED":
+        return "LIVE_PROVIDER_NOT_AUTHORIZED"
     return "BOOTSTRAP_FAILED"
 
 
@@ -196,7 +199,9 @@ def _open_delivery_bundle(root: Path) -> tuple[ControlPathGuard, ApplicationBund
     try:
         connection = guard.open_existing_database_read_only()
         connection.close()
-        bundle = build_application_bundle(root.resolve())
+        bundle = build_application_bundle(
+            root.resolve(), allow_live_provider=os.environ.get("APEXCREW_LIVE_SMOKE") == "1"
+        )
     except BaseException:
         guard.close()
         raise

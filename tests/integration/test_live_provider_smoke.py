@@ -57,10 +57,34 @@ def test_missing_live_credential_fails_before_dispatch() -> None:
     model = build_model_port(
         model_configuration=default_revision_documents().model_configuration,
         budget=default_revision_documents().budget,
+        allow_live_provider=True,
         credential_source=MemoryCredentialStore(),
         client_factory=fail_if_dispatched,
     )
 
     with pytest.raises(ModelCredentialError, match="MODEL_CREDENTIAL_MISSING"):
         model.complete(_request())
+    assert not dispatched
+
+
+def test_live_provider_requires_explicit_runtime_authorization() -> None:
+    dispatched = False
+
+    def fail_if_dispatched(**_: object) -> object:
+        nonlocal dispatched
+        dispatched = True
+        raise AssertionError("unauthorized live provider must not construct a client")
+
+    model = build_model_port(
+        model_configuration=default_revision_documents().model_configuration,
+        budget=default_revision_documents().budget,
+        allow_live_provider=False,
+        credential_source=MemoryCredentialStore({"deepseek": "test-key"}),
+        client_factory=fail_if_dispatched,
+    )
+
+    result = model.complete(_request())
+
+    assert result.kind == "UNKNOWN_OUTCOME"
+    assert result.reason_code == "LIVE_PROVIDER_NOT_AUTHORIZED"
     assert not dispatched

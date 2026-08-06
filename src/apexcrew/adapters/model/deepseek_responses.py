@@ -207,6 +207,7 @@ class DeepSeekResponsesAdapter:
         max_input_tokens: int | None = None,
         max_output_tokens: int | None = None,
         provider_storage_enabled: bool = False,
+        live_provider_authorized: bool = False,
     ) -> None:
         self._credentials = credential_source
         self._response_schemas = dict(response_schemas)
@@ -222,6 +223,7 @@ class DeepSeekResponsesAdapter:
         self._max_input_tokens = max_input_tokens
         self._max_output_tokens = max_output_tokens
         self._provider_storage_enabled = provider_storage_enabled
+        self._live_provider_authorized = live_provider_authorized
 
     @classmethod
     def from_approved_configuration(
@@ -232,6 +234,7 @@ class DeepSeekResponsesAdapter:
         credential_source: ModelCredentialPort,
         response_schemas: Mapping[str, Mapping[str, object]],
         client_factory: ClientFactory | None = None,
+        live_provider_authorized: bool = False,
     ) -> DeepSeekResponsesAdapter:
         """Build only from a complete, already validated revision pair."""
         if model_configuration.provider != "deepseek_responses":
@@ -270,9 +273,12 @@ class DeepSeekResponsesAdapter:
             max_input_tokens=settings.max_input_tokens,
             max_output_tokens=settings.max_output_tokens,
             provider_storage_enabled=settings.provider_storage_enabled,
+            live_provider_authorized=live_provider_authorized,
         )
 
     def complete(self, request: ModelRequest) -> ProviderAttemptResult:
+        if not self._live_provider_authorized:
+            return ProviderAttemptResult.unknown("LIVE_PROVIDER_NOT_AUTHORIZED")
         schema = self._response_schemas.get(request.tool_schema_digest)
         if schema is None:
             return ProviderAttemptResult.unknown("TOOL_SCHEMA_MISSING")

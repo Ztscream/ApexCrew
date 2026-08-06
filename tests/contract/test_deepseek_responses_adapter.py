@@ -121,6 +121,7 @@ def _adapter(
             response_schemas={SCHEMA_DIGEST: RESPONSE_SCHEMA},
             pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
             client_factory=factory,
+            live_provider_authorized=True,
             allowed_returned_model_ids=allowed_returned_model_ids,
             provider_storage_enabled=provider_storage_enabled,
         ),
@@ -255,6 +256,7 @@ def test_schema_length_constraint_fails_closed() -> None:
         response_schemas={SCHEMA_DIGEST: schema},
         pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
         client_factory=RecordingClientFactory(client),
+        live_provider_authorized=True,
     )
 
     result = adapter.complete(_request())

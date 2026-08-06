@@ -1527,6 +1527,7 @@ def build_application_bundle(
     secret_policy: SecretPathPolicy | None = None,
     response_schemas: Mapping[str, Mapping[str, object]] | None = None,
     client_factory: ClientFactory | None = None,
+    allow_live_provider: bool = False,
 ) -> ApplicationBundle:
     """Build one shared, closeable application object graph."""
     root = root.resolve()
@@ -1550,6 +1551,7 @@ def build_application_bundle(
             credential_source=credential_source,
             response_schemas=response_schemas,
             client_factory=client_factory,
+            allow_live_provider=allow_live_provider,
         )
         authority = AuthorityService(store)
         worker_model = AuthorityModelClient(model, store, authority, SystemUtcClock())
@@ -1652,6 +1654,9 @@ def build_application_bundle(
             model_client=DurableModelClient(model=model, journal=store),
             tools=_ToolSchema(selected_model_configuration.tool_schema_digest),
             phase_drivers=phase_drivers,
+            provider_dispatch_authorized=(
+                selected_model_configuration.provider != "deepseek_responses" or allow_live_provider
+            ),
         )
         queries = RunQueryService(ProjectionService(store))
     except BaseException:

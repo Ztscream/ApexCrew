@@ -84,6 +84,7 @@ def build_model_port(
     credential_source: ModelCredentialPort | None = None,
     response_schemas: Mapping[str, Mapping[str, object]] | None = None,
     client_factory: ClientFactory | None = None,
+    allow_live_provider: bool = False,
 ) -> ModelPort:
     """Select one provider from the exact model configuration revision."""
     if model_configuration.provider == "scripted_mock":
@@ -113,6 +114,7 @@ def build_model_port(
             credential_source=credentials,
             response_schemas=schemas,
             client_factory=client_factory,
+            live_provider_authorized=allow_live_provider,
         )
     except ValueError as error:
         raise ModelFactoryError(str(error)) from error

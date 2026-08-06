@@ -36,7 +36,7 @@ Target Reservation. Cleanup preserves the terminal Run state.
 
 ## 凭据安全配置
 
-The offline suite, the demo, and ordinary delivery commands run without a provider credential. The explicitly gated `live-smoke` target is the only delivery path that drives the real DeepSeek adapter.
+The offline suite, the demo, and ordinary delivery commands run without a provider credential. The real DeepSeek adapter is runtime-gated: only an explicitly authorized `live-smoke` run with `APEXCREW_LIVE_SMOKE=1` may dispatch it; an ordinary `run` is rejected before Permit consumption.
 
 ```text
 uv run --python 3.12 apexcrew credentials set      # hidden interactive input
@@ -99,6 +99,13 @@ The WebUI is a read-only projection, not an execution service.
 ## Status
 
 The frozen specification, reviewed M1 plan amendment, and Stage 4 cold-start gate authorize this implementation slice. M1-M4 are delivered at the SPRINT depth levels recorded in `AGENT_LOG.md`; SKELETON and STUB items remain explicitly bounded.
+
+R4.1-04 asymmetric terminal cleanup is implemented at commit `27f1b81` and has
+passed the offline, packaging, secret-scan, Docker, and fresh-process checks recorded
+in `AGENT_LOG.md`. The deterministic release path is locally verified. A real DeepSeek
+request is deliberately not part of ordinary verification: configure a keyring
+credential and set `APEXCREW_LIVE_SMOKE=1` only when the operator explicitly authorizes
+the one-request live smoke.
 
 ## Accepted v0.1 Boundary
 

@@ -48,15 +48,16 @@ because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
 Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
 builds a restricted digest-pinned argv but does not launch a Docker process.
 
-`DEBT-R4-RECOVERY-001`: the composed resolution boundary currently records
-unsettled effects as `INDETERMINATE` and requires authoritative recovery; it does
-not yet implement the class-specific read, check, file, or ref replay strategies
-from SPEC section 5.8.
+`DEBT-R4-RECOVERY-001`: the R4.1 action-class recovery and exact resolution paths
+are implemented and offline-verified. The remaining boundary is the explicitly
+authorized real-provider request; ordinary verification continues to use
+`ScriptedMockLLM`.
 
-`DEBT-R4-CLEANUP-001`: terminal cleanup executes the exact fully-observed
-registration/path sequence, but exact-admin-only and exact-path-only mixed crash
-states remain fail-closed and require operator repair before a new cleanup retry.
-The terminal Run state is preserved while cleanup is unresolved.
+`DEBT-R4-CLEANUP-001`: terminal cleanup now handles exact path-only and admin-only
+crash states with no-follow, identity/digest-bound deletion. Mixed, altered,
+malformed, and unobservable states remain fail-closed, record a conflict, and
+require operator repair before a new cleanup retry. The terminal Run state is
+preserved while cleanup is unresolved.
 
 The production runtime requires an unconsumed Runtime Permit before attempting
 the per-Run OS lock, then validates and consumes that Permit in the SQLite
@@ -70,3 +71,9 @@ resolves a provider credential. `tests/integration/test_live_provider_smoke.py`
 requires `APEXCREW_LIVE_SMOKE=1`, performs at most one provider request, and does
 not print credential or prompt bytes. The CLI remains the writable control surface;
 WebUI and Pages replay remain read-only projections.
+
+The production composition root passes that gate into the DeepSeek adapter, and
+`CrewRuntime` rechecks it after locating a Runtime Permit but before acquiring
+ownership or consuming the Permit. An unauthorized `run` therefore cannot create
+runtime ownership, consume a Permit, resolve a credential, construct a provider
+client, or dispatch a request.

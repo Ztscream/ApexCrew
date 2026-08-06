@@ -30558,7 +30558,7 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 | R4.1-02 atomic state/control resolution | NOT STARTED | pending | pending document review and red/green |
 | R4.1-03 runtime resolution/production wiring | COMPLETED | `be143bb` | Final correction chain (`9a2f915`, `d2eebf0`, `be143bb`) routes all production observers, binds typed Target-CAS and provider evidence, and uses current Audit sequence; full offline pytest, mypy, Ruff, diff check, independent Spec review, and Quality review are green. |
 | R4.1-04 asymmetric terminal cleanup | COMPLETED | `27f1b81` | Exact PATH_ONLY/ADMIN_ONLY no-follow cleanup, conflict-preserving terminal state, SQLite/memory settlement symmetry, and composed reopen verification. Task selectors: `5 passed, 1 skipped`; full offline pytest reached 100% with exit code 0; mypy, Ruff, format, and diff checks passed. Independent SPEC and quality reviews reported zero Critical/High implementation findings. |
-| R4.1-05 final verification and delivery evidence | NOT STARTED | pending | pending observed offline/build evidence; live remains owner-authorized |
+| R4.1-05 final verification and delivery evidence | NOT STARTED | pending | Verification and live-provider gate correction are staged; ledger closure follows the implementation commit and ordered independent reviews. Real DeepSeek remains explicit owner authorization. |
 
 **Document review gate:** PASS. SPEC reviewer Confucius (019fd4bd-25ed-7cf1-9106-2a30116e9596) and quality/workflow reviewer Ampere (019fd4bd-2a35-7fd0-91bb-e721ade91332) reported zero critical/high findings for e2785e3. Owner M1 GO is recorded from the current user objective. PLAN.md SHA-256: C5D73466F9001698CE303562E9F37C6A52A5AC35FA075C1261CEB94703160909. Companion plan SHA-256: 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
 
@@ -30571,7 +30571,8 @@ The R4.1 task chain is independently auditable through this required map. Each S
 | R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e2785e3 | pending | 019fd4bd-25ed-7cf1-9106-2a30116e9596 | pending | 019fd4bd-2a35-7fd0-91bb-e721ade91332 | pending | pending |
 | R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | `d2eebf0` | `be143bb` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `be143bb` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `be143bb` | `be143bb` |
-| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | `eff0d79` | `27f1b81` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `27f1b81` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `27f1b81` | `520c055` |
+| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | `eff0d79` | `27f1b81` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `27f1b81` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `27f1b81` | `63397ae` |
+| R4.1-05 | PR-R4.1-05 | .worktrees/m1-r4-5-final-verification | `63397ae` | pending | pending | pending | pending | pending | pending |
 
 The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 

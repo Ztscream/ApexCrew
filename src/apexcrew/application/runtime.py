@@ -1285,6 +1285,7 @@ class RuntimeService:
         model_client: DurableModelClient,
         tools: ToolSchemaProvider,
         phase_drivers: RuntimePhaseDriverService,
+        provider_dispatch_authorized: bool = True,
     ) -> None:
         self._store = store
         self._ownership = ownership
@@ -1295,6 +1296,7 @@ class RuntimeService:
         self._model_client = model_client
         self._tools = tools
         self._phase_drivers = phase_drivers
+        self._provider_dispatch_authorized = provider_dispatch_authorized
 
     def _pending_for_reason(self, run_id: RunId, reason: RunStopReason) -> ApprovalPending | None:
         if reason == RunStopReason.AWAITING_PLAN_APPROVAL:
@@ -1320,6 +1322,8 @@ class RuntimeService:
             if str(error) != "RUNTIME_PERMIT_NOT_FOUND":
                 raise
             return _stop_for_state(run_id, state, RunStopReason.NO_RUNTIME_PERMIT)
+        if not self._provider_dispatch_authorized:
+            raise RuntimeError("LIVE_PROVIDER_NOT_AUTHORIZED")
         with self._ownership.acquire(run_id, pending_permit) as owner:
             if owner is None:
                 return _stop_for_state(run_id, state, RunStopReason.ALREADY_RUNNING)

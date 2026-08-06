@@ -2349,3 +2349,80 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   remains: the unobservable adapter test does not instantiate the full TerminalCleanupRuntime;
   the runtime path is covered by the concrete conflict branch and the composed lifecycle suite.
 - No credential, provider, network, live smoke, push, or PR action occurred.
+
+## 2026-08-06 / R4.1-05 final verification and delivery evidence
+
+- **Base/worktree**: `63397ae`, `codex/m1-r4-5-final-verification`,
+  `.worktrees/m1-r4-5-final-verification`.
+- **Subagent**: none; the owner agent performed the docs/evidence collation and
+  the narrowly scoped live-provider gate correction.
+- **Human-Changes**: none.
+- **Changed paths**: `README.md`, `SECURITY.md`, `PLAN.md`, `AGENT_LOG.md`,
+  `src/apexcrew/adapters/model/deepseek_responses.py`,
+  `src/apexcrew/adapters/model/factory.py`,
+  `src/apexcrew/application/composition.py`,
+  `src/apexcrew/application/runtime.py`, `src/apexcrew/delivery/cli.py`,
+  and the three provider/CLI integration test files.
+- **Red evidence**: before the gate correction,
+  `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py::test_live_provider_requires_explicit_runtime_authorization -q`
+  failed with `TypeError: build_model_port() got an unexpected keyword argument
+  'allow_live_provider'`. The CLI gate selector initially reached the generic
+  `BOOTSTRAP_FAILED` mapping; the final correction maps the typed
+  `LIVE_PROVIDER_NOT_AUTHORIZED` invariant.
+- **Green gate evidence**:
+  `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py tests/integration/test_provider_selection.py tests/integration/test_live_cli_run_lifecycle.py::test_cli_run_rejects_unauthorized_deepseek_before_permit_consumption tests/unit/test_cli.py::test_cli_exposes_required_commands_and_safe_terminal_results -q`
+  -> `9 passed`. The unauthorized CLI run leaves the sanitized Run sequence
+  unchanged, so no Runtime Permit is consumed and no provider client is built.
+- **Observed verification**:
+  - `uv sync --frozen --all-groups` -> CPython 3.12.12, locked environment created,
+    48 packages installed.
+  - `make test` -> full pytest reached 100% with exit code 0.
+  - `make lint` -> Ruff format/check and mypy passed; `Success: no issues found in 60 source files`.
+  - `make demo` -> deterministic raw-shell denial, feedback-bound check failure, and
+    freshness-stale events emitted.
+  - `make secret-scan` -> `secret-scan: clean`.
+  - `make web-build` -> static WebUI bundle generated under `dist/webui`.
+  - `make build` -> wheel and source distribution built; Docker image built as
+    `sha256:bcca19a941c9f467f039340f31410a229ce794357cd124e35ad26ce85d60e471`.
+  - `docker run --rm --network=none apexcrew-executor:local --help` -> exit code 0;
+    image user `1000:1000`, labels `org.apexcrew.network=none` and
+    `org.apexcrew.docker_socket=denied` observed.
+  - `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q` -> `4 passed, 1 skipped`; the skip is the owner-authorized live boundary. The current user objective did not authorize credentials or network dispatch, so no real DeepSeek request was made.
+  - Secret-scan evidence for candidate `63397ae862ceecbbff5a7989a533279887c1395c`:
+    scanner SHA-256 `b88b3f12e29cdfc748c5cfe33113709ea2f20acfb8cbacf373ab0d84a487bd59`,
+    rules SHA-256 `6d37723b541169b103d8238bea753f1b32af6a8b87ab41037a785f824f8e93c1`,
+    33 local refs, 2545 reachable objects, result SHA-256
+    `8acd5b960cf6933d3b2a487e068bae52ed14e9d11732d944d1f89af25080851f`,
+    and `secret-scan: clean`.
+  - Exact fresh-process command: create a detached temporary Git repository at
+    `.verification-r41-05-final`, run `uv run --python 3.12 apexcrew init --root
+    .verification-r41-05-final`, then `run-create --target-ref refs/heads/main
+    --goal "fresh-process verification"`, parse its JSON `run_id`, and invoke
+    `show <run_id> --root .verification-r41-05-final` followed by
+    `status --root .verification-r41-05-final`. Observed output was
+    `INITIALIZED`; `RUN_CREATED` with target OID
+    `967fcd632d20b00d4b645401c106d7c6622f633d`; `RUN_VIEW` with
+    `AVAILABLE`, `DRAFT`, and sequence `1`; then `INITIALIZED`. The temporary
+    repository was removed after verification.
+- **Documentation**: README and SECURITY now state the offline release evidence,
+  exact cleanup status, and the enforced one-request DeepSeek authorization boundary.
+- No credential, provider request, live smoke, push, PR, or remote action occurred.
+- **Spec-Review**: Arendt (`019fd5fd-4543-75c3-82e9-74b26ab061d9`) found the
+  missing runtime gate, premature ledger completion, and incomplete lifecycle
+  evidence; the High finding was fixed and the evidence/ledger fields were added.
+- **Quality-Review**: Herschel (`019fd5fd-4b7f-7922-83de-42fedcd30ce7`) found
+  the same missing runtime gate plus ledger/evidence gaps; all High findings were
+  fixed. No Critical/High findings remain.
+- **Second independent review**: Galileo (`019fd60c-f613-7383-9274-7e75e7d8c9a6`)
+  and Kant (`019fd60c-fbd1-74a2-8ea1-9af804ebf2af`) rechecked the corrected diff.
+  Both confirmed the gate order; they identified the remaining final-lifecycle
+  evidence gap and Kant identified the fail-open low-level adapter default.
+- **Correction evidence**: `DeepSeekResponsesAdapter` and its approved factory
+  now default to live-provider denial; only the explicitly authorized composition
+  path enables it. The corrected focused selectors passed with `20 passed`, plus
+  Ruff, mypy, and diff checks passed.
+- **Fresh-process lifecycle evidence**:
+  `uv run --python 3.12 pytest tests/integration/test_composed_runtime_lifecycle.py tests/integration/test_runtime_permits.py::test_consumed_begin_command_replay_cannot_mint_another_permit tests/integration/test_runtime_permits.py::test_crashed_delivery_requires_fresh_continue_to_reclaim_orphan tests/integration/test_target_reservation.py::test_target_reservation_id_persists_across_sqlite_restart_and_identical_replay -q`
+  -> `5 passed`. This separate pytest process exercised CrewControl,
+  CrewRuntime, RunQueries, target-OID preservation, exact cleanup settlement,
+  Permit replay resistance, crash/reopen recovery, and SQLite restart/replay.
