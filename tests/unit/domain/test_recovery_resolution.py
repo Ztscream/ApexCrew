@@ -65,7 +65,9 @@ def observation(
         elif state == "EXACT_POST":
             defaults["current_oid"] = defaults["prepared_oid"]
     if state == "EXACT_COMPLETION":
-        defaults.setdefault("normalized_completion_digest", RESULT)
+        normalized_json = canonical_json({"completion": "done"})
+        defaults.setdefault("normalized_completion_json", normalized_json)
+        defaults.setdefault("normalized_completion_digest", sha256_digest(normalized_json))
     if state == "EXACT_SNAPSHOT":
         defaults.setdefault("bounded_result_json", BOUNDED)
         defaults.setdefault("bounded_result_digest", BOUNDED_DIGEST)
@@ -145,11 +147,18 @@ def observation(
             ),
             RecoveryActionClass.READ_SEARCH: (),
         }
-        proof = {"state": state}
-        proof.update({name: defaults[name] for name in proof_fields[action_class]})
-        completed_json = canonical_json(proof)
-        defaults.setdefault("bounded_result_json", completed_json)
-        defaults.setdefault("bounded_result_digest", sha256_digest(completed_json))
+        if action_class is RecoveryActionClass.MODEL:
+            completed_json = defaults["normalized_completion_json"]
+        else:
+            proof = {"state": state}
+            proof.update({name: defaults[name] for name in proof_fields[action_class]})
+            completed_json = canonical_json(proof)
+        if action_class is RecoveryActionClass.READ_SEARCH:
+            defaults.setdefault("bounded_result_json", completed_json)
+            defaults.setdefault("bounded_result_digest", sha256_digest(completed_json))
+        else:
+            defaults.setdefault("completion_proof_json", completed_json)
+            defaults.setdefault("completion_proof_digest", sha256_digest(completed_json))
     allowed = {
         RecoveryActionClass.MODEL: {
             "request_digest",
@@ -159,9 +168,10 @@ def observation(
             "schema_digest",
             "usage_json",
             "normalized_completion_digest",
+            "normalized_completion_json",
             "reservation_charge",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.READ_SEARCH: {
             "idempotency_key",
@@ -175,8 +185,8 @@ def observation(
             "idempotency_key",
             "expected_pre_tree_digest",
             "observed_post_tree_digest",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.CHECK: {
             "idempotency_key",
@@ -184,8 +194,8 @@ def observation(
             "argv_digest",
             "snapshot_digest",
             "receipt_digest",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.PRIVATE_REF: {
             "idempotency_key",
@@ -197,8 +207,8 @@ def observation(
             "old_oid",
             "prepared_oid",
             "current_oid",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.TARGET_CAS: {
             "idempotency_key",
@@ -210,8 +220,8 @@ def observation(
             "old_oid",
             "prepared_oid",
             "current_oid",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.TARGET_RESERVATION: {
             "idempotency_key",
@@ -220,8 +230,8 @@ def observation(
             "admin_binding_digest",
             "path_identity",
             "gitfile_digest",
-            "bounded_result_json",
-            "bounded_result_digest",
+            "completion_proof_json",
+            "completion_proof_digest",
         },
         RecoveryActionClass.GRANTED_ACTION: set(),
     }
