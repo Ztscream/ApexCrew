@@ -2433,3 +2433,16 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   -> `5 passed`. This separate pytest process exercised CrewControl,
   CrewRuntime, RunQueries, target-OID preservation, exact cleanup settlement,
   Permit replay resistance, crash/reopen recovery, and SQLite restart/replay.
+
+## M2-M4 Final-Production Plan Gate (2026-08-06)
+
+- **Branch/worktree**: `codex/m2-m4-final-production` /
+  `.worktrees/m2-m4-final-production`, base `9cc269f`.
+- **Plan**: `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`.
+- **Plan SHA-256**: `7DADBA8F2B9C3386C3ACDBBCDFAE9D737AE2C27CF715552CB7743EF45795AC78`.
+- **Spec-review**: Codex independent document pass, PASS; no Critical/High.
+- **Quality-review**: Codex independent document pass, PASS; no Critical/High.
+- **Baseline**: `uv run pytest tests/unit tests/contract tests/acceptance -q` passed;
+  existing platform/live skips remained explicit. `git diff --check` passed.
+- **Owner decision**: GO for local M2-M4 implementation from `9cc269f`.
+  Live DeepSeek smoke, push, PR merge, hosted Pages, and package publication remain HOLD.

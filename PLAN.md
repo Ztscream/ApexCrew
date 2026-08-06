@@ -1,20 +1,24 @@
-# ApexCrew M1 Implementation Plan
+# ApexCrew M1-M4 Implementation Plan
 
 > **For agentic workers:** Follow the Streamlined Execution Protocol below task-by-task: fresh subagent, observed red test, minimum implementation, ordered spec then quality review, one commit. Checkbox (`- [ ]`) state is evidence, not authority by itself.
 
-**Goal:** Close M1 honestly by correcting the merged M1-02/M1-06 defects, closing the remaining M1 security evidence, and replaying the unmerged M1-08 tasks from a corrected base; then carry M2-M4 under the same streamlined per-task protocol without a separate document-review gate per milestone.
+**Goal:** Close M1 honestly and execute the owner-authorized M2-M4 final-production plan with independent document and quality review evidence.
 
-**Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 builds immutable contracts, durable state/model effects, bounded Git and Authority adapters, the owned Coordinator/WorkerLoop core, typed tools, Runtime Permits, and exact Grants; provider, recovery, fixture, WebUI, and release work remains roadmap-only until a later reviewed plan revision.
+**Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 provides the core contracts; the M2-M4 plan completes the production composition, recovery, retention, executor, fixture, replay, CI, provider, and release evidence behind those ports.
 
 **Tech Stack:** Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI, Jinja2, keyring, DeepSeek Responses API, Docker, Git, Python and TypeScript fixture repositories, GitHub Actions, GitLab CI, and GitHub Pages.
 
-**Revision:** M1-R3 closeout plan, prepared 2026-08-03 and amended 2026-08-04 by owner decision to the Streamlined Execution Protocol below. It supersedes M1-R2 as execution authority.
+**Revision:** M2-M4 final-production amendment, prepared 2026-08-06 from base `9cc269f`; detailed execution authority is `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. `SPEC.md` remains frozen.
 
-**Current status:** **ACTIVE - STREAMLINED PROTOCOL IN FORCE.** The remaining R3 ledger tasks and every later milestone execute under the retained course controls (worktree/PR, fresh subagent, TDD, ordered per-task spec then quality review, ledger hash, `AGENT_LOG.md`). PR #8 is still closed without merge and its four task SHAs remain historical diagnostic evidence only.
+**Current status:** **ACTIVE - M2-M4 OWNER-AUTHORIZED.** The current branch is an isolated worktree. Each task remains subject to worktree/PR discipline, TDD, ordered per-task spec then quality review, ledger hash, and `AGENT_LOG.md`; no push, merge, hosted release, or live smoke is authorized by this amendment.
 
 **Historical R3 authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
 
 ## M1-M4 Sprint Execution Amendment (2026-08-04)
+
+## M2-M4 Final-Production Amendment (2026-08-06)
+
+The owner explicitly authorized completion of M2-M4 from base `9cc269f` on branch `codex/m2-m4-final-production`. The exact task map and completion contract are in `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. This amendment supersedes the old roadmap-only M2-M4 status for this branch, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, or owner-only external actions. The plan is docs-only until its SHA-256 is recorded in `AGENT_LOG.md` after independent spec and quality review.
 
 The owner request and root `SPRINT.md` authorize a bounded implementation pass through M4. The detailed task map, file ownership, red/green selectors, and final checks are recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4.md`; its independent coverage review is recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4-review.md`. This amendment supersedes the historical roadmap-only status for this execution turn, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, no-push rule, or owner-only PR/Pages actions. SPRINT depth labels remain authoritative: REAL behavior is tested, SKELETON behavior covers the main path and rejects unsupported edges, and STUB behavior raises or returns `INDETERMINATE` with a `DEBT-` marker.
 
@@ -352,9 +356,9 @@ This revision does not alter approved `SPEC.md` revision 2 or waive any signed r
 | --- | --- | --- |
 | M0 | Stage 4 host probe plus disposable Task 1 and Task 2A | **Complete input.** Attempt 3 returned zero blockers; all generated artifacts were destroyed and nothing was merged. |
 | M1 | Retained Task 1 and 2A, then 2B-17, including `7A/7B`, `11A/11B`, and `12A/12B` | **Candidate authority only.** Requires this revision's independent zero-blocker review and owner `M1 GO`; closes after 27 task slices and 8 module PRs merge with preserved task commits. |
-| M2 | Tasks 18-27 and 29A-32 | **Roadmap, not authorized.** Requires its own exact revision, independent review, capacity decision, and owner `GO`. Complete the offline `ScriptedMockLLM` path before any real-provider activation. |
-| M3 | Tasks 33A-35A, 36A-36C, then 35B | **Roadmap, not authorized.** Requires its own reviewed revision. `35B` may start only after 36C defines both later CI jobs. |
-| M4 | Task 28, Tasks 36D-36G, and the external same-revision release gate | **Post-M3 roadmap, not authorized.** Still required for a complete signed v0.1 claim; current capacity does not support a pre-deadline sprint claim. |
+| M2 | Tasks 18-27 and 29A-32, mapped to M2-01 through M2-05 | **Authorized on the 2026-08-06 final-production branch.** Requires the reviewed plan SHA and ordered task evidence; no live provider call is implied. |
+| M3 | Tasks 33A-35A, 36A-36C, then 35B, mapped to M3-01 and M3-02 | **Authorized on the 2026-08-06 final-production branch.** Hosted publication remains owner-only. |
+| M4 | Task 28, Tasks 36D-36G, and the external same-revision release gate, mapped to M4-01 through M4-03 | **Authorized on the 2026-08-06 final-production branch.** Release publication and live smoke remain separately owner-authorized actions. |
 
 At the end of each milestone, record a table in `AGENT_LOG.md` with elapsed hours, conservative remaining-hours estimate, hours available before the deadline, completed evidence, and an explicit owner `GO` or `HOLD` decision for the next milestone. If the observed schedule no longer closes, the valid outcomes are an owner-approved scope revision or added capacity/time; no agent silently omits a signed item. Task 28 remains an M4 provider profile: before live behavior is planned, the owner must reconfirm the frozen model/pricing profile or approve a new SPEC revision, select the credential profile, and separately authorize a smoke.
 
