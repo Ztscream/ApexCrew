@@ -1143,6 +1143,7 @@ def _completed_decision(
         result_digest=result_digest,
         bounded_result_json=bounded_result_json,
         settled_sequence=observation.settled_sequence,
+        snapshot_digest=observation.snapshot_digest,
     )
     return RecoveryDecision(
         RecoveryDecisionKind.COMPLETED,
