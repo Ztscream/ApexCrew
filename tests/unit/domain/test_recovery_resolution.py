@@ -104,6 +104,7 @@ def observation(
             "repository_instance_digest",
             "ref_name",
             "registration_digest",
+            "target_safety_digest",
             "old_oid",
             "prepared_oid",
             "current_oid",

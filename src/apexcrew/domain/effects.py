@@ -598,6 +598,7 @@ class RecoveryObservation(FrozenDocument):
                 "repository_instance_digest",
                 "ref_name",
                 "registration_digest",
+                "target_safety_digest",
                 "old_oid",
                 "prepared_oid",
                 "current_oid",
@@ -662,6 +663,7 @@ class RecoveryObservation(FrozenDocument):
                     "repository_instance_digest",
                     "ref_name",
                     "registration_digest",
+                    "target_safety_digest",
                     "old_oid",
                     "prepared_oid",
                     "current_oid",
@@ -708,7 +710,13 @@ class RecoveryObservation(FrozenDocument):
             or (self.kind is RecoveryActionClass.CHECK and self.state == "EXACT_RECEIPT")
             or (
                 self.kind is RecoveryActionClass.TARGET_RESERVATION
-                and self.state in {"BOTH_ABSENT", "BOTH_PRESENT_LOCKED"}
+                and (
+                    (self.reservation_operation == "CLEANUP" and self.state == "BOTH_ABSENT")
+                    or (
+                        self.reservation_operation == "CREATE"
+                        and self.state == "BOTH_PRESENT_LOCKED"
+                    )
+                )
             )
             or (
                 self.kind
@@ -749,9 +757,19 @@ class RecoveryObservation(FrozenDocument):
         for field_name in required[self.kind]:
             if getattr(self, field_name) is None:
                 raise ValueError(f"{self.kind}_OBSERVATION_FIELD_REQUIRED:{field_name}")
-        if self.state in {"EXACT_PRE", "BOTH_PRESENT_UNLOCKED"} and (
-            self.kind is not RecoveryActionClass.MODEL and not self.idempotency_key
-        ):
+        retry_state = self.state in {"EXACT_PRE", "BOTH_PRESENT_UNLOCKED"}
+        retry_state = retry_state or (
+            self.kind is RecoveryActionClass.TARGET_RESERVATION
+            and (
+                (self.reservation_operation == "CREATE" and self.state == "BOTH_ABSENT")
+                or (
+                    self.reservation_operation == "CLEANUP"
+                    and self.state
+                    in {"BOTH_PRESENT_LOCKED", "BOTH_PRESENT_UNLOCKED", "ADMIN_ONLY", "PATH_ONLY"}
+                )
+            )
+        )
+        if retry_state and self.kind is not RecoveryActionClass.MODEL and not self.idempotency_key:
             raise ValueError("RETRY_IDEMPOTENCY_KEY_REQUIRED")
         if (
             self.kind is RecoveryActionClass.MODEL
@@ -762,7 +780,7 @@ class RecoveryObservation(FrozenDocument):
         if (
             self.kind is RecoveryActionClass.MODEL
             and self.state == "RETURNED_MODEL_MISMATCH"
-            and (self.returned_model_id is None or self.reservation_charge != "FULL")
+            and self.reservation_charge != "FULL"
         ):
             raise ValueError("MODEL_MISMATCH_FULL_RESERVATION_REQUIRED")
         if self.kind is RecoveryActionClass.READ_SEARCH:
@@ -832,6 +850,15 @@ class RecoveryDecision:
             or self.applicable_revision_digests is None
         ):
             raise ValueError("COMPLETED_DURABLE_RESULT_REQUIRED")
+        if self.kind is RecoveryDecisionKind.COMPLETED:
+            assert self.effect_result is not None
+            if (
+                self.effect_result.outcome != "COMPLETED"
+                or self.effect_result.result_digest != self.result_digest
+                or self.effect_result.bounded_result_json != self.bounded_result_json
+                or self.effect_result.settled_sequence != self.settled_sequence
+            ):
+                raise ValueError("COMPLETED_RESULT_BINDING_MISMATCH")
         if self.kind is RecoveryDecisionKind.RETRY_SAME_INTENT and (
             self.prestate_digest is None or not self.idempotency_key
         ):
@@ -906,7 +933,16 @@ def _completed_decision(
 def abandon_observation(observation: RecoveryObservation, successor: str) -> RecoveryDecision:
     if observation.kind is RecoveryActionClass.MODEL:
         raise ValueError("MODEL_ABANDON_REQUIRES_OWNER_FAILURE")
-    if observation.state not in {"EXACT_PRE", "BOTH_ABSENT", "EXACT_SNAPSHOT", "STALE"}:
+    allowed_states = {
+        RecoveryActionClass.READ_SEARCH: {"EXACT_SNAPSHOT", "STALE"},
+        RecoveryActionClass.PATCH: {"EXACT_PRE"},
+        RecoveryActionClass.CHECK: {"EXACT_PRE", "STALE"},
+        RecoveryActionClass.PRIVATE_REF: {"EXACT_PRE"},
+        RecoveryActionClass.TARGET_CAS: {"EXACT_PRE"},
+        RecoveryActionClass.TARGET_RESERVATION: {"BOTH_ABSENT"},
+        RecoveryActionClass.GRANTED_ACTION: {"EXACT_PRE"},
+    }
+    if observation.state not in allowed_states[observation.kind]:
         raise ValueError("ABANDON_EFFECT_NOT_PROVEN")
     allowed_successors = {
         RecoveryActionClass.READ_SEARCH: {"PAUSED", "PAUSED/READ_ABANDONED"},
