@@ -45,9 +45,11 @@ closed but its process runner remains a debt.
 
 Observed multi-intent members are selectable only when exactly one member is
 identified by authoritative external observation; no observation or multiple
-observations remain `INDETERMINATE`. `DEBT-M2-002` through `DEBT-M2-004` keep
-Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
-builds a restricted digest-pinned argv but does not launch a Docker process.
+observations remain `INDETERMINATE`. Tier 2 export, retention, and eviction are
+implemented fail-closed through the typed retention manager; Tier 2 and
+quarantined content remain excluded from exports. The restricted executor
+launches only the closed digest-pinned Docker argv and reports daemon/process
+unavailability as a typed failure.
 
 `DEBT-R4-RECOVERY-001`: the R4.1 action-class recovery and exact resolution paths
 are implemented and offline-verified. The remaining boundary is the explicitly

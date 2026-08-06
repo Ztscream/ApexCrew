@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 from decimal import Decimal
+from subprocess import CompletedProcess
 
 import pytest
 
@@ -43,3 +45,38 @@ def test_restricted_command_is_digest_pinned_non_root_and_networkless() -> None:
 def test_restricted_executor_rejects_unapproved_executable() -> None:
     with pytest.raises(ValueError, match="EXECUTABLE_NOT_ALLOWED"):
         RestrictedDockerExecutor(profile()).command_for(("bash",))
+
+
+def test_restricted_executor_runs_closed_argv_without_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> CompletedProcess[bytes]:
+        observed["command"] = command
+        observed.update(kwargs)
+        return CompletedProcess(command, 0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr("apexcrew.adapters.executor.restricted.subprocess.run", fake_run)
+
+    result = RestrictedDockerExecutor(profile()).run(("pytest", "-q"))
+
+    assert result.code == "CHECK_PASSED"
+    assert result.output == "ok\n"
+    assert observed["shell"] is False
+    assert "--network=none" in observed["command"]
+
+
+def test_restricted_executor_timeout_is_infrastructure_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> CompletedProcess[bytes]:
+        del command, kwargs
+        raise subprocess.TimeoutExpired(("docker",), 1, output=b"partial")
+
+    monkeypatch.setattr("apexcrew.adapters.executor.restricted.subprocess.run", fake_run)
+
+    result = RestrictedDockerExecutor(profile()).run(("pytest",))
+
+    assert result.code == "INFRASTRUCTURE_UNCERTAINTY"
+    assert result.timed_out is True

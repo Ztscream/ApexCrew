@@ -1511,6 +1511,24 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M2-04 (2026-08-06)
+
+- **Base**: `642caf6`.
+- **Red**: the new restricted-run selectors failed before implementation because
+  the module had no `subprocess` seam and `run()` raised
+  `RESTRICTED_EXECUTOR_RUNNER_NOT_CONNECTED`.
+- **Green**: `uv run pytest tests/unit/adapters/executor/test_restricted.py tests/contract/test_executor.py -q` -> `10 passed`.
+- **Implementation**: connected the closed Docker argv to `subprocess.run` with
+  `shell=False`, empty host environment plus revision allowlist, tmpfs scratch,
+  bounded output, timeout uncertainty, and typed unavailable failures.
+- **Checks**: targeted mypy, Ruff check/format, and `git diff --check` passed.
+  No real image/daemon result is claimed; that requires the committed image and
+  an available Docker daemon.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M2-03 (2026-08-06)
 
 - **Base**: `72c4f89`.
