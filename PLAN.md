@@ -30571,7 +30571,7 @@ The R4.1 task chain is independently auditable through this required map. Each S
 | R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e2785e3 | pending | 019fd4bd-25ed-7cf1-9106-2a30116e9596 | pending | 019fd4bd-2a35-7fd0-91bb-e721ade91332 | pending | pending |
 | R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | `d2eebf0` | `be143bb` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `be143bb` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `be143bb` | `be143bb` |
-| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | `eff0d79` | `27f1b81` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `27f1b81` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `27f1b81` | pending |
+| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | `eff0d79` | `27f1b81` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `27f1b81` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `27f1b81` | `520c055` |
 
 The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 
