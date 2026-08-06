@@ -154,12 +154,11 @@ from apexcrew.domain.coordination import (
     validate_plan_proposal,
 )
 from apexcrew.domain.effects import (
+    ApplyResolutionRequest,
     AuditEvent,
     EffectIntent,
     EffectResult,
     PlanApproval,
-    RecoveryDecision,
-    RecoveryDecisionKind,
     ReservationObservation,
     RunBootstrapInputs,
     RunRecord,
@@ -167,14 +166,17 @@ from apexcrew.domain.effects import (
     StateCommitFault,
     StateConflict,
     TargetReservation,
+    abandon_observation,
     canonical_json,
     classify_reservation_creation,
+    observation_set_digest,
+    recover_observation,
+    recovery_action_class_for_intent,
     sha256_digest,
 )
 from apexcrew.domain.evidence import ContextCapsule, EvidenceReceipt
 from apexcrew.domain.freshness import FreshnessAssessment, promote_candidate
 from apexcrew.domain.indeterminate import (
-    ApplyResolutionRequest,
     ResolutionApplication,
     ResolutionSelection,
     UnresolvedIntentBinding,
@@ -8406,15 +8408,88 @@ class SqliteStateStore:
         current = self.unresolved_intent_set(request.run_id)
         if current is None or current.set_digest != request.selection.unresolved_set_digest:
             raise StateConflict("STALE_UNRESOLVED_SET")
+        if request.observation_set_digest != observation_set_digest(request.observations):
+            raise StateConflict("STALE_OBSERVATION_SET")
+        observations = {observation.intent_id: observation for observation in request.observations}
         if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
-            return ResolutionApplication(
-                status="DENIED",
-                resulting_sequence=request.expected_sequence,
-                remaining_set_digest=current.set_digest,
-                successor="INDETERMINATE",
+            if set(observations) != set(current.intents):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            try:
+                for set_member in current.member_bindings:
+                    set_observation = observations[IntentId(set_member.intent_id)]
+                    intent = self.effect_intent(IntentId(set_member.intent_id))
+                    if (
+                        set_observation.recovery_generation != set_member.recovery_generation
+                        or set_observation.source_payload_digest != intent.payload_digest
+                        or recovery_action_class_for_intent(intent) != set_observation.kind
+                    ):
+                        raise ValueError("OBSERVATION_BINDING_MISMATCH")
+                    abandon_observation(set_observation, "PAUSED")
+            except (KeyError, ValueError):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            set_result: list[ResolutionApplication] = []
+
+            def close_set(connection: sqlite3.Connection) -> None:
+                permit, _ = self._require_consumed_runtime_owner(
+                    connection,
+                    request.run_id,
+                    request.owner_id,
+                    request.permit_generation,
+                )
+                if (
+                    permit.allowed_phase != "INDETERMINATE"
+                    or permit.resolution_selection != request.selection
+                ):
+                    raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
+                for member in current.member_bindings:
+                    intent_id = IntentId(member.intent_id)
+                    connection.execute(
+                        "UPDATE indeterminate_members SET state = 'ABANDONED' WHERE intent_id = ?",
+                        (intent_id,),
+                    )
+                    connection.execute(
+                        "UPDATE effect_intents SET state = 'SETTLED' WHERE intent_id = ?",
+                        (intent_id,),
+                    )
+                next_state = "FAILED" if request.selection.resolution == "FAIL_RUN" else "CANCELLED"
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ?",
+                    (next_state, request.run_id),
+                )
+                set_result.append(
+                    ResolutionApplication(
+                        status="SETTLED",
+                        resulting_sequence=AuditSequence(request.expected_sequence + 1),
+                        remaining_set_digest=None,
+                        successor=next_state,
+                    )
+                )
+
+            self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "INDETERMINATE_SET_RESOLUTION_APPLIED",
+                    subject_digests=(
+                        request.selection.unresolved_set_digest,
+                        request.observation_set_digest,
+                    ),
+                ),
+                mutate=close_set,
             )
+            return set_result[0]
         assert request.selection.intent_id is not None
-        member = next(
+        selected_member = next(
             (
                 item
                 for item in current.member_bindings
@@ -8422,28 +8497,34 @@ class SqliteStateStore:
             ),
             None,
         )
-        if member is None or member.recovery_generation != request.selection.recovery_generation:
+        if (
+            selected_member is None
+            or selected_member.recovery_generation != request.selection.recovery_generation
+        ):
             raise StateConflict("STALE_UNRESOLVED_MEMBER")
+        observation = observations.get(IntentId(selected_member.intent_id))
+        intent = self.effect_intent(IntentId(selected_member.intent_id))
+        if (
+            observation is None
+            or observation.recovery_generation != selected_member.recovery_generation
+            or observation.source_payload_digest != intent.payload_digest
+            or recovery_action_class_for_intent(intent) != observation.kind
+        ):
+            raise StateConflict("OBSERVATION_BINDING_MISMATCH")
         if request.selection.resolution == "RECONCILE_OBSERVED":
-            if not isinstance(request.decision, RecoveryDecision):
-                raise StateConflict("OBSERVED_RECOVERY_DECISION_REQUIRED")
-            if request.decision.kind is not RecoveryDecisionKind.COMPLETED:
+            decision = recover_observation(observation)
+            if decision.kind.value != "COMPLETED" or decision.effect_result is None:
                 raise StateConflict("OBSERVED_RECOVERY_COMPLETION_REQUIRED")
-            if request.decision.effect_result is None:
-                raise StateConflict("OBSERVED_RECOVERY_RESULT_REQUIRED")
-            if request.decision.effect_result.settled_sequence != AuditSequence(
+            if decision.effect_result.settled_sequence != AuditSequence(
                 request.expected_sequence + 1
             ):
                 raise StateConflict("OBSERVED_RECOVERY_SEQUENCE_MISMATCH")
         elif request.selection.resolution == "RETRY_SAME_INTENT":
-            if not isinstance(request.decision, RecoveryDecision):
-                raise StateConflict("RETRY_RECOVERY_DECISION_REQUIRED")
-            if request.decision.kind is not RecoveryDecisionKind.RETRY_SAME_INTENT:
+            decision = recover_observation(observation)
+            if decision.kind.value != "RETRY_SAME_INTENT":
                 raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
-        elif not isinstance(request.decision, RecoveryDecision) or (
-            request.decision.kind is not RecoveryDecisionKind.ABANDONED
-        ):
-            raise StateConflict("ABANDON_RECOVERY_PROOF_REQUIRED")
+        else:
+            decision = abandon_observation(observation, "PAUSED")
         result: list[ResolutionApplication] = []
 
         def mutate(connection: sqlite3.Connection) -> None:
@@ -8459,48 +8540,58 @@ class SqliteStateStore:
             ):
                 raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
             if request.selection.resolution == "RECONCILE_OBSERVED":
-                assert isinstance(request.decision, RecoveryDecision)
-                assert request.decision.effect_result is not None
-                connection.execute(
-                    "UPDATE effect_results SET result_class = ?, result_json = ?, "
-                    "snapshot_digest = ?, settled_sequence = ? WHERE intent_id = ?",
-                    (
-                        request.decision.effect_result.result_class,
-                        effect_result_to_storage_json(request.decision.effect_result),
-                        request.decision.effect_result.snapshot_digest,
-                        request.decision.effect_result.settled_sequence,
-                        member.intent_id,
-                    ),
-                )
+                assert decision.effect_result is not None
+                if (
+                    decision.effect_result.intent_id != IntentId(selected_member.intent_id)
+                    or decision.effect_result.run_id != request.run_id
+                    or decision.effect_result.outcome != "COMPLETED"
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_RESULT_BINDING_MISMATCH")
+                if (
+                    connection.execute(
+                        "UPDATE effect_results SET result_class = ?, result_json = ?, "
+                        "snapshot_digest = ?, settled_sequence = ? WHERE intent_id = ?",
+                        (
+                            decision.effect_result.result_class,
+                            effect_result_to_storage_json(decision.effect_result),
+                            decision.effect_result.snapshot_digest,
+                            decision.effect_result.settled_sequence,
+                            selected_member.intent_id,
+                        ),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_RESULT_NOT_CURRENT")
                 connection.execute(
                     "UPDATE effect_intents SET state = 'SETTLED' WHERE intent_id = ?",
-                    (member.intent_id,),
+                    (selected_member.intent_id,),
                 )
                 connection.execute(
                     "UPDATE indeterminate_members SET state = 'SETTLED' WHERE intent_id = ?",
-                    (member.intent_id,),
+                    (selected_member.intent_id,),
                 )
             elif request.selection.resolution == "RETRY_SAME_INTENT":
                 connection.execute(
-                    "DELETE FROM effect_results WHERE intent_id = ?", (member.intent_id,)
+                    "DELETE FROM effect_results WHERE intent_id = ?",
+                    (selected_member.intent_id,),
                 )
                 connection.execute(
                     "UPDATE effect_intents SET state = 'UNSETTLED' WHERE intent_id = ?",
-                    (member.intent_id,),
+                    (selected_member.intent_id,),
                 )
                 connection.execute(
-                    "UPDATE indeterminate_members SET recovery_generation = ?, state = 'SETTLED' "
+                    "UPDATE indeterminate_members SET recovery_generation = ?, state = 'PENDING' "
                     "WHERE intent_id = ?",
-                    (member.recovery_generation + 1, member.intent_id),
+                    (selected_member.recovery_generation + 1, selected_member.intent_id),
                 )
             else:
                 connection.execute(
                     "UPDATE indeterminate_members SET state = 'ABANDONED' WHERE intent_id = ?",
-                    (member.intent_id,),
+                    (selected_member.intent_id,),
                 )
                 connection.execute(
                     "UPDATE effect_intents SET state = 'SETTLED' WHERE intent_id = ?",
-                    (member.intent_id,),
+                    (selected_member.intent_id,),
                 )
             remaining = self._unresolved_intent_set_in_transaction(connection, request.run_id)
             connection.execute(
@@ -8525,7 +8616,13 @@ class SqliteStateStore:
         self._commit_state_and_event(
             run_id=request.run_id,
             expected_sequence=request.expected_sequence,
-            event=AuditEvent.kind("INDETERMINATE_RESOLUTION_APPLIED"),
+            event=AuditEvent.kind(
+                "INDETERMINATE_RESOLUTION_APPLIED",
+                subject_digests=(
+                    request.selection.unresolved_set_digest,
+                    request.observation_set_digest,
+                ),
+            ),
             mutate=mutate,
         )
         return result[0]

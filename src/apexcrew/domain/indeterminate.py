@@ -8,7 +8,7 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
-from apexcrew.domain.types import AuditSequence, IntentId, RunId, RuntimeOwnerId
+from apexcrew.domain.types import AuditSequence, IntentId
 
 
 class IndeterminateResolution(RuntimeError):
@@ -72,16 +72,6 @@ def unresolved_set_digest_for_members(
         ensure_ascii=True,
     )
     return Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest())
-
-
-@dataclass(frozen=True, slots=True)
-class ApplyResolutionRequest:
-    run_id: RunId
-    selection: ResolutionSelection
-    permit_generation: int
-    owner_id: RuntimeOwnerId
-    expected_sequence: AuditSequence
-    decision: object | None = None
 
 
 @dataclass(frozen=True, slots=True)

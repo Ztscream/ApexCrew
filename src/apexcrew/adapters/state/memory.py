@@ -131,12 +131,11 @@ from apexcrew.domain.coordination import (
     validate_plan_proposal,
 )
 from apexcrew.domain.effects import (
+    ApplyResolutionRequest,
     AuditEvent,
     EffectIntent,
     EffectResult,
     PlanApproval,
-    RecoveryDecision,
-    RecoveryDecisionKind,
     ReservationObservation,
     RunBootstrapInputs,
     RunRecord,
@@ -144,12 +143,15 @@ from apexcrew.domain.effects import (
     StateCommitFault,
     StateConflict,
     TargetReservation,
+    abandon_observation,
     canonical_json,
     classify_reservation_creation,
+    observation_set_digest,
+    recover_observation,
+    recovery_action_class_for_intent,
     sha256_digest,
 )
 from apexcrew.domain.indeterminate import (
-    ApplyResolutionRequest,
     ResolutionApplication,
     ResolutionSelection,
     UnresolvedIntentSet,
@@ -4864,15 +4866,84 @@ class InMemoryStateStore:
         current = self.unresolved_intent_set(request.run_id)
         if current is None or current.set_digest != request.selection.unresolved_set_digest:
             raise StateConflict("STALE_UNRESOLVED_SET")
+        if request.observation_set_digest != observation_set_digest(request.observations):
+            raise StateConflict("STALE_OBSERVATION_SET")
+        observations = {observation.intent_id: observation for observation in request.observations}
         if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
-            return ResolutionApplication(
-                status="DENIED",
-                resulting_sequence=request.expected_sequence,
-                remaining_set_digest=current.set_digest,
-                successor="INDETERMINATE",
+            if set(observations) != set(current.intents):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            try:
+                for set_member in current.member_bindings:
+                    set_observation = observations[IntentId(set_member.intent_id)]
+                    intent = self.effect_intent(IntentId(set_member.intent_id))
+                    if (
+                        set_observation.recovery_generation != set_member.recovery_generation
+                        or set_observation.source_payload_digest != intent.payload_digest
+                        or recovery_action_class_for_intent(intent) != set_observation.kind
+                    ):
+                        raise ValueError("OBSERVATION_BINDING_MISMATCH")
+                    abandon_observation(set_observation, "PAUSED")
+            except (KeyError, ValueError):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            set_result: list[ResolutionApplication] = []
+
+            def close_set(copied: InMemoryStateStore) -> None:
+                permit = copied._runtime_permits.get((request.run_id, request.permit_generation))
+                if (
+                    permit is None
+                    or permit.state != "CONSUMED"
+                    or permit.consumed_owner_id != request.owner_id
+                    or permit.allowed_phase != "INDETERMINATE"
+                    or permit.resolution_selection != request.selection
+                ):
+                    raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
+                for member in current.member_bindings:
+                    intent_id = IntentId(member.intent_id)
+                    copied._indeterminate_effect_intents.remove(intent_id)
+                copied._runs[request.run_id] = replace(
+                    copied._runs[request.run_id],
+                    state=(
+                        RunState.FAILED
+                        if request.selection.resolution == "FAIL_RUN"
+                        else RunState.CANCELLED
+                    ),
+                )
+                set_result.append(
+                    ResolutionApplication(
+                        status="SETTLED",
+                        resulting_sequence=AuditSequence(request.expected_sequence + 1),
+                        remaining_set_digest=None,
+                        successor=(
+                            "FAILED" if request.selection.resolution == "FAIL_RUN" else "CANCELLED"
+                        ),
+                    )
+                )
+
+            self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "INDETERMINATE_SET_RESOLUTION_APPLIED",
+                    subject_digests=(
+                        request.selection.unresolved_set_digest,
+                        request.observation_set_digest,
+                    ),
+                ),
+                mutate=close_set,
             )
+            return set_result[0]
         assert request.selection.intent_id is not None
-        member = next(
+        selected_member = next(
             (
                 item
                 for item in current.member_bindings
@@ -4880,29 +4951,38 @@ class InMemoryStateStore:
             ),
             None,
         )
-        if member is None or member.recovery_generation != request.selection.recovery_generation:
+        if (
+            selected_member is None
+            or selected_member.recovery_generation != request.selection.recovery_generation
+        ):
             raise StateConflict("STALE_UNRESOLVED_MEMBER")
+        observation = observations.get(IntentId(selected_member.intent_id))
+        if (
+            observation is None
+            or observation.recovery_generation != selected_member.recovery_generation
+            or observation.source_payload_digest
+            != self.effect_intent(IntentId(selected_member.intent_id)).payload_digest
+            or recovery_action_class_for_intent(
+                self.effect_intent(IntentId(selected_member.intent_id))
+            )
+            != observation.kind
+        ):
+            raise StateConflict("OBSERVATION_BINDING_MISMATCH")
         if request.selection.resolution == "RECONCILE_OBSERVED":
-            if not isinstance(request.decision, RecoveryDecision):
-                raise StateConflict("OBSERVED_RECOVERY_DECISION_REQUIRED")
-            if request.decision.kind is not RecoveryDecisionKind.COMPLETED:
+            decision = recover_observation(observation)
+            if decision.kind.value != "COMPLETED" or decision.effect_result is None:
                 raise StateConflict("OBSERVED_RECOVERY_COMPLETION_REQUIRED")
-            if request.decision.effect_result is None:
-                raise StateConflict("OBSERVED_RECOVERY_RESULT_REQUIRED")
-            if request.decision.effect_result.settled_sequence != AuditSequence(
+            if decision.effect_result.settled_sequence != AuditSequence(
                 request.expected_sequence + 1
             ):
                 raise StateConflict("OBSERVED_RECOVERY_SEQUENCE_MISMATCH")
         elif request.selection.resolution == "RETRY_SAME_INTENT":
-            if not isinstance(request.decision, RecoveryDecision):
-                raise StateConflict("RETRY_RECOVERY_DECISION_REQUIRED")
-            if request.decision.kind is not RecoveryDecisionKind.RETRY_SAME_INTENT:
+            decision = recover_observation(observation)
+            if decision.kind.value != "RETRY_SAME_INTENT":
                 raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
-        elif not isinstance(request.decision, RecoveryDecision) or (
-            request.decision.kind is not RecoveryDecisionKind.ABANDONED
-        ):
-            raise StateConflict("ABANDON_RECOVERY_PROOF_REQUIRED")
-        member_intent_id = IntentId(member.intent_id)
+        else:
+            decision = abandon_observation(observation, "PAUSED")
+        member_intent_id = IntentId(selected_member.intent_id)
 
         result: list[ResolutionApplication] = []
 
@@ -4917,14 +4997,21 @@ class InMemoryStateStore:
             ):
                 raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
             if request.selection.resolution == "RECONCILE_OBSERVED":
-                assert isinstance(request.decision, RecoveryDecision)
-                assert request.decision.effect_result is not None
-                copied._effect_results[member_intent_id] = request.decision.effect_result
+                assert decision.effect_result is not None
+                if (
+                    decision.effect_result.intent_id != member_intent_id
+                    or decision.effect_result.run_id != request.run_id
+                    or decision.effect_result.outcome != "COMPLETED"
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_RESULT_BINDING_MISMATCH")
+                copied._effect_results[member_intent_id] = decision.effect_result
                 copied._indeterminate_effect_intents.remove(member_intent_id)
             elif request.selection.resolution == "RETRY_SAME_INTENT":
                 copied._effect_results.pop(member_intent_id, None)
-                copied._indeterminate_effect_intents.remove(member_intent_id)
-                copied._indeterminate_generations[member_intent_id] = member.recovery_generation + 1
+                copied._indeterminate_effect_intents.add(member_intent_id)
+                copied._indeterminate_generations[member_intent_id] = (
+                    selected_member.recovery_generation + 1
+                )
             else:
                 copied._indeterminate_effect_intents.remove(member_intent_id)
             remaining = copied.unresolved_intent_set(request.run_id)
@@ -4950,7 +5037,13 @@ class InMemoryStateStore:
         self._commit_state_and_event(
             run_id=request.run_id,
             expected_sequence=request.expected_sequence,
-            event=AuditEvent.kind("INDETERMINATE_RESOLUTION_APPLIED"),
+            event=AuditEvent.kind(
+                "INDETERMINATE_RESOLUTION_APPLIED",
+                subject_digests=(
+                    request.selection.unresolved_set_digest,
+                    request.observation_set_digest,
+                ),
+            ),
             mutate=mutate,
         )
         return result[0]

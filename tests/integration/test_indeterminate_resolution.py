@@ -24,9 +24,9 @@ from apexcrew.domain.effects import (
     EffectIntent,
     EffectResult,
     RecoveryActionClass,
-    RecoveryDecision,
-    RecoveryDecisionKind,
+    RecoveryObservation,
     StateConflict,
+    observation_set_digest,
 )
 from apexcrew.domain.types import AuditSequence, IntentId, RunId, RuntimeOwnerId
 
@@ -36,7 +36,7 @@ def _intent(run_id: RunId, intent_id: str, sequence: AuditSequence) -> EffectInt
     return EffectIntent(
         intent_id=IntentId(intent_id),
         run_id=run_id,
-        kind="TEST_EFFECT",
+        kind="read",
         idempotency_key=f"test:{intent_id}",
         applicable_revision_digests=ApplicableRevisionDigests(),
         payload_digest="sha256:" + sha256(payload.encode()).hexdigest(),
@@ -55,6 +55,23 @@ def _indeterminate_result(intent: EffectIntent, sequence: AuditSequence) -> Effe
         result_digest="sha256:" + sha256(payload.encode()).hexdigest(),
         bounded_result_json=payload,
         settled_sequence=sequence,
+    )
+
+
+def _abandon_observation(
+    intent: EffectIntent, generation: int, run_id: RunId
+) -> RecoveryObservation:
+    return RecoveryObservation.create(
+        kind=RecoveryActionClass.READ_SEARCH,
+        intent_id=intent.intent_id,
+        recovery_generation=generation,
+        source_payload_digest=intent.payload_digest,
+        state="STALE",
+        run_id=run_id,
+        idempotency_key=intent.idempotency_key,
+        snapshot_digest="sha256:" + "a" * 64,
+        scope_digest="sha256:" + "b" * 64,
+        ordering_digest="sha256:" + "c" * 64,
     )
 
 
@@ -148,11 +165,10 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
         app.store.audit_sequence(run_id),
     )
     assert consumed is not None
-    abandon_decision = RecoveryDecision(
-        kind=RecoveryDecisionKind.ABANDONED,
-        action_class=RecoveryActionClass.READ_SEARCH,
-        reason="EXACT_PRESTATE_OBSERVED",
-        successor="PAUSED",
+    observation = _abandon_observation(
+        first,
+        member.recovery_generation,
+        run_id,
     )
     applied = app.store.apply_indeterminate_resolution(
         ApplyResolutionRequest(
@@ -161,7 +177,8 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
             permit_generation=permit.generation,
             owner_id=RuntimeOwnerId("resolution-owner"),
             expected_sequence=app.store.audit_sequence(run_id),
-            decision=abandon_decision,
+            observations=(observation,),
+            observation_set_digest=observation_set_digest((observation,)),
         )
     )
     assert applied.status == "ABANDONED"
@@ -185,6 +202,8 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
                 permit_generation=permit.generation,
                 owner_id=RuntimeOwnerId("resolution-owner"),
                 expected_sequence=after,
+                observations=(),
+                observation_set_digest=observation_set_digest(()),
             )
         )
     except StateConflict as error:
@@ -201,6 +220,8 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
                 permit_generation=permit.generation,
                 owner_id=RuntimeOwnerId("resolution-owner"),
                 expected_sequence=after,
+                observations=(),
+                observation_set_digest=observation_set_digest(()),
             )
         )
     except StateConflict as error:
@@ -281,13 +302,68 @@ def test_memory_resolution_matches_sqlite_member_cas() -> None:
             permit_generation=permit.generation,
             owner_id=RuntimeOwnerId("memory-resolution-owner"),
             expected_sequence=AuditSequence(7),
-            decision=RecoveryDecision(
-                kind=RecoveryDecisionKind.ABANDONED,
-                action_class=RecoveryActionClass.READ_SEARCH,
-                reason="EXACT_PRESTATE_OBSERVED",
-                successor="PAUSED",
+            observations=(_abandon_observation(first, member.recovery_generation, run_id),),
+            observation_set_digest=observation_set_digest(
+                (_abandon_observation(first, member.recovery_generation, run_id),)
             ),
         )
     )
     assert applied.status == "ABANDONED"
     assert store.unresolved_intent_set(run_id) is not None
+
+
+def test_set_bound_fail_denies_without_complete_abandonability_observations(
+    tmp_path: Path,
+) -> None:
+    app = make_application(tmp_path, monotonic_clock=SystemMonotonicClock())
+    run_id = create_draft_with_three_proposals(app)
+    first = _intent(run_id, "set-indeterminate-1", AuditSequence(2))
+    app.store.record_intent(first, AuditSequence(1))
+    app.store.settle_intent(
+        run_id,
+        first.intent_id,
+        _indeterminate_result(first, AuditSequence(3)),
+        ApplicableRevisionDigests(),
+        AuditSequence(2),
+    )
+    second = _intent(run_id, "set-indeterminate-2", AuditSequence(4))
+    app.store.record_intent(second, AuditSequence(3))
+    app.store.settle_intent(
+        run_id,
+        second.intent_id,
+        _indeterminate_result(second, AuditSequence(5)),
+        ApplicableRevisionDigests(),
+        AuditSequence(4),
+    )
+    unresolved = app.store.unresolved_intent_set(run_id)
+    assert unresolved is not None
+    accepted = app.control.handle(
+        _resolve_command(
+            run_id,
+            AuditSequence(5),
+            str(unresolved.set_digest),
+            resolution="FAIL_RUN",
+            bindings=app.store.current_revision_digests(run_id),
+        )
+    )
+    assert accepted.status == "ACCEPTED"
+    permit = app.store.unconsumed_permit(run_id)
+    owner = RuntimeOwnerId("set-resolution-owner")
+    assert app.store.consume_current_runtime_permit(run_id, owner, AuditSequence(6)) is not None
+    observation = _abandon_observation(first, 1, run_id)
+    before = app.store.audit_sequence(run_id)
+    denied = app.store.apply_indeterminate_resolution(
+        ApplyResolutionRequest(
+            run_id=run_id,
+            selection=permit.resolution_selection,
+            permit_generation=permit.generation,
+            owner_id=owner,
+            expected_sequence=before,
+            observations=(observation,),
+            observation_set_digest=observation_set_digest((observation,)),
+        )
+    )
+    assert denied.status == "DENIED"
+    assert app.store.audit_sequence(run_id) == before
+    assert app.store.unresolved_intent_set(run_id) == unresolved
+    assert app.store.run_record(run_id).state.value == "INDETERMINATE"

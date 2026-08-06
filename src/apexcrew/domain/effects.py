@@ -32,8 +32,8 @@ from apexcrew.domain.commands import (
     CommandOutcome,
 )
 from apexcrew.domain.indeterminate import (
-    ApplyResolutionRequest,
     ResolutionApplication,
+    ResolutionSelection,
     UnresolvedIntentBinding,
     UnresolvedIntentSet,
     unresolved_set_digest_for_members,
@@ -59,6 +59,7 @@ from apexcrew.domain.types import (
     RevisionDigest,
     RunId,
     RunState,
+    RuntimeOwnerId,
     TaskId,
     UnresolvedSetDigest,
 )
@@ -1125,6 +1126,25 @@ class RecoveryDecision:
             or self.applicable_revision_digests is not None
         ):
             raise ValueError("NON_RESULT_DECISION_CARRIES_RESULT")
+
+
+def observation_set_digest(observations: tuple[RecoveryObservation, ...]) -> Sha256DigestText:
+    return sha256_digest(
+        canonical_json(
+            {"observations": [observation.model_dump(mode="json") for observation in observations]}
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyResolutionRequest:
+    run_id: RunId
+    selection: ResolutionSelection
+    permit_generation: int
+    owner_id: RuntimeOwnerId
+    expected_sequence: AuditSequence
+    observations: tuple[RecoveryObservation, ...]
+    observation_set_digest: Sha256DigestText
 
 
 def _exact_prestate_digest(observation: RecoveryObservation) -> Sha256DigestText:
