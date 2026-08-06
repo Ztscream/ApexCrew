@@ -155,7 +155,10 @@ def observation(
                     "code": "PATCH_APPLIED",
                     "run_id": defaults["run_id"],
                     "intent_id": "intent-1",
-                    "bounded_payload": {"snapshot_digest": defaults["snapshot_digest"]},
+                    "bounded_payload": {
+                        "snapshot_digest": defaults["snapshot_digest"],
+                        "post_tree_digest": defaults["observed_post_tree_digest"],
+                    },
                 }
             )
         elif action_class is RecoveryActionClass.CHECK:
@@ -169,7 +172,11 @@ def observation(
                         "output": "",
                         "output_bytes": 0,
                         "snapshot_digest": defaults["snapshot_digest"],
+                        "check_id": defaults["check_id"],
+                        "argv_digest": defaults["argv_digest"],
+                        "receipt_digest": defaults["receipt_digest"],
                     },
+                    "content_digest": defaults["receipt_digest"],
                 }
             )
         else:

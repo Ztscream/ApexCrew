@@ -1019,6 +1019,21 @@ class RecoveryObservation(FrozenDocument):
                 }
                 if tool_result.code not in expected_codes[self.kind]:
                     raise ValueError("TOOL_COMPLETION_PROOF_CODE_INVALID")
+                if self.kind is RecoveryActionClass.PATCH:
+                    if (
+                        tool_result.bounded_payload.get("snapshot_digest") != self.snapshot_digest
+                        or tool_result.bounded_payload.get("post_tree_digest")
+                        != self.observed_post_tree_digest
+                    ):
+                        raise ValueError("PATCH_COMPLETION_PROOF_BINDING_MISMATCH")
+                elif (
+                    tool_result.bounded_payload.get("check_id") != self.check_id
+                    or tool_result.bounded_payload.get("argv_digest") != self.argv_digest
+                    or tool_result.bounded_payload.get("snapshot_digest") != self.snapshot_digest
+                    or tool_result.bounded_payload.get("receipt_digest") != self.receipt_digest
+                    or tool_result.content_digest != self.receipt_digest
+                ):
+                    raise ValueError("CHECK_COMPLETION_PROOF_BINDING_MISMATCH")
             else:
                 proof = {"state": self.state}
                 proof.update({name: getattr(self, name) for name in proof_fields[self.kind]})
