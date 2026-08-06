@@ -1143,6 +1143,9 @@ class ApplyResolutionRequest:
     permit_generation: int
     owner_id: RuntimeOwnerId
     expected_sequence: AuditSequence
+    intent_ids: tuple[IntentId, ...]
+    payload_digests: tuple[Sha256DigestText, ...]
+    recovery_generations: tuple[int, ...]
     observations: tuple[RecoveryObservation, ...]
     observation_set_digest: Sha256DigestText
 
@@ -1248,6 +1251,18 @@ def abandon_observation(observation: RecoveryObservation, successor: str) -> Rec
         "NO_AUTHORITATIVE_EFFECT",
         successor=successor,
     )
+
+
+def abandon_successor_for(observation: RecoveryObservation) -> str:
+    return {
+        RecoveryActionClass.READ_SEARCH: "PAUSED/READ_ABANDONED",
+        RecoveryActionClass.PATCH: "PAUSED/PATCH_ABANDONED",
+        RecoveryActionClass.CHECK: "PAUSED/CHECK_ABANDONED",
+        RecoveryActionClass.PRIVATE_REF: "PAUSED/PRIVATE_REF_INIT_ABANDONED",
+        RecoveryActionClass.TARGET_CAS: "READY_FOR_APPROVAL",
+        RecoveryActionClass.TARGET_RESERVATION: "PAUSED",
+        RecoveryActionClass.GRANTED_ACTION: "PAUSED",
+    }.get(observation.kind, "PAUSED")
 
 
 def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
@@ -1389,16 +1404,16 @@ class RecoveryService:
         self._journal = journal
 
     def reconcile(self, run_id: RunId) -> RecoveryOutcome:
-        indeterminate = self._journal.indeterminate_intents(run_id)
-        if not indeterminate:
+        unresolved = self._journal.unresolved_intent_set(run_id)
+        if unresolved is None:
             return RecoveryOutcome.empty()
         members = tuple(
             UnresolvedIntentMember(
-                intent_id=intent.intent_id,
-                recovery_generation=1,
-                intent_digest=intent.payload_digest,
+                intent_id=IntentId(member.intent_id),
+                recovery_generation=member.recovery_generation,
+                intent_digest=member.intent_digest,
             )
-            for intent in indeterminate
+            for member in unresolved.member_bindings
         )
         set_digest = UnresolvedSetDigest(
             str(

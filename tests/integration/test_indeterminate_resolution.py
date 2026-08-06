@@ -28,6 +28,8 @@ from apexcrew.domain.effects import (
     StateConflict,
     observation_set_digest,
 )
+from apexcrew.domain.indeterminate import UnresolvedIntentSet
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import AuditSequence, IntentId, RunId, RuntimeOwnerId
 
 
@@ -72,6 +74,16 @@ def _abandon_observation(
         snapshot_digest="sha256:" + "a" * 64,
         scope_digest="sha256:" + "b" * 64,
         ordering_digest="sha256:" + "c" * 64,
+    )
+
+
+def _bindings(
+    unresolved: UnresolvedIntentSet,
+) -> tuple[tuple[IntentId, ...], tuple[Sha256DigestText, ...], tuple[int, ...]]:
+    return (
+        tuple(IntentId(member.intent_id) for member in unresolved.member_bindings),
+        tuple(member.intent_digest for member in unresolved.member_bindings),
+        tuple(member.recovery_generation for member in unresolved.member_bindings),
     )
 
 
@@ -177,6 +189,9 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
             permit_generation=permit.generation,
             owner_id=RuntimeOwnerId("resolution-owner"),
             expected_sequence=app.store.audit_sequence(run_id),
+            intent_ids=_bindings(unresolved)[0],
+            payload_digests=_bindings(unresolved)[1],
+            recovery_generations=_bindings(unresolved)[2],
             observations=(observation,),
             observation_set_digest=observation_set_digest((observation,)),
         )
@@ -202,8 +217,13 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
                 permit_generation=permit.generation,
                 owner_id=RuntimeOwnerId("resolution-owner"),
                 expected_sequence=after,
-                observations=(),
-                observation_set_digest=observation_set_digest(()),
+                intent_ids=_bindings(remaining_member)[0],
+                payload_digests=_bindings(remaining_member)[1],
+                recovery_generations=_bindings(remaining_member)[2],
+                observations=(_abandon_observation(second, 1, run_id),),
+                observation_set_digest=observation_set_digest(
+                    (_abandon_observation(second, 1, run_id),)
+                ),
             )
         )
     except StateConflict as error:
@@ -220,6 +240,9 @@ def test_control_persists_exact_resolution_subject_and_rejects_stale_bindings(
                 permit_generation=permit.generation,
                 owner_id=RuntimeOwnerId("resolution-owner"),
                 expected_sequence=after,
+                intent_ids=_bindings(unresolved)[0],
+                payload_digests=_bindings(unresolved)[1],
+                recovery_generations=_bindings(unresolved)[2],
                 observations=(),
                 observation_set_digest=observation_set_digest(()),
             )
@@ -302,6 +325,9 @@ def test_memory_resolution_matches_sqlite_member_cas() -> None:
             permit_generation=permit.generation,
             owner_id=RuntimeOwnerId("memory-resolution-owner"),
             expected_sequence=AuditSequence(7),
+            intent_ids=_bindings(unresolved)[0],
+            payload_digests=_bindings(unresolved)[1],
+            recovery_generations=_bindings(unresolved)[2],
             observations=(_abandon_observation(first, member.recovery_generation, run_id),),
             observation_set_digest=observation_set_digest(
                 (_abandon_observation(first, member.recovery_generation, run_id),)
@@ -359,6 +385,9 @@ def test_set_bound_fail_denies_without_complete_abandonability_observations(
             permit_generation=permit.generation,
             owner_id=owner,
             expected_sequence=before,
+            intent_ids=_bindings(unresolved)[0],
+            payload_digests=_bindings(unresolved)[1],
+            recovery_generations=_bindings(unresolved)[2],
             observations=(observation,),
             observation_set_digest=observation_set_digest((observation,)),
         )

@@ -144,6 +144,7 @@ from apexcrew.domain.effects import (
     StateConflict,
     TargetReservation,
     abandon_observation,
+    abandon_successor_for,
     canonical_json,
     classify_reservation_creation,
     observation_set_digest,
@@ -4866,9 +4867,36 @@ class InMemoryStateStore:
         current = self.unresolved_intent_set(request.run_id)
         if current is None or current.set_digest != request.selection.unresolved_set_digest:
             raise StateConflict("STALE_UNRESOLVED_SET")
+        expected_intent_ids = tuple(
+            IntentId(member.intent_id) for member in current.member_bindings
+        )
+        expected_payload_digests = tuple(member.intent_digest for member in current.member_bindings)
+        expected_generations = tuple(
+            member.recovery_generation for member in current.member_bindings
+        )
+        if (
+            request.intent_ids != expected_intent_ids
+            or request.payload_digests != expected_payload_digests
+            or request.recovery_generations != expected_generations
+        ):
+            raise StateConflict("STALE_UNRESOLVED_BINDINGS")
         if request.observation_set_digest != observation_set_digest(request.observations):
             raise StateConflict("STALE_OBSERVATION_SET")
         observations = {observation.intent_id: observation for observation in request.observations}
+        expected_observation_count = (
+            len(current.member_bindings)
+            if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}
+            else 1
+        )
+        if len(request.observations) != expected_observation_count:
+            if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            raise StateConflict("OBSERVATION_SET_CARDINALITY_MISMATCH")
         if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
             if set(observations) != set(current.intents):
                 return ResolutionApplication(
@@ -4887,7 +4915,7 @@ class InMemoryStateStore:
                         or recovery_action_class_for_intent(intent) != set_observation.kind
                     ):
                         raise ValueError("OBSERVATION_BINDING_MISMATCH")
-                    abandon_observation(set_observation, "PAUSED")
+                    abandon_observation(set_observation, abandon_successor_for(set_observation))
             except (KeyError, ValueError):
                 return ResolutionApplication(
                     status="DENIED",
@@ -4898,6 +4926,22 @@ class InMemoryStateStore:
             set_result: list[ResolutionApplication] = []
 
             def close_set(copied: InMemoryStateStore) -> None:
+                transaction_current = copied.unresolved_intent_set(request.run_id)
+                if (
+                    transaction_current is None
+                    or transaction_current.set_digest != request.selection.unresolved_set_digest
+                    or tuple(
+                        IntentId(member.intent_id) for member in transaction_current.member_bindings
+                    )
+                    != request.intent_ids
+                    or tuple(member.intent_digest for member in transaction_current.member_bindings)
+                    != request.payload_digests
+                    or tuple(
+                        member.recovery_generation for member in transaction_current.member_bindings
+                    )
+                    != request.recovery_generations
+                ):
+                    raise StateConflict("STALE_UNRESOLVED_BINDINGS")
                 permit = copied._runtime_permits.get((request.run_id, request.permit_generation))
                 if (
                     permit is None
@@ -4981,12 +5025,28 @@ class InMemoryStateStore:
             if decision.kind.value != "RETRY_SAME_INTENT":
                 raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
         else:
-            decision = abandon_observation(observation, "PAUSED")
+            decision = abandon_observation(observation, abandon_successor_for(observation))
         member_intent_id = IntentId(selected_member.intent_id)
 
         result: list[ResolutionApplication] = []
 
         def mutate(copied: InMemoryStateStore) -> None:
+            transaction_current = copied.unresolved_intent_set(request.run_id)
+            if (
+                transaction_current is None
+                or transaction_current.set_digest != request.selection.unresolved_set_digest
+                or tuple(
+                    IntentId(member.intent_id) for member in transaction_current.member_bindings
+                )
+                != request.intent_ids
+                or tuple(member.intent_digest for member in transaction_current.member_bindings)
+                != request.payload_digests
+                or tuple(
+                    member.recovery_generation for member in transaction_current.member_bindings
+                )
+                != request.recovery_generations
+            ):
+                raise StateConflict("STALE_UNRESOLVED_BINDINGS")
             permit = copied._runtime_permits.get((request.run_id, request.permit_generation))
             if (
                 permit is None
