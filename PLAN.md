@@ -30544,7 +30544,7 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 
 ## M1-R4.1 Recovery and Asymmetric Cleanup Revision (2026-08-06)
 
-**Status: PROPOSED / DOCUMENT-REVIEW REQUIRED.** This revision is the execution authority for correcting the R4-02B blockers. It authorizes no source, fixture, test, or CI changes until this complete `PLAN.md` revision and the companion plan at `docs/superpowers/plans/2026-08-06-apexcrew-recovery-resolution.md` receive an independent zero-blocker document review, the reviewed digest is recorded, and the owner records `M1 GO`. `SPEC.md` remains frozen.
+**Status: APPROVED / M1 GO RECORDED 2026-08-06.** This revision is the execution authority for correcting the R4-02B blockers. It authorizes source work only from the final document-review base recorded below. `SPEC.md` remains frozen.
 
 **Objective:** Implement action-class recovery, exact member/set-bound `INDETERMINATE` resolution, and exact path-only/admin-only terminal reservation cleanup while preserving Permit gating, dispatch closure, and terminal Run semantics.
 
@@ -30560,7 +30560,7 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 | R4.1-04 asymmetric terminal cleanup | NOT STARTED | pending | pending document review and red/green |
 | R4.1-05 final verification and delivery evidence | NOT STARTED | pending | pending observed offline/build evidence; live remains owner-authorized |
 
-**Document review gate:** pending independent reviewer, pending reviewed `PLAN.md` digest, pending owner `M1 GO`.
+**Document review gate:** PASS. SPEC reviewer Confucius (019fd4bd-25ed-7cf1-9106-2a30116e9596) and quality/workflow reviewer Ampere (019fd4bd-2a35-7fd0-91bb-e721ade91332) reported zero critical/high findings for e2785e3. Owner M1 GO is recorded from the current user objective. PLAN.md SHA-256: C5D73466F9001698CE303562E9F37C6A52A5AC35FA075C1261CEB94703160909. Companion plan SHA-256: 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
 
 ### M1-R4.1 Review Correction Authority
 
@@ -30568,7 +30568,7 @@ The R4.1 task chain is independently auditable through this required map. Each S
 
 | Task | PR | Worktree | Final-Reviewed-Base-SHA | Implementation-SHA | Spec-Review-SHA | Spec-Correction-SHAs | Quality-Review-SHA | Quality-Correction-SHAs | Ledger-SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | f601498 | pending | pending | pending | pending | pending | pending |
+| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e2785e3 | pending | 019fd4bd-25ed-7cf1-9106-2a30116e9596 | pending | 019fd4bd-2a35-7fd0-91bb-e721ade91332 | pending | pending |
 | R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | pending | pending | pending | pending | pending | pending | pending |

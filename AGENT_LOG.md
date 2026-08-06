@@ -2154,6 +2154,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / M1-R4.1 document review and GO
+
+- Plan revision: M1-R4.1 recovery resolution and asymmetric cleanup plan, final document-review base e2785e3.
+- Independent SPEC review: Confucius (019fd4bd-25ed-7cf1-9106-2a30116e9596) reported PASS with zero critical/high findings.
+- Independent quality/workflow review: Ampere (019fd4bd-2a35-7fd0-91bb-e721ade91332) reported PASS with zero critical/high findings.
+- Owner gate: the current user objective to set the goal and complete the final-user version records M1 GO; source work may begin only in the named R4.1-01 worktree.
+- Document digests: PLAN.md SHA-256 707912EE3DE4F7B4685413FECC93DEB148FE45A5F9F6DF72AA7F1877176E51E7; companion plan SHA-256 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
+- Boundary: no source implementation, provider credential, live API request, push, or remote PR action occurred during document review.
+
 ## 2026-08-06 / R4-02B independent review and Windows cleanup correction
 
 - **Implementation commit**: `f68de44` (`feat(runtime): complete R4-02B phase composition`), cherry-picked from implementation commit `9e8dd3f`; Subagent: Codex independent-review correction; Human-Changes: none.
