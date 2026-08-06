@@ -9,6 +9,7 @@ from apexcrew.domain.effects import (
     RecoveryDecisionKind,
     RecoveryObservation,
     abandon_observation,
+    canonical_json,
     recover_observation,
     sha256_digest,
 )
@@ -70,6 +71,32 @@ def observation(
         defaults.setdefault("bounded_result_digest", BOUNDED_DIGEST)
     if state == "EXACT_RECEIPT":
         defaults.setdefault("receipt_digest", RESULT)
+    completed = (
+        (action_class is RecoveryActionClass.MODEL and state == "EXACT_COMPLETION")
+        or (action_class is RecoveryActionClass.READ_SEARCH and state == "EXACT_SNAPSHOT")
+        or (action_class is RecoveryActionClass.CHECK and state == "EXACT_RECEIPT")
+        or (
+            action_class is RecoveryActionClass.TARGET_RESERVATION
+            and (
+                (defaults["reservation_operation"] == "CREATE" and state == "BOTH_PRESENT_LOCKED")
+                or (defaults["reservation_operation"] == "CLEANUP" and state == "BOTH_ABSENT")
+            )
+        )
+        or (
+            action_class
+            in {
+                RecoveryActionClass.PATCH,
+                RecoveryActionClass.PRIVATE_REF,
+                RecoveryActionClass.TARGET_CAS,
+                RecoveryActionClass.GRANTED_ACTION,
+            }
+            and state == "EXACT_POST"
+        )
+    )
+    if completed:
+        completed_json = canonical_json({"state": state})
+        defaults.setdefault("bounded_result_json", completed_json)
+        defaults.setdefault("bounded_result_digest", sha256_digest(completed_json))
     allowed = {
         RecoveryActionClass.MODEL: {
             "request_digest",
@@ -80,6 +107,8 @@ def observation(
             "usage_json",
             "normalized_completion_digest",
             "reservation_charge",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.READ_SEARCH: {
             "idempotency_key",
@@ -93,6 +122,8 @@ def observation(
             "idempotency_key",
             "expected_pre_tree_digest",
             "observed_post_tree_digest",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.CHECK: {
             "idempotency_key",
@@ -100,6 +131,8 @@ def observation(
             "argv_digest",
             "snapshot_digest",
             "receipt_digest",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.PRIVATE_REF: {
             "idempotency_key",
@@ -111,6 +144,8 @@ def observation(
             "old_oid",
             "prepared_oid",
             "current_oid",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.TARGET_CAS: {
             "idempotency_key",
@@ -122,6 +157,8 @@ def observation(
             "old_oid",
             "prepared_oid",
             "current_oid",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.TARGET_RESERVATION: {
             "idempotency_key",
@@ -130,6 +167,8 @@ def observation(
             "admin_binding_digest",
             "path_identity",
             "gitfile_digest",
+            "bounded_result_json",
+            "bounded_result_digest",
         },
         RecoveryActionClass.GRANTED_ACTION: set(),
     }

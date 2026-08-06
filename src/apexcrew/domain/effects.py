@@ -490,6 +490,46 @@ RecoveryObservationState = Literal[
 ]
 
 
+def _validate_bounded_result(
+    bounded_result_json: str, bounded_result_digest: Sha256DigestText | None
+) -> None:
+    try:
+        parsed = json.loads(bounded_result_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("READ_RESULT_NOT_JSON") from exc
+    canonical_result = json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if canonical_result != bounded_result_json:
+        raise ValueError("READ_RESULT_NOT_CANONICAL")
+    if len(bounded_result_json.encode("utf-8")) > 131_072:
+        raise ValueError("READ_RESULT_TOO_LARGE")
+    forbidden_keys = {
+        "credential",
+        "credentials",
+        "nonce",
+        "raw_transcript",
+        "provider_transcript",
+        "secret",
+        "token",
+    }
+
+    def contains_forbidden_key(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(
+                isinstance(key, str)
+                and key.lower() in forbidden_keys
+                or contains_forbidden_key(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains_forbidden_key(item) for item in value)
+        return False
+
+    if contains_forbidden_key(parsed):
+        raise ValueError("READ_RESULT_NOT_SANITIZED")
+    if bounded_result_digest != sha256_digest(bounded_result_json):
+        raise ValueError("READ_RESULT_DIGEST_MISMATCH")
+
+
 class RecoveryDecisionKind(StrEnum):
     COMPLETED = "COMPLETED"
     RETRY_SAME_INTENT = "RETRY_SAME_INTENT"
@@ -638,6 +678,8 @@ class RecoveryObservation(FrozenDocument):
                     "usage_json",
                     "normalized_completion_digest",
                     "reservation_charge",
+                    "bounded_result_json",
+                    "bounded_result_digest",
                 }
             ),
             RecoveryActionClass.READ_SEARCH: frozenset(
@@ -651,10 +693,24 @@ class RecoveryObservation(FrozenDocument):
                 }
             ),
             RecoveryActionClass.PATCH: frozenset(
-                {"idempotency_key", "expected_pre_tree_digest", "observed_post_tree_digest"}
+                {
+                    "idempotency_key",
+                    "expected_pre_tree_digest",
+                    "observed_post_tree_digest",
+                    "bounded_result_json",
+                    "bounded_result_digest",
+                }
             ),
             RecoveryActionClass.CHECK: frozenset(
-                {"idempotency_key", "check_id", "argv_digest", "snapshot_digest", "receipt_digest"}
+                {
+                    "idempotency_key",
+                    "check_id",
+                    "argv_digest",
+                    "snapshot_digest",
+                    "receipt_digest",
+                    "bounded_result_json",
+                    "bounded_result_digest",
+                }
             ),
             RecoveryActionClass.PRIVATE_REF: frozenset(
                 {
@@ -667,6 +723,8 @@ class RecoveryObservation(FrozenDocument):
                     "old_oid",
                     "prepared_oid",
                     "current_oid",
+                    "bounded_result_json",
+                    "bounded_result_digest",
                 }
             ),
             RecoveryActionClass.TARGET_CAS: frozenset(
@@ -680,6 +738,8 @@ class RecoveryObservation(FrozenDocument):
                     "old_oid",
                     "prepared_oid",
                     "current_oid",
+                    "bounded_result_json",
+                    "bounded_result_digest",
                 }
             ),
             RecoveryActionClass.TARGET_RESERVATION: frozenset(
@@ -690,6 +750,8 @@ class RecoveryObservation(FrozenDocument):
                     "admin_binding_digest",
                     "path_identity",
                     "gitfile_digest",
+                    "bounded_result_json",
+                    "bounded_result_digest",
                 }
             ),
             RecoveryActionClass.GRANTED_ACTION: frozenset(
@@ -699,6 +761,8 @@ class RecoveryObservation(FrozenDocument):
                     "grant_id",
                     "expected_prestate_digest",
                     "action_binding_digest",
+                    "bounded_result_json",
+                    "bounded_result_digest",
                 }
             ),
         }
@@ -734,6 +798,8 @@ class RecoveryObservation(FrozenDocument):
             or self.settled_sequence is None
             or self.settled_sequence < 1
             or self.applicable_revision_digests is None
+            or self.bounded_result_json is None
+            or self.bounded_result_digest is None
         ):
             raise ValueError("COMPLETION_DURABLE_BINDING_REQUIRED")
         common = {
@@ -851,6 +917,9 @@ class RecoveryObservation(FrozenDocument):
                 and not self.registration_identity
             ):
                 raise ValueError("RESERVATION_IDENTITY_REQUIRED")
+        if completed_state and self.kind is not RecoveryActionClass.READ_SEARCH:
+            assert self.bounded_result_json is not None
+            _validate_bounded_result(self.bounded_result_json, self.bounded_result_digest)
         payload = self.model_dump(mode="json", exclude={"observation_digest"}, exclude_none=True)
         expected = sha256_digest(canonical_json(payload))
         if self.observation_digest != expected:
@@ -949,12 +1018,14 @@ def _exact_prestate_digest(observation: RecoveryObservation) -> Sha256DigestText
 def _completed_decision(
     observation: RecoveryObservation,
     reason: str,
-    result_digest: Sha256DigestText,
-    bounded_result_json: str = "{}",
+    result_digest: Sha256DigestText | None = None,
+    bounded_result_json: str | None = None,
 ) -> RecoveryDecision:
-    if sha256_digest(bounded_result_json) != result_digest:
-        bounded_result_json = canonical_json({"observation_digest": str(result_digest)})
-        result_digest = sha256_digest(bounded_result_json)
+    del result_digest, bounded_result_json
+    assert observation.bounded_result_json is not None
+    assert observation.bounded_result_digest is not None
+    result_digest = observation.bounded_result_digest
+    bounded_result_json = observation.bounded_result_json
     assert observation.run_id is not None
     assert observation.settled_sequence is not None
     assert observation.applicable_revision_digests is not None
