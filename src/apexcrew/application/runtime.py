@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
@@ -35,11 +35,25 @@ from apexcrew.domain.commands import (
     RuntimeState,
 )
 from apexcrew.domain.effects import (
+    ApplyResolutionRequest,
     EffectIntent,
+    RecoveryActionClass,
+    RecoveryObservation,
     RecoveryOutcome,
     StateConflict,
     TargetReservation,
+    abandon_observation,
+    abandon_successor_for,
     canonical_json,
+    observation_set_digest,
+    recover_observation,
+    recovery_action_class_for_intent,
+)
+from apexcrew.domain.indeterminate import (
+    ResolutionApplication,
+    ResolutionSelection,
+    UnresolvedIntentBinding,
+    UnresolvedIntentSet,
 )
 from apexcrew.domain.model import (
     CommittedModelTurn,
@@ -337,26 +351,223 @@ class ResolutionDriver(Protocol):
         raise NotImplementedError
 
 
-class ResolutionRuntime(ResolutionDriver):
-    """Re-project unresolved effects without guessing an external outcome."""
+class ResolutionObservationPort(Protocol):
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        raise NotImplementedError
 
-    def __init__(self, recovery: RuntimeRecoveryService, journal: RuntimeRecoveryJournal) -> None:
-        self._recovery = recovery
+
+class ResolutionObservationRegistry(ResolutionObservationPort):
+    """Dispatch action-class observers while retaining a fail-closed fallback."""
+
+    def __init__(
+        self,
+        observers: Mapping[str, ResolutionObservationPort] | None = None,
+    ) -> None:
+        self._observers = dict(observers or {})
+
+    def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
+        observer = self._observers.get(intent.kind, self)
+        if observer is not self:
+            return observer.observe(intent, recovery_generation)
+        return _unavailable_resolution_observation(intent, recovery_generation)
+
+
+def _unavailable_resolution_observation(
+    intent: EffectIntent, recovery_generation: int
+) -> RecoveryObservation:
+    zero = Sha256DigestText("sha256:" + "0" * 64)
+    action_class = recovery_action_class_for_intent(intent)
+    values: dict[str, object] = {
+        "kind": action_class,
+        "intent_id": intent.intent_id,
+        "recovery_generation": recovery_generation,
+        "source_payload_digest": intent.payload_digest,
+        "state": "UNAVAILABLE",
+        "run_id": intent.run_id,
+        "idempotency_key": intent.idempotency_key,
+    }
+    required = {
+        RecoveryActionClass.MODEL: {"request_digest": intent.payload_digest},
+        RecoveryActionClass.READ_SEARCH: {
+            "snapshot_digest": zero,
+            "scope_digest": zero,
+            "ordering_digest": zero,
+        },
+        RecoveryActionClass.PATCH: {
+            "expected_pre_tree_digest": zero,
+            "observed_post_tree_digest": zero,
+            "snapshot_digest": zero,
+        },
+        RecoveryActionClass.CHECK: {
+            "check_id": "unavailable",
+            "argv_digest": zero,
+            "snapshot_digest": zero,
+        },
+        RecoveryActionClass.PRIVATE_REF: {
+            "repository_id": "unavailable",
+            "repository_instance_digest": zero,
+            "ref_name": "unavailable",
+            "registration_digest": zero,
+            "target_safety_digest": zero,
+            "old_oid": "0" * 40,
+            "prepared_oid": "1" * 40,
+            "current_oid": "2" * 40,
+        },
+        RecoveryActionClass.TARGET_CAS: {
+            "repository_id": "unavailable",
+            "repository_instance_digest": zero,
+            "ref_name": "unavailable",
+            "registration_digest": zero,
+            "target_safety_digest": zero,
+            "old_oid": "0" * 40,
+            "prepared_oid": "1" * 40,
+            "current_oid": "2" * 40,
+        },
+        RecoveryActionClass.TARGET_RESERVATION: {
+            "registration_identity": "unavailable",
+            "reservation_operation": "CREATE",
+            "admin_binding_digest": zero,
+            "path_identity": "unavailable",
+            "gitfile_digest": zero,
+        },
+        RecoveryActionClass.GRANTED_ACTION: {
+            "pending_action_id": "unavailable",
+            "grant_id": "unavailable",
+            "expected_prestate_digest": zero,
+            "action_binding_digest": zero,
+        },
+    }
+    values.update(required[action_class])
+    return RecoveryObservation.create(**values)
+
+
+class ResolutionRuntime(ResolutionDriver):
+    """Observe and atomically apply one Permit-bound indeterminate resolution."""
+
+    def __init__(
+        self,
+        journal: ResolutionStateJournal,
+        observer: ResolutionObservationPort,
+    ) -> None:
         self._journal = journal
+        self._observer = observer
 
     def resume(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         if (
             permit.run_id != run_id
             or permit.state != "CONSUMED"
             or permit.allowed_phase != "INDETERMINATE"
+            or permit.consumed_owner_id is None
+            or permit.resolution_selection is None
         ):
             raise ValueError("INDETERMINATE_RESOLUTION_PERMIT_PHASE_MISMATCH")
-        outcome = self._recovery.reconcile(run_id)
-        if outcome.requires_human_resolution:
-            return RuntimeDecision.pause("INDETERMINATE", self._journal.audit_sequence(run_id))
-        return RuntimeDecision.pause(
-            "INDETERMINATE_RESOLUTION_REQUIRED", self._journal.audit_sequence(run_id)
+        selection = permit.resolution_selection
+        unresolved = self._journal.unresolved_intent_set(run_id)
+        if unresolved is None or unresolved.set_digest != selection.unresolved_set_digest:
+            raise StateConflict("STALE_UNRESOLVED_SET")
+        member_bindings = unresolved.member_bindings
+        members: tuple[UnresolvedIntentBinding, ...]
+        if selection.intent_id is not None:
+            selected = next(
+                (member for member in member_bindings if member.intent_id == selection.intent_id),
+                None,
+            )
+            if selected is None or selected.recovery_generation != selection.recovery_generation:
+                raise StateConflict("STALE_UNRESOLVED_MEMBER")
+            members = (selected,)
+        else:
+            members = member_bindings
+        observations = tuple(
+            self._observe_member(
+                run_id,
+                self._journal.effect_intent(IntentId(member.intent_id)),
+                member.recovery_generation,
+            )
+            for member in members
         )
+        self._validate_member_strategy(
+            selection,
+            observations,
+            expected_sequence=self._journal.audit_sequence(run_id),
+        )
+        application = self._journal.apply_indeterminate_resolution(
+            ApplyResolutionRequest(
+                run_id=run_id,
+                selection=selection,
+                permit_generation=permit.generation,
+                owner_id=permit.consumed_owner_id,
+                expected_sequence=self._journal.audit_sequence(run_id),
+                intent_ids=tuple(IntentId(member.intent_id) for member in member_bindings),
+                payload_digests=tuple(member.intent_digest for member in member_bindings),
+                recovery_generations=tuple(
+                    member.recovery_generation for member in member_bindings
+                ),
+                observations=observations,
+                observation_set_digest=observation_set_digest(observations),
+            )
+        )
+        return _resolution_application_decision(application)
+
+    def _observe_member(
+        self, run_id: RunId, intent: EffectIntent, recovery_generation: int
+    ) -> RecoveryObservation:
+        if intent.run_id != run_id:
+            raise StateConflict("OBSERVATION_RUN_BINDING_MISMATCH")
+        observation = self._observer.observe(intent, recovery_generation)
+        if (
+            observation.intent_id != intent.intent_id
+            or observation.run_id not in {None, run_id}
+            or observation.recovery_generation != recovery_generation
+            or observation.source_payload_digest != intent.payload_digest
+            or observation.kind != recovery_action_class_for_intent(intent)
+        ):
+            raise StateConflict("OBSERVATION_BINDING_MISMATCH")
+        return observation
+
+    @staticmethod
+    def _validate_member_strategy(
+        selection: ResolutionSelection,
+        observations: tuple[RecoveryObservation, ...],
+        *,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+            return
+        if len(observations) != 1:
+            raise StateConflict("OBSERVATION_SET_CARDINALITY_MISMATCH")
+        observation = observations[0]
+        if selection.resolution == "RECONCILE_OBSERVED":
+            decision = recover_observation(observation)
+            if (
+                decision.kind.value != "COMPLETED"
+                or decision.effect_result is None
+                or decision.effect_result.settled_sequence != AuditSequence(expected_sequence + 1)
+            ):
+                raise StateConflict("OBSERVED_RECOVERY_COMPLETION_REQUIRED")
+        elif selection.resolution == "RETRY_SAME_INTENT":
+            decision = recover_observation(observation)
+            if decision.kind.value != "RETRY_SAME_INTENT":
+                raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
+        else:
+            abandon_observation(observation, abandon_successor_for(observation))
+
+
+def _resolution_application_decision(application: ResolutionApplication) -> RuntimeDecision:
+    if application.remaining_set_digest is not None or application.status == "DENIED":
+        return RuntimeDecision.pause("INDETERMINATE", application.resulting_sequence)
+    return RuntimeDecision.pause(application.successor, application.resulting_sequence)
+
+
+class ResolutionStateJournal(Protocol):
+    def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
+
+    def unresolved_intent_set(self, run_id: RunId) -> UnresolvedIntentSet | None: ...
+
+    def effect_intent(self, intent_id: IntentId) -> EffectIntent: ...
+
+    def apply_indeterminate_resolution(
+        self, request: ApplyResolutionRequest
+    ) -> ResolutionApplication: ...
 
 
 class FinalIntegrationDriver(Protocol):

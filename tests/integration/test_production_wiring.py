@@ -69,3 +69,20 @@ def test_reopened_bundle_preserves_run_bindings(tmp_path: Path) -> None:
         assert after == before
     finally:
         second.close()
+
+
+def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: Path) -> None:
+    options = {
+        "repository_authority": FixtureRepositoryAuthority(),
+        "model_configuration": default_revision_documents().model_configuration.model_copy(
+            update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
+        ),
+        "scripted_model": ScriptedMockLLM(()),
+    }
+    bundle = build_application_bundle(tmp_path, **options)
+    try:
+        resolution = bundle.runtime._phase_drivers._resolution  # type: ignore[attr-defined]
+        assert type(resolution).__name__ == "ResolutionRuntime"
+        assert type(resolution._observer).__name__ == "ResolutionObservationRegistry"
+    finally:
+        bundle.close()
