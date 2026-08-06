@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 
 import pytest
 
-from apexcrew.application.runtime import ResolutionRuntime, _stop_reason_for_decision
+from apexcrew.application.runtime import (
+    ModelResolutionObserver,
+    ResolutionRuntime,
+    _stop_reason_for_decision,
+)
 from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import (
     ApplyResolutionRequest,
@@ -19,6 +25,16 @@ from apexcrew.domain.indeterminate import (
     ResolutionSelection,
     UnresolvedIntentBinding,
     UnresolvedIntentSet,
+)
+from apexcrew.domain.model import (
+    LogicalModelTurn,
+    ModelCompletion,
+    ModelRequest,
+    ModelRequestIntent,
+    ModelUsage,
+    ProviderAttemptResult,
+    SettledModelAttempt,
+    model_request_to_json,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import AuditSequence, IntentId, RequestId, RunId, RuntimeOwnerId
@@ -224,3 +240,181 @@ def test_set_resolution_rejects_unabandonable_observation_before_store_apply() -
             (_observation(intent, "UNAVAILABLE"),),
             expected_sequence=AuditSequence(1),
         )
+
+
+def _model_request() -> ModelRequest:
+    return ModelRequest(
+        run_id=RUN_ID,
+        plan_digest=None,
+        policy_digest="sha256:" + "3" * 64,
+        budget_digest="sha256:" + "4" * 64,
+        model_configuration_digest="sha256:" + "5" * 64,
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
+        prompt=({"role": "user", "content": "recover"},),
+        tool_schema_digest="sha256:" + "6" * 64,
+        request_digest="sha256:" + "7" * 64,
+        idempotency_key="model:runtime-resolution-run:1",
+        max_input_tokens=100,
+        max_output_tokens=100,
+        reserved_cost_usd=Decimal("0.01"),
+    )
+
+
+class _ModelJournal:
+    def __init__(
+        self, request: ModelRequestIntent, attempts: tuple[SettledModelAttempt, ...] = ()
+    ) -> None:
+        self.request = request
+        self.attempts = attempts
+
+    def model_request(self, run_id: RunId, intent_id: IntentId) -> ModelRequestIntent:
+        assert run_id == self.request.run_id
+        assert intent_id == self.request.intent_id
+        return self.request
+
+    def committed_model_turn(self, run_id: RunId, logical_turn_id: str) -> None:
+        assert run_id == self.request.run_id
+        assert logical_turn_id == self.request.logical_turn_id
+
+    def model_attempts(
+        self, run_id: RunId, logical_turn_id: str
+    ) -> tuple[SettledModelAttempt, ...]:
+        assert run_id == self.request.run_id
+        assert logical_turn_id == self.request.logical_turn_id
+        return self.attempts
+
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        assert run_id == self.request.run_id
+        return AuditSequence(4)
+
+
+class _ProviderLookup:
+    def __init__(self, result: ProviderAttemptResult | None) -> None:
+        self.result = result
+        self.calls: list[tuple[ModelRequest, str | None]] = []
+
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        self.calls.append((request, provider_response_id))
+        return self.result
+
+
+def _model_effect(request: ModelRequest, intent_id: IntentId) -> EffectIntent:
+    payload = model_request_to_json(request)
+    return EffectIntent(
+        intent_id=intent_id,
+        run_id=RUN_ID,
+        kind="model",
+        idempotency_key=request.idempotency_key,
+        applicable_revision_digests=ApplicableRevisionDigests(
+            policy_digest=request.policy_digest,
+            budget_digest=request.budget_digest,
+            model_configuration_digest=request.model_configuration_digest,
+        ),
+        payload_digest=Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest()),
+        normalized_payload_json=payload,
+        recorded_sequence=AuditSequence(4),
+    )
+
+
+def test_model_resolution_queries_provider_without_a_committed_local_turn() -> None:
+    request = _model_request()
+    reserved = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    intent_id = IntentId("model-resolution-intent")
+    reserved = replace(reserved, intent_id=intent_id)
+    provider_result = ProviderAttemptResult.completed(
+        ModelCompletion(
+            response_id="provider-response-1",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
+            usage=ModelUsage(3, 4, Decimal("0.0001")),
+            normalized_action={"kind": "finish"},
+        )
+    )
+    lookup = _ProviderLookup(provider_result)
+    journal = _ModelJournal(reserved, (SettledModelAttempt.from_result(reserved, provider_result),))
+
+    observation = ModelResolutionObserver(journal, lookup).observe(
+        _model_effect(request, intent_id), 1
+    )
+
+    assert observation.state == "EXACT_COMPLETION"
+    assert lookup.calls == [(request, "provider-response-1")]
+    assert observation.provider_response_id == "provider-response-1"
+
+
+def test_model_resolution_rejects_incomplete_provider_evidence() -> None:
+    request = _model_request()
+    reserved = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    intent_id = IntentId("model-resolution-incomplete")
+    reserved = replace(reserved, intent_id=intent_id)
+    provider_result = ProviderAttemptResult.completed(
+        ModelCompletion(
+            response_id="provider-response-1",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
+            usage=None,
+            normalized_action={"kind": "finish"},
+        )
+    )
+    lookup = _ProviderLookup(provider_result)
+    journal = _ModelJournal(reserved, (SettledModelAttempt.from_result(reserved, provider_result),))
+
+    observation = ModelResolutionObserver(journal, lookup).observe(
+        _model_effect(request, intent_id), 1
+    )
+
+    assert observation.state == "UNAVAILABLE"
+
+
+def test_model_resolution_rejects_a_completed_attempt_from_another_intent() -> None:
+    request = _model_request()
+    reserved = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    intent_id = IntentId("model-resolution-current")
+    reserved = replace(reserved, intent_id=intent_id)
+    provider_result = ProviderAttemptResult.completed(
+        ModelCompletion(
+            response_id="provider-response-other",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash",
+            usage=ModelUsage(3, 4, Decimal("0.0001")),
+            normalized_action={"kind": "finish"},
+        )
+    )
+    other_attempt = replace(
+        SettledModelAttempt.from_result(reserved, provider_result),
+        intent_id=IntentId("model-resolution-other"),
+    )
+    lookup = _ProviderLookup(provider_result)
+
+    observation = ModelResolutionObserver(
+        _ModelJournal(reserved, (other_attempt,)), lookup
+    ).observe(_model_effect(request, intent_id), 1)
+
+    assert observation.state == "UNAVAILABLE"
+
+
+def test_model_resolution_rejects_a_provider_model_outside_the_allowlist() -> None:
+    request = _model_request()
+    reserved = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    intent_id = IntentId("model-resolution-model-mismatch")
+    reserved = replace(reserved, intent_id=intent_id)
+    provider_result = ProviderAttemptResult.completed(
+        ModelCompletion(
+            response_id="provider-response-mismatch",
+            requested_model_id="deepseek-v4-flash",
+            returned_model_id="deepseek-v4-flash-alias",
+            usage=ModelUsage(3, 4, Decimal("0.0001")),
+            normalized_action={"kind": "finish"},
+        )
+    )
+    attempt = SettledModelAttempt.from_result(reserved, provider_result)
+    lookup = _ProviderLookup(provider_result)
+
+    observation = ModelResolutionObserver(_ModelJournal(reserved, (attempt,)), lookup).observe(
+        _model_effect(request, intent_id), 1
+    )
+
+    assert observation.state == "UNAVAILABLE"

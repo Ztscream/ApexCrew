@@ -2154,6 +2154,16 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4.1-03 correction pass
+
+- **Task / branch**: `R4.1-03`, `codex/m1-r4-3-resolution-runtime`; correction base `d2eebf0`.
+- **Spec correction**: Target-CAS recovery now requires a typed `TargetCasIntent` round trip, complete payload digest, and exact Run/repository/ref/OID/safety/registration bindings. MODEL recovery now invokes an injected authoritative provider lookup, including the no-local-turn uncertainty window, and rejects missing or mismatched provider response/model/usage/schema/completion evidence. Granted-action completion uses the current journal Audit sequence.
+- **Tests added**: typed Target-CAS payload tamper rejection; current-Audit-sequence GrantedAction observer; DeepSeek exact lookup and storage-disabled fail-closed behavior; provider lookup without a committed local turn and incomplete-evidence fail-closed behavior.
+- **Observed green evidence**: focused resolution/provider/candidate selectors passed; final `uv run --python 3.12 pytest -q` passed with the existing xfail/skip set; final `uv run --python 3.12 mypy src` -> success; Ruff check/format and `git diff --check` -> success.
+- **Scope exception**: provider lookup and typed Target-CAS required changes in existing adapter/domain files outside the companion plan's narrow R4.1-03 file list; Nash recorded this as a workflow finding for owner review.
+- **Boundary**: no credential was read, no live DeepSeek request, network call, push, or remote PR was performed. Reviewer correction is disposable and remains on this worktree.
+- **Review status**: Nash Standards/Quality found no new behavior defect and recorded the scope/logging findings; Mencius SPEC final correction review PASS with zero remaining High/Medium/Low findings. No credential, provider, network, push, or remote PR action occurred.
+
 ## 2026-08-06 / R4.1-03 production observer correction
 
 - **Timestamp / task:** 2026-08-06, `R4.1-03` runtime resolution and production wiring.

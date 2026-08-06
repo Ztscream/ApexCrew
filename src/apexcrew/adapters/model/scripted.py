@@ -46,3 +46,9 @@ class ScriptedMockLLM:
         self._results.popleft()
         self.call_count += 1
         return step.result
+
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        del request, provider_response_id
+        return None

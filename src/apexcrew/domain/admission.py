@@ -181,6 +181,52 @@ class RefCasIntent(FrozenDocument):
         return candidate
 
 
+class TargetCasIntent(FrozenDocument):
+    intent_id: IntentId
+    run_id: RunId
+    kind: Literal["target_ref_cas"]
+    repository_id: RepositoryId
+    repository_instance_digest: Sha256DigestText
+    ref_name: str
+    expected_old_oid: GitOid
+    prepared_oid: GitOid
+    target_safety_digest: Sha256DigestText
+    registration_digest: Sha256DigestText
+    applicable_revision_digests: ApplicableRevisionDigests
+    idempotency_key: str
+
+    def to_effect_intent(self, recorded_sequence: AuditSequence) -> EffectIntent:
+        payload = canonical_json(self.model_dump(mode="json"))
+        return EffectIntent(
+            intent_id=self.intent_id,
+            run_id=self.run_id,
+            kind=self.kind,
+            idempotency_key=self.idempotency_key,
+            applicable_revision_digests=self.applicable_revision_digests,
+            payload_digest=sha256_digest(payload),
+            normalized_payload_json=payload,
+            recorded_sequence=recorded_sequence,
+            expected_prestate_json=canonical_json(
+                {
+                    "expected_old_oid": self.expected_old_oid,
+                    "prepared_oid": self.prepared_oid,
+                    "ref_name": self.ref_name,
+                    "registration_digest": self.registration_digest,
+                    "repository_id": self.repository_id,
+                    "repository_instance_digest": self.repository_instance_digest,
+                    "target_safety_digest": self.target_safety_digest,
+                }
+            ),
+        )
+
+    @classmethod
+    def from_effect_intent(cls, effect: EffectIntent) -> TargetCasIntent:
+        candidate = cls.model_validate_json(effect.normalized_payload_json)
+        if candidate.to_effect_intent(effect.recorded_sequence) != effect:
+            raise ValueError("TARGET_CAS_EFFECT_INTENT_BINDING_MISMATCH")
+        return candidate
+
+
 class StartGuardBinding(FrozenDocument):
     run_id: RunId
     repository_id: RepositoryId

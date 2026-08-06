@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from apexcrew.domain.admission import TargetCasIntent
 from apexcrew.domain.candidate import (
     TargetCasRequest,
     consume_final_grant,
     freeze_run_candidate,
     issue_final_grant,
 )
+from apexcrew.domain.commands import ApplicableRevisionDigests
 from apexcrew.domain.evidence import ContextCapsule, EvidenceReceipt
 from apexcrew.domain.freshness import FreshnessAssessment, promote_candidate
 
@@ -61,4 +65,33 @@ def test_grant_subject_or_expected_target_mismatch_fails_closed() -> None:
             candidate.model_copy(update={"head_oid": "c" * 40}),
             confirmation_code="ABC123",
             new_oid="b" * 40,
+        )
+
+
+def test_target_cas_effect_intent_round_trip_binds_the_complete_payload() -> None:
+    intent = TargetCasIntent(
+        intent_id="target-cas-intent-1",
+        run_id="run-1",
+        kind="target_ref_cas",
+        repository_id="repo-1",
+        repository_instance_digest="sha256:" + "3" * 64,
+        ref_name="refs/heads/main",
+        expected_old_oid="a" * 40,
+        prepared_oid="b" * 40,
+        target_safety_digest="sha256:" + "4" * 64,
+        registration_digest="sha256:" + "5" * 64,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        idempotency_key="target-cas:1",
+    )
+    effect = intent.to_effect_intent(7)
+
+    assert TargetCasIntent.from_effect_intent(effect) == intent
+    with pytest.raises(ValueError, match="TARGET_CAS_EFFECT_INTENT_BINDING_MISMATCH"):
+        TargetCasIntent.from_effect_intent(
+            replace(
+                effect,
+                normalized_payload_json=effect.normalized_payload_json.replace(
+                    "refs/heads/main", "refs/heads/release"
+                ),
+            )
         )

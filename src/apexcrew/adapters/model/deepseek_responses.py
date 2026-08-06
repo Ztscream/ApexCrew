@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
 
-from apexcrew.adapters.credentials.model_key import ModelCredentialPort
+from apexcrew.adapters.credentials.model_key import ModelCredentialError, ModelCredentialPort
 from apexcrew.domain.model import (
     ModelCompletion,
     ModelRequest,
@@ -31,6 +31,9 @@ _MISSING = object()
 
 class ResponsesAPI(Protocol):
     def create(self, **request: object) -> Any:
+        raise NotImplementedError
+
+    def retrieve(self, response_id: str) -> Any:
         raise NotImplementedError
 
 
@@ -322,6 +325,39 @@ class DeepSeekResponsesAdapter:
         except APIError:
             return ProviderAttemptResult.unknown("PROVIDER_ERROR_OUTCOME_UNKNOWN")
 
+        return self._result_from_response(request, response)
+
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        if not self._provider_storage_enabled or not provider_response_id:
+            return None
+        try:
+            api_key = self._credentials.resolve(self._profile)
+            client = self._client_factory(
+                api_key=api_key,
+                base_url=DEEPSEEK_BASE_URL,
+                max_retries=0,
+            )
+            response = client.responses.retrieve(provider_response_id)
+        except (
+            APIStatusError,
+            APITimeoutError,
+            APIConnectionError,
+            APIError,
+            ModelCredentialError,
+        ):
+            return None
+        if getattr(response, "id", None) != provider_response_id:
+            return None
+        return self._result_from_response(request, response)
+
+    def _result_from_response(
+        self, request: ModelRequest, response: object
+    ) -> ProviderAttemptResult:
+        schema = self._response_schemas.get(request.tool_schema_digest)
+        if schema is None:
+            return ProviderAttemptResult.unknown("TOOL_SCHEMA_MISSING")
         response_id = getattr(response, "id", None)
         returned_model_id = getattr(response, "model", None)
         status = getattr(response, "status", None)

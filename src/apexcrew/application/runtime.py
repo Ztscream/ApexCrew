@@ -61,10 +61,13 @@ from apexcrew.domain.model import (
     DurableModelClient,
     LogicalTurnId,
     ModelRecoveryBinding,
+    ModelRequest,
     ModelRequestIntent,
     ProviderAttemptKind,
+    ProviderAttemptResult,
     RecoveredModelAction,
     SettledModelAttempt,
+    model_request_from_json,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
@@ -391,6 +394,13 @@ class ModelResolutionJournal(Protocol):
         raise NotImplementedError
 
 
+class ModelProviderLookup(Protocol):
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        raise NotImplementedError
+
+
 class ResolutionObservationRegistry(ResolutionObservationPort):
     """Dispatch action-class observers while retaining a fail-closed fallback."""
 
@@ -448,7 +458,9 @@ class GrantedActionResolutionObserver(ResolutionObservationPort):
             values.update(
                 {
                     "run_id": intent.run_id,
-                    "settled_sequence": AuditSequence(intent.recorded_sequence + 1),
+                    "settled_sequence": AuditSequence(
+                        self._journal.audit_sequence(intent.run_id) + 1
+                    ),
                     "applicable_revision_digests": intent.applicable_revision_digests,
                     "completion_proof_json": proof_json,
                     "completion_proof_digest": sha256_digest(proof_json),
@@ -505,36 +517,78 @@ class SnapshotResolutionObserver(ResolutionObservationPort):
 class ModelResolutionObserver(ResolutionObservationPort):
     """Project a durable provider completion into recovery evidence."""
 
-    def __init__(self, journal: ModelResolutionJournal) -> None:
+    def __init__(
+        self, journal: ModelResolutionJournal, provider_lookup: ModelProviderLookup
+    ) -> None:
         self._journal = journal
+        self._provider_lookup = provider_lookup
 
     def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
         try:
             request = self._journal.model_request(intent.run_id, intent.intent_id)
             turn = self._journal.committed_model_turn(intent.run_id, request.logical_turn_id)
             attempts = self._journal.model_attempts(intent.run_id, request.logical_turn_id)
+            payload_request = model_request_from_json(intent.normalized_payload_json)
         except (AttributeError, KeyError, StateConflict, ValueError, TypeError):
             return _unavailable_resolution_observation(intent, recovery_generation)
-        if turn is None or turn.recovery_binding.request_digest != request.request.request_digest:
+        if (
+            request.intent_id != intent.intent_id
+            or request.run_id != intent.run_id
+            or request.request.idempotency_key != intent.idempotency_key
+            or intent.payload_digest != sha256_digest(intent.normalized_payload_json)
+            or payload_request != request.request
+            or (
+                turn is not None
+                and turn.recovery_binding.request_digest != request.request.request_digest
+            )
+        ):
             return _unavailable_resolution_observation(intent, recovery_generation)
         completed = next(
             (
                 attempt
                 for attempt in attempts
                 if attempt.kind is ProviderAttemptKind.COMPLETED
-                and attempt.dispatch_result == turn.dispatch_result
+                and attempt.intent_id == request.intent_id
+                and attempt.run_id == request.run_id
+                and attempt.logical_turn_id == request.logical_turn_id
+                and attempt.request == request.request
+                and (turn is None or attempt.dispatch_result == turn.dispatch_result)
             ),
             None,
         )
+        provider_response_id = None if completed is None else completed.provider_response_id
+        if provider_response_id is None:
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        try:
+            provider_result = self._provider_lookup.lookup(request.request, provider_response_id)
+        except (OSError, AttributeError, KeyError, StateConflict, TypeError, ValueError):
+            return _unavailable_resolution_observation(intent, recovery_generation)
         if (
-            completed is None
-            or turn.state != "COMPLETION_COMMITTED"
-            or completed.provider_response_id is None
-            or completed.reported_usage is None
+            provider_result is None
+            or provider_result.kind is not ProviderAttemptKind.COMPLETED
+            or provider_result.completion is None
+            or provider_result.completion.usage is None
+            or provider_result.completion.requested_model_id != request.request.requested_model_id
+            or provider_result.completion.returned_model_id not in request.request.allowed_model_ids
         ):
             return _unavailable_resolution_observation(intent, recovery_generation)
-        completion_json = canonical_json(turn.normalized_payload)
-        usage = completed.reported_usage
+        provider_completion = provider_result.completion
+        if completed is not None and (
+            completed.provider_response_id != provider_completion.response_id
+            or completed.reported_usage != provider_completion.usage
+        ):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        if turn is not None and (
+            turn.state != "COMPLETION_COMMITTED"
+            or turn.returned_model_id != provider_completion.returned_model_id
+            or turn.normalized_payload != provider_completion.normalized_action
+            or sha256_digest(canonical_json(turn.normalized_payload))
+            != Sha256DigestText(turn.normalized_output_digest)
+        ):
+            return _unavailable_resolution_observation(intent, recovery_generation)
+        completion_json = canonical_json(provider_completion.normalized_action)
+        normalized_completion_digest = sha256_digest(completion_json)
+        usage = provider_completion.usage
         values: dict[str, object] = {
             "kind": RecoveryActionClass.MODEL,
             "intent_id": intent.intent_id,
@@ -543,8 +597,8 @@ class ModelResolutionObserver(ResolutionObservationPort):
             "state": "EXACT_COMPLETION",
             "request_digest": request.request.request_digest,
             "idempotency_key": intent.idempotency_key,
-            "provider_response_id": completed.provider_response_id,
-            "returned_model_id": turn.returned_model_id,
+            "provider_response_id": provider_completion.response_id,
+            "returned_model_id": provider_completion.returned_model_id,
             "schema_digest": Sha256DigestText(request.request.tool_schema_digest),
             "usage_json": None
             if usage is None
@@ -555,7 +609,7 @@ class ModelResolutionObserver(ResolutionObservationPort):
                     "output_tokens": usage.output_tokens,
                 }
             ),
-            "normalized_completion_digest": Sha256DigestText(turn.normalized_output_digest),
+            "normalized_completion_digest": normalized_completion_digest,
             "normalized_completion_json": completion_json,
             "completion_proof_json": completion_json,
             "completion_proof_digest": sha256_digest(completion_json),
@@ -700,6 +754,8 @@ def _unavailable_resolution_observation(
         },
     }
     values.update(required[action_class])
+    if action_class is RecoveryActionClass.MODEL:
+        values["reservation_charge"] = "FULL"
     return RecoveryObservation.create(**values)
 
 

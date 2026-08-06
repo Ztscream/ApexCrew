@@ -75,6 +75,7 @@ from apexcrew.domain.admission import (
     RefEffectBinding,
     RuntimeStartBinding,
     StartGuardDecision,
+    TargetCasIntent,
     TargetReservationAdmissionService,
     TargetReservationBootstrapAdmissionService,
     TargetReservationCreationIntent,
@@ -136,7 +137,6 @@ from apexcrew.domain.tools import (
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
-    GitOid,
     IntentId,
     RepositoryId,
     RevisionDigest,
@@ -931,23 +931,21 @@ class _ProductionRefResolutionObserver:
         from apexcrew.application.runtime import _unavailable_resolution_observation
 
         try:
-            payload = json.loads(intent.normalized_payload_json)
+            typed = TargetCasIntent.from_effect_intent(intent)
             run = self._store.run_record(intent.run_id)
             reservation = self._store.target_reservation_for_run(intent.run_id)
-            recorded_repository_id = RepositoryId(str(payload["repository_id"]))
-            recorded_instance_digest = Sha256DigestText(str(payload["repository_instance_digest"]))
-            recorded_ref_name = str(payload["ref_name"])
-            recorded_old_oid = GitOid(str(payload["expected_old_oid"]))
-            recorded_prepared_oid = GitOid(str(payload["prepared_oid"]))
-            recorded_safety_digest = Sha256DigestText(str(payload["target_safety_digest"]))
-            raw_registration_digest = payload.get("registration_digest") or payload.get(
-                "admin_binding_digest"
-            )
-            if not isinstance(raw_registration_digest, str):
-                return _unavailable_resolution_observation(intent, recovery_generation)
-            recorded_registration_digest = Sha256DigestText(raw_registration_digest)
+            recorded_repository_id = typed.repository_id
+            recorded_instance_digest = typed.repository_instance_digest
+            recorded_ref_name = typed.ref_name
+            recorded_old_oid = typed.expected_old_oid
+            recorded_prepared_oid = typed.prepared_oid
+            recorded_safety_digest = typed.target_safety_digest
+            recorded_registration_digest = typed.registration_digest
             if (
-                recorded_repository_id != run.repository_id
+                typed.run_id != intent.run_id
+                or typed.applicable_revision_digests != intent.applicable_revision_digests
+                or typed.idempotency_key != intent.idempotency_key
+                or recorded_repository_id != run.repository_id
                 or recorded_instance_digest != run.repository_instance_digest
                 or recorded_ref_name != run.target_ref
                 or recorded_safety_digest != self._store.target_authority_digest(intent.run_id)
@@ -1503,8 +1501,8 @@ def build_application_bundle(
         recovery = RecoveryService(store)
         resolution_observers = ResolutionObservationRegistry(
             {
-                "model": ModelResolutionObserver(store),
-                "model_request": ModelResolutionObserver(store),
+                "model": ModelResolutionObserver(store, model),
+                "model_request": ModelResolutionObserver(store, model),
                 "granted_risky_action": GrantedActionResolutionObserver(store, worker_tools),
                 "read": SnapshotResolutionObserver(store, worker_tools),
                 "search": SnapshotResolutionObserver(store, worker_tools),

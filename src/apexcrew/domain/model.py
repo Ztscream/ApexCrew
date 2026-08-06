@@ -612,6 +612,11 @@ class ModelPort(Protocol):
     def complete(self, request: ModelRequest) -> ProviderAttemptResult:
         raise NotImplementedError
 
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        raise NotImplementedError
+
 
 def model_request_to_json(request: ModelRequest) -> str:
     return json.dumps(

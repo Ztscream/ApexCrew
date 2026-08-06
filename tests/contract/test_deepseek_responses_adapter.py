@@ -36,10 +36,15 @@ class RecordingResponsesClient:
     def __init__(self, response: object) -> None:
         self.response = response
         self.requests: list[dict[str, object]] = []
+        self.retrieved: list[str] = []
         self.responses = self
 
     def create(self, **request: object) -> object:
         self.requests.append(dict(request))
+        return self.response
+
+    def retrieve(self, response_id: str) -> object:
+        self.retrieved.append(response_id)
         return self.response
 
 
@@ -106,6 +111,7 @@ def _adapter(
     response: object,
     *,
     allowed_returned_model_ids: frozenset[str] | None = None,
+    provider_storage_enabled: bool = False,
 ) -> tuple[DeepSeekResponsesAdapter, RecordingClientFactory, RecordingResponsesClient]:
     client = RecordingResponsesClient(response)
     factory = RecordingClientFactory(client)
@@ -116,10 +122,30 @@ def _adapter(
             pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
             client_factory=factory,
             allowed_returned_model_ids=allowed_returned_model_ids,
+            provider_storage_enabled=provider_storage_enabled,
         ),
         factory,
         client,
     )
+
+
+def test_lookup_returns_only_the_exact_retrieved_provider_response() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()), provider_storage_enabled=True)
+
+    result = adapter.lookup(_request(), "response-1")
+
+    assert result is not None
+    assert result.kind == "COMPLETED"
+    assert result.completion is not None
+    assert result.completion.response_id == "response-1"
+    assert client.retrieved == ["response-1"]
+
+
+def test_disabled_provider_storage_fails_closed_without_lookup() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    assert adapter.lookup(_request(), "response-1") is None
+    assert client.retrieved == []
 
 
 def test_request_pins_no_sdk_retries_and_deepseek_parameters() -> None:
