@@ -922,21 +922,64 @@ class RecoveryObservation(FrozenDocument):
         if completed_state and self.kind is not RecoveryActionClass.READ_SEARCH:
             assert self.bounded_result_json is not None
             _validate_bounded_result(self.bounded_result_json, self.bounded_result_digest)
-        if self.kind is RecoveryActionClass.MODEL and self.state == "EXACT_COMPLETION":
-            assert self.normalized_completion_digest is not None
-            assert self.bounded_result_digest is not None
-            if self.normalized_completion_digest != self.bounded_result_digest:
-                raise ValueError("MODEL_COMPLETION_DIGEST_MISMATCH")
-        if self.kind is RecoveryActionClass.CHECK and self.state == "EXACT_RECEIPT":
-            assert self.receipt_digest is not None
-            assert self.bounded_result_digest is not None
-            if self.receipt_digest != self.bounded_result_digest:
-                raise ValueError("CHECK_RECEIPT_DIGEST_MISMATCH")
-        if self.kind is RecoveryActionClass.PATCH and self.state == "EXACT_POST":
-            assert self.observed_post_tree_digest is not None
-            assert self.bounded_result_digest is not None
-            if self.observed_post_tree_digest != self.bounded_result_digest:
-                raise ValueError("PATCH_POST_DIGEST_MISMATCH")
+            proof_fields = {
+                RecoveryActionClass.MODEL: (
+                    "request_digest",
+                    "provider_response_id",
+                    "returned_model_id",
+                    "schema_digest",
+                    "usage_json",
+                    "normalized_completion_digest",
+                ),
+                RecoveryActionClass.PATCH: (
+                    "expected_pre_tree_digest",
+                    "observed_post_tree_digest",
+                ),
+                RecoveryActionClass.CHECK: (
+                    "check_id",
+                    "argv_digest",
+                    "snapshot_digest",
+                    "receipt_digest",
+                ),
+                RecoveryActionClass.PRIVATE_REF: (
+                    "repository_id",
+                    "repository_instance_digest",
+                    "ref_name",
+                    "registration_digest",
+                    "target_safety_digest",
+                    "old_oid",
+                    "prepared_oid",
+                    "current_oid",
+                ),
+                RecoveryActionClass.TARGET_CAS: (
+                    "repository_id",
+                    "repository_instance_digest",
+                    "ref_name",
+                    "registration_digest",
+                    "target_safety_digest",
+                    "old_oid",
+                    "prepared_oid",
+                    "current_oid",
+                ),
+                RecoveryActionClass.TARGET_RESERVATION: (
+                    "registration_identity",
+                    "reservation_operation",
+                    "admin_binding_digest",
+                    "path_identity",
+                    "gitfile_digest",
+                ),
+                RecoveryActionClass.GRANTED_ACTION: (
+                    "pending_action_id",
+                    "grant_id",
+                    "expected_prestate_digest",
+                    "action_binding_digest",
+                ),
+                RecoveryActionClass.READ_SEARCH: (),
+            }
+            proof = {"state": self.state}
+            proof.update({name: getattr(self, name) for name in proof_fields[self.kind]})
+            if self.bounded_result_json != canonical_json(proof):
+                raise ValueError("COMPLETION_PROOF_NOT_BOUND_TO_ACTION")
         payload = self.model_dump(mode="json", exclude={"observation_digest"}, exclude_none=True)
         expected = sha256_digest(canonical_json(payload))
         if self.observation_digest != expected:
@@ -1105,11 +1148,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
     state = observation.state
     if observation.kind is RecoveryActionClass.MODEL:
         if state == "EXACT_COMPLETION" and observation.normalized_completion_digest is not None:
-            return _completed_decision(
-                observation,
-                "EXACT_NORMALIZED_COMPLETION",
-                observation.normalized_completion_digest,
-            )
+            return _completed_decision(observation, "EXACT_NORMALIZED_COMPLETION")
         return RecoveryDecision(
             RecoveryDecisionKind.INDETERMINATE,
             observation.kind,
@@ -1120,19 +1159,13 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
     if observation.kind is RecoveryActionClass.READ_SEARCH:
         if state == "EXACT_SNAPSHOT" and observation.bounded_result_json is not None:
             assert observation.bounded_result_digest is not None
-            return _completed_decision(
-                observation,
-                "EXACT_SNAPSHOT",
-                observation.bounded_result_digest,
-                observation.bounded_result_json,
-            )
+            return _completed_decision(observation, "EXACT_SNAPSHOT")
         if state == "STALE":
             return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
     if observation.kind is RecoveryActionClass.CHECK:
         if state == "EXACT_RECEIPT" and observation.receipt_digest is not None:
-            assert observation.receipt_digest is not None
-            return _completed_decision(observation, state, observation.receipt_digest)
+            return _completed_decision(observation, state)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,

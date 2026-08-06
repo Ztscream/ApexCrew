@@ -94,15 +94,62 @@ def observation(
         )
     )
     if completed:
-        completed_json = canonical_json({"state": state})
+        proof_fields = {
+            RecoveryActionClass.MODEL: (
+                "request_digest",
+                "provider_response_id",
+                "returned_model_id",
+                "schema_digest",
+                "usage_json",
+                "normalized_completion_digest",
+            ),
+            RecoveryActionClass.PATCH: ("expected_pre_tree_digest", "observed_post_tree_digest"),
+            RecoveryActionClass.CHECK: (
+                "check_id",
+                "argv_digest",
+                "snapshot_digest",
+                "receipt_digest",
+            ),
+            RecoveryActionClass.PRIVATE_REF: (
+                "repository_id",
+                "repository_instance_digest",
+                "ref_name",
+                "registration_digest",
+                "target_safety_digest",
+                "old_oid",
+                "prepared_oid",
+                "current_oid",
+            ),
+            RecoveryActionClass.TARGET_CAS: (
+                "repository_id",
+                "repository_instance_digest",
+                "ref_name",
+                "registration_digest",
+                "target_safety_digest",
+                "old_oid",
+                "prepared_oid",
+                "current_oid",
+            ),
+            RecoveryActionClass.TARGET_RESERVATION: (
+                "registration_identity",
+                "reservation_operation",
+                "admin_binding_digest",
+                "path_identity",
+                "gitfile_digest",
+            ),
+            RecoveryActionClass.GRANTED_ACTION: (
+                "pending_action_id",
+                "grant_id",
+                "expected_prestate_digest",
+                "action_binding_digest",
+            ),
+            RecoveryActionClass.READ_SEARCH: (),
+        }
+        proof = {"state": state}
+        proof.update({name: defaults[name] for name in proof_fields[action_class]})
+        completed_json = canonical_json(proof)
         defaults.setdefault("bounded_result_json", completed_json)
         defaults.setdefault("bounded_result_digest", sha256_digest(completed_json))
-        if action_class is RecoveryActionClass.MODEL and state == "EXACT_COMPLETION":
-            defaults["normalized_completion_digest"] = defaults["bounded_result_digest"]
-        if action_class is RecoveryActionClass.CHECK and state == "EXACT_RECEIPT":
-            defaults["receipt_digest"] = defaults["bounded_result_digest"]
-        if action_class is RecoveryActionClass.PATCH and state == "EXACT_POST":
-            defaults["observed_post_tree_digest"] = defaults["bounded_result_digest"]
     allowed = {
         RecoveryActionClass.MODEL: {
             "request_digest",
