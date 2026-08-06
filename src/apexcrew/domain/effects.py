@@ -31,6 +31,13 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
 )
+from apexcrew.domain.indeterminate import (
+    ApplyResolutionRequest,
+    ResolutionApplication,
+    UnresolvedIntentBinding,
+    UnresolvedIntentSet,
+    unresolved_set_digest_for_members,
+)
 from apexcrew.domain.model import (
     CommittedModelTurn,
     LogicalModelTurn,
@@ -341,6 +348,17 @@ class EffectJournal(Protocol):
         raise NotImplementedError
 
     def unsettled_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        raise NotImplementedError
+
+    def indeterminate_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        raise NotImplementedError
+
+    def unresolved_intent_set(self, run_id: RunId) -> UnresolvedIntentSet | None:
+        raise NotImplementedError
+
+    def apply_indeterminate_resolution(
+        self, request: ApplyResolutionRequest
+    ) -> ResolutionApplication:
         raise NotImplementedError
 
     def committed_model_turn(
@@ -1351,8 +1369,8 @@ class RecoveryService:
         self._journal = journal
 
     def reconcile(self, run_id: RunId) -> RecoveryOutcome:
-        unsettled = self._journal.unsettled_intents(run_id)
-        if not unsettled:
+        indeterminate = self._journal.indeterminate_intents(run_id)
+        if not indeterminate:
             return RecoveryOutcome.empty()
         members = tuple(
             UnresolvedIntentMember(
@@ -1360,22 +1378,18 @@ class RecoveryService:
                 recovery_generation=1,
                 intent_digest=intent.payload_digest,
             )
-            for intent in unsettled
+            for intent in indeterminate
         )
         set_digest = UnresolvedSetDigest(
             str(
-                sha256_digest(
-                    canonical_json(
-                        {
-                            "members": [
-                                {
-                                    "intent_id": str(member.intent_id),
-                                    "recovery_generation": member.recovery_generation,
-                                    "intent_digest": str(member.intent_digest),
-                                }
-                                for member in members
-                            ]
-                        }
+                unresolved_set_digest_for_members(
+                    tuple(
+                        UnresolvedIntentBinding(
+                            intent_id=str(member.intent_id),
+                            recovery_generation=member.recovery_generation,
+                            intent_digest=member.intent_digest,
+                        )
+                        for member in members
                     )
                 )
             )

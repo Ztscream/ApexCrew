@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from apexcrew.domain.indeterminate import ResolutionSelection
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
@@ -86,6 +87,7 @@ class RuntimePermit(FrozenDocument):
     state: Literal["UNCONSUMED", "CONSUMED", "INVALIDATED"]
     consumed_owner_id: RuntimeOwnerId | None = None
     consumed_sequence: AuditSequence | None = Field(default=None, ge=1)
+    resolution_selection: ResolutionSelection | None = None
 
     @model_validator(mode="after")
     def validate_consumption_binding(self) -> Self:
@@ -94,6 +96,11 @@ class RuntimePermit(FrozenDocument):
             raise ValueError("consumed Permit must bind an owner")
         if consumed != (self.consumed_sequence is not None):
             raise ValueError("consumed Permit must bind its sequence")
+        if self.allowed_phase == "INDETERMINATE":
+            if self.resolution_selection is None:
+                raise ValueError("indeterminate Permit must bind a resolution selection")
+        elif self.resolution_selection is not None:
+            raise ValueError("non-indeterminate Permit cannot bind a resolution selection")
         return self
 
 
@@ -235,7 +242,7 @@ class ResolveIndeterminatePayload(StrictPayload):
         "CANCEL_RUN",
     ]
     intent_id: IntentId | None = None
-    recovery_generation: int | None = Field(default=None, ge=0)
+    recovery_generation: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def validate_resolution_shape(self) -> Self:
@@ -249,6 +256,8 @@ class ResolveIndeterminatePayload(StrictPayload):
                 raise ValueError(
                     "member-bound resolution requires intent_id and recovery_generation"
                 )
+            if str(self.intent_id) != str(self.intent_id).strip():
+                raise ValueError("member-bound intent_id must be canonical")
         elif self.intent_id is not None or self.recovery_generation is not None:
             raise ValueError("set-bound terminal resolution forbids member fields")
         return self

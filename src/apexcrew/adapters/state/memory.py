@@ -110,6 +110,7 @@ from apexcrew.domain.commands import (
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
     PublicRunSnapshot,
+    ResolveIndeterminatePayload,
     ResumePayload,
     RunStop,
     RuntimeAllowedPhase,
@@ -134,6 +135,8 @@ from apexcrew.domain.effects import (
     EffectIntent,
     EffectResult,
     PlanApproval,
+    RecoveryDecision,
+    RecoveryDecisionKind,
     ReservationObservation,
     RunBootstrapInputs,
     RunRecord,
@@ -144,6 +147,12 @@ from apexcrew.domain.effects import (
     canonical_json,
     classify_reservation_creation,
     sha256_digest,
+)
+from apexcrew.domain.indeterminate import (
+    ApplyResolutionRequest,
+    ResolutionApplication,
+    ResolutionSelection,
+    UnresolvedIntentSet,
 )
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
@@ -444,6 +453,7 @@ class InMemoryStateStore:
         self._action_deadlines: dict[IntentId, ActionDeadline] = {}
         self._timeout_decisions: dict[IntentId, TimeoutDecision] = {}
         self._indeterminate_effect_intents: set[IntentId] = set()
+        self._indeterminate_generations: dict[IntentId, int] = {}
         self._model_turns: dict[LogicalTurnId, LogicalModelTurn | CommittedModelTurn] = {}
         self._model_attempt_numbers: dict[tuple[RunId, LogicalTurnId, int], IntentId] = {}
         self._model_attempts: dict[IntentId, ModelRequestIntent | SettledModelAttempt] = {}
@@ -536,6 +546,7 @@ class InMemoryStateStore:
         copied._action_deadlines = self._action_deadlines.copy()
         copied._timeout_decisions = self._timeout_decisions.copy()
         copied._indeterminate_effect_intents = self._indeterminate_effect_intents.copy()
+        copied._indeterminate_generations = self._indeterminate_generations.copy()
         copied._model_turns = self._model_turns.copy()
         copied._model_attempt_numbers = self._model_attempt_numbers.copy()
         copied._model_attempts = self._model_attempts.copy()
@@ -606,6 +617,7 @@ class InMemoryStateStore:
         self._action_deadlines = copied._action_deadlines
         self._timeout_decisions = copied._timeout_decisions
         self._indeterminate_effect_intents = copied._indeterminate_effect_intents
+        self._indeterminate_generations = copied._indeterminate_generations
         self._model_turns = copied._model_turns
         self._model_attempt_numbers = copied._model_attempt_numbers
         self._model_attempts = copied._model_attempts
@@ -4776,6 +4788,10 @@ class InMemoryStateStore:
             except ToolEffectResultError as error:
                 raise StateConflict(error.code) from error
             copied._effect_results[intent_id] = result
+            if result.outcome == "INDETERMINATE":
+                copied._indeterminate_effect_intents.add(intent_id)
+                copied._indeterminate_generations.setdefault(intent_id, 1)
+                copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
 
         return self._commit_state_and_event(
             run_id=run_id,
@@ -4815,6 +4831,129 @@ class InMemoryStateStore:
                     key=lambda intent: (intent.recorded_sequence, intent.intent_id),
                 )
             )
+
+    def indeterminate_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        self._effect_intents[intent_id]
+                        for intent_id in self._indeterminate_effect_intents
+                        if self._effect_intents[intent_id].run_id == run_id
+                    ),
+                    key=lambda intent: (intent.recorded_sequence, intent.intent_id),
+                )
+            )
+
+    def unresolved_intent_set(self, run_id: RunId) -> UnresolvedIntentSet | None:
+        from apexcrew.domain.indeterminate import UnresolvedIntentBinding, UnresolvedIntentSet
+
+        members = tuple(
+            UnresolvedIntentBinding(
+                intent_id=str(intent.intent_id),
+                recovery_generation=self._indeterminate_generations.get(intent.intent_id, 1),
+                intent_digest=intent.payload_digest,
+            )
+            for intent in self.indeterminate_intents(run_id)
+        )
+        return None if not members else UnresolvedIntentSet.from_members(members)
+
+    def apply_indeterminate_resolution(
+        self, request: ApplyResolutionRequest
+    ) -> ResolutionApplication:
+        current = self.unresolved_intent_set(request.run_id)
+        if current is None or current.set_digest != request.selection.unresolved_set_digest:
+            raise StateConflict("STALE_UNRESOLVED_SET")
+        if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+            return ResolutionApplication(
+                status="DENIED",
+                resulting_sequence=request.expected_sequence,
+                remaining_set_digest=current.set_digest,
+                successor="INDETERMINATE",
+            )
+        assert request.selection.intent_id is not None
+        member = next(
+            (
+                item
+                for item in current.member_bindings
+                if item.intent_id == request.selection.intent_id
+            ),
+            None,
+        )
+        if member is None or member.recovery_generation != request.selection.recovery_generation:
+            raise StateConflict("STALE_UNRESOLVED_MEMBER")
+        if request.selection.resolution == "RECONCILE_OBSERVED":
+            if not isinstance(request.decision, RecoveryDecision):
+                raise StateConflict("OBSERVED_RECOVERY_DECISION_REQUIRED")
+            if request.decision.kind is not RecoveryDecisionKind.COMPLETED:
+                raise StateConflict("OBSERVED_RECOVERY_COMPLETION_REQUIRED")
+            if request.decision.effect_result is None:
+                raise StateConflict("OBSERVED_RECOVERY_RESULT_REQUIRED")
+            if request.decision.effect_result.settled_sequence != AuditSequence(
+                request.expected_sequence + 1
+            ):
+                raise StateConflict("OBSERVED_RECOVERY_SEQUENCE_MISMATCH")
+        elif request.selection.resolution == "RETRY_SAME_INTENT":
+            if not isinstance(request.decision, RecoveryDecision):
+                raise StateConflict("RETRY_RECOVERY_DECISION_REQUIRED")
+            if request.decision.kind is not RecoveryDecisionKind.RETRY_SAME_INTENT:
+                raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
+        elif not isinstance(request.decision, RecoveryDecision) or (
+            request.decision.kind is not RecoveryDecisionKind.ABANDONED
+        ):
+            raise StateConflict("ABANDON_RECOVERY_PROOF_REQUIRED")
+        member_intent_id = IntentId(member.intent_id)
+
+        result: list[ResolutionApplication] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit = copied._runtime_permits.get((request.run_id, request.permit_generation))
+            if (
+                permit is None
+                or permit.state != "CONSUMED"
+                or permit.consumed_owner_id != request.owner_id
+                or permit.allowed_phase != "INDETERMINATE"
+                or permit.resolution_selection != request.selection
+            ):
+                raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
+            if request.selection.resolution == "RECONCILE_OBSERVED":
+                assert isinstance(request.decision, RecoveryDecision)
+                assert request.decision.effect_result is not None
+                copied._effect_results[member_intent_id] = request.decision.effect_result
+                copied._indeterminate_effect_intents.remove(member_intent_id)
+            elif request.selection.resolution == "RETRY_SAME_INTENT":
+                copied._effect_results.pop(member_intent_id, None)
+                copied._indeterminate_effect_intents.remove(member_intent_id)
+                copied._indeterminate_generations[member_intent_id] = member.recovery_generation + 1
+            else:
+                copied._indeterminate_effect_intents.remove(member_intent_id)
+            remaining = copied.unresolved_intent_set(request.run_id)
+            copied._runs[request.run_id] = replace(
+                copied._runs[request.run_id],
+                state=RunState.INDETERMINATE if remaining is not None else RunState.PAUSED,
+            )
+            status_by_resolution: dict[str, Literal["SETTLED", "RETRY", "ABANDONED", "DENIED"]] = {
+                "RECONCILE_OBSERVED": "SETTLED",
+                "RETRY_SAME_INTENT": "RETRY",
+                "ABANDON_INTENT": "ABANDONED",
+            }
+            status = status_by_resolution[request.selection.resolution]
+            result.append(
+                ResolutionApplication(
+                    status=status,
+                    resulting_sequence=AuditSequence(request.expected_sequence + 1),
+                    remaining_set_digest=None if remaining is None else remaining.set_digest,
+                    successor="INDETERMINATE" if remaining is not None else "PAUSED",
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=request.expected_sequence,
+            event=AuditEvent.kind("INDETERMINATE_RESOLUTION_APPLIED"),
+            mutate=mutate,
+        )
+        return result[0]
 
     def reserve_model_request(
         self, request: ModelRequest, expected_sequence: AuditSequence
@@ -5238,6 +5377,16 @@ class InMemoryStateStore:
                 run_id, 0
             ),
             state="UNCONSUMED",
+            resolution_selection=(
+                ResolutionSelection(
+                    resolution=command.payload.resolution,
+                    unresolved_set_digest=command.payload.unresolved_set_digest,
+                    intent_id=command.payload.intent_id,
+                    recovery_generation=command.payload.recovery_generation,
+                )
+                if isinstance(command.payload, ResolveIndeterminatePayload)
+                else None
+            ),
         )
         copied._runtime_permits[(run_id, generation)] = permit
         return permit
@@ -6332,6 +6481,66 @@ class InMemoryStateStore:
             if outcome is None:
                 raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
             return outcome
+        if isinstance(command.payload, ResolveIndeterminatePayload):
+            current = self.unresolved_intent_set(run_id)
+            if run.state != RunState.INDETERMINATE or current is None:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "INDETERMINATE_RESOLUTION_REQUIRES_INDETERMINATE_RUN",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            member = next(
+                (
+                    item
+                    for item in current.member_bindings
+                    if item.intent_id == command.payload.intent_id
+                ),
+                None,
+            )
+            binding_valid = (
+                command.applicable_revision_digests == self.current_revision_digests(run_id)
+                and target_authority.current_for(run_id) == self.target_authority_digest(run_id)
+                and command.payload.unresolved_set_digest == current.set_digest
+                and (
+                    command.payload.intent_id is None
+                    or (
+                        member is not None
+                        and member.recovery_generation == command.payload.recovery_generation
+                    )
+                )
+            )
+            if not binding_valid:
+                return self._record_unsequenced_control_outcome(
+                    command,
+                    CommandOutcome.for_payload(
+                        command.payload,
+                        status=CommandStatus.STALE,
+                        run_id=run_id,
+                        resulting_sequence=sequence,
+                        failed_invariant="STALE_INDETERMINATE_RESOLUTION_BINDING",
+                    ),
+                )
+
+            def issue(copied: InMemoryStateStore) -> None:
+                self._issue_runtime_permit_on_copy(
+                    copied,
+                    command,
+                    "INDETERMINATE",
+                    copied.current_revision_digests(run_id),
+                    copied.target_authority_digest(run_id),
+                    AuditSequence(sequence + 1),
+                )
+
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.ACCEPTED,
+                None,
+                "RUNTIME_PERMIT_ISSUED",
+                issue,
+            )
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, run.state)
         if isinstance(

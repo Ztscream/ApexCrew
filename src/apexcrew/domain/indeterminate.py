@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Literal, Self
 
 from pydantic import Field, model_validator
 
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
-from apexcrew.domain.types import IntentId
+from apexcrew.domain.types import AuditSequence, IntentId, RunId, RuntimeOwnerId
 
 
 class IndeterminateResolution(RuntimeError):
@@ -58,8 +59,41 @@ class ResolutionSelection(FrozenDocument):
         return self
 
 
+def unresolved_set_digest_for_members(
+    members: tuple[UnresolvedIntentBinding, ...],
+) -> Sha256DigestText:
+    payload = json.dumps(
+        [
+            member.model_dump(mode="json")
+            for member in sorted(members, key=lambda item: item.intent_id)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest())
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyResolutionRequest:
+    run_id: RunId
+    selection: ResolutionSelection
+    permit_generation: int
+    owner_id: RuntimeOwnerId
+    expected_sequence: AuditSequence
+    decision: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionApplication:
+    status: Literal["SETTLED", "RETRY", "ABANDONED", "DENIED"]
+    resulting_sequence: AuditSequence
+    remaining_set_digest: Sha256DigestText | None
+    successor: str
+
+
 class UnresolvedIntentSet(FrozenDocument):
-    intents: tuple[str, ...] = Field(min_length=2)
+    intents: tuple[str, ...] = Field(min_length=1)
     set_digest: Sha256DigestText
     member_bindings: tuple[UnresolvedIntentBinding, ...] = ()
     status: Literal["INDETERMINATE"] = "INDETERMINATE"
@@ -82,21 +116,13 @@ class UnresolvedIntentSet(FrozenDocument):
     @classmethod
     def from_members(cls, members: tuple[UnresolvedIntentBinding, ...]) -> Self:
         intents = tuple(member.intent_id for member in members)
-        if len(intents) < 2:
-            raise ValueError("MULTIPLE_INTENTS_REQUIRED")
-        payload = json.dumps(
-            [
-                member.model_dump(mode="json")
-                for member in sorted(members, key=lambda item: item.intent_id)
-            ],
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
+        if not intents:
+            raise ValueError("UNRESOLVED_SET_EMPTY")
+        ordered = tuple(sorted(members, key=lambda item: item.intent_id))
         return cls(
             intents=tuple(sorted(intents)),
             member_bindings=tuple(sorted(members, key=lambda item: item.intent_id)),
-            set_digest=Sha256DigestText("sha256:" + sha256(payload.encode()).hexdigest()),
+            set_digest=unresolved_set_digest_for_members(ordered),
         )
 
     @model_validator(mode="after")
