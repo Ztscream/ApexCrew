@@ -30576,3 +30576,95 @@ The R4.1 task chain is independently auditable through this required map. Each S
 The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 
 The resolution design is closed: typed action-class observations are constructed only by internal runtime adapters; CommandEnvelope carries only strategy and exact member/set bindings; RuntimePermit persists the exact resolution subject; member resolution and set-bound FAIL_RUN/CANCEL_RUN are separate atomic store operations; the complete set is re-observed before a set-bound close; Permit replay/crash cases, active-time ownership, Audit redaction, and RunQueries redaction are tested. Asymmetric cleanup owns both no-follow OS adapters and SQLite/memory settlement and deletes only exact PATH_ONLY or ADMIN_ONLY identity; all mixed/third/unobservable states preserve terminal Run state with zero deletion.
+
+## M1-R4.2 Worker Integration and Prepared Commit Revision (2026-08-06)
+
+**Status: PROPOSED / REQUIRES DOCUMENT REVIEW.** This revision is a corrective module to complete R4-02B Worker/tool wiring and R4-04B prepared-commit creation, which are blocked by recovery and multi-intent resolution gaps in R4.1. R4.2 depends on the final-reviewed base of R4.1-02. `SPEC.md` remains frozen.
+
+**Objective:** Wire the existing tool/Worker infrastructure into composition, materialize Worker attempt workspaces from validated blob/tree data, implement real PatchExecutor and Docker-backed executor ports, and teach Admission to construct prepared commits on which Task checks run.
+
+**Execution plan:** Five sequential tasks via separate worktrees, each with independent red/green selectors and two-pass review (SPEC + quality). The module depends on R4.1-02 final-reviewed base `efc39f3` for recovery types. Each task completes all critical/high findings before the next one starts; module closeout updates this ledger and creates a single module PR.
+
+**R4.2 Ledger (initial plan):**
+
+| Task | Module | Depth | Worktree | Base | Implementation commit | Spec-Review | Quality-Review |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R4.2-01 | Git object write plumbing | REAL | .worktrees/m1-r4-2-git-objects | efc39f3 | pending | pending | pending |
+| R4.2-02 | Attempt workspace + PatchExecutor | REAL | .worktrees/m1-r4-2-attempt-workspace | R4.2-01 | pending | pending | pending |
+| R4.2-03 | Docker executor runner | REAL | .worktrees/m1-r4-2-docker-executor | R4.2-02 | pending | pending | pending |
+| R4.2-04 | Admission prepared-commit + checks | REAL | .worktrees/m1-r4-2-candidate-prep | R4.2-03 | pending | pending | pending |
+| R4.2-05 | Composition wiring + end-to-end reversal | REAL | .worktrees/m1-r4-2-composition-final | R4.2-04 | pending | pending | pending |
+
+### R4.2-01 Git Object Write Plumbing (REAL)
+
+**Files:** `src/apexcrew/adapters/repository/git.py`
+
+**Closed design:** Three new `GitOperation` subclasses: `GitHashObjectWrite(blob_path: Path)` → `("hash-object", "-w", "--", path)`; `GitMkTree(entries: ...)` with stdin line protocol; `GitCommitTree(tree_oid, parent_oid, message)` → `("commit-tree", tree, "-p", parent, "-m", message)`. All succeed only when objects materialize in `objects/` without refs being touched.
+
+**Modified protocol:** `GitSpawner.run` gains `stdin: bytes | None = None` with 1 MiB hard cap, fail-closed on overflow.
+
+**Red evidence:**
+- `pytest tests/integration/test_git_object_writing.py::test_hash_object_deterministic` → RED (no implementation)
+- `pytest tests/integration/test_git_object_writing.py::test_mktree_canonical_ordering` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_commit_tree_parent_binding` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_stdin_overflow_rejected` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_mode_120000_rejected_by_mktree` → RED
+
+**Green evidence:** All five pass; `mypy src`, `ruff check/format`, `git diff --check` clean; no Unix symlink creation required; no network/provider calls.
+
+### R4.2-02 Attempt Workspace + Real PatchExecutor (REAL)
+
+**Files:** `src/apexcrew/adapters/repository/attempt_workspace.py` (new); `src/apexcrew/adapters/executor/attempt_patch.py` (new); `tests/integration/test_attempt_workspace.py` (new)
+
+**Closed design:** `AttemptWorkspace(base_oid, globs)` materializes from `GitLsTreeRecursive` + `GitCatFileBlob`, stores in `.apexcrew/data/attempts/<id>/`, uses no-follow handles for writes, rejects `mode=120000` entries. `AttemptPatchExecutor` implements `PatchExecutorPort`, uses `_apply_unified_diff` + atomic `mkstemp`/`replace` from `GrantedWorkspaceAdapter`, returns `post_tree_digest` via `canonical_json({path: sha256(bytes)})`. Scope `write_globs`-enforced; secret paths rejected with distinct codes.
+
+**Red evidence:**
+- `pytest tests/integration/test_attempt_workspace.py::test_materialize_blobs_from_tree` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_glob_scope_enforced` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_secret_path_rejected` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_patch_outside_globs_denied` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_ancestor_replacement_toctou_denied` → RED (skip on Windows if symlink creation unavailable)
+
+**Green evidence:** All pass; FakeExecutor contracts pass (identical `post_tree_digest` logic); `mypy`, `ruff`, `diff` green.
+
+### R4.2-03 Docker Executor Runner (REAL, closes DEBT-M2-005)
+
+**Files:** `src/apexcrew/adapters/executor/restricted.py` (modify `run` method); `tests/integration/test_restricted_executor.py` (new, Linux-only)
+
+**Closed design:** `RestrictedDockerExecutor.run(argv, snapshot, timeout)` calls `docker run` with command built by `command_for()`, mounts snapshot `:ro`, enforces 1 MiB stdout/stderr cap (shared, not per-stream), collects exit code/timing, delegates secret-line redaction to `ExecutionResult.from_output`, returns three-state result (PASS/FAIL/UNCERTAINTY).
+
+**Red evidence:**
+- `pytest -m "test_restricted_executor and linux" tests/` → all RED (function not implemented)
+- Platform guard: `@pytest.mark.skipif(sys.platform != "linux", reason="Docker not available")`
+
+**Green evidence:** On Linux only: exit code 0 → PASSED; non-zero → FAILED; timeout → UNCERTAINTY + `timed_out=True`; `network=none` blocks connectivity; read-only root prevents writes; output truncation works; secret-path lines become `[redacted]`.
+
+### R4.2-04 Admission Prepared-Commit Creation (REAL)
+
+**Files:** `src/apexcrew/domain/admission.py` (extend); `src/apexcrew/adapters/repository/candidate_preparation.py` (new)
+
+**Closed design:** On Candidate freeze: record current Run Head `H`; materialize Attempt workspace from approved globs; hash each changed blob; construct incremental tree (reuse `H`'s tree for unchanged dirs); `commit-tree` to create `P` with parent=`H`; re-materialize `P` under check scope; run Task checks; freeze Candidate `READY` only if all checks pass.
+
+**Red evidence:**
+- `pytest tests/integration/test_candidate_preparation.py::test_prepared_commit_parent_correct` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_unchanged_blobs_reused` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_check_failure_stales_candidate` → RED
+
+**Green evidence:** `git show P:<path>` matches patch content; `rev-list --all` unchanged; `refs/heads/main` and `refs/apexcrew/runs/*` untouched; check pass → READY; check fail or timeout → stale/failed.
+
+### R4.2-05 Composition Wiring + End-to-End Acceptance Reversal (REAL)
+
+**Files:** `src/apexcrew/application/composition.py` (modify `_CompositionWorkerTools._runtime()`); `tests/integration/test_composed_runtime_lifecycle.py` (revert xfail); `tests/acceptance/test_money_unit_drift_run.py` (revert xfail); `tests/acceptance/test_timestamp_unit_drift_run.py` (revert xfail)
+
+**Closed design:** Pass six parameters to `ScopedToolRuntime`: `executor=RestrictedDockerExecutor(...)`, `patch_executor=AttemptPatchExecutor(...)`, `declared_checks=DeclaredCheckRegistry({c.check_id: c for c in contract.checks})`, `sanitized_snapshot=workspace.materialize(...)`, `deadline_journal=store`, `deadline_authority=authority`. Update `_LifecycleModel` to return `read → patch → check → finish` action sequence. Remove `strict xfail` decorators from acceptance tests; revert end-to-end assertions: target OID **must change** and fixture defects **must be repaired**.
+
+**Red evidence:**
+- `pytest tests/integration/test_composed_runtime_lifecycle.py::test_composed_runtime_integrates_frozen_candidate_once` → **FAILS** (target OID unchanged; xfail removed)
+- `pytest tests/acceptance/test_money_unit_drift_run.py::test_money_unit_drift_is_detected_and_repaired_end_to_end` → **FAILS** (xfail removed; skeleton boundary not yet cleared)
+- `pytest tests/acceptance/test_timestamp_unit_drift_run.py` → **FAILS** (xfail removed)
+
+**Green evidence:** Same three tests pass; target OID changed via prepared commit; fixture defect repaired; `mypy`, `ruff`, `diff` green; `uv run pytest` full suite green including new tests from R4.2-01..04.
+
+---
+
+**Final state:** All Worker actions (read/search/patch/check) executable in production composition; prepared commits constructible and verifiable; acceptance fixtures self-repair deterministically under scripted mock; zero network calls except authorization gate. R4.2 unblocks R4-03B Worker end-to-end and R4-04B executor integration. No live-provider calls required; credential and DeepSeek smoke remain gated. Module closeout: one PR containing five sequential worktrees, independent reviews/corrections, final ledger update.
