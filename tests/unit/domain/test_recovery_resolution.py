@@ -67,7 +67,7 @@ def observation(
     if state == "EXACT_COMPLETION":
         normalized_json = canonical_json({"completion": "done"})
         defaults.setdefault("normalized_completion_json", normalized_json)
-        defaults.setdefault("normalized_completion_digest", sha256_digest(normalized_json))
+        defaults["normalized_completion_digest"] = sha256_digest(normalized_json)
     if state == "EXACT_SNAPSHOT":
         defaults.setdefault("bounded_result_json", BOUNDED)
         defaults.setdefault("bounded_result_digest", BOUNDED_DIGEST)

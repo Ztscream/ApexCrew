@@ -862,6 +862,11 @@ class RecoveryObservation(FrozenDocument):
             )
         ):
             raise ValueError("MODEL_COMPLETION_PROVIDER_EVIDENCE_REQUIRED")
+        if self.kind is RecoveryActionClass.MODEL and self.state == "EXACT_COMPLETION":
+            assert self.normalized_completion_json is not None
+            assert self.normalized_completion_digest is not None
+            if self.normalized_completion_digest != sha256_digest(self.normalized_completion_json):
+                raise ValueError("MODEL_COMPLETION_DIGEST_MISMATCH")
         if (
             self.kind is RecoveryActionClass.MODEL
             and self.state == "RETURNED_MODEL_MISMATCH"
