@@ -2156,8 +2156,14 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 
 ## 2026-08-06 / R4.1-03 production observer correction
 
+- **Timestamp / task:** 2026-08-06, `R4.1-03` runtime resolution and production wiring.
+- **Skill:** `code-review` two-axis review, plus `karpathy-guidelines` for surgical correction.
+- **Prompt/context:** finish the user-facing CrewControl/CrewRuntime path with Permit-bound indeterminate resolution; review against `SPEC.md`, the R4.1 companion plan, and `AGENTS.md` without live DeepSeek or credentials.
 - **Independent Spec finding:** the production resolution registry left MODEL, PATCH, CHECK, PRIVATE_REF, and TARGET_CAS on the unavailable fallback, so valid recovery permits could not reach their concrete evidence adapters.
 - **Correction:** production composition now routes provider completions through durable model-attempt lookup, patch/check through bounded tool recovery observation, private refs through the no-follow Git start guard, target refs through the typed target-CAS adapter, and includes every supported action-class key. Unknown or malformed evidence remains fail-closed.
+- **Subagent output / commit:** Mencius reported the original observer-coverage High; Nash reviewed standards/workflow; implementation correction committed as `9a2f915` by the Codex implementation pass.
+- **Human intervention:** none; the owner only requested continuation and an independent review branch.
+- **Lesson:** registry presence is insufficient; each action class must bind its durable intent, current evidence, completion sequence, and fail-closed behavior before a resolution Permit can settle it.
 - **Observed green evidence:** `uv run --python 3.12 pytest -q` -> full suite passed with the existing xfail/skip set; `uv run --python 3.12 mypy src/apexcrew` -> `Success: no issues found in 60 source files`; `uv run --python 3.12 ruff check src tests` -> all checks passed; `uv run --python 3.12 ruff format --check src tests` -> all files formatted; `git diff --check` -> exit code 0.
 - **Review status:** fresh Spec and Quality reviews are required for the correction. No credential, provider, network, push, or PR action occurred.
 

@@ -526,10 +526,15 @@ class ModelResolutionObserver(ResolutionObservationPort):
             ),
             None,
         )
-        if completed is None or turn.state != "COMPLETION_COMMITTED":
+        if (
+            completed is None
+            or turn.state != "COMPLETION_COMMITTED"
+            or completed.provider_response_id is None
+            or completed.reported_usage is None
+        ):
             return _unavailable_resolution_observation(intent, recovery_generation)
         completion_json = canonical_json(turn.normalized_payload)
-        usage = getattr(completed, "reported_usage", None)
+        usage = completed.reported_usage
         values: dict[str, object] = {
             "kind": RecoveryActionClass.MODEL,
             "intent_id": intent.intent_id,
@@ -564,7 +569,8 @@ class ModelResolutionObserver(ResolutionObservationPort):
 class ToolActionResolutionObserver(ResolutionObservationPort):
     """Use the bounded tool runtime's action-specific recovery observation."""
 
-    def __init__(self, tools: ResolutionToolPort) -> None:
+    def __init__(self, journal: ResolutionStateJournal, tools: ResolutionToolPort) -> None:
+        self._journal = journal
         self._tools = tools
 
     def observe(self, intent: EffectIntent, recovery_generation: int) -> RecoveryObservation:
@@ -597,9 +603,7 @@ class ToolActionResolutionObserver(ResolutionObservationPort):
                     {
                         "run_id": intent.run_id,
                         "settled_sequence": AuditSequence(
-                            self._tools.audit_sequence(intent.run_id)
-                            if hasattr(self._tools, "audit_sequence")
-                            else intent.recorded_sequence + 1
+                            self._journal.audit_sequence(intent.run_id) + 1
                         ),
                         "applicable_revision_digests": intent.applicable_revision_digests,
                         "completion_proof_json": proof,
@@ -622,7 +626,7 @@ class ToolActionResolutionObserver(ResolutionObservationPort):
                 snapshot_digest=tool_intent.snapshot_digest,
                 receipt_digest=Sha256DigestText(str(bounded["receipt_digest"])),
                 run_id=intent.run_id,
-                settled_sequence=AuditSequence(intent.recorded_sequence + 1),
+                settled_sequence=AuditSequence(self._journal.audit_sequence(intent.run_id) + 1),
                 applicable_revision_digests=intent.applicable_revision_digests,
                 completion_proof_json=proof,
                 completion_proof_digest=sha256_digest(proof),

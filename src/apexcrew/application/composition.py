@@ -136,6 +136,7 @@ from apexcrew.domain.tools import (
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    GitOid,
     IntentId,
     RepositoryId,
     RevisionDigest,
@@ -919,6 +920,7 @@ class _ProductionRefResolutionObserver:
                 old_oid=old_oid,
                 prepared_oid=prepared_oid,
                 current_oid=current_oid,
+                settled_sequence=AuditSequence(self._store.audit_sequence(intent.run_id) + 1),
             )
         except (OSError, KeyError, StateConflict, TypeError, ValueError, RuntimeError):
             return _unavailable_resolution_observation(intent, recovery_generation)
@@ -929,30 +931,51 @@ class _ProductionRefResolutionObserver:
         from apexcrew.application.runtime import _unavailable_resolution_observation
 
         try:
+            payload = json.loads(intent.normalized_payload_json)
             run = self._store.run_record(intent.run_id)
             reservation = self._store.target_reservation_for_run(intent.run_id)
-            expected_old_oid = self._store.final_candidate(intent.run_id).head_oid
-            prepared_oid = self._store.final_candidate_prepared_oid(intent.run_id)
+            recorded_repository_id = RepositoryId(str(payload["repository_id"]))
+            recorded_instance_digest = Sha256DigestText(str(payload["repository_instance_digest"]))
+            recorded_ref_name = str(payload["ref_name"])
+            recorded_old_oid = GitOid(str(payload["expected_old_oid"]))
+            recorded_prepared_oid = GitOid(str(payload["prepared_oid"]))
+            recorded_safety_digest = Sha256DigestText(str(payload["target_safety_digest"]))
+            raw_registration_digest = payload.get("registration_digest") or payload.get(
+                "admin_binding_digest"
+            )
+            if not isinstance(raw_registration_digest, str):
+                return _unavailable_resolution_observation(intent, recovery_generation)
+            recorded_registration_digest = Sha256DigestText(raw_registration_digest)
+            if (
+                recorded_repository_id != run.repository_id
+                or recorded_instance_digest != run.repository_instance_digest
+                or recorded_ref_name != run.target_ref
+                or recorded_safety_digest != self._store.target_authority_digest(intent.run_id)
+            ):
+                return _unavailable_resolution_observation(intent, recovery_generation)
             adapter = self._resources.target_cas(
                 reservation, run.repository_id, run.repository_instance_digest
             )
             observed = adapter.observe_resolution(
-                target_ref=run.target_ref,
-                expected_old_oid=expected_old_oid,
-                prepared_oid=prepared_oid,
+                target_ref=recorded_ref_name,
+                expected_old_oid=recorded_old_oid,
+                prepared_oid=recorded_prepared_oid,
             )
+            if observed.registration_digest != recorded_registration_digest:
+                return _unavailable_resolution_observation(intent, recovery_generation)
             return self._ref_observation(
                 intent=intent,
                 recovery_generation=recovery_generation,
                 state=observed.state,
                 repository_id=run.repository_id,
                 repository_instance_digest=run.repository_instance_digest,
-                ref_name=run.target_ref,
+                ref_name=recorded_ref_name,
                 registration_digest=observed.registration_digest,
-                safety_digest=self._store.target_authority_digest(intent.run_id),
-                old_oid=expected_old_oid,
-                prepared_oid=prepared_oid,
-                current_oid=observed.observed_oid or expected_old_oid,
+                safety_digest=recorded_safety_digest,
+                old_oid=recorded_old_oid,
+                prepared_oid=recorded_prepared_oid,
+                current_oid=observed.observed_oid or recorded_old_oid,
+                settled_sequence=AuditSequence(self._store.audit_sequence(intent.run_id) + 1),
             )
         except (OSError, KeyError, StateConflict, TypeError, ValueError, RuntimeError):
             return _unavailable_resolution_observation(intent, recovery_generation)
@@ -971,6 +994,7 @@ class _ProductionRefResolutionObserver:
         old_oid: object,
         prepared_oid: object,
         current_oid: object,
+        settled_sequence: AuditSequence,
     ) -> RecoveryObservation:
         from apexcrew.application.runtime import _unavailable_resolution_observation
 
@@ -1015,7 +1039,7 @@ class _ProductionRefResolutionObserver:
             values.update(
                 {
                     "run_id": intent.run_id,
-                    "settled_sequence": AuditSequence(intent.recorded_sequence + 1),
+                    "settled_sequence": settled_sequence,
                     "applicable_revision_digests": intent.applicable_revision_digests,
                     "completion_proof_json": proof,
                     "completion_proof_digest": sha256_digest(proof),
@@ -1484,8 +1508,8 @@ def build_application_bundle(
                 "granted_risky_action": GrantedActionResolutionObserver(store, worker_tools),
                 "read": SnapshotResolutionObserver(store, worker_tools),
                 "search": SnapshotResolutionObserver(store, worker_tools),
-                "patch": ToolActionResolutionObserver(worker_tools),
-                "check": ToolActionResolutionObserver(worker_tools),
+                "patch": ToolActionResolutionObserver(store, worker_tools),
+                "check": ToolActionResolutionObserver(store, worker_tools),
                 "private_ref_init": _ProductionRefResolutionObserver(store, resources),
                 "private_ref_cas": _ProductionRefResolutionObserver(store, resources),
                 "target_ref_cas": _ProductionRefResolutionObserver(store, resources),

@@ -97,5 +97,9 @@ def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: 
             "target_ref_cas",
             "target_reservation_creation",
         }
+        assert all(
+            observer is not resolution._observer  # type: ignore[attr-defined]
+            for observer in resolution._observer._observers.values()  # type: ignore[attr-defined]
+        )
     finally:
         bundle.close()
