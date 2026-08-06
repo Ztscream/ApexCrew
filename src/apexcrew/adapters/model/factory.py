@@ -53,6 +53,8 @@ def _default_response_schema() -> dict[str, object]:
     if not isinstance(worker_branches, list) or not isinstance(planning_branches, list):
         raise ModelFactoryError("MODEL_ACTION_SCHEMA_INVALID")
     return {
+        "type": "object",
+        "properties": {"kind": {"type": "string"}},
         "$defs": definitions,
         "discriminator": {
             "propertyName": "kind",
@@ -65,7 +67,9 @@ def _default_response_schema() -> dict[str, object]:
                 },
             },
         },
-        "oneOf": worker_branches
+        # DeepSeek's structured-output validator accepts a root union through
+        # anyOf/type/$ref, but rejects a root oneOf without a sibling type.
+        "anyOf": worker_branches
         + [
             branch
             for branch in planning_branches

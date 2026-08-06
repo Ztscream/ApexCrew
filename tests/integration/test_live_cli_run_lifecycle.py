@@ -178,5 +178,5 @@ def test_live_cli_approval_permit_runtime_lifecycle(tmp_path: Path) -> None:
 
     assert delivered.exit_code == 0, delivered.stdout
     outcome = json.loads(delivered.stdout)
-    assert outcome["status"] == "AWAITING_PLAN_APPROVAL"
+    assert outcome["status"] == "AWAITING_PLAN_APPROVAL", delivered.stdout
     assert calls == 1

@@ -1510,9 +1510,15 @@ class _CompositionPlanningContext:
                 for path, digest, size in manifest.entries
             ],
             "instructions": (
-                "Return exactly one planning action object. Use submit_plan with a complete "
-                "plan_document, or use one bounded read/search action before submitting. "
-                "Do not return a Worker action."
+                "Return exactly one submit_plan action now with a complete plan_document "
+                "derived from the goal, constraints, acceptance criteria, and manifest. "
+                "Do not return read_tracked_file, search_tracked_content, or a Worker action. "
+                "plan_document must contain exactly tasks, run_checks, and "
+                "proposed_promotion_order. Each task must contain task_id, read_globs, "
+                "dependency_globs, dependency_task_ids, write_globs, checks, and "
+                "constraints. Each check and run_check must contain argv and input_globs. "
+                "Use task-01 as the task_id and proposed promotion order when one task is "
+                "sufficient."
             ),
         }
         prompt = canonical_json(prompt_document)

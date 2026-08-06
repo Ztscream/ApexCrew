@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from apexcrew.adapters.credentials.model_key import MemoryCredentialStore
 from apexcrew.adapters.model.deepseek_responses import DeepSeekResponsesAdapter
+from apexcrew.adapters.model.factory import _default_response_schema
 from apexcrew.domain.model import (
     LogicalModelTurn,
     ModelRequest,
@@ -31,6 +32,16 @@ RESPONSE_SCHEMA: dict[str, object] = {
         "properties": {"kind": {"type": "string"}},
     },
 }
+
+
+def test_default_schema_uses_deepseek_compatible_root_union() -> None:
+    schema = _default_response_schema()
+
+    assert schema["type"] == "object"
+    assert schema["properties"] == {"kind": {"type": "string"}}
+    assert "anyOf" in schema
+    assert "oneOf" not in schema
+    assert isinstance(schema["anyOf"], list)
 
 
 class RecordingResponsesClient:
