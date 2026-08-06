@@ -48,6 +48,16 @@ because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
 Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
 builds a restricted digest-pinned argv but does not launch a Docker process.
 
+`DEBT-R4-RECOVERY-001`: the composed resolution boundary currently records
+unsettled effects as `INDETERMINATE` and requires authoritative recovery; it does
+not yet implement the class-specific read, check, file, or ref replay strategies
+from SPEC section 5.8.
+
+`DEBT-R4-CLEANUP-001`: terminal cleanup executes the exact fully-observed
+registration/path sequence, but exact-admin-only and exact-path-only mixed crash
+states remain fail-closed and require operator repair before a new cleanup retry.
+The terminal Run state is preserved while cleanup is unresolved.
+
 The production runtime now checks the unconsumed Runtime Permit before acquiring
 the per-Run OS lock. The lock is cross-process and platform-backed; an absent,
 stale, or already-consumed Permit cannot create ownership. This control is covered

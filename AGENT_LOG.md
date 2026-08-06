@@ -2154,6 +2154,15 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4-02B independent review and Windows cleanup correction
+
+- **Implementation commit**: `f68de44` (`feat(runtime): complete R4-02B phase composition`), cherry-picked from implementation commit `9e8dd3f`; Subagent: Codex independent-review correction; Human-Changes: none.
+- **Correction evidence**: the real Git lifecycle initially failed on Windows because cached no-follow handles blocked `worktree unlock` and `worktree remove --force`. Typed cleanup operations now release only the exact reservation admin/data subtrees, exclude that verified subtree from the pre-command storage snapshot, refresh bindings after Git, and re-observe post-state. Cleanup preserves `COMPLETED` and settles the reservation administratively.
+- **Observed green evidence**: the composed lifecycle selector passed; the composition/production-wiring selectors passed; full offline `pytest -q` passed with the repository's existing xfail/skip set; the live selectors passed only their offline assertions with the credential-gated tests skipped; Ruff, format, mypy, and `git diff --check` passed.
+- **Standards review**: Nash found the R4 ledger/task-review workflow was not closed, the implementation evidence was not recorded in task commits, and the lifecycle test used private delivery/state seams. The test seam was corrected on the independent review branch to use public `CrewControl`, `CrewRuntime`, and filesystem/Git post-state observations.
+- **Spec review**: Mencius found class-specific recovery and exact-admin-only/exact-path-only terminal cleanup recovery remain incomplete. These are recorded as `DEBT-R4-RECOVERY-001` and `DEBT-R4-CLEANUP-001` in `SECURITY.md`; R4-02B remains blocked and no final-user release claim is made.
+- **Permit ordering clarification**: the review concern about OS ownership ordering is not treated as a defect: runtime obtains the OS advisory handle first, then the SQLite transaction consumes the matching Permit and installs `runtime_owner_id`, matching SPEC section 3's stated ordering. No credential, provider request, push, or PR action occurred.
+
 ## 2026-08-06 / R4-02B Task 1 final-user runtime
 
 - **Red evidence**: the public-interface lifecycle selector initially failed before plan approval with `PAUSED`; the pre-existing lifecycle test also reached into `bundle.runtime._store` for revisions and sequences.

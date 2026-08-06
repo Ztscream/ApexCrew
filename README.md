@@ -30,6 +30,9 @@ DeepSeek; after the three revision approvals, `begin-planning` issues a Runtime
 Permit and `run` consumes it before planning, Worker, or repository effects. Use
 `show` for the next exact digest, pending action, Candidate, and confirmation
 code preview. The read-only WebUI and Pages replay never execute a Run.
+After a terminal Run reaches `COMPLETED`, issue `reconcile-cleanup` and then
+`run` to consume the terminal-administrative Permit and settle the exact Git
+Target Reservation. Cleanup preserves the terminal Run state.
 
 ## 凭据安全配置
 
