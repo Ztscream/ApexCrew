@@ -1511,6 +1511,21 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M3-01 (2026-08-06)
+
+- **Base**: `dba8d12`.
+- **Red**: static WebUI contract failed on the missing no-store request policy;
+  prior output already used `textContent` but had no explicit CSP contract.
+- **Green**: `uv run pytest tests/unit/test_replay_web.py tests/unit/test_webui_build.py -q` -> `3 passed`.
+- **Implementation**: added a same-origin CSP meta policy, explicit GET with
+  omitted credentials and no-store caching, while preserving the sanitized
+  `RunQueries`-only read route and no mutation methods.
+- **Checks**: targeted Ruff and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M2-04 (2026-08-06)
 
 - **Base**: `642caf6`.
