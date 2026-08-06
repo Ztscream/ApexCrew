@@ -589,13 +589,7 @@ class RecoveryObservation(FrozenDocument):
     @model_validator(mode="after")
     def validate_observation(self) -> Self:
         required: dict[RecoveryActionClass, tuple[str, ...]] = {
-            RecoveryActionClass.MODEL: (
-                "request_digest",
-                "provider_response_id",
-                "returned_model_id",
-                "schema_digest",
-                "usage_json",
-            ),
+            RecoveryActionClass.MODEL: ("request_digest",),
             RecoveryActionClass.READ_SEARCH: ("snapshot_digest", "scope_digest", "ordering_digest"),
             RecoveryActionClass.PATCH: ("expected_pre_tree_digest", "observed_post_tree_digest"),
             RecoveryActionClass.CHECK: ("check_id", "argv_digest", "snapshot_digest"),
@@ -780,9 +774,15 @@ class RecoveryObservation(FrozenDocument):
         if (
             self.kind is RecoveryActionClass.MODEL
             and self.state == "EXACT_COMPLETION"
-            and self.normalized_completion_digest is None
+            and (
+                self.normalized_completion_digest is None
+                or self.provider_response_id is None
+                or self.returned_model_id is None
+                or self.schema_digest is None
+                or self.usage_json is None
+            )
         ):
-            raise ValueError("MODEL_COMPLETION_DIGEST_REQUIRED")
+            raise ValueError("MODEL_COMPLETION_PROVIDER_EVIDENCE_REQUIRED")
         if (
             self.kind is RecoveryActionClass.MODEL
             and self.state == "RETURNED_MODEL_MISMATCH"
@@ -909,7 +909,13 @@ class RecoveryDecision:
             RecoveryDecisionKind.STALE,
             RecoveryDecisionKind.CONFLICT,
             RecoveryDecisionKind.INDETERMINATE,
-        } and (self.result_digest is not None or self.bounded_result_json is not None):
+        } and (
+            self.result_digest is not None
+            or self.bounded_result_json is not None
+            or self.effect_result is not None
+            or self.settled_sequence is not None
+            or self.applicable_revision_digests is not None
+        ):
             raise ValueError("NON_RESULT_DECISION_CARRIES_RESULT")
 
 
