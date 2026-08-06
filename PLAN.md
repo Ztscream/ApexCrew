@@ -30555,7 +30555,7 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 | Task | Status | Implementation commit | Evidence |
 | --- | --- | --- | --- |
 | R4.1-01 domain recovery classification | COMPLETED | `4f41182` + correction chain ending `efc39f3` | SPEC review PASS; quality review PASS; full offline pytest/static checks green; final reviewed base `efc39f3` |
-| R4.1-02 atomic state/control resolution | NOT STARTED | pending | pending document review and red/green |
+| R4.1-02 atomic state/control resolution | COMPLETED | `33e1eed`; corrections `3dd5739, 617bfb8, 868fd07, 4984a42` | SPEC review PASS; quality review PASS; full offline pytest/static checks green; final reviewed base `efc39f3` |
 | R4.1-03 runtime resolution/production wiring | NOT STARTED | pending | pending document review and red/green |
 | R4.1-04 asymmetric terminal cleanup | NOT STARTED | pending | pending document review and red/green |
 | R4.1-05 final verification and delivery evidence | NOT STARTED | pending | pending observed offline/build evidence; live remains owner-authorized |
@@ -30569,7 +30569,7 @@ The R4.1 task chain is independently auditable through this required map. Each S
 | Task | PR | Worktree | Final-Reviewed-Base-SHA | Implementation-SHA | Spec-Review-SHA | Spec-Correction-SHAs | Quality-Review-SHA | Quality-Correction-SHAs | Ledger-SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e1d9aa4 | `4f41182`; corrections `08ac108, 79248fd, 82fd14a, df1c244, b365552, c9976f5, 2159c25, 0751b25, f98616c, 23bb486, 716ec9f, 9b439dd, efc39f3` | 019fd4ef-6224-7161-8def-81640752f95b (PASS) | all listed correction SHAs | 019fd4ce-6e42-7053-b18c-d772f70df951 (PASS) | all listed correction SHAs | 5057059 |
-| R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
+| R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | efc39f3 | `33e1eed`; corrections `3dd5739, 617bfb8, 868fd07, 4984a42` | 019fd4bd-25ed-7cf1-9106-2a30116e9596 (PASS) | `4984a42` | 019fd4bd-2a35-7fd0-91bb-e721ade91332 (PASS) | `868fd07, 4984a42` | pending |
 | R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | pending | pending | pending | pending | pending | pending | pending |
 | R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | pending | pending | pending | pending | pending | pending | pending |
 

@@ -2154,6 +2154,16 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
+## 2026-08-06 / R4.1-02 atomic state/control resolution closeout
+
+- **Worktree/branch**: `.worktrees/m1-r4-2-resolution-state` / `codex/m1-r4-2-resolution-state`, fixed base `efc39f3`.
+- **Implementation**: `33e1eed`; correction chain `3dd5739`, `617bfb8`, `868fd07`, `4984a42`. Subagent: Codex main implementation and review-correction passes. Human-Changes: none.
+- **Delivered**: atomic member/set resolution CAS over the current unresolved-set digest, typed observer-owned evidence requirements, persisted Permit resolution subject, generation-safe retry, class-specific successor mapping, set-bound `FAIL_RUN`/`CANCEL_RUN` denial/closure, SQLite/memory parity, and restart-safe SQLite observed reconciliation.
+- **SPEC review**: independent reviewer `019fd4bd-25ed-7cf1-9106-2a30116e9596` returned PASS for the R4.1-02 scope after reclassifying candidate/Grant owner transitions as the later R4.1-03 runtime task. The remaining adapter-level class-successor and set-success paths are non-blocking test gaps.
+- **Quality review**: independent reviewer `019fd4bd-2a35-7fd0-91bb-e721ade91332` returned PASS with no Critical/High findings. Review correction findings were fixed in `868fd07` (SQLite intent state binding) and `4984a42` (class-specific successor mapping).
+- **Observed evidence**: full `uv run pytest -q` passed with the repository's existing xfail/skip set; focused state/integration selectors passed; `uv run mypy src/apexcrew` passed; Ruff check/format and `git diff --check` passed. `mypy src tests` is not used because the repository's `tests/helpers` layout is discovered as both `application` and `helpers.application`; the configured source check passes.
+- **Boundary**: no DeepSeek request, provider credential, network, push, remote PR, or live smoke occurred. R4.1-03 remains the next task and owns runtime resolution/production wiring.
+
 ## 2026-08-06 / M1-R4.1 document review and GO
 
 - Plan revision: M1-R4.1 recovery resolution and asymmetric cleanup plan, final document-review base e2785e3.
