@@ -6973,6 +6973,69 @@ class InMemoryStateStore:
             raise StateConflict("TARGET_RESERVATION_NOT_FOUND")
         return matches[0]
 
+    def settle_terminal_cleanup(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit, _ = self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            run = copied._runs[run_id]
+            if permit.allowed_phase != "TERMINAL_ADMINISTRATION" or run.state not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }:
+                raise StateConflict("TERMINAL_CLEANUP_PERMIT_BINDING_MISMATCH")
+            reservation = copied.target_reservation_for_run(run_id)
+            if reservation.phase not in {"REGISTERED_LOCKED", "CLEANUP_SETTLED"}:
+                raise StateConflict("TARGET_RESERVATION_CLEANUP_PHASE_INVALID")
+            copied._target_reservations[reservation.reservation_id] = replace(
+                reservation, phase="CLEANUP_SETTLED"
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_SETTLED"),
+            mutate=mutate,
+        )
+
+    def record_terminal_cleanup_conflict(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(copied: InMemoryStateStore) -> None:
+            permit, _ = self._require_consumed_runtime_owner_on_copy(
+                copied, run_id, owner_id, permit_generation
+            )
+            run = copied._runs[run_id]
+            if permit.allowed_phase != "TERMINAL_ADMINISTRATION" or run.state not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }:
+                raise StateConflict("TERMINAL_CLEANUP_PERMIT_BINDING_MISMATCH")
+            reservation = copied.target_reservation_for_run(run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_CLEANUP_PHASE_INVALID")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_CONFLICT"),
+            mutate=mutate,
+        )
+
     def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
         owner = self._runtime_owners.get(run_id)
         return None if owner is None else owner[0]

@@ -54,9 +54,11 @@ FILE_READ_DATA = 0x0001
 FILE_WRITE_DATA = 0x0002
 FILE_LIST_DIRECTORY = 0x0001
 FILE_READ_ATTRIBUTES = 0x0080
+DELETE = 0x00010000
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 OPEN_EXISTING = 3
+FILE_DISPOSITION_INFO = 4
 INVALID_HANDLE_VALUE = c_void_p(-1).value
 FILE_ID_BOTH_DIRECTORY_INFORMATION = 37
 FILE_ID_BOTH_DIRECTORY_HEADER_SIZE = 104
@@ -159,6 +161,13 @@ class WindowsNoFollowBackend:
         self._kernel32.WriteFile.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            c_void_p,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
         self._ntdll.NtCreateFile.argtypes = [
             POINTER(wintypes.HANDLE),
             wintypes.ULONG,
@@ -217,6 +226,7 @@ class WindowsNoFollowBackend:
         kind: NodeKind,
         *,
         create: bool = False,
+        delete_access: bool = False,
     ) -> OpenedNode:
         encoded_name = name.encode("utf-16-le")
         if len(encoded_name) > 65_532:
@@ -245,6 +255,8 @@ class WindowsNoFollowBackend:
         self._last_ntstatus = None
         access = FILE_READ_ATTRIBUTES | SYNCHRONIZE
         access |= FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA
+        if delete_access:
+            access |= DELETE
         if create and kind == "file":
             access |= FILE_WRITE_DATA
         share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE
@@ -419,6 +431,15 @@ class WindowsNoFollowBackend:
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self._open_relative(parent.handle, name, parent.components + (name,), kind)
 
+    def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
+        return self._open_relative(
+            parent.handle,
+            name,
+            parent.components + (name,),
+            kind,
+            delete_access=True,
+        )
+
     def try_open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode | None:
         try:
             return self.open_child(parent, name, kind)
@@ -452,6 +473,28 @@ class WindowsNoFollowBackend:
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._query_directory_handle_names(node.handle, maximum)
+
+    def _delete_handle(self, expected: OpenedNode) -> None:
+        disposition = c_ubyte(1)
+        if not self._kernel32.SetFileInformationByHandle(
+            wintypes.HANDLE(expected.handle),
+            FILE_DISPOSITION_INFO,
+            byref(disposition),
+            sizeof(disposition),
+        ):
+            raise RepositoryUnsafeError("DELETE_FAILED")
+
+    def unlink_child(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        del parent
+        if expected.identity.kind != "file" or not name or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        self._delete_handle(expected)
+
+    def remove_child_directory(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        del parent
+        if expected.identity.kind != "directory" or not name or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        self._delete_handle(expected)
 
     def close(self, node: OpenedNode) -> None:
         if not self._kernel32.CloseHandle(wintypes.HANDLE(node.handle)):

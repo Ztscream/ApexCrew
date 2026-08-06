@@ -32,6 +32,9 @@ class OpenedNode:
 class NoFollowBackend(Protocol):
     def open_root_chain(self, root: Path) -> tuple[OpenedNode, ...]: ...
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode: ...
+    def open_child_for_delete(
+        self, parent: OpenedNode, name: str, kind: NodeKind
+    ) -> OpenedNode: ...
     def create_child_directory(self, parent: OpenedNode, name: str) -> OpenedNode: ...
     def create_child_file(self, parent: OpenedNode, name: str) -> OpenedNode: ...
     def try_open_child(
@@ -41,6 +44,13 @@ class NoFollowBackend(Protocol):
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes: ...
     def write_bytes(self, node: OpenedNode, value: bytes) -> None: ...
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]: ...
+
+    def unlink_child(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None: ...
+
+    def remove_child_directory(
+        self, parent: OpenedNode, name: str, expected: OpenedNode
+    ) -> None: ...
+
     def close(self, node: OpenedNode) -> None: ...
 
 
@@ -113,6 +123,37 @@ class StableHandleTree:
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._backend.list_names(node, maximum)
+
+    def remove_file(self, relative: str, expected: HandleIdentity) -> None:
+        parts = self._parts(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        self.release_cached(relative)
+        node = self._backend.open_child_for_delete(parent, parts[-1], "file")
+        try:
+            if node.identity != expected:
+                raise RepositoryUnsafeError("DELETE_IDENTITY_CHANGED")
+            self._backend.unlink_child(parent, parts[-1], node)
+        finally:
+            self._backend.close(node)
+
+    def remove_directory(self, relative: str, expected: HandleIdentity) -> None:
+        parts = self._parts(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        self.release_cached(relative)
+        node = self._backend.open_child_for_delete(parent, parts[-1], "directory")
+        try:
+            if node.identity != expected:
+                raise RepositoryUnsafeError("DELETE_IDENTITY_CHANGED")
+            self._backend.remove_child_directory(parent, parts[-1], node)
+        finally:
+            self._backend.close(node)
+
+    @staticmethod
+    def _parts(relative: str) -> tuple[str, ...]:
+        parts = tuple(relative.split("/"))
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            raise RepositoryUnsafeError("INVALID_HANDLE_RELATIVE_PATH")
+        return parts
 
     def assert_name_bindings(self) -> None:
         self._retry_pending_closes()

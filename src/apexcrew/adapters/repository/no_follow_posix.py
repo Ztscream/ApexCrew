@@ -97,6 +97,9 @@ class PosixNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_OPEN_DENIED") from error
         return self._node(parent.components + (name,), handle, kind)
 
+    def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
+        return self.open_child(parent, name, kind)
+
     def create_child_directory(self, parent: OpenedNode, name: str) -> OpenedNode:
         _required_open_flags()
         if os.mkdir not in os.supports_dir_fd:
@@ -169,6 +172,33 @@ class PosixNoFollowBackend:
         if len(names) > maximum or any(name in {"", ".", ".."} for name in names):
             raise RepositoryUnsafeError("GIT_DIRECTORY_INVENTORY_INVALID")
         return names
+
+    @staticmethod
+    def _require_identity(node: OpenedNode) -> None:
+        try:
+            observed = os.fstat(node.handle)
+        except OSError as error:
+            raise RepositoryUnsafeError("DELETE_IDENTITY_QUERY_FAILED") from error
+        if observed.st_dev != node.identity.volume or observed.st_ino != node.identity.file_id:
+            raise RepositoryUnsafeError("DELETE_IDENTITY_CHANGED")
+
+    def unlink_child(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        self._require_identity(expected)
+        if expected.identity.kind != "file" or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        try:
+            os.unlink(name, dir_fd=parent.handle)
+        except OSError as error:
+            raise RepositoryUnsafeError("DELETE_FAILED") from error
+
+    def remove_child_directory(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        self._require_identity(expected)
+        if expected.identity.kind != "directory" or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        try:
+            os.rmdir(name, dir_fd=parent.handle)
+        except OSError as error:
+            raise RepositoryUnsafeError("DELETE_FAILED") from error
 
     def close(self, node: OpenedNode) -> None:
         os.close(node.handle)

@@ -66,6 +66,7 @@ class GitTargetCasAdapter:
             if (
                 observation.admin_entry_name != self._reservation.admin_entry_name
                 or observation.admin_binding_digest != self._reservation.admin_binding_digest
+                or not observation.locked
             ):
                 raise RepositoryEffectError("TARGET_UNSAFE")
             before = self._runner.run(self._repository, GitShowRefVerify(target_ref))

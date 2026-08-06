@@ -69,6 +69,7 @@ from apexcrew.domain.model import (
     SettledModelAttempt,
     model_request_from_json,
 )
+from apexcrew.domain.reservation_cleanup import CleanupObservation, CleanupObservationKind
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
     GrantedActionJournal,
@@ -922,9 +923,22 @@ class TerminalCleanupState(Protocol):
     ) -> AuditSequence:
         raise NotImplementedError
 
+    def record_terminal_cleanup_conflict(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
 
 class TargetReservationCleanup(Protocol):
-    def reconcile(self, reservation: TargetReservation) -> None:
+    def observe(self, reservation: TargetReservation) -> CleanupObservation:
+        raise NotImplementedError
+
+    def apply_exact(self, reservation: TargetReservation, observation: CleanupObservation) -> None:
         raise NotImplementedError
 
 
@@ -945,7 +959,25 @@ class TerminalCleanupRuntime(TerminalCleanupDriver):
         ):
             raise ValueError("TERMINAL_CLEANUP_PERMIT_PHASE_MISMATCH")
         reservation = self._state.target_reservation_for_run(run_id)
-        self._cleanup.reconcile(reservation)
+        observation = self._cleanup.observe(reservation)
+        if observation.kind is CleanupObservationKind.CONFLICT:
+            sequence = self._state.record_terminal_cleanup_conflict(
+                run_id=run_id,
+                owner_id=owner_id,
+                permit_generation=permit.generation,
+                expected_sequence=self._state.audit_sequence(run_id),
+            )
+            return RuntimeDecision.pause("TARGET_RESERVATION_CLEANUP_CONFLICT", sequence)
+        try:
+            self._cleanup.apply_exact(reservation, observation)
+        except (RuntimeError, OSError):
+            sequence = self._state.record_terminal_cleanup_conflict(
+                run_id=run_id,
+                owner_id=owner_id,
+                permit_generation=permit.generation,
+                expected_sequence=self._state.audit_sequence(run_id),
+            )
+            return RuntimeDecision.pause("TARGET_RESERVATION_CLEANUP_CONFLICT", sequence)
         sequence = self._state.settle_terminal_cleanup(
             run_id=run_id,
             owner_id=owner_id,

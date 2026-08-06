@@ -10795,6 +10795,35 @@ class SqliteStateStore:
             mutate=mutate,
         )
 
+    def record_terminal_cleanup_conflict(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit, run = self._require_consumed_runtime_owner(
+                connection, run_id, owner_id, permit_generation
+            )
+            if permit.allowed_phase != "TERMINAL_ADMINISTRATION" or run["state"] not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }:
+                raise StateConflict("TERMINAL_CLEANUP_PERMIT_BINDING_MISMATCH")
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_CLEANUP_PHASE_INVALID")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_CONFLICT"),
+            mutate=mutate,
+        )
+
     def runtime_owner(self, run_id: RunId) -> RuntimeOwnerId | None:
         row = self._connection.execute(
             "SELECT runtime_owner_id FROM runs WHERE run_id = ?", (run_id,)

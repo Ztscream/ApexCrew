@@ -120,6 +120,7 @@ from apexcrew.domain.model import DurableModelClient, ModelRequest, RecoveredMod
 from apexcrew.domain.plan import CanonicalPath
 from apexcrew.domain.policy import PlanningPathPolicy, SecretPathPolicy
 from apexcrew.domain.projection import ProjectionService
+from apexcrew.domain.reservation_cleanup import CleanupObservation, CleanupObservationKind
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     ModelConfigurationRevisionDocument,
@@ -359,7 +360,11 @@ class _CompositionRepositoryResources:
         repository_id: RepositoryId,
         repository_instance_digest: Sha256DigestText,
         target_authority_digest: Sha256DigestText,
-    ) -> tuple[TargetReservationObservationService, GitTargetReservationRepository]:
+    ) -> tuple[
+        TargetReservationObservationService,
+        GitTargetReservationRepository,
+        ReservationPathInspector,
+    ]:
         self._allow_reservation_worktree(reservation.reservation_id)
         self.validate_repository_binding(repository_id, repository_instance_digest)
         repository, runner, data_handles = self._ensure()
@@ -390,7 +395,7 @@ class _CompositionRepositoryResources:
             ),
             backend,
         )
-        return TargetReservationObservationService(git, path_reader), git
+        return TargetReservationObservationService(git, path_reader), git, path_reader
 
     def private_ref_guard(
         self,
@@ -402,7 +407,7 @@ class _CompositionRepositoryResources:
     ) -> GitPrivateRefStartGuard:
         self._allow_reservation_worktree(reservation.reservation_id)
         repository, runner, _ = self._ensure()
-        observer, git = self.reservation_adapters(
+        observer, git, _path_reader = self.reservation_adapters(
             reservation,
             repository_id,
             repository_instance_digest,
@@ -730,7 +735,7 @@ class _ProductionTargetReservationDriver(TargetReservationDriver):
     def initialize(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         run = self._store.run_record(run_id)
         reservation = self._store.target_reservation_for_run(run_id)
-        observer, git = self._resources.reservation_adapters(
+        observer, git, _path_reader = self._resources.reservation_adapters(
             reservation,
             run.repository_id,
             run.repository_instance_digest,
@@ -788,7 +793,7 @@ class _ProductionTargetReservationResolutionObserver:
                 path=Path(creation.reservation_path),
                 phase="CREATION_INTENT_RECORDED",
             )
-            observer, _ = self._resources.reservation_adapters(
+            observer, _, _path_reader = self._resources.reservation_adapters(
                 reservation,
                 run.repository_id,
                 run.repository_instance_digest,
@@ -1109,41 +1114,149 @@ class _CompositionReservationCleanup:
         self._store = store
         self._resources = resources
 
-    def reconcile(self, reservation: TargetReservation) -> None:
+    def observe(self, reservation: TargetReservation) -> CleanupObservation:
         run = self._store.run_record(reservation.run_id)
-        observer, git = self._resources.reservation_adapters(
+        observer, _git, _path_reader = self._resources.reservation_adapters(
             reservation,
             run.repository_id,
             run.repository_instance_digest,
             self._store.target_authority_digest(reservation.run_id),
         )
         observed = observer.observe(reservation)
-        if not observed.observable or observed.registration_present != observed.path_present:
-            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        conflict = CleanupObservation(CleanupObservationKind.CONFLICT, reservation.reservation_id)
+        if not observed.observable:
+            return conflict
         if not observed.registration_present and not observed.path_present:
+            return CleanupObservation(
+                CleanupObservationKind.BOTH_ABSENT, reservation.reservation_id
+            )
+        admin_exact = (
+            observed.registration_present
+            and observed.registration_exact_identity
+            and observed.admin_entry_name == reservation.reservation_id
+            and observed.admin_binding_digest is not None
+            and observed.admin_binding_digest == reservation.admin_binding_digest
+        )
+        path_exact = (
+            observed.path_present
+            and observed.gitfile_only
+            and observed.path_exact_back_reference
+            and observed.path_identity is not None
+            and observed.gitfile_digest is not None
+        )
+        if observed.registration_present and observed.path_present and admin_exact and path_exact:
+            kind = (
+                CleanupObservationKind.BOTH_EXACT_LOCKED
+                if observed.locked
+                else CleanupObservationKind.BOTH_EXACT_UNLOCKED
+            )
+            return CleanupObservation(
+                kind,
+                reservation.reservation_id,
+                observed.path_identity,
+                observed.gitfile_digest,
+                observed.admin_binding_digest,
+                observed.lock_digest,
+            )
+        if not observed.registration_present and path_exact:
+            return CleanupObservation(
+                CleanupObservationKind.PATH_ONLY_EXACT_GITFILE,
+                reservation.reservation_id,
+                observed.path_identity,
+                observed.gitfile_digest,
+                None,
+                None,
+            )
+        if not observed.path_present and admin_exact:
+            return CleanupObservation(
+                CleanupObservationKind.ADMIN_ONLY_EXACT,
+                reservation.reservation_id,
+                None,
+                None,
+                observed.admin_binding_digest,
+                observed.lock_digest,
+            )
+        return conflict
+
+    def apply_exact(self, reservation: TargetReservation, observation: CleanupObservation) -> None:
+        run = self._store.run_record(reservation.run_id)
+        observer, git, path_reader = self._resources.reservation_adapters(
+            reservation,
+            run.repository_id,
+            run.repository_instance_digest,
+            self._store.target_authority_digest(reservation.run_id),
+        )
+        if observation.kind is CleanupObservationKind.BOTH_ABSENT:
             return
-        if (
-            not observed.exact_identity
-            or not observed.registration_present
-            or not observed.path_present
-        ):
-            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
-        if observed.locked:
+        if observation.kind is CleanupObservationKind.PATH_ONLY_EXACT_GITFILE:
+            git.release_cached_reservation(reservation)
+            path = path_reader.observe_path(reservation)
+            if (
+                path.path_identity != observation.path_identity_digest
+                or path.gitfile_digest != observation.gitfile_digest
+            ):
+                raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+            path_reader.remove_exact_gitfile(reservation, path)
+        elif observation.kind is CleanupObservationKind.ADMIN_ONLY_EXACT:
+            git.remove_exact_admin_entry(
+                reservation, observation.admin_identity_digest, observation.lock_digest
+            )
+        elif observation.kind is CleanupObservationKind.BOTH_EXACT_LOCKED:
             git.unlock(reservation)
-            observed = observer.observe(reservation)
-        if (
-            not observed.observable
-            or not observed.exact_identity
-            or not observed.registration_present
-            or not observed.path_present
-            or observed.locked
-        ):
+            unlocked = observer.observe(reservation)
+            if not (
+                unlocked.observable
+                and unlocked.registration_present
+                and unlocked.path_present
+                and unlocked.registration_exact_identity
+                and unlocked.path_exact_back_reference
+                and unlocked.gitfile_only
+                and unlocked.path_identity is not None
+                and unlocked.gitfile_digest is not None
+                and unlocked.path_identity == observation.path_identity_digest
+                and unlocked.gitfile_digest == observation.gitfile_digest
+                and unlocked.admin_binding_digest == observation.admin_identity_digest
+                and not unlocked.locked
+            ):
+                raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+            git.remove_force(
+                reservation,
+                expected_path_identity=unlocked.path_identity,
+                expected_gitfile_digest=unlocked.gitfile_digest,
+            )
+        elif observation.kind is CleanupObservationKind.BOTH_EXACT_UNLOCKED:
+            unlocked = observer.observe(reservation)
+            if not (
+                unlocked.observable
+                and unlocked.registration_present
+                and unlocked.path_present
+                and unlocked.registration_exact_identity
+                and unlocked.path_exact_back_reference
+                and unlocked.gitfile_only
+                and unlocked.path_identity is not None
+                and unlocked.gitfile_digest is not None
+                and unlocked.path_identity == observation.path_identity_digest
+                and unlocked.gitfile_digest == observation.gitfile_digest
+                and unlocked.admin_binding_digest == observation.admin_identity_digest
+                and not unlocked.locked
+            ):
+                raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+            git.remove_force(
+                reservation,
+                expected_path_identity=unlocked.path_identity,
+                expected_gitfile_digest=unlocked.gitfile_digest,
+            )
+        else:
             raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
-        git.remove_force(reservation)
-        observed = observer.observe(reservation)
-        if not observed.observable or observed.registration_present or observed.path_present:
+        after = observer.observe(reservation)
+        if after.observable and not after.registration_present and not after.path_present:
+            self._resources.refresh()
+            return
+        if observation.kind is CleanupObservationKind.PATH_ONLY_EXACT_GITFILE:
             raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
-        self._resources.refresh()
+        if observation.kind is CleanupObservationKind.ADMIN_ONLY_EXACT:
+            raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
+        raise RuntimeError("TARGET_RESERVATION_CLEANUP_CONFLICT")
 
 
 class _ProductionStartGuard:

@@ -377,6 +377,7 @@ class ReservationRegistrationObservation:
     observable: bool
     admin_entry_name: str | None = None
     admin_binding_digest: Sha256DigestText | None = None
+    lock_digest: Sha256DigestText | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,6 +387,7 @@ class ReservationPathObservation:
     exact_back_reference: bool
     observable: bool
     gitfile_digest: Sha256DigestText | None = None
+    path_identity: str | None = None
 
 
 class TargetReservationRegistrationReader(Protocol):
@@ -428,14 +430,20 @@ class TargetReservationObservationService(TargetReservationObserver):
             gitfile_only=path.gitfile_only,
             admin_entry_name=registration.admin_entry_name,
             admin_binding_digest=registration.admin_binding_digest,
-            path_identity=str(reservation.path) if path.path_present else None,
+            lock_digest=registration.lock_digest,
+            path_identity=path.path_identity,
             gitfile_digest=path.gitfile_digest,
+            registration_exact_identity=registration.exact_identity
+            and not registration.unexpected_registration,
+            path_exact_back_reference=path.exact_back_reference,
         )
 
 
 class ReservationAdminObservation(FrozenDocument):
     admin_entry_name: str | None
     admin_binding_digest: Sha256DigestText | None
+    locked: bool = True
+    lock_digest: Sha256DigestText | None = None
 
 
 class TargetReservationWorktreeGuard(Protocol):
@@ -461,6 +469,22 @@ class TargetReservationWorktreeGuard(Protocol):
         raise NotImplementedError
 
     def release_cached_reservation(self, reservation: TargetReservation) -> None:
+        raise NotImplementedError
+
+    def remove_exact_admin_entry(
+        self,
+        reservation: TargetReservation,
+        expected_digest: Sha256DigestText | None,
+        expected_lock_digest: Sha256DigestText | None,
+    ) -> None:
+        raise NotImplementedError
+
+    def require_exact_cleanup_path(
+        self,
+        reservation: TargetReservation,
+        expected_path_identity: str,
+        expected_gitfile_digest: Sha256DigestText,
+    ) -> None:
         raise NotImplementedError
 
     def refresh_after_git_transition(self) -> None:

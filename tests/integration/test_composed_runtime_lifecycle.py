@@ -9,6 +9,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.application.composition import build_application_bundle
 from apexcrew.application.configuration import default_revision_documents
 from apexcrew.delivery.cli import app as cli_app
@@ -224,7 +225,7 @@ def test_composed_runtime_reaches_plan_approval_with_real_git_reservation(tmp_pa
         bundle.close()
 
 
-def test_composed_runtime_integrates_frozen_candidate_once(tmp_path: Path) -> None:
+def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
@@ -411,6 +412,12 @@ def test_composed_runtime_integrates_frozen_candidate_once(tmp_path: Path) -> No
         reservations = root / ".apexcrew" / "data" / "reservations"
         assert tuple(reservations.iterdir()) == ()
         assert _git(root, "worktree", "list", "--porcelain").count("worktree ") == 1
+        bundle.close()
+        reopened = SqliteStateStore(root / ".apexcrew" / "state.db")
+        try:
+            assert reopened.target_reservation_for_run(run_id).phase == "CLEANUP_SETTLED"
+        finally:
+            reopened.close()
         replay = runner.invoke(cli_app, command_args)
         assert replay.exit_code == 0, replay.stdout
         assert json.loads(replay.stdout)["status"] == "COMMAND_ACCEPTED"

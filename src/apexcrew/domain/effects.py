@@ -114,6 +114,9 @@ class ReservationObservation(FrozenDocument):
     observable: bool = True
     path_identity: str | None = None
     gitfile_digest: Sha256DigestText | None = None
+    registration_exact_identity: bool = False
+    path_exact_back_reference: bool = False
+    lock_digest: Sha256DigestText | None = None
 
     def __init__(
         self,
@@ -127,6 +130,9 @@ class ReservationObservation(FrozenDocument):
         observable: bool = True,
         path_identity: str | None = None,
         gitfile_digest: Sha256DigestText | None = None,
+        registration_exact_identity: bool = False,
+        path_exact_back_reference: bool = False,
+        lock_digest: Sha256DigestText | None = None,
     ) -> None:
         super().__init__(  # type: ignore[call-arg]
             registration_present=registration_present,
@@ -139,6 +145,9 @@ class ReservationObservation(FrozenDocument):
             observable=observable,
             path_identity=path_identity,
             gitfile_digest=gitfile_digest,
+            registration_exact_identity=registration_exact_identity,
+            path_exact_back_reference=path_exact_back_reference,
+            lock_digest=lock_digest,
         )
 
 

@@ -1439,19 +1439,22 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         self.require_safe_before_list(reservation)
         names = self._worktree_admin_names()
         if not names:
-            if self._reservation_path_state(reservation)[0]:
-                raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
-            return ReservationAdminObservation(admin_entry_name=None, admin_binding_digest=None)
+            return ReservationAdminObservation(
+                admin_entry_name=None, admin_binding_digest=None, locked=False, lock_digest=None
+            )
         expected = _target_reservation_component(reservation.reservation_id)
         if names != (expected,):
             raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_INVENTORY_INVALID")
         record = self._read_exact_admin_record(reservation)
-        path_present, gitfile_exact = self._reservation_path_state(reservation)
-        if not path_present or not gitfile_exact:
-            raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
         return ReservationAdminObservation(
             admin_entry_name=record.entry_name,
             admin_binding_digest=record.binding_digest,
+            locked=record.locked is not None,
+            lock_digest=(
+                None
+                if record.locked is None
+                else Sha256DigestText("sha256:" + hashlib.sha256(record.locked).hexdigest())
+            ),
         )
 
     def require_absent_before_add(self, operation: TargetReservationOperation) -> None:
@@ -1507,6 +1510,174 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         self._data_handles.release_cached(
             "reservations/" + _target_reservation_component(reservation.reservation_id)
         )
+
+    def remove_exact_admin_entry(
+        self,
+        reservation: TargetReservation,
+        expected_digest: Sha256DigestText | None,
+        expected_lock_digest: Sha256DigestText | None,
+    ) -> None:
+        self.require_safe_before_list(reservation)
+        if expected_digest is None or self._reservation_path_state(reservation)[0]:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_PRESTATE_INVALID")
+        current = self._read_exact_admin_record(reservation)
+        if current.binding_digest != expected_digest:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_DIGEST_MISMATCH")
+        current_lock_digest = (
+            None
+            if current.locked is None
+            else Sha256DigestText("sha256:" + hashlib.sha256(current.locked).hexdigest())
+        )
+        if current_lock_digest != expected_lock_digest:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_LOCK_DIGEST_MISMATCH")
+        self.release_cached_admin_entry(reservation)
+        backend = (
+            WindowsNoFollowBackend(allow_delete_share=True)
+            if os.name == "nt"
+            else PosixNoFollowBackend()
+        )
+        tree = StableHandleTree(self._repository.root, backend)
+        try:
+            git_dir = tree.open(".git", "directory")
+            if git_dir.identity != self._repository.git_dir_identity:
+                raise RepositoryEffectError("TARGET_RESERVATION_COMMONDIR_IDENTITY_CHANGED")
+            entry_relative = ".git/worktrees/" + _target_reservation_component(
+                reservation.reservation_id
+            )
+            entry = tree.open(entry_relative, "directory")
+            names = tree.list_names(entry, MAX_TARGET_RESERVATION_ADMIN_ENTRIES)
+            required = (
+                _TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES
+                | _TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES
+            )
+            if set(names) not in (
+                required,
+                required | _TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES,
+            ):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            gitdir = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/gitdir", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="GITDIR",
+            )
+            commondir = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/commondir", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="COMMONDIR",
+            )
+            head = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/HEAD", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="HEAD",
+            )
+            logs = tree.open(entry_relative + "/logs", "directory")
+            if tree.list_names(logs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES) != ("HEAD",):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            logs_head = tree.read_bytes(
+                tree.open(entry_relative + "/logs/HEAD", "file"),
+                MAX_TARGET_RESERVATION_LOG_HEAD_BYTES,
+            )
+            refs = tree.open(entry_relative + "/refs", "directory")
+            if tree.list_names(refs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            locked_node = tree.try_open(entry_relative + "/locked", "file")
+            if locked_node is not None:
+                _exact_admin_line(
+                    tree.read_bytes(locked_node, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES),
+                    label="LOCK",
+                )
+            observed_lock_digest = (
+                None
+                if locked_node is None
+                else Sha256DigestText(
+                    "sha256:"
+                    + hashlib.sha256(
+                        tree.read_bytes(locked_node, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES)
+                    ).hexdigest()
+                )
+            )
+            if observed_lock_digest != expected_lock_digest:
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_LOCK_DIGEST_MISMATCH")
+            if (
+                gitdir != os.fsencode((reservation.path / ".git").as_posix()) + b"\n"
+                or commondir != b"../..\n"
+                or head != b"ref: " + os.fsencode(reservation.target_ref) + b"\n"
+            ):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_BACK_REFERENCE_INVALID")
+            digest = sha256_digest(
+                canonical_json(
+                    {
+                        "entry_name": reservation.reservation_id,
+                        "gitdir_hex": gitdir.hex(),
+                        "commondir_hex": commondir.hex(),
+                        "head_hex": head.hex(),
+                        "logs_head_hex": logs_head.hex(),
+                    }
+                )
+            )
+            if digest != expected_digest:
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_DIGEST_MISMATCH")
+            for relative in (
+                entry_relative + "/HEAD",
+                entry_relative + "/commondir",
+                entry_relative + "/gitdir",
+                entry_relative + "/locked",
+                entry_relative + "/logs/HEAD",
+            ):
+                node = tree.try_open(relative, "file")
+                if node is not None:
+                    tree.remove_file(relative, node.identity)
+            tree.remove_directory(entry_relative + "/logs", logs.identity)
+            tree.remove_directory(entry_relative + "/refs", refs.identity)
+            tree.remove_directory(entry_relative, entry.identity)
+        except (RepositoryUnsafeError, OSError) as error:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_CLEANUP_FAILED") from error
+        finally:
+            tree.close()
+        self.refresh_after_git_transition()
+
+    def require_exact_cleanup_path(
+        self,
+        reservation: TargetReservation,
+        expected_path_identity: str,
+        expected_gitfile_digest: Sha256DigestText,
+    ) -> None:
+        self.require_safe_before_list(reservation)
+        relative = "reservations/" + _target_reservation_component(reservation.reservation_id)
+        directory = self._data_handles.open(relative, "directory")
+        if self._data_handles.list_names(directory, 2) != (".git",):
+            raise RepositoryEffectError("TARGET_RESERVATION_PATH_PRESTATE_NOT_EXACT")
+        identity = directory.identity
+        actual_path_identity = (
+            "sha256:"
+            + hashlib.sha256(
+                f"{identity.platform}:{identity.volume}:{identity.file_id}:{identity.kind}".encode()
+            ).hexdigest()
+        )
+        gitfile = self._data_handles.open(relative + "/.git", "file")
+        raw = self._data_handles.read_bytes(gitfile, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES)
+        actual_gitfile_digest = Sha256DigestText("sha256:" + hashlib.sha256(raw).hexdigest())
+        expected_gitfile = (
+            b"gitdir: "
+            + os.fsencode(
+                (
+                    self._repository.root / ".git" / "worktrees" / reservation.reservation_id
+                ).as_posix()
+            )
+            + b"\n"
+        )
+        if (
+            actual_path_identity != expected_path_identity
+            or actual_gitfile_digest != expected_gitfile_digest
+            or raw != expected_gitfile
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_PATH_PRESTATE_NOT_EXACT")
 
     def refresh_after_git_transition(self) -> None:
         self._repository = self._repository.refresh_after_verified_owned_transition()
@@ -1613,7 +1784,6 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
                     "commondir_hex": commondir.hex(),
                     "head_hex": head.hex(),
                     "logs_head_hex": logs_head.hex(),
-                    "locked_hex": None if locked is None else locked.hex(),
                 }
             )
         )
@@ -1790,6 +1960,7 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             observable=True,
             admin_entry_name=admin_after.admin_entry_name,
             admin_binding_digest=admin_after.admin_binding_digest,
+            lock_digest=admin_after.lock_digest,
         )
 
     def unlock(self, reservation: TargetReservation) -> None:
@@ -1822,7 +1993,13 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_UNLOCK_POSTSTATE_NOT_EXACT")
 
-    def remove_force(self, reservation: TargetReservation) -> None:
+    def remove_force(
+        self,
+        reservation: TargetReservation,
+        *,
+        expected_path_identity: str,
+        expected_gitfile_digest: Sha256DigestText,
+    ) -> None:
         expected = self._data_root / "reservations" / reservation.reservation_id
         if reservation.path != expected:
             raise RepositoryEffectError("TARGET_RESERVATION_CLEANUP_PATH_INVALID")
@@ -1834,6 +2011,9 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             or before.locked
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_PRESTATE_NOT_EXACT")
+        self._worktree_guard.require_exact_cleanup_path(
+            reservation, expected_path_identity, expected_gitfile_digest
+        )
         self._worktree_guard.release_cached_reservation(reservation)
         result = self._runner.run(
             self._repository,
@@ -1848,6 +2028,22 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         after = self.observe_registration(reservation)
         if not after.observable or after.registration_present or after.unexpected_registration:
             raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_POSTSTATE_NOT_EXACT")
+
+    def remove_exact_admin_entry(
+        self,
+        reservation: TargetReservation,
+        expected_digest: Sha256DigestText | None,
+        expected_lock_digest: Sha256DigestText | None = None,
+    ) -> None:
+        try:
+            self._worktree_guard.remove_exact_admin_entry(
+                reservation, expected_digest, expected_lock_digest
+            )
+        except (RepositoryEffectError, RepositoryUnsafeError) as error:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_CLEANUP_FAILED") from error
+
+    def release_cached_reservation(self, reservation: TargetReservation) -> None:
+        self._worktree_guard.release_cached_reservation(reservation)
 
     def _require_pinned_target(
         self, operation: TargetReservationOperation, *, post_operation: bool
