@@ -1552,7 +1552,7 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
   - `make demo` -> deterministic guard, feedback, and freshness outputs passed.
   - `make secret-scan` -> `secret-scan: clean`.
   - `uv run python scripts/check_static_replay.py` -> `static-replay: clean`.
-  - `uv run python scripts/measure_performance.py --output .tmp/reference-performance.json` -> bounded report, `0.21 ms` observed.
+  - `uv run python scripts/measure_performance.py --output .tmp/reference-performance.json` -> bounded report, `0.175 ms` observed.
   - `git diff --check` -> exit code 0.
 - **Docker boundary**: `tests/integration/test_restricted_executor_docker.py` was
   explicitly skipped because the Docker Desktop daemon pipe was unavailable.
@@ -2590,7 +2590,7 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Branch/worktree**: `codex/m2-m4-final-production` /
   `.worktrees/m2-m4-final-production`, base `9cc269f`.
 - **Plan**: `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`.
-- **Plan SHA-256**: `7DADBA8F2B9C3386C3ACDBBCDFAE9D737AE2C27CF715552CB7743EF45795AC78`.
+- **Plan SHA-256**: `3617188CE9F5EA69CFA63BD252C6B4AD9D9393AEA61497142EE8F11E7FA814DC`.
 - **Spec-review**: Codex independent document pass, PASS; no Critical/High.
 - **Quality-review**: Codex independent document pass, PASS; no Critical/High.
 - **Baseline**: `uv run pytest tests/unit tests/contract tests/acceptance -q` passed;

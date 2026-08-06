@@ -35,13 +35,13 @@ any exposed credential outside this repository before sharing diagnostic metadat
 
 ## Delivery Status
 
-M1-M4 delivery artifacts are present at the depth recorded in `SPRINT.md` and
-`AGENT_LOG.md`. SKELETON and STUB tasks are intentionally not described as
-production-complete. The secret scanner checks the tracked tree and reachable
-history; replay/WebUI delivery is projection-only; Docker argv construction is
-closed but its process runner remains a debt.
+M2-M4 local delivery artifacts and production boundaries are implemented at the
+depth recorded in the final-production plan and `AGENT_LOG.md`. The secret
+scanner checks the tracked tree and reachable history; replay/WebUI delivery is
+projection-only; Docker execution remains fail-closed when the daemon or image
+is unavailable.
 
-## Known Runtime Debt
+## Known Operational Boundaries
 
 Observed multi-intent members are selectable only when exactly one member is
 identified by authoritative external observation; no observation or multiple

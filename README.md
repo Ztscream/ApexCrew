@@ -102,7 +102,11 @@ The WebUI is a read-only projection, not an execution service.
 
 ## Status
 
-The frozen specification, reviewed M1 plan amendment, and Stage 4 cold-start gate authorize this implementation slice. M1-M4 are delivered at the SPRINT depth levels recorded in `AGENT_LOG.md`; SKELETON and STUB items remain explicitly bounded.
+The frozen specification and the reviewed M2-M4 final-production plan authorize
+this branch. M2-M4 local production capabilities are implemented and offline
+verified at the public application boundary; hosted publication and real
+DeepSeek smoke remain explicit owner actions, and are not implied by offline
+verification.
 
 R4.1-04 asymmetric terminal cleanup is implemented at commit `27f1b81` and has
 passed the offline, packaging, secret-scan, Docker, and fresh-process checks recorded
@@ -124,7 +128,7 @@ the one-request live smoke.
 - Revision-bound context, checks, approvals, and integration evidence.
 - Coordinator-scheduled, Admission-owned candidate preparation/CAS through a sanitized host Git adapter, with repository commands confined to a restricted networkless executor.
 - DeepSeek Responses API with `deepseek-v4-flash` as the sole real adapter; deterministic core tests use `ScriptedMockLLM`.
-- CLI-only commands, a read-only loopback WebUI, and a sanitized fixture replay published through GitHub Pages.
+- CLI-only commands, a read-only loopback WebUI, and a sanitized fixture replay prepared for GitHub Pages; hosted publication remains owner-only.
 - Required checks run offline from sanitized regular-file snapshots; symlinks and fixed plus host-local secret paths are hard denied.
 - A locked Git-native Target Reservation is reused for the Run and removed by exact journaled terminal cleanup before purge.
 - Publication scans both the tracked tree and full reachable Git history; terminal-only purge is approval-bound and crash-idempotent without touching Git, and purged queries expose only a minimal tombstone view.
@@ -156,6 +160,10 @@ The repository owner decided on 2026-07-31 that no NJU/GitLab remote will be con
 
 The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python money-unit and TypeScript timestamp-unit fixture problems are included. No API credential value is needed for the offline core or delivery commands.
 
-## 已知债务
+## 已实现边界与剩余外部动作
 
 Multi-intent recovery selects a member only from exactly one authoritative observation; ambiguity remains `INDETERMINATE`. Retention redacts/quarantines restricted diagnostics and applies the documented expiry/eviction order. The restricted executor launches only the digest-pinned, networkless Docker command and fails closed when Docker is unavailable.
+
+No active `DEBT-` markers remain in `src`; abstract Protocol methods are ports,
+not deferred production success paths. Real DeepSeek smoke, hosted Pages enablement,
+push, merge, and package publication remain explicit owner actions.
