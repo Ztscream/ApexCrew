@@ -182,6 +182,7 @@ from apexcrew.domain.indeterminate import (
     ResolutionSelection,
     UnresolvedIntentBinding,
     UnresolvedIntentSet,
+    run_state_for_resolution_successor,
 )
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
@@ -8655,9 +8656,17 @@ class SqliteStateStore:
                     (selected_member.intent_id,),
                 )
             remaining = self._unresolved_intent_set_in_transaction(connection, request.run_id)
+            successor = (
+                "INDETERMINATE" if remaining is not None else (decision.successor or "PAUSED")
+            )
             connection.execute(
                 "UPDATE runs SET state = ? WHERE run_id = ?",
-                ("INDETERMINATE" if remaining is not None else "PAUSED", request.run_id),
+                (
+                    RunState.INDETERMINATE
+                    if remaining is not None
+                    else run_state_for_resolution_successor(successor),
+                    request.run_id,
+                ),
             )
             status_by_resolution: dict[str, Literal["SETTLED", "RETRY", "ABANDONED", "DENIED"]] = {
                 "RECONCILE_OBSERVED": "SETTLED",
@@ -8670,7 +8679,7 @@ class SqliteStateStore:
                     status=status,
                     resulting_sequence=AuditSequence(request.expected_sequence + 1),
                     remaining_set_digest=None if remaining is None else remaining.set_digest,
-                    successor="INDETERMINATE" if remaining is not None else "PAUSED",
+                    successor=successor,
                 )
             )
 

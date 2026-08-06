@@ -8,7 +8,7 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
-from apexcrew.domain.types import AuditSequence, IntentId
+from apexcrew.domain.types import AuditSequence, IntentId, RunState
 
 
 class IndeterminateResolution(RuntimeError):
@@ -80,6 +80,12 @@ class ResolutionApplication:
     resulting_sequence: AuditSequence
     remaining_set_digest: Sha256DigestText | None
     successor: str
+
+
+def run_state_for_resolution_successor(successor: str) -> RunState:
+    if successor == "READY_FOR_APPROVAL":
+        return RunState.READY_FOR_APPROVAL
+    return RunState.PAUSED
 
 
 class UnresolvedIntentSet(FrozenDocument):

@@ -8,8 +8,9 @@ from apexcrew.domain.indeterminate import (
     ResolutionSelection,
     UnresolvedIntentBinding,
     UnresolvedIntentSet,
+    run_state_for_resolution_successor,
 )
-from apexcrew.domain.types import IntentId
+from apexcrew.domain.types import IntentId, RunState
 
 
 def test_resolution_selection_requires_exact_member_or_set_shape() -> None:
@@ -67,3 +68,8 @@ def test_unresolved_set_digest_includes_member_generation_and_payload() -> None:
         )
     )
     assert first.set_digest != changed.set_digest
+
+
+def test_class_specific_resolution_successor_maps_to_run_state() -> None:
+    assert run_state_for_resolution_successor("READY_FOR_APPROVAL") is RunState.READY_FOR_APPROVAL
+    assert run_state_for_resolution_successor("PAUSED/TARGET_UNSAFE") is RunState.PAUSED

@@ -156,6 +156,7 @@ from apexcrew.domain.indeterminate import (
     ResolutionApplication,
     ResolutionSelection,
     UnresolvedIntentSet,
+    run_state_for_resolution_successor,
 )
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
@@ -5075,9 +5076,16 @@ class InMemoryStateStore:
             else:
                 copied._indeterminate_effect_intents.remove(member_intent_id)
             remaining = copied.unresolved_intent_set(request.run_id)
+            successor = (
+                "INDETERMINATE" if remaining is not None else (decision.successor or "PAUSED")
+            )
             copied._runs[request.run_id] = replace(
                 copied._runs[request.run_id],
-                state=RunState.INDETERMINATE if remaining is not None else RunState.PAUSED,
+                state=(
+                    RunState.INDETERMINATE
+                    if remaining is not None
+                    else run_state_for_resolution_successor(successor)
+                ),
             )
             status_by_resolution: dict[str, Literal["SETTLED", "RETRY", "ABANDONED", "DENIED"]] = {
                 "RECONCILE_OBSERVED": "SETTLED",
@@ -5090,7 +5098,7 @@ class InMemoryStateStore:
                     status=status,
                     resulting_sequence=AuditSequence(request.expected_sequence + 1),
                     remaining_set_digest=None if remaining is None else remaining.set_digest,
-                    successor="INDETERMINATE" if remaining is not None else "PAUSED",
+                    successor=successor,
                 )
             )
 
