@@ -43,8 +43,9 @@ closed but its process runner remains a debt.
 
 ## Known Runtime Debt
 
-`DEBT-M2-001`: multiple unresolved effects are represented as `INDETERMINATE`
-because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
+Observed multi-intent members are selectable only when exactly one member is
+identified by authoritative external observation; no observation or multiple
+observations remain `INDETERMINATE`. `DEBT-M2-002` through `DEBT-M2-004` keep
 Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
 builds a restricted digest-pinned argv but does not launch a Docker process.
 

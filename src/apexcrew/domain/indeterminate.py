@@ -143,7 +143,20 @@ class UnresolvedIntentSet(FrozenDocument):
         return self
 
 
-def resolve_multiple_intents(unresolved: UnresolvedIntentSet) -> None:
-    del unresolved
-    # DEBT-M2-001: no deterministic multi-intent precedence table exists yet.
-    raise IndeterminateResolution("MULTIPLE_INTENTS_UNRESOLVED")
+def resolve_multiple_intents(
+    unresolved: UnresolvedIntentSet,
+    *,
+    observable_intent_ids: frozenset[str] = frozenset(),
+) -> str:
+    """Select one member only when external observation makes it unambiguous.
+
+    The caller supplies identifiers derived from authoritative state/Git
+    observations. The function intentionally accepts no model output or
+    ordering hint; ambiguity remains fail-closed.
+    """
+    unresolved_ids = frozenset(unresolved.intents)
+    if not observable_intent_ids <= unresolved_ids:
+        raise IndeterminateResolution("OBSERVATION_MEMBER_NOT_IN_SET")
+    if len(observable_intent_ids) != 1:
+        raise IndeterminateResolution("MULTIPLE_INTENTS_UNRESOLVED")
+    return next(iter(observable_intent_ids))

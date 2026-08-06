@@ -2446,3 +2446,18 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   existing platform/live skips remained explicit. `git diff --check` passed.
 - **Owner decision**: GO for local M2-M4 implementation from `9cc269f`.
   Live DeepSeek smoke, push, PR merge, hosted Pages, and package publication remain HOLD.
+
+## PLAN-Task M2-02 (2026-08-06)
+
+- **Base**: `00e452c`.
+- **Red**: added observable-member selectors; before implementation the selector
+  reported `2 failed, 2 passed` with `MULTIPLE_INTENTS_UNRESOLVED`.
+- **Green**: `uv run pytest tests/unit/domain/test_indeterminate.py -q` -> `4 passed`.
+- **Implementation**: `resolve_multiple_intents` accepts only a set of externally
+  observed IDs, rejects IDs outside the canonical unresolved set, selects exactly
+  one member, and preserves `INDETERMINATE` for zero or multiple observations.
+- **Checks**: targeted mypy, Ruff check/format, and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
