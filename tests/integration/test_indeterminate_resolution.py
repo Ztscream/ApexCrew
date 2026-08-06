@@ -77,6 +77,28 @@ def _abandon_observation(
     )
 
 
+def _observed_completion(
+    intent: EffectIntent, generation: int, run_id: RunId, settled_sequence: AuditSequence
+) -> RecoveryObservation:
+    bounded_result = '{"items":[]}'
+    return RecoveryObservation.create(
+        kind=RecoveryActionClass.READ_SEARCH,
+        intent_id=intent.intent_id,
+        recovery_generation=generation,
+        source_payload_digest=intent.payload_digest,
+        state="EXACT_SNAPSHOT",
+        run_id=run_id,
+        settled_sequence=settled_sequence,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        idempotency_key=intent.idempotency_key,
+        snapshot_digest="sha256:" + "a" * 64,
+        scope_digest="sha256:" + "b" * 64,
+        ordering_digest="sha256:" + "c" * 64,
+        bounded_result_json=bounded_result,
+        bounded_result_digest="sha256:" + sha256(bounded_result.encode()).hexdigest(),
+    )
+
+
 def _bindings(
     unresolved: UnresolvedIntentSet,
 ) -> tuple[tuple[IntentId, ...], tuple[Sha256DigestText, ...], tuple[int, ...]]:
@@ -336,6 +358,68 @@ def test_memory_resolution_matches_sqlite_member_cas() -> None:
     )
     assert applied.status == "ABANDONED"
     assert store.unresolved_intent_set(run_id) is not None
+
+
+def test_sqlite_observed_reconciliation_settles_intent_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    app = make_application(tmp_path, monotonic_clock=SystemMonotonicClock())
+    run_id = create_draft_with_three_proposals(app)
+    intent = _intent(run_id, "observed-reconcile", AuditSequence(2))
+    app.store.record_intent(intent, AuditSequence(1))
+    indeterminate = _indeterminate_result(intent, AuditSequence(3))
+    app.store.settle_intent(
+        run_id,
+        intent.intent_id,
+        indeterminate,
+        ApplicableRevisionDigests(),
+        AuditSequence(2),
+    )
+    unresolved = app.store.unresolved_intent_set(run_id)
+    assert unresolved is not None
+    member = unresolved.member_bindings[0]
+    accepted = app.control.handle(
+        _resolve_command(
+            run_id,
+            AuditSequence(3),
+            str(unresolved.set_digest),
+            intent_id=str(intent.intent_id),
+            recovery_generation=member.recovery_generation,
+            resolution="RECONCILE_OBSERVED",
+            bindings=app.store.current_revision_digests(run_id),
+        )
+    )
+    assert accepted.status == "ACCEPTED"
+    permit = app.store.unconsumed_permit(run_id)
+    owner = RuntimeOwnerId("observed-reconcile-owner")
+    assert app.store.consume_current_runtime_permit(run_id, owner, AuditSequence(4))
+    observation = _observed_completion(intent, member.recovery_generation, run_id, AuditSequence(6))
+    applied = app.store.apply_indeterminate_resolution(
+        ApplyResolutionRequest(
+            run_id=run_id,
+            selection=permit.resolution_selection,
+            permit_generation=permit.generation,
+            owner_id=owner,
+            expected_sequence=AuditSequence(5),
+            intent_ids=_bindings(unresolved)[0],
+            payload_digests=_bindings(unresolved)[1],
+            recovery_generations=_bindings(unresolved)[2],
+            observations=(observation,),
+            observation_set_digest=observation_set_digest((observation,)),
+        )
+    )
+    assert applied.status == "SETTLED"
+    assert intent not in app.store.indeterminate_intents(run_id)
+    assert intent not in app.store.unsettled_intents(run_id)
+    assert app.store.effect_result(intent.intent_id).outcome == "COMPLETED"
+    app.close()
+
+    reopened = type(app.store)(app.database)
+    assert intent not in reopened.indeterminate_intents(run_id)
+    assert intent not in reopened.unsettled_intents(run_id)
+    assert reopened.effect_result(intent.intent_id).outcome == "COMPLETED"
+    assert reopened.unresolved_intent_set(run_id) is None
+    reopened.close()
 
 
 def test_set_bound_fail_denies_without_complete_abandonability_observations(

@@ -8622,6 +8622,15 @@ class SqliteStateStore:
                     != 1
                 ):
                     raise StateConflict("OBSERVED_RECOVERY_RESULT_NOT_CURRENT")
+                if (
+                    connection.execute(
+                        "UPDATE effect_intents SET state = 'SETTLED' "
+                        "WHERE intent_id = ? AND run_id = ? AND state = 'INDETERMINATE'",
+                        (selected_member.intent_id, request.run_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_INTENT_NOT_CURRENT")
                 connection.execute(
                     "UPDATE indeterminate_members SET state = 'SETTLED' WHERE intent_id = ?",
                     (selected_member.intent_id,),
