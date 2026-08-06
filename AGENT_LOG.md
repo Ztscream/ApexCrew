@@ -1510,6 +1510,21 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Base and task**: `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3`, P3 from `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
+
+## PLAN-Task M2-03 (2026-08-06)
+
+- **Base**: `72c4f89`.
+- **Red**: the new retention selector reported `6 failed`; the old module had no
+  artifact model, persistence, redaction, export, or eviction implementation.
+- **Green**: `uv run pytest tests/unit/domain/test_retention.py -q` -> `6 passed`.
+- **Implementation**: added typed retention artifacts, known-credential replacement,
+  suspicious-content quarantine, per-kind byte caps, Tier 1 metadata-only export,
+  30-day expiry, oldest-terminal eviction, and active-run metadata-only overflow.
+- **Checks**: mypy, Ruff check, Ruff format, and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
 - **Red evidence**: `uv run --python 3.12 pytest tests/contract/test_model_configuration.py -q` exited `1` with 2 failures: default fixtures remained `mock-model`/old pricing and reservation failed with `MODEL_PRICING_MISSING`.
 - **Implementation**: default model/budget fixtures and all former `gpt-5.6-terra` test bindings now use `deepseek-v4-flash`; pricing is USD 0.28/0.56 per million, observed 2026-08-05, with a USD 1 default reserve. Added the focused model-configuration contract.
 - **Green evidence**: focused P3 selector `3 passed`; full offline suite passed with 7 skips; mypy passed for 54 source files; Ruff format/check passed; `git diff --check` passed.

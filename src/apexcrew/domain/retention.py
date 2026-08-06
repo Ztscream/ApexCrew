@@ -1,20 +1,149 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from typing import Literal
 
-class RetentionNotImplemented(RuntimeError):
-    pass
+RetentionState = Literal["STORED", "QUARANTINED", "DROPPED_BY_RETENTION"]
+
+_PREVIEW_CAPS = {
+    "prompt": 128 * 1024,
+    "response": 128 * 1024,
+    "diff": 256 * 1024,
+    "stdout": 64 * 1024,
+    "stderr": 64 * 1024,
+}
+_SUSPICIOUS_PATTERNS = (
+    re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(rb"(?i)\b(?:bearer|api[_-]?key|access[_-]?token)\s*[:=]\s*\S+"),
+    re.compile(rb"(?i)\bsk-[a-z0-9_-]{12,}"),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionArtifact:
+    record_id: str
+    run_id: str
+    run_state: str
+    tier: Literal[1, 2]
+    kind: str
+    state: RetentionState
+    persisted_at: datetime
+    original_length: int
+    content_digest: str
+    preview: bytes | None
 
 
 class RetentionManager:
-    def export_diagnostic(self, *, tier: int, record: object) -> None:
-        del record
-        if tier == 2:
-            # DEBT-M2-002: Tier 2 redaction/export policy is not implemented.
-            raise RetentionNotImplemented("TIER_TWO_EXPORT_DISABLED")
-        # DEBT-M2-003: retention-tier export is intentionally unavailable.
-        raise RetentionNotImplemented("RETENTION_EXPORT_NOT_IMPLEMENTED")
+    """Manage local diagnostic artifacts without widening the query surface."""
 
-    def evict(self, *, record_id: str) -> None:
-        del record_id
-        # DEBT-M2-004: durable retention eviction needs a reviewed tombstone policy.
-        raise RetentionNotImplemented("EVICTION_NOT_IMPLEMENTED")
+    def __init__(
+        self,
+        *,
+        known_credentials: tuple[str, ...] = (),
+        max_bytes: int = 1 << 30,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        if max_bytes < 0:
+            raise ValueError("RETENTION_CAP_INVALID")
+        self._known_credentials = tuple(
+            value.encode("utf-8") for value in known_credentials if value
+        )
+        self._max_bytes = max_bytes
+        self._now = now or (lambda: datetime.now(UTC))
+        self._artifacts: dict[str, RetentionArtifact] = {}
+
+    def persist(
+        self,
+        *,
+        record_id: str,
+        run_id: str,
+        run_state: str,
+        tier: Literal[1, 2],
+        kind: str,
+        content: bytes,
+        persisted_at: datetime | None = None,
+    ) -> RetentionArtifact:
+        if not record_id or not run_id or not kind or tier not in {1, 2}:
+            raise ValueError("RETENTION_RECORD_INVALID")
+        if persisted_at is None:
+            persisted_at = self._now()
+        if persisted_at.tzinfo is None:
+            raise ValueError("RETENTION_TIMESTAMP_MUST_BE_AWARE")
+
+        original_length = len(content)
+        original_digest = "sha256:" + sha256(content).hexdigest()
+        redacted = self._redact(content)
+        suspicious = any(pattern.search(redacted) for pattern in _SUSPICIOUS_PATTERNS)
+        state: RetentionState = "QUARANTINED" if suspicious else "STORED"
+        preview = None if suspicious else redacted[: _PREVIEW_CAPS.get(kind, 64 * 1024)]
+        artifact = RetentionArtifact(
+            record_id=record_id,
+            run_id=run_id,
+            run_state=run_state,
+            tier=tier,
+            kind=kind,
+            state=state,
+            persisted_at=persisted_at,
+            original_length=original_length,
+            content_digest=original_digest,
+            preview=preview,
+        )
+
+        self._artifacts.pop(record_id, None)
+        self._evict_for(len(preview or b""))
+        if self._stored_bytes() + len(preview or b"") > self._max_bytes:
+            artifact = replace(artifact, state="DROPPED_BY_RETENTION", preview=None)
+        self._artifacts[record_id] = artifact
+        return artifact
+
+    def export_diagnostic(
+        self, *, tier: Literal[1, 2], record: RetentionArtifact
+    ) -> dict[str, object] | None:
+        if tier != 1 or record.tier != 1 or record.state != "STORED":
+            return None
+        return {
+            "record_id": record.record_id,
+            "run_id": record.run_id,
+            "tier": record.tier,
+            "kind": record.kind,
+            "state": record.state,
+            "original_length": record.original_length,
+            "content_digest": record.content_digest,
+        }
+
+    def evict(self, *, record_id: str) -> bool:
+        return self._artifacts.pop(record_id, None) is not None
+
+    def get(self, record_id: str) -> RetentionArtifact | None:
+        return self._artifacts.get(record_id)
+
+    def _redact(self, content: bytes) -> bytes:
+        redacted = content
+        for credential in sorted(self._known_credentials, key=len, reverse=True):
+            redacted = redacted.replace(credential, b"[REDACTED]")
+        return redacted
+
+    def _stored_bytes(self) -> int:
+        return sum(len(artifact.preview or b"") for artifact in self._artifacts.values())
+
+    def _evict_for(self, incoming_bytes: int) -> None:
+        while self._stored_bytes() + incoming_bytes > self._max_bytes:
+            expired = [
+                artifact
+                for artifact in self._artifacts.values()
+                if artifact.tier == 2 and self._now() - artifact.persisted_at >= timedelta(days=30)
+            ]
+            candidates = expired or [
+                artifact
+                for artifact in self._artifacts.values()
+                if artifact.run_state in {"COMPLETED", "FAILED", "CANCELLED"}
+                and artifact.state == "STORED"
+            ]
+            if not candidates:
+                return
+            oldest = min(candidates, key=lambda artifact: artifact.persisted_at)
+            self._artifacts.pop(oldest.record_id, None)
