@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from apexcrew.domain.commands import ApplicableRevisionDigests
 from apexcrew.domain.effects import (
     RecoveryActionClass,
     RecoveryDecisionKind,
@@ -12,7 +13,7 @@ from apexcrew.domain.effects import (
     sha256_digest,
 )
 from apexcrew.domain.revisions import Sha256DigestText
-from apexcrew.domain.types import IntentId
+from apexcrew.domain.types import AuditSequence, IntentId, RunId
 
 PAYLOAD = Sha256DigestText("sha256:" + "1" * 64)
 RESULT = Sha256DigestText("sha256:" + "2" * 64)
@@ -28,6 +29,10 @@ def observation(
     defaults: dict[str, object] = {
         "request_digest": PAYLOAD,
         "idempotency_key": "intent-1-key",
+        "returned_model_id": "deepseek-chat",
+        "run_id": RunId("run-1"),
+        "settled_sequence": AuditSequence(1),
+        "applicable_revision_digests": ApplicableRevisionDigests(),
         "snapshot_digest": PAYLOAD,
         "scope_digest": PAYLOAD,
         "ordering_digest": PAYLOAD,
@@ -50,6 +55,11 @@ def observation(
         "gitfile_digest": PAYLOAD,
     }
     defaults.update(fields)
+    if action_class in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
+        if state == "EXACT_PRE":
+            defaults["current_oid"] = defaults["old_oid"]
+        elif state == "EXACT_POST":
+            defaults["current_oid"] = defaults["prepared_oid"]
     if state == "EXACT_COMPLETION":
         defaults.setdefault("normalized_completion_digest", RESULT)
     if state == "EXACT_SNAPSHOT":
@@ -119,7 +129,12 @@ def observation(
         },
         RecoveryActionClass.GRANTED_ACTION: set(),
     }
-    defaults = {key: value for key, value in defaults.items() if key in allowed[action_class]}
+    defaults = {
+        key: value
+        for key, value in defaults.items()
+        if key in allowed[action_class]
+        or key in {"run_id", "settled_sequence", "applicable_revision_digests"}
+    }
     return RecoveryObservation.create(
         kind=action_class,
         intent_id=IntentId("intent-1"),

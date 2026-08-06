@@ -506,6 +506,9 @@ class RecoveryObservation(FrozenDocument):
     source_payload_digest: Sha256DigestText
     state: RecoveryObservationState
     observation_digest: Sha256DigestText
+    run_id: RunId | None = None
+    settled_sequence: AuditSequence | None = None
+    applicable_revision_digests: ApplicableRevisionDigests | None = None
     request_digest: Sha256DigestText | None = None
     idempotency_key: str | None = None
     provider_response_id: str | None = None
@@ -576,7 +579,10 @@ class RecoveryObservation(FrozenDocument):
 
     @classmethod
     def create(cls, **values: Any) -> Self:
-        payload = {key: value for key, value in values.items() if value is not None}
+        candidate = cls.model_construct(**values)
+        payload = candidate.model_dump(
+            mode="json", exclude={"observation_digest"}, exclude_none=True
+        )
         values["observation_digest"] = sha256_digest(canonical_json(payload))
         return cls(**values)
 
@@ -696,6 +702,32 @@ class RecoveryObservation(FrozenDocument):
         }
         if self.recovery_generation < 1:
             raise ValueError("RECOVERY_GENERATION_INVALID")
+        completed_state = (
+            (self.kind is RecoveryActionClass.MODEL and self.state == "EXACT_COMPLETION")
+            or (self.kind is RecoveryActionClass.READ_SEARCH and self.state == "EXACT_SNAPSHOT")
+            or (self.kind is RecoveryActionClass.CHECK and self.state == "EXACT_RECEIPT")
+            or (
+                self.kind is RecoveryActionClass.TARGET_RESERVATION
+                and self.state in {"BOTH_ABSENT", "BOTH_PRESENT_LOCKED"}
+            )
+            or (
+                self.kind
+                in {
+                    RecoveryActionClass.PATCH,
+                    RecoveryActionClass.PRIVATE_REF,
+                    RecoveryActionClass.TARGET_CAS,
+                    RecoveryActionClass.GRANTED_ACTION,
+                }
+                and self.state == "EXACT_POST"
+            )
+        )
+        if completed_state and (
+            self.run_id is None
+            or self.settled_sequence is None
+            or self.settled_sequence < 1
+            or self.applicable_revision_digests is None
+        ):
+            raise ValueError("COMPLETION_DURABLE_BINDING_REQUIRED")
         common = {
             "kind",
             "intent_id",
@@ -703,6 +735,9 @@ class RecoveryObservation(FrozenDocument):
             "source_payload_digest",
             "state",
             "observation_digest",
+            "run_id",
+            "settled_sequence",
+            "applicable_revision_digests",
         }
         for field_name in type(self).model_fields:
             if (
@@ -724,6 +759,12 @@ class RecoveryObservation(FrozenDocument):
             and self.normalized_completion_digest is None
         ):
             raise ValueError("MODEL_COMPLETION_DIGEST_REQUIRED")
+        if (
+            self.kind is RecoveryActionClass.MODEL
+            and self.state == "RETURNED_MODEL_MISMATCH"
+            and (self.returned_model_id is None or self.reservation_charge != "FULL")
+        ):
+            raise ValueError("MODEL_MISMATCH_FULL_RESERVATION_REQUIRED")
         if self.kind is RecoveryActionClass.READ_SEARCH:
             if self.state == "EXACT_SNAPSHOT":
                 if self.bounded_result_json is None or self.bounded_result_digest is None:
@@ -747,6 +788,11 @@ class RecoveryObservation(FrozenDocument):
             and self.receipt_digest is None
         ):
             raise ValueError("CHECK_RECEIPT_REQUIRED")
+        if self.kind in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
+            if self.state == "EXACT_PRE" and self.current_oid != self.old_oid:
+                raise ValueError("REF_EXACT_PRE_OID_MISMATCH")
+            if self.state == "EXACT_POST" and self.current_oid != self.prepared_oid:
+                raise ValueError("REF_EXACT_POST_OID_MISMATCH")
         if self.kind is RecoveryActionClass.TARGET_RESERVATION:
             if self.reservation_operation == "CREATE" and self.state in {"PATH_ONLY", "ADMIN_ONLY"}:
                 raise ValueError("RESERVATION_CREATE_PARTIAL_STATE")
@@ -778,8 +824,14 @@ class RecoveryDecision:
     applicable_revision_digests: ApplicableRevisionDigests | None = None
 
     def __post_init__(self) -> None:
-        if self.kind is RecoveryDecisionKind.COMPLETED and self.result_digest is None:
-            raise ValueError("COMPLETED_RESULT_DIGEST_REQUIRED")
+        if self.kind is RecoveryDecisionKind.COMPLETED and (
+            self.result_digest is None
+            or self.effect_result is None
+            or self.bounded_result_json is None
+            or self.settled_sequence is None
+            or self.applicable_revision_digests is None
+        ):
+            raise ValueError("COMPLETED_DURABLE_RESULT_REQUIRED")
         if self.kind is RecoveryDecisionKind.RETRY_SAME_INTENT and (
             self.prestate_digest is None or not self.idempotency_key
         ):
@@ -821,11 +873,52 @@ def _exact_prestate_digest(observation: RecoveryObservation) -> Sha256DigestText
     return observation.observation_digest
 
 
+def _completed_decision(
+    observation: RecoveryObservation,
+    reason: str,
+    result_digest: Sha256DigestText,
+    bounded_result_json: str = "{}",
+) -> RecoveryDecision:
+    assert observation.run_id is not None
+    assert observation.settled_sequence is not None
+    assert observation.applicable_revision_digests is not None
+    effect_result = EffectResult(
+        intent_id=observation.intent_id,
+        run_id=observation.run_id,
+        outcome="COMPLETED",
+        result_class=reason,
+        result_digest=result_digest,
+        bounded_result_json=bounded_result_json,
+        settled_sequence=observation.settled_sequence,
+    )
+    return RecoveryDecision(
+        RecoveryDecisionKind.COMPLETED,
+        observation.kind,
+        reason,
+        bounded_result_json=bounded_result_json,
+        result_digest=result_digest,
+        effect_result=effect_result,
+        settled_sequence=observation.settled_sequence,
+        applicable_revision_digests=observation.applicable_revision_digests,
+    )
+
+
 def abandon_observation(observation: RecoveryObservation, successor: str) -> RecoveryDecision:
     if observation.kind is RecoveryActionClass.MODEL:
         raise ValueError("MODEL_ABANDON_REQUIRES_OWNER_FAILURE")
     if observation.state not in {"EXACT_PRE", "BOTH_ABSENT", "EXACT_SNAPSHOT", "STALE"}:
         raise ValueError("ABANDON_EFFECT_NOT_PROVEN")
+    allowed_successors = {
+        RecoveryActionClass.READ_SEARCH: {"PAUSED", "PAUSED/READ_ABANDONED"},
+        RecoveryActionClass.PATCH: {"PAUSED", "PAUSED/PATCH_ABANDONED"},
+        RecoveryActionClass.CHECK: {"PAUSED", "PAUSED/CHECK_ABANDONED"},
+        RecoveryActionClass.PRIVATE_REF: {"READY", "PAUSED/PRIVATE_REF_INIT_ABANDONED"},
+        RecoveryActionClass.TARGET_CAS: {"READY_FOR_APPROVAL"},
+        RecoveryActionClass.TARGET_RESERVATION: {"DRAFT", "PAUSED"},
+        RecoveryActionClass.GRANTED_ACTION: {"PAUSED"},
+    }
+    if successor not in allowed_successors[observation.kind]:
+        raise ValueError("ABANDON_SUCCESSOR_NOT_CLASS_SPECIFIC")
     return RecoveryDecision(
         RecoveryDecisionKind.ABANDONED,
         observation.kind,
@@ -838,11 +931,10 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
     state = observation.state
     if observation.kind is RecoveryActionClass.MODEL:
         if state == "EXACT_COMPLETION" and observation.normalized_completion_digest is not None:
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
+            return _completed_decision(
+                observation,
                 "EXACT_NORMALIZED_COMPLETION",
-                result_digest=observation.normalized_completion_digest,
+                observation.normalized_completion_digest,
             )
         return RecoveryDecision(
             RecoveryDecisionKind.INDETERMINATE,
@@ -853,24 +945,20 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
         )
     if observation.kind is RecoveryActionClass.READ_SEARCH:
         if state == "EXACT_SNAPSHOT" and observation.bounded_result_json is not None:
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
+            assert observation.bounded_result_digest is not None
+            return _completed_decision(
+                observation,
                 "EXACT_SNAPSHOT",
-                bounded_result_json=observation.bounded_result_json,
-                result_digest=observation.bounded_result_digest,
+                observation.bounded_result_digest,
+                observation.bounded_result_json,
             )
         if state == "STALE":
             return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
     if observation.kind is RecoveryActionClass.CHECK:
         if state == "EXACT_RECEIPT" and observation.receipt_digest is not None:
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
-                state,
-                result_digest=observation.receipt_digest,
-            )
+            assert observation.receipt_digest is not None
+            return _completed_decision(observation, state, observation.receipt_digest)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
@@ -890,19 +978,9 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                     prestate_digest=_exact_prestate_digest(observation),
                     idempotency_key=observation.idempotency_key,
                 )
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
-                state,
-                result_digest=observation.observation_digest,
-            )
+            return _completed_decision(observation, state, observation.observation_digest)
         if observation.reservation_operation == "CREATE" and state == "BOTH_PRESENT_LOCKED":
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
-                state,
-                result_digest=observation.observation_digest,
-            )
+            return _completed_decision(observation, state, observation.observation_digest)
         if observation.reservation_operation == "CLEANUP" and state in {
             "BOTH_PRESENT_LOCKED",
             "BOTH_PRESENT_UNLOCKED",
@@ -929,12 +1007,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
     if observation.kind in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
         if state == "EXACT_POST":
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
-                state,
-                result_digest=observation.observation_digest,
-            )
+            return _completed_decision(observation, state, observation.observation_digest)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
@@ -953,12 +1026,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
         RecoveryActionClass.GRANTED_ACTION,
     }:
         if state == "EXACT_POST":
-            return RecoveryDecision(
-                RecoveryDecisionKind.COMPLETED,
-                observation.kind,
-                state,
-                result_digest=observation.observation_digest,
-            )
+            return _completed_decision(observation, state, observation.observation_digest)
         if state == "EXACT_PRE":
             return RecoveryDecision(
                 RecoveryDecisionKind.RETRY_SAME_INTENT,
