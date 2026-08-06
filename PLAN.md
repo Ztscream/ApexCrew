@@ -30508,6 +30508,8 @@ apexcrew grant <run-id> --root <repo> --pending-action-id <id> --action-digest <
 apexcrew run <run-id> --root <repo>
 apexcrew integrate <run-id> --root <repo> --candidate-id <id> --prepared-oid <oid> --expected-target-oid <oid> --evidence-digest <digest> --confirmation-code <code>
 apexcrew run <run-id> --root <repo>
+apexcrew reconcile-cleanup <run-id> --root <repo>
+apexcrew run <run-id> --root <repo>
 apexcrew show <run-id> --root <repo>
 apexcrew credentials clear
 ```

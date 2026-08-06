@@ -21,7 +21,6 @@ from apexcrew.domain.commands import (
     BeginPlanningPayload,
     CommandEnvelope,
     CreateRunPayload,
-    ReconcileCleanupPayload,
     StartPayload,
 )
 from apexcrew.domain.model import ModelCompletion, ModelUsage, ProviderAttemptResult
@@ -400,20 +399,12 @@ def test_composed_runtime_integrates_frozen_candidate_once(tmp_path: Path) -> No
         integrated = bundle.runtime.run_until_blocked(run_id)
         assert integrated.reason == "TERMINAL"
         assert bundle.queries.get(run_id).state == "COMPLETED"
-        cleanup_outcome = bundle.control.handle(
-            CommandEnvelope(
-                request_id="reconcile-cleanup",
-                expected_sequence=bundle.queries.get(run_id).sequence,
-                applicable_revision_digests=ApplicableRevisionDigests(
-                    plan_digest=plan_digest,
-                    policy_digest=policy_digest,
-                    budget_digest=budget_digest,
-                    model_configuration_digest=model_digest,
-                ),
-                payload=ReconcileCleanupPayload(run_id=run_id),
-            )
+        cleanup_outcome = runner.invoke(
+            cli_app,
+            ["reconcile-cleanup", str(run_id), "--root", str(root)],
         )
-        assert cleanup_outcome.status == "ACCEPTED"
+        assert cleanup_outcome.exit_code == 0, cleanup_outcome.stdout
+        assert json.loads(cleanup_outcome.stdout)["status"] == "COMMAND_ACCEPTED"
         cleanup_stop = bundle.runtime.run_until_blocked(run_id)
         assert cleanup_stop.reason == "TERMINAL"
         assert bundle.queries.get(run_id).state == "COMPLETED"
