@@ -636,7 +636,11 @@ class RecoveryObservation(FrozenDocument):
         required: dict[RecoveryActionClass, tuple[str, ...]] = {
             RecoveryActionClass.MODEL: ("request_digest",),
             RecoveryActionClass.READ_SEARCH: ("snapshot_digest", "scope_digest", "ordering_digest"),
-            RecoveryActionClass.PATCH: ("expected_pre_tree_digest", "observed_post_tree_digest"),
+            RecoveryActionClass.PATCH: (
+                "expected_pre_tree_digest",
+                "observed_post_tree_digest",
+                "snapshot_digest",
+            ),
             RecoveryActionClass.CHECK: ("check_id", "argv_digest", "snapshot_digest"),
             RecoveryActionClass.PRIVATE_REF: (
                 "repository_id",
@@ -703,6 +707,7 @@ class RecoveryObservation(FrozenDocument):
                     "idempotency_key",
                     "expected_pre_tree_digest",
                     "observed_post_tree_digest",
+                    "snapshot_digest",
                     "completion_proof_json",
                     "completion_proof_digest",
                 }

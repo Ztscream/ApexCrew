@@ -208,6 +208,7 @@ def observation(
             "idempotency_key",
             "expected_pre_tree_digest",
             "observed_post_tree_digest",
+            "snapshot_digest",
             "completion_proof_json",
             "completion_proof_digest",
         },
