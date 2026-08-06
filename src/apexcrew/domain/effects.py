@@ -7,7 +7,9 @@ from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
+
+from pydantic import model_validator
 
 if TYPE_CHECKING:
     from apexcrew.domain.authority import (
@@ -425,6 +427,69 @@ class RecoveryActionClass(StrEnum):
     GRANTED_ACTION = "GRANTED_ACTION"
 
 
+def recovery_action_class_for_intent(intent: object) -> RecoveryActionClass:
+    """Derive the recovery class from a persisted typed intent, never a command."""
+    if isinstance(intent, ModelRequestIntent):
+        return RecoveryActionClass.MODEL
+    from apexcrew.domain.admission import RefCasIntent, TargetReservationCreationIntent
+    from apexcrew.domain.authority import GrantedActionIntent
+    from apexcrew.domain.tools import ToolIntent
+
+    if isinstance(intent, ToolIntent):
+        action_kind = intent.action.kind
+        if action_kind in {"read", "search"}:
+            return RecoveryActionClass.READ_SEARCH
+        if action_kind == "patch":
+            return RecoveryActionClass.PATCH
+        if action_kind == "check":
+            return RecoveryActionClass.CHECK
+    if isinstance(intent, RefCasIntent):
+        return RecoveryActionClass.PRIVATE_REF
+    if isinstance(intent, TargetReservationCreationIntent):
+        return RecoveryActionClass.TARGET_RESERVATION
+    if isinstance(intent, GrantedActionIntent):
+        return RecoveryActionClass.GRANTED_ACTION
+    if isinstance(intent, EffectIntent):
+        effect_classes = {
+            "private_ref_init": RecoveryActionClass.PRIVATE_REF,
+            "private_ref_cas": RecoveryActionClass.PRIVATE_REF,
+            "target_ref_cas": RecoveryActionClass.TARGET_CAS,
+            "target_reservation_creation": RecoveryActionClass.TARGET_RESERVATION,
+            "target_reservation_cleanup": RecoveryActionClass.TARGET_RESERVATION,
+            "granted_risky_action": RecoveryActionClass.GRANTED_ACTION,
+            "read": RecoveryActionClass.READ_SEARCH,
+            "search": RecoveryActionClass.READ_SEARCH,
+            "patch": RecoveryActionClass.PATCH,
+            "check": RecoveryActionClass.CHECK,
+        }
+        try:
+            return effect_classes[intent.kind]
+        except KeyError as exc:
+            raise ValueError("RECOVERY_ACTION_CLASS_UNSUPPORTED") from exc
+    raise ValueError("RECOVERY_ACTION_CLASS_UNSUPPORTED")
+
+
+RecoveryObservationState = Literal[
+    "EXACT_COMPLETION",
+    "RETURNED_MODEL_MISMATCH",
+    "EXACT_SNAPSHOT",
+    "STALE",
+    "EXACT_POST",
+    "EXACT_PRE",
+    "TARGET_UNSAFE",
+    "THIRD_STATE",
+    "EXACT_RECEIPT",
+    "BOTH_ABSENT",
+    "BOTH_PRESENT_LOCKED",
+    "BOTH_PRESENT_UNLOCKED",
+    "PATH_ONLY",
+    "ADMIN_ONLY",
+    "MIXED",
+    "UNAVAILABLE",
+    "UNOBSERVABLE",
+]
+
+
 class RecoveryDecisionKind(StrEnum):
     COMPLETED = "COMPLETED"
     RETRY_SAME_INTENT = "RETRY_SAME_INTENT"
@@ -439,21 +504,160 @@ class RecoveryObservation(FrozenDocument):
     intent_id: IntentId
     recovery_generation: int
     source_payload_digest: Sha256DigestText
-    state: str
+    state: RecoveryObservationState
     observation_digest: Sha256DigestText
     request_digest: Sha256DigestText | None = None
+    idempotency_key: str | None = None
     provider_response_id: str | None = None
+    returned_model_id: str | None = None
+    schema_digest: Sha256DigestText | None = None
+    usage_json: str | None = None
     normalized_completion_digest: Sha256DigestText | None = None
     reservation_charge: Literal["FULL"] | None = None
     snapshot_digest: Sha256DigestText | None = None
     scope_digest: Sha256DigestText | None = None
+    ordering_digest: Sha256DigestText | None = None
     bounded_result_json: str | None = None
     bounded_result_digest: Sha256DigestText | None = None
+    expected_pre_tree_digest: Sha256DigestText | None = None
+    observed_post_tree_digest: Sha256DigestText | None = None
     check_id: str | None = None
     argv_digest: Sha256DigestText | None = None
     receipt_digest: Sha256DigestText | None = None
     repository_id: str | None = None
+    repository_instance_digest: Sha256DigestText | None = None
+    ref_name: str | None = None
     registration_digest: Sha256DigestText | None = None
+    target_safety_digest: Sha256DigestText | None = None
+    old_oid: GitOid | None = None
+    prepared_oid: GitOid | None = None
+    current_oid: GitOid | None = None
+    registration_identity: str | None = None
+    reservation_operation: Literal["CREATE", "CLEANUP"] | None = None
+    admin_binding_digest: Sha256DigestText | None = None
+    path_identity: str | None = None
+    gitfile_digest: Sha256DigestText | None = None
+
+    @property
+    def action_class(self) -> RecoveryActionClass:
+        return self.kind
+
+    @classmethod
+    def from_intent(cls, intent: object, **values: Any) -> Self:
+        idempotency_key: str | None
+        if isinstance(intent, EffectIntent):
+            source_digest = intent.payload_digest
+            intent_id = intent.intent_id
+            idempotency_key = intent.idempotency_key
+        else:
+            intent_any = cast(Any, intent)
+            if hasattr(intent, "model_dump"):
+                payload = intent_any.model_dump(mode="json")
+            else:
+                from dataclasses import asdict
+
+                payload = asdict(intent_any)
+            source_digest = sha256_digest(canonical_json(payload))
+            intent_id = intent_any.intent_id
+            idempotency_key = (
+                intent_any.idempotency_key if hasattr(intent, "idempotency_key") else None
+            )
+        values.update(
+            kind=recovery_action_class_for_intent(intent),
+            intent_id=intent_id,
+            source_payload_digest=source_digest,
+            idempotency_key=idempotency_key,
+        )
+        return cls.create(**values)
+
+    @classmethod
+    def create(cls, **values: Any) -> Self:
+        payload = {key: value for key, value in values.items() if value is not None}
+        values["observation_digest"] = sha256_digest(canonical_json(payload))
+        return cls(**values)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> Self:
+        required: dict[RecoveryActionClass, tuple[str, ...]] = {
+            RecoveryActionClass.MODEL: ("request_digest",),
+            RecoveryActionClass.READ_SEARCH: ("snapshot_digest", "scope_digest", "ordering_digest"),
+            RecoveryActionClass.PATCH: ("expected_pre_tree_digest", "observed_post_tree_digest"),
+            RecoveryActionClass.CHECK: ("check_id", "argv_digest", "snapshot_digest"),
+            RecoveryActionClass.PRIVATE_REF: (
+                "repository_id",
+                "repository_instance_digest",
+                "ref_name",
+                "registration_digest",
+                "old_oid",
+                "prepared_oid",
+                "current_oid",
+            ),
+            RecoveryActionClass.TARGET_CAS: (
+                "repository_id",
+                "repository_instance_digest",
+                "ref_name",
+                "registration_digest",
+                "target_safety_digest",
+                "old_oid",
+                "prepared_oid",
+                "current_oid",
+            ),
+            RecoveryActionClass.TARGET_RESERVATION: (
+                "registration_identity",
+                "reservation_operation",
+                "admin_binding_digest",
+                "path_identity",
+                "gitfile_digest",
+            ),
+            RecoveryActionClass.GRANTED_ACTION: (),
+        }
+        if self.recovery_generation < 1:
+            raise ValueError("RECOVERY_GENERATION_INVALID")
+        for field_name in required[self.kind]:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"{self.kind}_OBSERVATION_FIELD_REQUIRED:{field_name}")
+        if (
+            self.kind is RecoveryActionClass.MODEL
+            and self.state == "EXACT_COMPLETION"
+            and self.normalized_completion_digest is None
+        ):
+            raise ValueError("MODEL_COMPLETION_DIGEST_REQUIRED")
+        if self.kind is RecoveryActionClass.READ_SEARCH:
+            if self.state == "EXACT_SNAPSHOT":
+                if self.bounded_result_json is None or self.bounded_result_digest is None:
+                    raise ValueError("READ_RESULT_REQUIRED")
+                try:
+                    parsed = json.loads(self.bounded_result_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("READ_RESULT_NOT_JSON") from exc
+                canonical_result = json.dumps(
+                    parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                )
+                if canonical_result != self.bounded_result_json:
+                    raise ValueError("READ_RESULT_NOT_CANONICAL")
+                if self.bounded_result_digest != sha256_digest(self.bounded_result_json):
+                    raise ValueError("READ_RESULT_DIGEST_MISMATCH")
+            elif self.bounded_result_json is not None or self.bounded_result_digest is not None:
+                raise ValueError("READ_RESULT_FORBIDDEN")
+        if (
+            self.kind is RecoveryActionClass.CHECK
+            and self.state == "EXACT_RECEIPT"
+            and self.receipt_digest is None
+        ):
+            raise ValueError("CHECK_RECEIPT_REQUIRED")
+        if self.kind is RecoveryActionClass.TARGET_RESERVATION:
+            if self.reservation_operation == "CREATE" and self.state in {"PATH_ONLY", "ADMIN_ONLY"}:
+                raise ValueError("RESERVATION_CREATE_PARTIAL_STATE")
+            if (
+                self.state in {"PATH_ONLY", "ADMIN_ONLY", "MIXED"}
+                and not self.registration_identity
+            ):
+                raise ValueError("RESERVATION_IDENTITY_REQUIRED")
+        payload = self.model_dump(mode="json", exclude={"observation_digest"}, exclude_none=True)
+        expected = sha256_digest(canonical_json(payload))
+        if self.observation_digest != expected:
+            raise ValueError("OBSERVATION_DIGEST_MISMATCH")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +667,26 @@ class RecoveryDecision:
     reason: str
     bounded_result_json: str | None = None
     full_reservation_required: bool = False
+    result_digest: Sha256DigestText | None = None
+    successor: str | None = None
+    prestate_digest: Sha256DigestText | None = None
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is RecoveryDecisionKind.COMPLETED and self.result_digest is None:
+            raise ValueError("COMPLETED_RESULT_DIGEST_REQUIRED")
+        if self.kind is RecoveryDecisionKind.RETRY_SAME_INTENT and (
+            self.prestate_digest is None or not self.idempotency_key
+        ):
+            raise ValueError("RETRY_PROOF_REQUIRED")
+        if self.kind is RecoveryDecisionKind.ABANDONED and not self.successor:
+            raise ValueError("ABANDON_SUCCESSOR_REQUIRED")
+        if self.kind in {
+            RecoveryDecisionKind.STALE,
+            RecoveryDecisionKind.CONFLICT,
+            RecoveryDecisionKind.INDETERMINATE,
+        } and (self.result_digest is not None or self.bounded_result_json is not None):
+            raise ValueError("NON_RESULT_DECISION_CARRIES_RESULT")
 
 
 def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
@@ -473,6 +697,7 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 RecoveryDecisionKind.COMPLETED,
                 observation.kind,
                 "EXACT_NORMALIZED_COMPLETION",
+                result_digest=observation.normalized_completion_digest,
             )
         return RecoveryDecision(
             RecoveryDecisionKind.INDETERMINATE,
@@ -488,40 +713,104 @@ def recover_observation(observation: RecoveryObservation) -> RecoveryDecision:
                 observation.kind,
                 "EXACT_SNAPSHOT",
                 bounded_result_json=observation.bounded_result_json,
+                result_digest=observation.bounded_result_digest,
             )
         if state == "STALE":
             return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
         return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
-    if (
-        observation.kind is RecoveryActionClass.CHECK
-        and state == "EXACT_RECEIPT"
-        and observation.receipt_digest is not None
-    ):
-        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
-    if state == "EXACT_POST":
-        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
-    if state == "EXACT_PRE":
-        return RecoveryDecision(RecoveryDecisionKind.RETRY_SAME_INTENT, observation.kind, state)
-    if state == "TARGET_UNSAFE":
-        return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
-    if state == "THIRD_STATE":
-        return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
-    if observation.kind is RecoveryActionClass.TARGET_RESERVATION and state == "BOTH_ABSENT":
-        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, state)
-    if (
-        observation.kind is RecoveryActionClass.TARGET_RESERVATION
-        and state == "BOTH_PRESENT_LOCKED"
-    ):
-        return RecoveryDecision(RecoveryDecisionKind.COMPLETED, observation.kind, "EXACT_LOCKED")
-    if (
-        observation.kind is RecoveryActionClass.TARGET_RESERVATION
-        and state == "BOTH_PRESENT_UNLOCKED"
-    ):
-        return RecoveryDecision(
-            RecoveryDecisionKind.RETRY_SAME_INTENT, observation.kind, "EXACT_UNLOCKED"
-        )
-    if state == "MIXED":
-        return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
+    if observation.kind is RecoveryActionClass.CHECK:
+        if state == "EXACT_RECEIPT" and observation.receipt_digest is not None:
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                state,
+                result_digest=observation.receipt_digest,
+            )
+        if state == "EXACT_PRE":
+            return RecoveryDecision(
+                RecoveryDecisionKind.RETRY_SAME_INTENT,
+                observation.kind,
+                state,
+                prestate_digest=observation.observation_digest,
+                idempotency_key=observation.idempotency_key,
+            )
+        return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
+    if observation.kind is RecoveryActionClass.TARGET_RESERVATION:
+        if state == "BOTH_ABSENT":
+            if observation.reservation_operation == "CREATE":
+                return RecoveryDecision(
+                    RecoveryDecisionKind.RETRY_SAME_INTENT,
+                    observation.kind,
+                    "EXACT_PRE",
+                    prestate_digest=observation.observation_digest,
+                    idempotency_key=observation.idempotency_key,
+                )
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                state,
+                result_digest=observation.observation_digest,
+            )
+        if state in {"BOTH_PRESENT_LOCKED", "ADMIN_ONLY", "PATH_ONLY"}:
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                state,
+                result_digest=observation.observation_digest,
+            )
+        if state == "BOTH_PRESENT_UNLOCKED":
+            return RecoveryDecision(
+                RecoveryDecisionKind.RETRY_SAME_INTENT,
+                observation.kind,
+                "EXACT_UNLOCKED",
+                prestate_digest=observation.observation_digest,
+                idempotency_key=observation.idempotency_key,
+            )
+        if state == "MIXED":
+            return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
+        return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
+    if observation.kind in {RecoveryActionClass.PRIVATE_REF, RecoveryActionClass.TARGET_CAS}:
+        if state == "EXACT_POST":
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                state,
+                result_digest=observation.observation_digest,
+            )
+        if state == "EXACT_PRE":
+            return RecoveryDecision(
+                RecoveryDecisionKind.RETRY_SAME_INTENT,
+                observation.kind,
+                state,
+                prestate_digest=observation.observation_digest,
+                idempotency_key=observation.idempotency_key,
+            )
+        if state == "TARGET_UNSAFE":
+            return RecoveryDecision(RecoveryDecisionKind.STALE, observation.kind, state)
+        if state == "THIRD_STATE":
+            return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
+        return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
+    if observation.kind in {
+        RecoveryActionClass.PATCH,
+        RecoveryActionClass.GRANTED_ACTION,
+    }:
+        if state == "EXACT_POST":
+            return RecoveryDecision(
+                RecoveryDecisionKind.COMPLETED,
+                observation.kind,
+                state,
+                result_digest=observation.observation_digest,
+            )
+        if state == "EXACT_PRE":
+            return RecoveryDecision(
+                RecoveryDecisionKind.RETRY_SAME_INTENT,
+                observation.kind,
+                state,
+                prestate_digest=observation.observation_digest,
+                idempotency_key=observation.idempotency_key,
+            )
+        if state == "THIRD_STATE":
+            return RecoveryDecision(RecoveryDecisionKind.CONFLICT, observation.kind, state)
     return RecoveryDecision(RecoveryDecisionKind.INDETERMINATE, observation.kind, state)
 
 

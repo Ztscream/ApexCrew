@@ -28,3 +28,13 @@ def test_resolution_selection_requires_exact_member_or_set_shape() -> None:
             recovery_generation=1,
             unresolved_set_digest=unresolved.set_digest,
         )
+
+
+def test_unresolved_set_rejects_duplicates_and_malformed_digest() -> None:
+    with pytest.raises(ValueError, match="UNRESOLVED_SET_DUPLICATE_MEMBER"):
+        UnresolvedIntentSet.create(("intent-1", "intent-1"))
+    with pytest.raises(ValidationError):
+        ResolutionSelection(
+            resolution="FAIL_RUN",
+            unresolved_set_digest="not-a-sha256-digest",
+        )

@@ -7,7 +7,7 @@ from typing import Literal, Self
 from pydantic import Field, model_validator
 
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
-from apexcrew.domain.types import IntentId, UnresolvedSetDigest
+from apexcrew.domain.types import IntentId
 
 
 class IndeterminateResolution(RuntimeError):
@@ -22,7 +22,7 @@ class ResolutionSelection(FrozenDocument):
         "FAIL_RUN",
         "CANCEL_RUN",
     ]
-    unresolved_set_digest: UnresolvedSetDigest
+    unresolved_set_digest: Sha256DigestText
     intent_id: IntentId | None = None
     recovery_generation: int | None = Field(default=None, ge=1)
 
@@ -36,6 +36,11 @@ class ResolutionSelection(FrozenDocument):
         if self.resolution in member_bound:
             if self.intent_id is None or self.recovery_generation is None:
                 raise ValueError("MEMBER_RESOLUTION_BINDING_REQUIRED")
+            if (
+                not str(self.intent_id).strip()
+                or str(self.intent_id) != str(self.intent_id).strip()
+            ):
+                raise ValueError("MEMBER_RESOLUTION_INTENT_INVALID")
         elif self.intent_id is not None or self.recovery_generation is not None:
             raise ValueError("SET_RESOLUTION_FORBIDS_MEMBER_BINDING")
         return self
@@ -48,8 +53,12 @@ class UnresolvedIntentSet(FrozenDocument):
 
     @classmethod
     def create(cls, intents: tuple[str, ...]) -> Self:
-        ordered = tuple(sorted(set(intents)))
-        if len(ordered) < 2 or any(not item for item in ordered):
+        if len(intents) != len(set(intents)):
+            raise ValueError("UNRESOLVED_SET_DUPLICATE_MEMBER")
+        if any(not item or item != item.strip() for item in intents):
+            raise ValueError("UNRESOLVED_SET_MEMBER_INVALID")
+        ordered = tuple(sorted(intents))
+        if len(ordered) < 2:
             raise ValueError("MULTIPLE_INTENTS_REQUIRED")
         payload = json.dumps(ordered, separators=(",", ":"), ensure_ascii=True)
         return cls(

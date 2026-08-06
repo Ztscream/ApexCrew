@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from apexcrew.domain.effects import (
     RecoveryActionClass,
     RecoveryDecisionKind,
     RecoveryObservation,
     recover_observation,
+    sha256_digest,
 )
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import IntentId
 
 PAYLOAD = Sha256DigestText("sha256:" + "1" * 64)
 RESULT = Sha256DigestText("sha256:" + "2" * 64)
+BOUNDED = '{"items":["src/a.py"]}'
+BOUNDED_DIGEST = sha256_digest(BOUNDED)
 
 
 def observation(
@@ -18,14 +24,45 @@ def observation(
     state: str,
     **fields: object,
 ) -> RecoveryObservation:
-    return RecoveryObservation(
+    defaults: dict[str, object] = {
+        "request_digest": PAYLOAD,
+        "idempotency_key": "intent-1-key",
+        "snapshot_digest": PAYLOAD,
+        "scope_digest": PAYLOAD,
+        "ordering_digest": PAYLOAD,
+        "expected_pre_tree_digest": PAYLOAD,
+        "observed_post_tree_digest": RESULT,
+        "check_id": "check-1",
+        "argv_digest": PAYLOAD,
+        "repository_id": "repo-1",
+        "repository_instance_digest": PAYLOAD,
+        "ref_name": "refs/heads/private",
+        "registration_digest": PAYLOAD,
+        "target_safety_digest": PAYLOAD,
+        "old_oid": "old",
+        "prepared_oid": "prepared",
+        "current_oid": "current",
+        "registration_identity": "reservation-1",
+        "reservation_operation": "CREATE",
+        "admin_binding_digest": PAYLOAD,
+        "path_identity": "workspace-1",
+        "gitfile_digest": PAYLOAD,
+    }
+    defaults.update(fields)
+    if state == "EXACT_COMPLETION":
+        defaults.setdefault("normalized_completion_digest", RESULT)
+    if state == "EXACT_SNAPSHOT":
+        defaults.setdefault("bounded_result_json", BOUNDED)
+        defaults.setdefault("bounded_result_digest", BOUNDED_DIGEST)
+    if state == "EXACT_RECEIPT":
+        defaults.setdefault("receipt_digest", RESULT)
+    return RecoveryObservation.create(
         kind=action_class,
         intent_id=IntentId("intent-1"),
         recovery_generation=1,
         source_payload_digest=PAYLOAD,
         state=state,
-        observation_digest=RESULT,
-        **fields,
+        **defaults,
     )
 
 
@@ -74,6 +111,11 @@ def test_model_unavailable_is_indeterminate() -> None:
     )
 
 
+def test_model_exact_pre_is_never_retryable() -> None:
+    decision = recover_observation(observation(RecoveryActionClass.MODEL, "EXACT_PRE"))
+    assert decision.kind == RecoveryDecisionKind.INDETERMINATE
+
+
 def test_read_search_same_snapshot_returns_bounded_payload() -> None:
     decision = recover_observation(
         observation(
@@ -81,8 +123,8 @@ def test_read_search_same_snapshot_returns_bounded_payload() -> None:
             "EXACT_SNAPSHOT",
             snapshot_digest=PAYLOAD,
             scope_digest=RESULT,
-            bounded_result_json='{"items":["src/a.py"]}',
-            bounded_result_digest=RESULT,
+            bounded_result_json=BOUNDED,
+            bounded_result_digest=BOUNDED_DIGEST,
         )
     )
     assert decision.kind == RecoveryDecisionKind.COMPLETED
@@ -93,6 +135,24 @@ def test_read_search_changed_scope_is_stale_without_content() -> None:
     decision = recover_observation(observation(RecoveryActionClass.READ_SEARCH, "STALE"))
     assert decision.kind == RecoveryDecisionKind.STALE
     assert decision.bounded_result_json is None
+
+
+def test_observation_digest_is_canonical_and_bound_to_all_fields() -> None:
+    valid = observation(RecoveryActionClass.PATCH, "EXACT_POST")
+    altered = valid.model_dump()
+    altered["observation_digest"] = PAYLOAD
+    with pytest.raises(ValidationError, match="OBSERVATION_DIGEST_MISMATCH"):
+        RecoveryObservation(**altered)
+
+
+def test_stale_read_observation_cannot_carry_result_content() -> None:
+    with pytest.raises(ValidationError, match="READ_RESULT_FORBIDDEN"):
+        observation(
+            RecoveryActionClass.READ_SEARCH,
+            "STALE",
+            bounded_result_json=BOUNDED,
+            bounded_result_digest=BOUNDED_DIGEST,
+        )
 
 
 def test_patch_exact_post_is_completed() -> None:
@@ -183,7 +243,7 @@ def test_target_cas_target_unsafe_is_stale() -> None:
 
 def test_reservation_creation_matrix_covers_absent_unlocked_locked_mixed_unobservable() -> None:
     expected = {
-        "BOTH_ABSENT": RecoveryDecisionKind.COMPLETED,
+        "BOTH_ABSENT": RecoveryDecisionKind.RETRY_SAME_INTENT,
         "BOTH_PRESENT_UNLOCKED": RecoveryDecisionKind.RETRY_SAME_INTENT,
         "BOTH_PRESENT_LOCKED": RecoveryDecisionKind.COMPLETED,
         "MIXED": RecoveryDecisionKind.CONFLICT,
@@ -194,3 +254,14 @@ def test_reservation_creation_matrix_covers_absent_unlocked_locked_mixed_unobser
             recover_observation(observation(RecoveryActionClass.TARGET_RESERVATION, state)).kind
             == kind
         )
+
+
+def test_reservation_cleanup_absence_is_already_complete() -> None:
+    decision = recover_observation(
+        observation(
+            RecoveryActionClass.TARGET_RESERVATION,
+            "BOTH_ABSENT",
+            reservation_operation="CLEANUP",
+        )
+    )
+    assert decision.kind == RecoveryDecisionKind.COMPLETED
