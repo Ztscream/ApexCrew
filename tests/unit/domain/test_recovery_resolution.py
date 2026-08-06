@@ -158,6 +158,7 @@ def observation(
                     "bounded_payload": {
                         "snapshot_digest": defaults["snapshot_digest"],
                         "post_tree_digest": defaults["observed_post_tree_digest"],
+                        "pre_tree_digest": defaults["expected_pre_tree_digest"],
                     },
                 }
             )

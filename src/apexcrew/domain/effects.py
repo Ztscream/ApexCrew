@@ -1024,6 +1024,8 @@ class RecoveryObservation(FrozenDocument):
                         tool_result.bounded_payload.get("snapshot_digest") != self.snapshot_digest
                         or tool_result.bounded_payload.get("post_tree_digest")
                         != self.observed_post_tree_digest
+                        or tool_result.bounded_payload.get("pre_tree_digest")
+                        != self.expected_pre_tree_digest
                     ):
                         raise ValueError("PATCH_COMPLETION_PROOF_BINDING_MISMATCH")
                 elif (
