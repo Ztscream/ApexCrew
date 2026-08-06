@@ -30,6 +30,9 @@ def observation(
         "request_digest": PAYLOAD,
         "idempotency_key": "intent-1-key",
         "returned_model_id": "deepseek-chat",
+        "provider_response_id": "response-1",
+        "schema_digest": PAYLOAD,
+        "usage_json": "{}",
         "run_id": RunId("run-1"),
         "settled_sequence": AuditSequence(1),
         "applicable_revision_digests": ApplicableRevisionDigests(),
@@ -232,6 +235,17 @@ def test_stale_read_observation_cannot_carry_result_content() -> None:
             "STALE",
             bounded_result_json=BOUNDED,
             bounded_result_digest=BOUNDED_DIGEST,
+        )
+
+
+def test_read_result_rejects_sensitive_fields() -> None:
+    secret_result = '{"items":[{"token":"redacted"}]}'
+    with pytest.raises(ValidationError, match="READ_RESULT_NOT_SANITIZED"):
+        observation(
+            RecoveryActionClass.READ_SEARCH,
+            "EXACT_SNAPSHOT",
+            bounded_result_json=secret_result,
+            bounded_result_digest=sha256_digest(secret_result),
         )
 
 

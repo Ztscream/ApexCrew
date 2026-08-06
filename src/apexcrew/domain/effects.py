@@ -589,7 +589,13 @@ class RecoveryObservation(FrozenDocument):
     @model_validator(mode="after")
     def validate_observation(self) -> Self:
         required: dict[RecoveryActionClass, tuple[str, ...]] = {
-            RecoveryActionClass.MODEL: ("request_digest",),
+            RecoveryActionClass.MODEL: (
+                "request_digest",
+                "provider_response_id",
+                "returned_model_id",
+                "schema_digest",
+                "usage_json",
+            ),
             RecoveryActionClass.READ_SEARCH: ("snapshot_digest", "scope_digest", "ordering_digest"),
             RecoveryActionClass.PATCH: ("expected_pre_tree_digest", "observed_post_tree_digest"),
             RecoveryActionClass.CHECK: ("check_id", "argv_digest", "snapshot_digest"),
@@ -796,6 +802,32 @@ class RecoveryObservation(FrozenDocument):
                 )
                 if canonical_result != self.bounded_result_json:
                     raise ValueError("READ_RESULT_NOT_CANONICAL")
+                if len(self.bounded_result_json.encode("utf-8")) > 131_072:
+                    raise ValueError("READ_RESULT_TOO_LARGE")
+                forbidden_keys = {
+                    "credential",
+                    "credentials",
+                    "nonce",
+                    "raw_transcript",
+                    "provider_transcript",
+                    "secret",
+                    "token",
+                }
+
+                def contains_forbidden_key(value: object) -> bool:
+                    if isinstance(value, dict):
+                        return any(
+                            isinstance(key, str)
+                            and key.lower() in forbidden_keys
+                            or contains_forbidden_key(item)
+                            for key, item in value.items()
+                        )
+                    if isinstance(value, list):
+                        return any(contains_forbidden_key(item) for item in value)
+                    return False
+
+                if contains_forbidden_key(parsed):
+                    raise ValueError("READ_RESULT_NOT_SANITIZED")
                 if self.bounded_result_digest != sha256_digest(self.bounded_result_json):
                     raise ValueError("READ_RESULT_DIGEST_MISMATCH")
             elif self.bounded_result_json is not None or self.bounded_result_digest is not None:
@@ -865,6 +897,14 @@ class RecoveryDecision:
             raise ValueError("RETRY_PROOF_REQUIRED")
         if self.kind is RecoveryDecisionKind.ABANDONED and not self.successor:
             raise ValueError("ABANDON_SUCCESSOR_REQUIRED")
+        if self.kind is RecoveryDecisionKind.ABANDONED and (
+            self.effect_result is not None
+            or self.result_digest is not None
+            or self.bounded_result_json is not None
+            or self.settled_sequence is not None
+            or self.applicable_revision_digests is not None
+        ):
+            raise ValueError("ABANDONED_CANNOT_CARRY_RESULT")
         if self.kind in {
             RecoveryDecisionKind.STALE,
             RecoveryDecisionKind.CONFLICT,
