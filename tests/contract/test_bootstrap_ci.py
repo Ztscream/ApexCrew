@@ -13,5 +13,13 @@ def test_minimal_ci_runs_quality_and_offline_tests_on_every_push() -> None:
     assert "uv run ruff format --check ." in workflow
     assert "uv run ruff check ." in workflow
     assert "uv run mypy src" in workflow
-    assert workflow.count("uv run pytest") == 2
+    assert workflow.count("uv run pytest") == 3
+    for job in (
+        "integration:",
+        "pages:",
+        "browser-quality:",
+        "reference-performance:",
+    ):
+        assert job in workflow
+    assert "needs: [quality, unit-ubuntu, unit-windows, integration, build, pages]" in workflow
     assert "OPENAI_API_KEY" not in workflow

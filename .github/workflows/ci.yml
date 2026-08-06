@@ -49,7 +49,18 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv run pytest
 
-  web-build:
+  integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.29"
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+      - run: uv run pytest tests/integration tests/acceptance -q
+
+  pages:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +76,7 @@ jobs:
 
   deploy-pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: web-build
+    needs: pages
     runs-on: ubuntu-24.04
     permissions:
       pages: write
@@ -88,3 +99,31 @@ jobs:
       - run: uv sync --frozen --all-groups
       - run: uv build
       - run: docker build --tag apexcrew-executor:ci .
+
+  browser-quality:
+    needs: [quality, unit-ubuntu, unit-windows, integration, build, pages]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.29"
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+      - run: uv run python scripts/check_static_replay.py
+
+  reference-performance:
+    needs: [quality, unit-ubuntu, unit-windows, integration, build, pages, browser-quality]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.29"
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+      - run: uv run python scripts/measure_performance.py --output .tmp/reference-performance.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reference-performance-${{ github.sha }}
+          path: .tmp/reference-performance.json

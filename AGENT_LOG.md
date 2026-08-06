@@ -1511,6 +1511,24 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
 
+## PLAN-Task M3-02 (2026-08-06)
+
+- **Base**: `2a6326e`.
+- **Red**: CI contract first reported `2` pytest invocations and no integration,
+  pages, browser-quality, or reference-performance topology.
+- **Green**: `uv run pytest tests/contract/test_bootstrap_ci.py tests/contract/test_release_artifacts.py -q` -> `3 passed`.
+- **Implementation**: added the integration job, renamed the static artifact job
+  to `pages`, added browser-quality/static replay validation and a sanitized
+  same-SHA performance artifact job, plus local static and timing scripts.
+- **Observed local reports**: `static-replay: clean`; performance report was
+  `bytes_read=2061`, `static_read_ms=0.421`, threshold `1000`.
+- **Boundary**: hosted Pages publication and release writes remain owner-only;
+  the local performance report is not hosted CI evidence.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
 ## PLAN-Task M4-02 (2026-08-06)
 
 - **Base**: `c60cbb2`.
