@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -11,13 +12,17 @@ from typing import Protocol
 
 from apexcrew.adapters.repository.git import (
     GitCatFileBlob,
+    GitCatFileSize,
     GitLsTreeRecursive,
     GitOperation,
     RepositoryInstance,
     RepositoryUnsafeError,
 )
+from apexcrew.adapters.repository.no_follow import (
+    HandleIdentity,
+    StableHandleTree,
+)
 from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError as NoFollowError
-from apexcrew.adapters.repository.no_follow import StableHandleTree
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.domain.effects import canonical_json, sha256_digest
@@ -31,6 +36,8 @@ MAX_TREE_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 2_000
 MAX_WORKSPACE_FILE_BYTES = 16 * 1024 * 1024
 MAX_WORKSPACE_BYTES = 256 * 1024 * 1024
+MAX_CLEANUP_NODES = 8_000
+MAX_CLEANUP_DEPTH = 256
 
 
 class AttemptWorkspaceGitRunner(Protocol):
@@ -110,6 +117,7 @@ class AttemptWorkspaceAdapter:
         self._runner = runner
         self._data_root = data_root
         self._secret_paths = secret_paths
+        self._materialization_lock = threading.RLock()
 
     def materialize_context(
         self,
@@ -152,31 +160,32 @@ class AttemptWorkspaceAdapter:
         globs: Sequence[GlobPattern],
         kind: str,
     ) -> MaterializedWorkspace:
-        component = _attempt_component(attempt_id)
-        entries_and_content = self._load_manifest(base_oid, globs)
-        root = self._workspace_root(component, kind)
-        self._ensure_data_root()
-        tree = self._tree()
-        relative_root = f"attempts/{component}/{kind}"
-        try:
-            tree.ensure_directory("attempts")
-            tree.ensure_directory(f"attempts/{component}")
-            self._remove_existing_directory(tree, relative_root)
-            tree.ensure_directory(relative_root)
-            for entry, content in entries_and_content:
-                node = tree.create_file(f"{relative_root}/{entry.path}")
-                tree.write_bytes(node, content)
-            tree.assert_name_bindings()
-        except (NoFollowError, OSError, ValueError) as error:
-            raise AttemptWorkspaceError("WORKSPACE_WRITE_DENIED") from error
-        finally:
-            tree.close()
-        entries = tuple(entry for entry, _content in entries_and_content)
-        return MaterializedWorkspace(
-            root=root,
-            entries=entries,
-            tree_digest=self._tree_digest(entries_and_content),
-        )
+        with self._materialization_lock:
+            component = _attempt_component(attempt_id)
+            entries_and_content = self._load_manifest(base_oid, globs)
+            root = self._workspace_root(component, kind)
+            self._ensure_data_root()
+            tree = self._tree()
+            relative_root = f"attempts/{component}/{kind}"
+            try:
+                tree.ensure_directory("attempts")
+                tree.ensure_directory(f"attempts/{component}")
+                self._remove_existing_directory(tree, relative_root)
+                tree.ensure_directory(relative_root)
+                for entry, content in entries_and_content:
+                    node = tree.create_file(f"{relative_root}/{entry.path}")
+                    tree.write_bytes(node, content)
+                tree.assert_name_bindings()
+            except (NoFollowError, OSError, ValueError) as error:
+                raise AttemptWorkspaceError("WORKSPACE_WRITE_DENIED") from error
+            finally:
+                tree.close()
+            entries = tuple(entry for entry, _content in entries_and_content)
+            return MaterializedWorkspace(
+                root=root,
+                entries=entries,
+                tree_digest=self._tree_digest(entries_and_content),
+            )
 
     def _load_manifest(
         self, base_oid: GitOid, globs: Sequence[GlobPattern]
@@ -188,6 +197,9 @@ class AttemptWorkspaceAdapter:
         for entry in _parse_tree(result.stdout):
             if any(pattern.matches(entry.path) for pattern in globs):
                 selected.append(entry)
+        folded_paths = {str(entry.path).casefold() for entry in selected}
+        if len(folded_paths) != len(selected):
+            raise AttemptWorkspaceError("CASEFOLD_PATH_COLLISION")
         if len(selected) > MAX_SNAPSHOT_ENTRIES:
             raise AttemptWorkspaceError("SNAPSHOT_ENTRY_LIMIT")
 
@@ -222,8 +234,21 @@ class AttemptWorkspaceAdapter:
         return tuple(materialized)
 
     def _read_blob(self, object_id: GitOid) -> bytes:
+        size_result = self._run(GitCatFileSize(object_id))
+        if size_result.returncode != 0 or not size_result.stdout.endswith(b"\n"):
+            raise AttemptWorkspaceError("GIT_BLOB_SIZE_UNAVAILABLE")
+        try:
+            size = int(size_result.stdout[:-1].decode("ascii", errors="strict"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise AttemptWorkspaceError("GIT_BLOB_SIZE_INVALID") from error
+        if size < 0 or size > MAX_WORKSPACE_FILE_BYTES:
+            raise AttemptWorkspaceError("WORKSPACE_FILE_TOO_LARGE")
         result = self._run(GitCatFileBlob(object_id))
-        if result.returncode != 0 or not isinstance(result.stdout, bytes):
+        if (
+            result.returncode != 0
+            or not isinstance(result.stdout, bytes)
+            or len(result.stdout) != size
+        ):
             raise AttemptWorkspaceError("GIT_BLOB_READ_FAILED")
         return result.stdout
 
@@ -277,17 +302,37 @@ class AttemptWorkspaceAdapter:
             return
         if node.identity.kind != "directory":
             raise AttemptWorkspaceError("WORKSPACE_ROOT_UNSAFE")
-        identity = node.identity
-        for name in tree.list_names(node, MAX_SNAPSHOT_ENTRIES):
-            child_relative = f"{relative}/{name}"
+        pending: list[tuple[str, HandleIdentity, tuple[str, ...], int]] = [
+            (relative, node.identity, tree.list_names(node, MAX_SNAPSHOT_ENTRIES), 0)
+        ]
+        visited = 0
+        while pending:
+            current, identity, names, index = pending[-1]
+            if index == len(names):
+                tree.remove_directory(current, identity)
+                pending.pop()
+                continue
+            pending[-1] = (current, identity, names, index + 1)
+            visited += 1
+            if visited > MAX_CLEANUP_NODES:
+                raise AttemptWorkspaceError("WORKSPACE_CLEANUP_LIMIT")
+            child_relative = f"{current}/{names[index]}"
             child = tree.try_open_any(child_relative)
             if child is None:
                 raise AttemptWorkspaceError("WORKSPACE_ENTRY_CHANGED")
             if child.identity.kind == "directory":
-                self._remove_existing_directory(tree, child_relative)
+                if len(pending) >= MAX_CLEANUP_DEPTH:
+                    raise AttemptWorkspaceError("WORKSPACE_CLEANUP_DEPTH")
+                pending.append(
+                    (
+                        child_relative,
+                        child.identity,
+                        tree.list_names(child, MAX_SNAPSHOT_ENTRIES),
+                        0,
+                    )
+                )
             else:
                 tree.remove_file(child_relative, child.identity)
-        tree.remove_directory(relative, identity)
 
     @staticmethod
     def _tree_digest(

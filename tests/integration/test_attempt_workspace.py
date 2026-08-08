@@ -15,6 +15,7 @@ from apexcrew.adapters.repository.attempt_workspace import (
 )
 from apexcrew.adapters.repository.git import (
     GitCatFileBlob,
+    GitCatFileSize,
     GitCommandRunner,
     GitLsTreeRecursive,
     GitOperation,
@@ -177,6 +178,8 @@ def test_scope_filter_precedes_mode_secret_and_blob_inspection(tmp_path: Path) -
                     b"100644 blob " + b"1" * 40 + b"\tsrc/read.py\0",
                     b"",
                 )
+            if isinstance(operation, GitCatFileSize):
+                return subprocess.CompletedProcess([], 0, b"5\n", b"")
             if isinstance(operation, GitCatFileBlob):
                 return subprocess.CompletedProcess([], 0, b"read\n", b"")
             raise AssertionError(operation)
@@ -199,7 +202,116 @@ def test_scope_filter_precedes_mode_secret_and_blob_inspection(tmp_path: Path) -
         assert _paths(workspace) == ("src/read.py",)
         assert runner.calls == [
             GitLsTreeRecursive(GitOid("a" * 40)),
+            GitCatFileSize(GitOid("1" * 40)),
             GitCatFileBlob(GitOid("1" * 40)),
+        ]
+    finally:
+        _close(adapter)
+
+
+def test_casefold_path_collision_is_rejected_before_blob_reads(tmp_path: Path) -> None:
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self.calls: list[GitOperation] = []
+
+        def run_bytes(
+            self, _repository: RepositoryInstance, operation: GitOperation
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.calls.append(operation)
+            if isinstance(operation, GitLsTreeRecursive):
+                return subprocess.CompletedProcess(
+                    [],
+                    0,
+                    b"100644 blob " + b"1" * 40 + b"\tsrc/Foo.py\0"
+                    b"100644 blob " + b"2" * 40 + b"\tsrc/foo.py\0",
+                    b"",
+                )
+            raise AssertionError(operation)
+
+    runner = RecordingRunner()
+    adapter = AttemptWorkspaceAdapter(
+        cast(RepositoryInstance, object()),
+        runner,
+        tmp_path / "data",
+        SecretPathPolicy.from_host_rules((), b"k" * 32),
+    )
+    try:
+        with pytest.raises(AttemptWorkspaceError, match="CASEFOLD_PATH_COLLISION"):
+            adapter.materialize_context(
+                attempt_id=AttemptId("attempt-1"),
+                base_oid=GitOid("a" * 40),
+                read_globs=(GlobPattern.parse("src/**"),),
+                dependency_globs=(),
+            )
+        assert runner.calls == [GitLsTreeRecursive(GitOid("a" * 40))]
+    finally:
+        _close(adapter)
+
+
+def test_submodule_mode_is_rejected_in_scope(tmp_path: Path) -> None:
+    class RecordingRunner:
+        def run_bytes(
+            self, _repository: RepositoryInstance, operation: GitOperation
+        ) -> subprocess.CompletedProcess[bytes]:
+            if isinstance(operation, GitLsTreeRecursive):
+                return subprocess.CompletedProcess(
+                    [], 0, b"160000 commit " + b"1" * 40 + b"\tsrc/module\0", b""
+                )
+            raise AssertionError(operation)
+
+    adapter = AttemptWorkspaceAdapter(
+        cast(RepositoryInstance, object()),
+        RecordingRunner(),
+        tmp_path / "data",
+        SecretPathPolicy.from_host_rules((), b"k" * 32),
+    )
+    try:
+        with pytest.raises(AttemptWorkspaceError, match="SUBMODULE_MODE_DENIED"):
+            adapter.materialize_context(
+                attempt_id=AttemptId("attempt-1"),
+                base_oid=GitOid("a" * 40),
+                read_globs=(GlobPattern.parse("src/**"),),
+                dependency_globs=(),
+            )
+    finally:
+        _close(adapter)
+
+
+def test_blob_size_is_checked_before_blob_read(tmp_path: Path) -> None:
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self.calls: list[GitOperation] = []
+
+        def run_bytes(
+            self, _repository: RepositoryInstance, operation: GitOperation
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.calls.append(operation)
+            if isinstance(operation, GitLsTreeRecursive):
+                return subprocess.CompletedProcess(
+                    [], 0, b"100644 blob " + b"1" * 40 + b"\tsrc/large.py\0", b""
+                )
+            if isinstance(operation, GitCatFileSize):
+                return subprocess.CompletedProcess([], 0, b"16777217\n", b"")
+            raise AssertionError(operation)
+
+    runner = RecordingRunner()
+    adapter = AttemptWorkspaceAdapter(
+        cast(RepositoryInstance, object()),
+        runner,
+        tmp_path / "data",
+        SecretPathPolicy.from_host_rules((), b"k" * 32),
+    )
+    try:
+        with pytest.raises(AttemptWorkspaceError, match="WORKSPACE_FILE_TOO_LARGE"):
+            adapter.materialize_context(
+                attempt_id=AttemptId("attempt-1"),
+                base_oid=GitOid("a" * 40),
+                read_globs=(GlobPattern.parse("src/**"),),
+                dependency_globs=(),
+            )
+        assert runner.calls == [
+            GitLsTreeRecursive(GitOid("a" * 40)),
+            GitCatFileSize(GitOid("1" * 40)),
         ]
     finally:
         _close(adapter)
