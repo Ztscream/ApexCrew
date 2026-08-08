@@ -30683,7 +30683,7 @@ The local `.env` remains ignored and untracked. Push, PR merge, hosted release, 
 
 ## M1-R4.3 Executable Repair Loop Closure (2026-08-08)
 
-**Status: APPROVED / M1 GO RECORDED 2026-08-08.** This revision replaces the unstarted body of M1-R4.2 with a dependency-ordered chain derived from a fresh read of the working tree. `SPEC.md` remains frozen and is not amended by this module. The formal implementation base is `9e7648f` (`codex/m2-m4-final-production`), the independently verified R4.1/M2-M4 candidate. The uncommitted primary-checkout draft at `3676526` is diagnostic input only and is not an implementation base. The zero-blocker review record is in docs-only commit `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; the next docs-only review closeout records that commit and is the immediate ancestor for R4.3-00. No source/test/fixture/CI change may enter either documentation commit.
+**Status: APPROVED / M1 GO RECORDED 2026-08-08.** This revision replaces the unstarted body of M1-R4.2 with a dependency-ordered chain derived from a fresh read of the working tree. `SPEC.md` remains frozen and is not amended by this module. The formal implementation base is `9e7648f` (`codex/m2-m4-final-production`), the independently verified R4.1/M2-M4 candidate. The uncommitted primary-checkout draft at `3676526` is diagnostic input only and is not an implementation base. The zero-blocker review record is in formal-base docs-only commit `e8461003ee3c8da888683fb1975bb1523803096c`; the current docs-only closeout is its descendant and is the immediate ancestor for R4.3-00. No source/test/fixture/CI change may enter either documentation commit.
 
 **Objective:** Make the claim "the harness actually repairs a defect" true end to end: the Worker sees real repository bytes, writes a real patch, runs a declared check against the patched workspace, promotes a verified Task Candidate to the private Run Head, freezes a separate fresh Run Candidate, and advances the target ref only through the final Grant-bound CAS. The existing governance, Permit, reservation, and typed CAS boundaries are preserved and completed rather than bypassed.
 
@@ -30706,7 +30706,7 @@ The local `.env` remains ignored and untracked. Push, PR merge, hosted release, 
 
 | Task | Module | Depth | PR | Worktree | Base (exact reviewed ancestor) | Implementation commit | Spec-Review | Quality-Review |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | docs-only review closeout descended from `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1` | pending | pending | pending |
+| R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | formal-base docs-only closeout descended from `e8461003ee3c8da888683fb1975bb1523803096c` | pending | pending | pending |
 | R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit | pending | pending | pending |
 | R4.3-02 | Attempt PatchExecutor and Worker context | REAL | PR-R4.3-02 | .worktrees/m1-r4-3-patch-context | R4.3-01 final-reviewed commit | pending | pending | pending |
 | R4.3-03 | Restricted Docker composition wiring | REAL | PR-R4.3-03 | .worktrees/m1-r4-3-executor-wiring | R4.3-02 final-reviewed commit | pending | pending | pending |
@@ -30742,7 +30742,7 @@ The local `.env` remains ignored and untracked. Push, PR merge, hosted release, 
 | Review findings | All first-review findings corrected and rechecked: Run Candidate parent/prepared OID, clean-base red evidence, reviewed-plan ancestor, union filter order, per-check `Q_i`, typed delete/rename/mode, PR map, exact viewports, `DEBT-M2-005` state, GitLab `unit-test` |
 | Review-input PLAN.md SHA-256 (before this PASS record) | `98D0005BFB0930745A3A35369E6732260387D798F91844FC06EE26290F7398A5` |
 | Review-input companion plan SHA-256 (before this PASS record) | `21B6BD802224F9E950C6D25A60732D49D02493C619AF0EF39E274796EAB32E7C` |
-| Reviewed-plan commit / owner M1 GO | `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; `GO` granted for R4.3 source work under this plan |
+| Reviewed-plan commit / owner M1 GO | `e8461003ee3c8da888683fb1975bb1523803096c`; `GO` granted for R4.3 source work under this plan |
 
 ---
 
