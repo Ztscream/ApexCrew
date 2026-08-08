@@ -268,6 +268,7 @@ class _CompositionWorkerContext:
                 "files": files,
                 "goal": bootstrap.goal,
                 "task_contract": {
+                    "constraints": list(contract.constraints),
                     "dependency_globs": [item.value for item in contract.dependency_globs],
                     "dependency_task_ids": [str(item) for item in contract.dependency_task_ids],
                     "read_globs": [item.value for item in contract.read_globs],

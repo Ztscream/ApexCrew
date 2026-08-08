@@ -170,6 +170,7 @@ def test_context_contains_task_contract_and_scoped_files(tmp_path: Path) -> None
     assert payload["task_contract"]["read_globs"] == ["src/read.py"]
     assert payload["task_contract"]["dependency_globs"] == ["src/dependency.py"]
     assert payload["task_contract"]["write_globs"] == ["src/write.py"]
+    assert payload["task_contract"]["constraints"] == ["stay in src"]
     assert payload["checks"] == [{"argv": ["pytest", "-q"], "check_id": "task-1:check-1"}]
     assert [item["path"] for item in payload["files"]] == [
         "src/dependency.py",

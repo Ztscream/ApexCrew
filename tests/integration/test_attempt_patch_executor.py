@@ -12,7 +12,7 @@ from apexcrew.adapters.executor.attempt_patch import (
     AttemptPatchExecutor,
 )
 from apexcrew.adapters.executor.memory_patch import MemoryPatchExecutor
-from apexcrew.adapters.repository.no_follow import StableHandleTree
+from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError, StableHandleTree
 from apexcrew.domain.authority import WorkspaceLease
 from apexcrew.domain.effects import canonical_json, sha256_digest
 from apexcrew.domain.plan import GlobPattern
@@ -116,6 +116,33 @@ def test_patch_outside_write_globs_denied_with_zero_side_effects(tmp_path: Path)
     assert not (root / "tests").exists()
 
 
+def test_new_file_creation_is_cleaned_up_when_prewrite_binding_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    target = root / "src" / "new.py"
+    original_assert = StableHandleTree.assert_name_bindings
+    calls = 0
+
+    def fail_after_create(tree: StableHandleTree) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RepositoryUnsafeError("injected binding failure")
+        original_assert(tree)
+
+    monkeypatch.setattr(StableHandleTree, "assert_name_bindings", fail_after_create)
+
+    result = AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+        _lease("src/**"),
+        {"src/new.py": b"@@ -0,0 +1 @@\n+created\n"},
+    )
+
+    assert result.code == "LEASE_SCOPE_DENIED"
+    assert not target.exists()
+
+
 def test_malformed_diff_denied_with_zero_side_effects(tmp_path: Path) -> None:
     root = tmp_path / "check"
     (root / "src").mkdir(parents=True)
@@ -209,10 +236,10 @@ def test_digest_failure_after_replace_is_uncertain(
     target.write_bytes(b"value = 1\n")
     executor = AttemptPatchExecutor(root, _secret_policy())
 
-    def fail_digest() -> Sha256DigestText:
+    def fail_digest(_tree: StableHandleTree) -> Sha256DigestText:
         raise SnapshotUnavailable("injected digest failure")
 
-    monkeypatch.setattr(executor, "tree_digest", fail_digest)
+    monkeypatch.setattr(executor, "_tree_digest", fail_digest)
 
     with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
         executor.apply_patch(

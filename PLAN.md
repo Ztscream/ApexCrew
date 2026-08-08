@@ -30810,21 +30810,28 @@ The reservation worktree is untouched by this adapter; that is asserted, not ass
 
 ### R4.3-02 Attempt PatchExecutor and Worker Context (REAL)
 
-**Files:** `src/apexcrew/adapters/executor/attempt_patch.py` (new); `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_patch_executor.py` (new); `tests/integration/test_worker_context.py` (new)
+**Files:** `src/apexcrew/adapters/executor/attempt_patch.py` (new); `src/apexcrew/adapters/repository/no_follow_windows.py`; `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_patch_executor.py` (new); `tests/integration/test_worker_context.py` (new)
 
-**Closed design:** `AttemptPatchExecutor(workspace, secret_paths)` implements `PatchExecutorPort` with the R4.3-00 denial order, differing only in persistence: it reads the current bytes through a no-follow handle, applies `apply_unified_diff`, writes through `tempfile.mkstemp` in the same directory followed by `os.replace`, and recomputes `tree_digest`. `StableHandleTree.assert_name_bindings()` runs immediately before and after the replacement so an ancestor-directory substitution between preflight and write is denied with zero side effects, matching the guarantee already established for granted actions. A rejected diff leaves the file byte-identical.
+**Closed design:** `AttemptPatchExecutor(workspace, secret_paths)` implements `PatchExecutorPort` with the R4.3-00 denial order. It reads the current bytes through a no-follow handle and applies `apply_unified_diff`. Because v0.1 has no cross-platform compare-and-swap primitive for an existing final name, an existing target is reopened relative to its held parent, its OS identity is compared with the preflight identity, and the update is written through that held writable handle; a missing target is created exclusively under an already-existing held parent, never by implicit ancestor creation. Windows truncates and flushes the held handle after writing. No target or temporary pathname is resolved for mutation. `StableHandleTree.assert_name_bindings()` runs before opening the writable handle, after reopening/creating it, after writing, and at the end of the same held-tree `tree_digest`; a pre-write new-file binding failure removes the created file through its held parent, while any post-write or cleanup uncertainty raises `PATCH_RESULT_UNCERTAIN`. A rejected diff leaves the file byte-identical.
 
-`_CompositionWorkerContext.build_current` stops returning a placeholder. It emits canonical JSON containing the persisted goal, constraints, acceptance criteria, `task_id`, the task contract's `read_globs`, `dependency_globs`, `write_globs`, and declared checks with their `check_id` and `argv`, plus only the contents of regular files in the separate `R union D` context workspace. Per-file content is bounded by `max_file_bytes` (131 072) and the file set is bounded in aggregate, with an explicit truncation marker when either bound binds. Secret-policy matches are excluded before content is read. `ContextCapsule.create` receives one dependency digest per included context file, so a change in the observed context changes the capsule binding and remains visible to `FreshnessAssessment`; the `Q union W` check workspace is bound independently and never becomes model context implicitly.
+`_CompositionWorkerContext.build_current` stops returning a placeholder. It emits canonical JSON containing the persisted goal, constraints, acceptance criteria, `task_id`, the task contract's `constraints`, `read_globs`, `dependency_globs`, `write_globs`, and declared checks with their `check_id` and `argv`, plus only the contents of regular files in the separate `R union D` context workspace. Per-file content is bounded by `max_file_bytes` (131 072) and the file set is bounded in aggregate, with an explicit truncation marker when either bound binds. Secret-policy matches are excluded before content is read. Each Context Capsule dependency digest binds the canonical observed path, materialized content digest, observed bytes digest, observed byte count, and truncation state, so path/content changes remain visible to `FreshnessAssessment`; the `Q union W` check workspace is bound independently and never becomes model context implicitly.
 
 **Red evidence:**
 
 - `pytest tests/integration/test_attempt_patch_executor.py::test_patch_writes_real_bytes` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_patch_truncates_existing_file_through_handle` → RED
 - `pytest tests/integration/test_attempt_patch_executor.py::test_patch_outside_write_globs_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_new_file_creation_is_cleaned_up_when_prewrite_binding_fails` → RED
 - `pytest tests/integration/test_attempt_patch_executor.py::test_malformed_diff_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_final_target_replacement_is_uncertain_without_overwriting_substitute` → RED (POSIX race; Windows handle denial)
+- `pytest tests/integration/test_attempt_patch_executor.py::test_digest_failure_after_replace_is_uncertain` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_digest_rejects_root_replacement_after_write` → RED (POSIX only)
 - `pytest tests/integration/test_attempt_patch_executor.py::test_ancestor_replacement_between_preflight_and_write_denied` → RED (POSIX only)
 - `pytest tests/integration/test_worker_context.py::test_context_contains_task_contract_and_scoped_files` → RED (placeholder string still returned)
 - `pytest tests/integration/test_worker_context.py::test_context_excludes_secret_paths` → RED
 - `pytest tests/integration/test_worker_context.py::test_context_truncation_is_marked` → RED
+- `pytest tests/integration/test_worker_context.py::test_context_dependencies_bind_paths_even_when_bytes_match` → RED
+- `pytest tests/integration/test_worker_context.py::test_context_dependencies_bind_bytes_observed_from_workspace` → RED
 
 **Green evidence:** All selectors pass; the existing `FakeExecutor` contract suite still passes unchanged against the shared `post_tree_digest` algorithm; `mypy`, `ruff`, `git diff --check` clean.
 

@@ -27,7 +27,6 @@ from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
     PatchExecutionResult,
     PatchExecutorPort,
-    SnapshotNoFollowDenied,
     SnapshotUnavailable,
 )
 
@@ -68,7 +67,9 @@ class AttemptPatchExecutor(PatchExecutorPort):
 
         with self._lock:
             tree: StableHandleTree | None = None
+            created_node: OpenedNode | None = None
             mutation_started = False
+            post_tree_digest: Sha256DigestText | None = None
             try:
                 tree = self._tree()
                 node = tree.try_open(str(path), "file")
@@ -89,9 +90,13 @@ class AttemptPatchExecutor(PatchExecutorPort):
                 # There is no cross-platform compare-and-swap replace for an existing
                 # final name. Keep the final handle and write through it so a final-name
                 # swap cannot redirect the mutation; any post-write mismatch is uncertain.
+                parent = self._parent_path(path)
+                if parent:
+                    tree.open(parent, "directory")
                 tree.assert_name_bindings()
                 if node is None:
                     node = tree.create_file(str(path))
+                    created_node = node
                 else:
                     expected_identity = node.identity
                     node = tree.open_for_write(str(path))
@@ -99,9 +104,24 @@ class AttemptPatchExecutor(PatchExecutorPort):
                         raise RepositoryUnsafeError("GIT_STORAGE_IDENTITY_CHANGED")
                 tree.assert_name_bindings()
                 mutation_started = True
+                created_node = None
                 tree.write_bytes(node, updated)
                 tree.assert_name_bindings()
-            except (OSError, RepositoryUnsafeError, ValueError) as error:
+                post_tree_digest = self._tree_digest(tree)
+            except (
+                OSError,
+                RepositoryUnsafeError,
+                SnapshotUnavailable,
+                ValueError,
+            ) as error:
+                if created_node is not None and tree is not None:
+                    try:
+                        tree.remove_file(str(path), created_node.identity)
+                        created_node = None
+                    except (OSError, RepositoryUnsafeError) as cleanup_error:
+                        raise AttemptPatchExecutionError(
+                            "PATCH_RESULT_UNCERTAIN"
+                        ) from cleanup_error
                 if mutation_started:
                     raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                 return PatchExecutionResult(code="LEASE_SCOPE_DENIED")
@@ -114,46 +134,46 @@ class AttemptPatchExecutor(PatchExecutorPort):
                             raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                         raise
 
-            try:
-                post_tree_digest = self.tree_digest()
-            except (
-                OSError,
-                RepositoryUnsafeError,
-                SnapshotNoFollowDenied,
-                SnapshotUnavailable,
-                ValueError,
-            ) as error:
-                raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
+            if post_tree_digest is None:
+                raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN")
             return PatchExecutionResult(code="PATCH_APPLIED", post_tree_digest=post_tree_digest)
 
     def tree_digest(self) -> Sha256DigestText:
         tree = self._tree()
-        files: dict[str, str] = {}
-        pending: list[tuple[str, OpenedNode]] = [("", tree.root_node)]
         try:
-            while pending:
-                parent, node = pending.pop()
-                for name in reversed(tree.list_names(node, MAX_SNAPSHOT_ENTRIES)):
-                    relative = name if not parent else f"{parent}/{name}"
-                    child = tree.try_open_any(relative)
-                    if child is None:
-                        raise RepositoryUnsafeError("SNAPSHOT_ENTRY_CHANGED")
-                    if child.identity.kind == "directory":
-                        pending.append((relative, child))
-                    else:
-                        path = CanonicalPath.parse(relative)
-                        content = tree.read_bytes(child, MAX_WORKSPACE_FILE_BYTES)
-                        files[str(path)] = "sha256:" + sha256(content).hexdigest()
-                    if len(files) + len(pending) > MAX_SNAPSHOT_ENTRIES:
-                        raise RepositoryUnsafeError("SNAPSHOT_ENTRY_LIMIT")
-            tree.assert_name_bindings()
-            return sha256_digest(canonical_json(files))
+            return self._tree_digest(tree)
         finally:
             tree.close()
+
+    def _tree_digest(self, tree: StableHandleTree) -> Sha256DigestText:
+        files: dict[str, str] = {}
+        pending: list[tuple[str, OpenedNode]] = [("", tree.root_node)]
+        while pending:
+            parent, node = pending.pop()
+            for name in reversed(tree.list_names(node, MAX_SNAPSHOT_ENTRIES)):
+                relative = name if not parent else f"{parent}/{name}"
+                child = tree.try_open_any(relative)
+                if child is None:
+                    raise RepositoryUnsafeError("SNAPSHOT_ENTRY_CHANGED")
+                if child.identity.kind == "directory":
+                    pending.append((relative, child))
+                else:
+                    path = CanonicalPath.parse(relative)
+                    content = tree.read_bytes(child, MAX_WORKSPACE_FILE_BYTES)
+                    files[str(path)] = "sha256:" + sha256(content).hexdigest()
+                if len(files) + len(pending) > MAX_SNAPSHOT_ENTRIES:
+                    raise RepositoryUnsafeError("SNAPSHOT_ENTRY_LIMIT")
+        tree.assert_name_bindings()
+        return sha256_digest(canonical_json(files))
 
     def _tree(self) -> StableHandleTree:
         backend = PosixNoFollowBackend() if os.name == "posix" else WindowsNoFollowBackend()
         return StableHandleTree(self._root, backend)
+
+    @staticmethod
+    def _parent_path(path: CanonicalPath) -> str:
+        parts = str(path).split("/")
+        return "/".join(parts[:-1])
 
 
 __all__ = ["AttemptPatchExecutionError", "AttemptPatchExecutor"]
