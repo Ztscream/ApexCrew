@@ -2676,3 +2676,10 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Correction**: unified-diff integer parsing now maps conversion failures to `PROTECTED_PATCH_FORMAT_INVALID`; the demo attempt state implements the full WorkerAttemptState surface and removes its broad casts; snapshot content digests hash the exact file bytes; and an oversized-header zero-side-effect regression test was added.
 - **Correction evidence**: focused R4.3-00 selectors -> `8 passed`; related repository/patch/check/recovery selectors -> `27 passed, 2 skipped`; mypy, Ruff, format, diff, and byte-identical demo repeatability passed. The corrected implementation SHA is recorded after the rerun reviews.
 - **Rerun status**: the SPEC review is rerun because the patch-denial contract changed; the final quality review follows that ordered check. No provider credential, network request, push, remote PR, or live Docker request occurred.
+
+## 2026-08-08 / R4.3-00 final quality marker correction
+
+- **Final SPEC review**: reviewer `019fe120-bcac-7c31-8419-4f0d02302356`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High/Medium findings for `408f106f01efb1f43f322b81e64bf63dc3d80a8a`.
+- **Final quality review**: reviewer `019fe112-7865-7e90-a440-7c5c802bf78a`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High findings and one Low documentation marker finding.
+- **Correction**: added the required `# DEBT-M3-001` marker to the malformed-diff denial branch in `MemoryPatchExecutor`. No runtime behavior changed.
+- **Verification**: the final quality rerun is required against this marker-only correction; focused tests and static checks remain green. No provider credential, network request, push, remote PR, or live Docker request occurred.

@@ -40,6 +40,7 @@ class MemoryPatchExecutor:
             current = self._workspace_files[str(path)]
             updated = apply_unified_diff(current, raw_diff.decode("utf-8"))
         except (KeyError, UnicodeDecodeError, RepositoryUnsafeError):
+            # DEBT-M3-001: the closed result code set cannot distinguish malformed diffs.
             return PatchExecutionResult(code="LEASE_SCOPE_DENIED")
         self._workspace_files[str(path)] = updated
         return PatchExecutionResult(
