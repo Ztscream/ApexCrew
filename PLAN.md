@@ -30597,3 +30597,340 @@ Observed verification on `codex/m2-m4-final-production`:
 - Digest-pinned Docker restriction test -> passed: UID/GID 1000, no network, read-only root, dropped capabilities, no-new-privileges, and discarded writes.
 
 The local `.env` remains ignored and untracked. Push, PR merge, hosted release, and package publication remain outside this verification claim.
+**R4.2 Ledger (initial plan):**
+
+| Task | Module | Depth | Worktree | Base | Implementation commit | Spec-Review | Quality-Review |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R4.2-01 | Git object write plumbing | REAL | .worktrees/m1-r4-2-git-objects | efc39f3 | pending | pending | pending |
+| R4.2-02 | Attempt workspace + PatchExecutor | REAL | .worktrees/m1-r4-2-attempt-workspace | R4.2-01 | pending | pending | pending |
+| R4.2-03 | Docker executor runner | REAL | .worktrees/m1-r4-2-docker-executor | R4.2-02 | pending | pending | pending |
+| R4.2-04 | Admission prepared-commit + checks | REAL | .worktrees/m1-r4-2-candidate-prep | R4.2-03 | pending | pending | pending |
+| R4.2-05 | Composition wiring + end-to-end reversal | REAL | .worktrees/m1-r4-2-composition-final | R4.2-04 | pending | pending | pending |
+
+### R4.2-01 Git Object Write Plumbing (REAL)
+
+**Files:** `src/apexcrew/adapters/repository/git.py`
+
+**Closed design:** Three new `GitOperation` subclasses: `GitHashObjectWrite(blob_path: Path)` → `("hash-object", "-w", "--", path)`; `GitMkTree(entries: ...)` with stdin line protocol; `GitCommitTree(tree_oid, parent_oid, message)` → `("commit-tree", tree, "-p", parent, "-m", message)`. All succeed only when objects materialize in `objects/` without refs being touched.
+
+**Modified protocol:** `GitSpawner.run` gains `stdin: bytes | None = None` with 1 MiB hard cap, fail-closed on overflow.
+
+**Red evidence:**
+- `pytest tests/integration/test_git_object_writing.py::test_hash_object_deterministic` → RED (no implementation)
+- `pytest tests/integration/test_git_object_writing.py::test_mktree_canonical_ordering` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_commit_tree_parent_binding` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_stdin_overflow_rejected` → RED
+- `pytest tests/integration/test_git_object_writing.py::test_mode_120000_rejected_by_mktree` → RED
+
+**Green evidence:** All five pass; `mypy src`, `ruff check/format`, `git diff --check` clean; no Unix symlink creation required; no network/provider calls.
+
+### R4.2-02 Attempt Workspace + Real PatchExecutor (REAL)
+
+**Files:** `src/apexcrew/adapters/repository/attempt_workspace.py` (new); `src/apexcrew/adapters/executor/attempt_patch.py` (new); `tests/integration/test_attempt_workspace.py` (new)
+
+**Closed design:** `AttemptWorkspace(base_oid, globs)` materializes from `GitLsTreeRecursive` + `GitCatFileBlob`, stores in `.apexcrew/data/attempts/<id>/`, uses no-follow handles for writes, rejects `mode=120000` entries. `AttemptPatchExecutor` implements `PatchExecutorPort`, uses `_apply_unified_diff` + atomic `mkstemp`/`replace` from `GrantedWorkspaceAdapter`, returns `post_tree_digest` via `canonical_json({path: sha256(bytes)})`. Scope `write_globs`-enforced; secret paths rejected with distinct codes.
+
+**Red evidence:**
+- `pytest tests/integration/test_attempt_workspace.py::test_materialize_blobs_from_tree` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_glob_scope_enforced` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_secret_path_rejected` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_patch_outside_globs_denied` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_ancestor_replacement_toctou_denied` → RED (skip on Windows if symlink creation unavailable)
+
+**Green evidence:** All pass; FakeExecutor contracts pass (identical `post_tree_digest` logic); `mypy`, `ruff`, `diff` green.
+
+### R4.2-03 Docker Executor Runner (SUPERSEDED; does not close DEBT-M2-005)
+
+**Files:** `src/apexcrew/adapters/executor/restricted.py` (modify `run` method); `tests/integration/test_restricted_executor.py` (new, Linux-only)
+
+**Closed design:** `RestrictedDockerExecutor.run(argv, snapshot, timeout)` calls `docker run` with command built by `command_for()`, mounts snapshot `:ro`, enforces 1 MiB stdout/stderr cap (shared, not per-stream), collects exit code/timing, delegates secret-line redaction to `ExecutionResult.from_output`, returns three-state result (PASS/FAIL/UNCERTAINTY).
+
+**Red evidence:**
+- `pytest -m "test_restricted_executor and linux" tests/` → all RED (function not implemented)
+- Platform guard: `@pytest.mark.skipif(sys.platform != "linux", reason="Docker not available")`
+
+**Green evidence:** On Linux only: exit code 0 → PASSED; non-zero → FAILED; timeout → UNCERTAINTY + `timed_out=True`; `network=none` blocks connectivity; read-only root prevents writes; output truncation works; secret-path lines become `[redacted]`.
+
+### R4.2-04 Admission Prepared-Commit Creation (REAL)
+
+**Files:** `src/apexcrew/domain/admission.py` (extend); `src/apexcrew/adapters/repository/candidate_preparation.py` (new)
+
+**Closed design:** On Candidate freeze: record current Run Head `H`; materialize Attempt workspace from approved globs; hash each changed blob; construct incremental tree (reuse `H`'s tree for unchanged dirs); `commit-tree` to create `P` with parent=`H`; re-materialize `P` under check scope; run Task checks; freeze Candidate `READY` only if all checks pass.
+
+**Red evidence:**
+- `pytest tests/integration/test_candidate_preparation.py::test_prepared_commit_parent_correct` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_unchanged_blobs_reused` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_check_failure_stales_candidate` → RED
+
+**Green evidence:** `git show P:<path>` matches patch content; `rev-list --all` unchanged; `refs/heads/main` and `refs/apexcrew/runs/*` untouched; check pass → READY; check fail or timeout → stale/failed.
+
+### R4.2-05 Composition Wiring + End-to-End Acceptance Reversal (REAL)
+
+**Files:** `src/apexcrew/application/composition.py` (modify `_CompositionWorkerTools._runtime()`); `tests/integration/test_composed_runtime_lifecycle.py` (revert xfail); `tests/acceptance/test_money_unit_drift_run.py` (revert xfail); `tests/acceptance/test_timestamp_unit_drift_run.py` (revert xfail)
+
+**Closed design:** Pass six parameters to `ScopedToolRuntime`: `executor=RestrictedDockerExecutor(...)`, `patch_executor=AttemptPatchExecutor(...)`, `declared_checks=DeclaredCheckRegistry({c.check_id: c for c in contract.checks})`, `sanitized_snapshot=workspace.materialize(...)`, `deadline_journal=store`, `deadline_authority=authority`. Update `_LifecycleModel` to return `read → patch → check → finish` action sequence. Remove `strict xfail` decorators from acceptance tests; revert end-to-end assertions: target OID **must change** and fixture defects **must be repaired**.
+
+**Red evidence:**
+- `pytest tests/integration/test_composed_runtime_lifecycle.py::test_composed_runtime_integrates_frozen_candidate_once` → **FAILS** (target OID unchanged; xfail removed)
+- `pytest tests/acceptance/test_money_unit_drift_run.py::test_money_unit_drift_is_detected_and_repaired_end_to_end` → **FAILS** (xfail removed; skeleton boundary not yet cleared)
+- `pytest tests/acceptance/test_timestamp_unit_drift_run.py` → **FAILS** (xfail removed)
+
+**Green evidence:** Same three tests pass; target OID changed via prepared commit; fixture defect repaired; `mypy`, `ruff`, `diff` green; `uv run pytest` full suite green including new tests from R4.2-01..04.
+
+---
+
+**Historical R4.2 state:** The five-task design was superseded before implementation and is not completion evidence. It does not close `DEBT-M2-005`, does not authorize a host executor, and does not provide a PR or green acceptance claim. R4.3 owns the replacement chain below.
+
+## M1-R4.3 Executable Repair Loop Closure (2026-08-08)
+
+**Status: PROPOSED / REQUIRES DOCUMENT REVIEW.** This revision replaces the unstarted body of M1-R4.2 with a dependency-ordered chain derived from a fresh read of the working tree. `SPEC.md` remains frozen and is not amended by this module. The formal implementation base is `9e7648f` (`codex/m2-m4-final-production`), the independently verified R4.1/M2-M4 candidate. The uncommitted primary-checkout draft at `3676526` is diagnostic input only and is not an implementation base. After a zero-blocker document review, the owner must create a docs-only reviewed-plan commit whose parents include `9e7648f` and whose changed paths are limited to `PLAN.md`, this companion plan, and the review/GO record in `AGENT_LOG.md`; R4.3-00 must be created from that exact reviewed-plan commit, not directly from `9e7648f`.
+
+**Objective:** Make the claim "the harness actually repairs a defect" true end to end: the Worker sees real repository bytes, writes a real patch, runs a declared check against the patched workspace, promotes a verified Task Candidate to the private Run Head, freezes a separate fresh Run Candidate, and advances the target ref only through the final Grant-bound CAS. The existing governance, Permit, reservation, and typed CAS boundaries are preserved and completed rather than bypassed.
+
+**Relationship to R4.2.** R4.2-01 planned a hand-written `GitMkTree` stdin line protocol with incremental tree reuse. That task is **superseded and withdrawn**: prepared commits are constructed through a temporary index file instead (`read-tree` / `hash-object -w` / `update-index` / `write-tree` / `commit-tree`), which touches no ref, delegates incremental tree reuse to Git itself, and removes the stdin overflow protocol entirely. The R4.2-01 skeleton commit `b4d802e` in `.worktrees/m1-r4-2-git-objects` is abandoned, not merged. R4.2-02 through R4.2-05 are absorbed into R4.3-01 through R4.3-05. R4.2-03's Docker process seam is implemented by R4.3-03; `DEBT-M2-005` remains **OPEN** until that task observes a real restricted Docker invocation and synchronizes `README.md`, `SECURITY.md`, `SPRINT.md`, and `AGENT_LOG.md`. No final v0.1 completion claim may leave that debt in an ambiguous state.
+
+**Observed defect inventory (re-derived from the tree at `3676526`, not from earlier plan text):**
+
+1. `adapters/repository/git.py:983` reserves the target through `GitWorktreeAddNoCheckout`, so `reservation.path` is an empty directory. `application/composition.py:505` builds the Worker snapshot over that empty directory; every Worker read observes nothing.
+2. `application/composition.py:148-156` returns a fixed placeholder string as the Worker Context Capsule content. No goal, task contract, or file bytes reach the model.
+3. `application/composition.py:504-518` constructs `ScopedToolRuntime` without `executor`, `patch_executor`, `declared_checks`, `sanitized_snapshot`, `deadline_journal`, or `deadline_authority`. `domain/tools.py:873` and `domain/tools.py:913` therefore fail closed on every `patch` and `check` in the production composition.
+4. `adapters/state/sqlite.py:2040` inserts `run_candidates.prepared_oid` as `NULL`, and `delivery/cli.py:645` silently falls back to `context.candidate_head_oid`. The final CAS is consequently a no-op that reports success.
+5. `tests/acceptance/test_money_unit_drift_run.py:14` and `tests/acceptance/test_timestamp_unit_drift_run.py:14` are `xfail(strict=True)`; `tests/integration/test_composed_runtime_lifecycle.py:417` asserts the target OID is **unchanged**.
+6. `demo.py:76` fabricates behaviour (2) of course requirement A.6 by calling `replace(request, prompt=...)` by hand. The real feedback binding in `domain/worker.py:78` is never driven by the demonstration.
+
+**Reusable material already in the tree (no reimplementation permitted):** `GitLsTreeRecursive`, `GitLsTreePath`, `GitCatFileBlob`, `GitCatFileSize` (`git.py:1007-1023`); `GrantedWorkspaceAdapter` unified-diff application and atomic replacement (`granted_workspace.py`); `ExecutionResult.from_output` output bounding and secret-line redaction (`tools.py:250`); `SqliteStateStore.action_deadline` (`sqlite.py:8183`) already satisfying `CheckDeadlineJournal`; `SanitizedSnapshot.from_regular_files` (`tools.py:131`), which performs no filesystem access; `GitTargetCasAdapter.apply` (`target_cas.py`), which already accepts an arbitrary `prepared_oid`.
+
+**Execution plan:** Eight sequential tasks in separate worktrees, beginning at the reviewed-plan commit descended from `9e7648f`. Each task observes red on its own selectors before implementation, receives an independent SPEC review and an independent quality review, fixes every critical/high finding, and updates the ledger before the next task worktree is created. Each row has exactly one corresponding PR (`PR-R4.3-00` through `PR-R4.3-07`); owner-only PR creation, push, and merge remain external gates, but no two tasks may be combined into one PR. Commit bodies carry `PLAN-Task`, `Subagent`, `Human-Changes`, `Spec-Review`, and `Quality-Review`.
+
+**R4.3 Ledger (initial plan):**
+
+| Task | Module | Depth | PR | Worktree | Base (exact reviewed ancestor) | Implementation commit | Spec-Review | Quality-Review |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | reviewed-plan commit descended from `9e7648f` | pending | pending | pending |
+| R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit | pending | pending | pending |
+| R4.3-02 | Attempt PatchExecutor and Worker context | REAL | PR-R4.3-02 | .worktrees/m1-r4-3-patch-context | R4.3-01 final-reviewed commit | pending | pending | pending |
+| R4.3-03 | Restricted Docker composition wiring | REAL | PR-R4.3-03 | .worktrees/m1-r4-3-executor-wiring | R4.3-02 final-reviewed commit | pending | pending | pending |
+| R4.3-04 | Task Candidate preparation and private promotion | REAL | PR-R4.3-04 | .worktrees/m1-r4-3-task-candidate | R4.3-03 final-reviewed commit | pending | pending | pending |
+| R4.3-05 | Run Candidate freeze and final target CAS | REAL | PR-R4.3-05 | .worktrees/m1-r4-3-run-candidate | R4.3-04 final-reviewed commit | pending | pending | pending |
+| R4.3-06 | Acceptance fixtures and retention purge | REAL | PR-R4.3-06 | .worktrees/m1-r4-3-acceptance-retention | R4.3-05 final-reviewed commit | pending | pending | pending |
+| R4.3-07 | Same-revision release verification | REAL | PR-R4.3-07 | .worktrees/m1-r4-3-release-gates | R4.3-06 final-reviewed commit | pending | pending | pending |
+
+**Module-wide invariants.** Every task holds these; a violation is a critical review finding.
+
+- No task writes into `reservation.path`. The locked no-checkout reservation worktree remains the target-reservation evidence and is never a Worker workspace.
+- The target ref is byte-identical before R4.3-05's final CAS and changes exactly once there. R4.3-04 may change only `refs/apexcrew/runs/<run-id>` through an Admission-issued `RefCasIntent`; it must prove that the target ref and all user refs are unchanged. No task uses raw ref text or a direct Git update.
+- A Task Candidate is not a Run Candidate. R4.3-04 records the Attempt's prepared/verified change and privately promotes it to the Run Head; R4.3-05 freezes the resulting Run Candidate with a fresh run-wide Evidence Bundle and integrates only that frozen candidate through the final Grant-bound `TargetCasIntent`. A missing prepared OID never falls back to the current head.
+- Unified-diff application has exactly one implementation. Duplicating the hunk algorithm is a critical finding.
+- Every uncovered branch denies. A patch that does not apply, a check without a trusted deadline, a workspace entry that is not a regular blob, and a preparation failure all fail closed; none of them degrade to a permissive default.
+- Secret-path matches are never echoed into a result, a model request, an executor input, a log line, or an exception message.
+- The Worker Context Capsule reads only `R union D`; a mutable patch/check workspace is materialized separately for `Q union W`. Neither path silently widens to the full repository, and a digest from one path cannot authorize the other.
+- The only process executor in production composition is `RestrictedDockerExecutor` with a digest-pinned image. Docker unavailability returns bounded uncertainty; there is no host-subprocess fallback or environment-variable escape hatch.
+- Every task has one named PR, one implementation commit plus recorded SPEC/quality review and correction SHAs, and one ledger update before the next task worktree is created. The docs-only reviewed-plan commit is an ancestor of R4.3-00 and contains no source, test, fixture, or CI change.
+
+**Per-task review gate.** After each task's implementation commit, an independent SPEC reviewer checks the task against the frozen `SPEC.md` and this plan. The task owner fixes every Critical/High finding and records the correction commits. A separate quality reviewer then checks the corrected task diff and tests; the owner fixes every Critical/High finding and records those corrections. Only then may the task row, implementation base, reviewer IDs, correction SHAs, and ledger SHA be written to `PLAN.md`/`AGENT_LOG.md`, and only then may the next worktree be created. A final module review cannot substitute for any missing task review.
+
+**Review correction addendum (binding).** The independent review must explicitly verify the following: the formal base is `9e7648f` and no unreviewed `3676526` draft is copied; the prior red claims are invalidated and fresh red output is captured in a disposable checkout rooted at `9e7648f` with only the task's named red tests before implementation; the reviewed-plan docs commit is an ancestor of R4.3-00; host execution is absent; Task Candidate/private Run Head promotion and Run Candidate/final target CAS are separate state transitions; context uses `R union D` while each check materialization uses its own `Q_i union W_i`; in-scope filtering precedes symlink/submodule and secret rejection; typed index operations cover deletion, rename as delete-plus-add, and executable-mode changes with the required `REQUIRE_APPROVAL`; every task has its own PR mapping; retention content/quarantine state does not block purge and all eligible artifact metadata enters the frozen Purge Manifest; `DEBT-M2-005` is closed only after an observed restricted Docker process run and synchronized documentation; and final verification includes exact performance thresholds, MockLLM onboarding, static replay-size, WebUI accessibility/responsive checks at 360 and 1440 CSS pixels, both Windows and Ubuntu CI definitions, GitLab `unit-test`, and same-revision release evidence. Any omission is a document-review blocker.
+
+**R4.3 Document Review Record (current review is not a GO):**
+
+| Field | Value |
+| --- | --- |
+| Reviewed implementation base | `9e7648f` |
+| Primary diagnostic draft | `3676526` (uncommitted; invalid implementation/red-evidence base) |
+| Reviewer | `019fe0e5-77f9-7050-bde1-d3b42d1da1a1` (`gpt-5.6-luna`, max reasoning) |
+| Verdict | `PASS` (second independent review; zero Critical/High findings) |
+| Review findings | All first-review findings corrected and rechecked: Run Candidate parent/prepared OID, clean-base red evidence, reviewed-plan ancestor, union filter order, per-check `Q_i`, typed delete/rename/mode, PR map, exact viewports, `DEBT-M2-005` state, GitLab `unit-test` |
+| Review-input PLAN.md SHA-256 (before this PASS record) | `98D0005BFB0930745A3A35369E6732260387D798F91844FC06EE26290F7398A5` |
+| Review-input companion plan SHA-256 (before this PASS record) | `21B6BD802224F9E950C6D25A60732D49D02493C619AF0EF39E274796EAB32E7C` |
+| Reviewed-plan commit / owner M1 GO | pending docs-only commit; `GO` granted for R4.3 source work under this plan |
+
+---
+
+### R4.3-00 Demonstration Feedback Loop Correction (REAL)
+
+Course requirement A.6 behaviour (2) is currently fabricated. This task is sequenced first because it is independent of the repository plumbing and is a graded deliverable.
+
+**Files:** `src/apexcrew/adapters/repository/unified_diff.py` (new); `src/apexcrew/adapters/repository/granted_workspace.py`; `src/apexcrew/adapters/executor/memory_patch.py` (new); `src/apexcrew/demo.py`; `tests/unit/test_demo.py`
+
+**Closed design:**
+
+The hunk algorithm and its regular expression move from `GrantedWorkspaceAdapter` into `adapters/repository/unified_diff.py` as module-level `apply_unified_diff(original: bytes, unified_diff: str) -> bytes` and `reverse_unified_diff(current: bytes, unified_diff: str) -> bytes`, raising the existing `RepositoryUnsafeError` codes unchanged. `GrantedWorkspaceAdapter._apply_unified_diff` and `_reverse_unified_diff` become thin delegating static methods so existing call sites and their tests remain valid.
+
+`MemoryPatchExecutor` implements `PatchExecutorPort` over an in-memory file mapping. Its denial order is fixed and identical to `FakeExecutor.apply_patch`: lease not `ACTIVE` or not exactly one patch entry, then non-canonical path, then secret-path match, then a path outside `lease.write_globs`, then a diff that `apply_unified_diff` rejects. The first four return the codes they already return today; the fifth returns `LEASE_SCOPE_DENIED` and carries `# DEBT-M3-001`, because the closed `PatchExecutionResult` code set cannot distinguish a malformed patch from a scope violation and widening it requires a `SPEC.md` amendment that this module does not open. `post_tree_digest` uses the algorithm already used by `FakeExecutor`, `sha256_digest(canonical_json({path: "sha256:" + sha256(content).hexdigest()}))` over sorted paths, so the two executors remain contract-interchangeable.
+
+`build_demo_trace` keeps behaviour (1) on the real `ActionPolicy.default().classify` and behaviour (3) on the real `FreshnessAssessment.assess`. Behaviour (2) is rebuilt on the production `WorkerLoopService`: a `ScriptedMockLLM` subclass returns `check` on the first turn and `patch` on the second; a demonstration model client adapts `ModelReservationRequest` to `ModelDispatchResult`; a real `ScopedToolRuntime` receives `MemoryRepositorySnapshot`, `FakeExecutor` as `executor` with an injected non-zero exit, `MemoryPatchExecutor` as `patch_executor`, a `DeclaredCheckRegistry`, a `SanitizedSnapshot`, and a demonstration deadline journal/authority pair. The demonstration authority derives `ALLOW` from the real `ActionPolicy`, and the demonstration attempt state calls the real `validate_authorized_worker_action` and the real `bounded_worker_feedback`.
+
+Binding constraints that must hold or `ScopedToolRuntime._current_authorization` denies before any tool runs: the authority's `binding_digest` equals the runtime's `authorization_binding_digest`; `repository_id`, `snapshot_digest`, `scope_digest`, and `dependency_fingerprint_basis` all originate from one `WorkerTurnBinding`; `SanitizedSnapshot.tree_digest` equals `binding.snapshot_digest`; `ActionDeadline.snapshot_digest` equals that same digest; and `ActionDeadline.expires_at` equals `started_at + V01_MECHANISM_LIMITS.check_timeout_seconds` exactly, which is 600 seconds.
+
+**Red evidence status:** The earlier observations made at `3676526` with an uncommitted test draft are invalidated and are not evidence. Before R4.3-00 implementation, create a disposable checkout rooted at formal base `9e7648f` (and later prove that the reviewed-plan docs commit is its only documentation ancestor), introduce only the named red selectors in that task, and capture fresh failure output. No green result or implementation file may be copied from `3676526`.
+
+**Required fresh red selectors (to be observed at that clean base before implementation):**
+
+- `pytest tests/unit/test_demo.py::test_demo_feedback_behavior_is_driven_by_the_real_worker_loop` → RED (`KeyError: 'loop_turns'`)
+- `pytest tests/unit/test_demo.py::test_demo_failed_check_is_produced_by_a_real_tool_execution` → RED (`KeyError: 'tool_executions'`)
+- `pytest tests/unit/test_demo.py::test_demo_binds_the_observed_failure_into_the_next_model_request` → RED (`KeyError: 'feedback_role'`)
+- `pytest tests/unit/test_demo.py::test_demo_repair_reaches_the_workspace` → RED (`KeyError: 'repaired_path'`)
+
+**Green evidence:** All five demonstration selectors pass. The emitted feedback event reports `loop_turns=2`, `tool_executions=2`, `first_action=check`, `next_action=patch`, `first_turn_result=CHECK_FAILED`, `next_turn_result=PATCH_APPLIED`, `feedback_role=tool`, a `feedback_bound` string containing `"code":"CHECK_FAILED"` and the injected failure text, `first_turn_feedback_absent=true`, and `repaired=true` for `src/money.py`. `python -m apexcrew.demo` is repeatable and byte-identical across runs, performs no network access, and reads no credential. `mypy src`, `ruff check .`, `ruff format --check .`, and `git diff --check` are clean, and the existing `granted_workspace` protected-patch suite still passes against the extracted algorithm.
+
+---
+
+### R4.3-01 Attempt Context and Check Workspace Materialization (REAL)
+
+**Files:** `src/apexcrew/adapters/repository/attempt_workspace.py` (new); `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_workspace.py` (new)
+
+**Closed design:** `AttemptWorkspaceAdapter(repository, runner, data_root, secret_paths)` exposes two explicit materializers from the same pinned tree: `materialize_context(*, attempt_id, base_oid, read_globs, dependency_globs) -> MaterializedWorkspace` and `materialize_check(*, attempt_id, base_oid, input_globs, write_globs) -> MaterializedWorkspace`. The first manifest is exactly `R union D` and is used for Worker read/search/context facts. The second manifest is exactly `Q union W` and is the only mutable workspace supplied to the patch executor and Docker check snapshot. `MaterializedWorkspace` carries `root: Path`, `entries: tuple[SanitizedSnapshotEntry, ...]` sorted by canonical path, and a tree digest computed with the R4.3-00 algorithm. The two roots and digests are retained separately in the Attempt binding; neither digest is accepted in place of the other.
+
+Entries come from `GitLsTreeRecursive(base_oid)`. Filtering is fail-closed and ordered: first canonicalize each entry and test membership in the requested union; an entry outside that union is skipped without mode, secret-policy, or blob inspection. Only an in-scope entry is then checked for mode `120000` or `160000`, a secret-path match, regular-blob status, and the `MAX_SNAPSHOT_ENTRIES` (2 000) bound. A symlink or submodule in scope raises rather than skipping, because silently omitting it would let a Worker believe its scope is complete. Surviving entries are read with `GitCatFileBlob` and written under separate `data_root/attempts/<attempt-id>/context/` and `data_root/attempts/<attempt-id>/check/` roots through `StableHandleTree` no-follow handles. An existing directory for the attempt is removed and rebuilt, so materialization is idempotent after a crash mid-write. The check workspace includes every `W` path even when `W` is not in `Q`; Plan validation still proves `W` is covered by the Task's `R` scope.
+
+The reservation worktree is untouched by this adapter; that is asserted, not assumed.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_attempt_workspace.py::test_context_materializes_read_and_dependency_union` → RED (module absent)
+- `pytest tests/integration/test_attempt_workspace.py::test_check_materializes_input_and_write_union` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_context_and_check_digests_are_not_interchangeable` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_glob_scope_enforced` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_secret_path_rejected_without_echoing_path` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_symlink_mode_rejected` → RED (POSIX only; `skipif` on Windows where the entry cannot be constructed)
+- `pytest tests/integration/test_attempt_workspace.py::test_materialize_is_idempotent_after_partial_write` → RED
+- `pytest tests/integration/test_attempt_workspace.py::test_reservation_worktree_is_not_written` → RED
+
+**Green evidence:** All selectors pass; context bytes equal `git cat-file blob` output for every `R union D` path, check bytes equal it for every `Q union W` path, the two digests remain distinct when the manifests differ, the reservation worktree is untouched, and all non-final refs remain unchanged; `mypy`, `ruff`, `git diff --check` clean.
+
+---
+
+### R4.3-02 Attempt PatchExecutor and Worker Context (REAL)
+
+**Files:** `src/apexcrew/adapters/executor/attempt_patch.py` (new); `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_patch_executor.py` (new); `tests/integration/test_worker_context.py` (new)
+
+**Closed design:** `AttemptPatchExecutor(workspace, secret_paths)` implements `PatchExecutorPort` with the R4.3-00 denial order, differing only in persistence: it reads the current bytes through a no-follow handle, applies `apply_unified_diff`, writes through `tempfile.mkstemp` in the same directory followed by `os.replace`, and recomputes `tree_digest`. `StableHandleTree.assert_name_bindings()` runs immediately before and after the replacement so an ancestor-directory substitution between preflight and write is denied with zero side effects, matching the guarantee already established for granted actions. A rejected diff leaves the file byte-identical.
+
+`_CompositionWorkerContext.build_current` stops returning a placeholder. It emits canonical JSON containing the persisted goal, constraints, acceptance criteria, `task_id`, the task contract's `read_globs`, `dependency_globs`, `write_globs`, and declared checks with their `check_id` and `argv`, plus only the contents of regular files in the separate `R union D` context workspace. Per-file content is bounded by `max_file_bytes` (131 072) and the file set is bounded in aggregate, with an explicit truncation marker when either bound binds. Secret-policy matches are excluded before content is read. `ContextCapsule.create` receives one dependency digest per included context file, so a change in the observed context changes the capsule binding and remains visible to `FreshnessAssessment`; the `Q union W` check workspace is bound independently and never becomes model context implicitly.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_attempt_patch_executor.py::test_patch_writes_real_bytes` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_patch_outside_write_globs_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_malformed_diff_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_ancestor_replacement_between_preflight_and_write_denied` → RED (POSIX only)
+- `pytest tests/integration/test_worker_context.py::test_context_contains_task_contract_and_scoped_files` → RED (placeholder string still returned)
+- `pytest tests/integration/test_worker_context.py::test_context_excludes_secret_paths` → RED
+- `pytest tests/integration/test_worker_context.py::test_context_truncation_is_marked` → RED
+
+**Green evidence:** All selectors pass; the existing `FakeExecutor` contract suite still passes unchanged against the shared `post_tree_digest` algorithm; `mypy`, `ruff`, `git diff --check` clean.
+
+---
+
+### R4.3-03 Check Executor Composition Wiring (REAL)
+
+**Files:** `src/apexcrew/application/composition.py`; `src/apexcrew/adapters/executor/restricted.py`; `README.md`; `SECURITY.md`; `SPRINT.md`; `AGENT_LOG.md`; `tests/integration/test_composed_worker_tools.py` (new); `tests/integration/test_restricted_executor_docker.py` (modify/add selectors)
+
+**Closed design:** `_CompositionWorkerTools._runtime()` supplies the six parameters currently omitted. `snapshot` is the read-only context snapshot from the `R union D` workspace for read/search; `patch_executor` is the R4.3-02 executor over the `Q union W` mutable workspace; `sanitized_snapshot` for a check is built from that same `Q union W` workspace with its own digest; `declared_checks` resolves only the approved check definition; `deadline_journal` is the existing store, which already implements `action_deadline`; and `deadline_authority` is the existing authority service. The runtime rejects a binding that swaps the context and check digests. For a Run Check Set, each check has its own declared `Q_i` (and approved `W_i` where applicable), its own `Q_i union W_i` materialization and digest, and its own check binding; no Run-level union is reused for another check.
+
+`declared_checks` requires a `check_id` that `DeclaredCheckRegistry.require()` can resolve. `CheckDefinition` carries no identifier today, so the identifier is derived by one function, `check_id_for(task_id, definition)`, defined once and used both where task contracts are persisted and where the registry is built. A duplicated or divergent derivation is the most likely failure mode in this task and is covered by a dedicated contract test before the wiring is written.
+
+`RestrictedDockerExecutor` is the sole production `ExecutorPort`. Its command is always the existing digest-pinned Docker invocation with `--network=none`, no host network or Docker socket, read-only input, bounded scratch, dropped capabilities, and the approved environment allowlist. Docker absence, image failure, timeout, or an unobservable process result returns the existing bounded uncertainty result and never falls back to a host subprocess. There is no `APEXCREW_HOST_EXECUTOR` switch, `LocalSubprocessExecutor`, or `DEBT-M3-002`; adding one would require a SPEC amendment and is outside this plan.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_composed_worker_tools.py::test_check_id_derivation_is_shared` → RED
+- `pytest tests/integration/test_composed_worker_tools.py::test_composed_patch_is_not_lease_scope_denied` → RED (currently denied because `patch_executor` is `None`)
+- `pytest tests/integration/test_composed_worker_tools.py::test_composed_check_resolves_declared_definition` → RED
+- `pytest tests/integration/test_composed_worker_tools.py::test_context_and_check_workspace_bindings_are_distinct` → RED
+- `pytest tests/integration/test_restricted_executor_docker.py::test_docker_executor_is_the_only_composed_check_path` → RED
+
+**Green evidence:** All selectors pass; composition always selects `RestrictedDockerExecutor`, no host subprocess selector or environment escape exists, context/check workspace bindings are distinct, the Docker boundary tests pass or remain explicitly platform/daemon-skipped, and `mypy`, `ruff`, `git diff --check` are clean. `SECURITY.md` states that Docker unavailability is uncertainty, not a local-execution fallback.
+
+---
+
+### R4.3-04 Task Candidate Preparation and Private Run-Head Promotion (REAL)
+
+**Files:** `src/apexcrew/domain/admission.py`; `src/apexcrew/adapters/repository/git.py`; `src/apexcrew/adapters/repository/candidate_preparation.py` (new); `src/apexcrew/adapters/state/sqlite.py`; `src/apexcrew/adapters/state/memory.py`; `src/apexcrew/application/runtime.py`; `tests/integration/test_task_candidate_promotion.py` (new); `tests/integration/test_candidate_preparation.py` (new)
+
+**Closed design:** The typed `GitOperation` union and its argv `match` gain `GitReadTree(base_oid)`, `GitHashObjectWrite(blob_path)`, `GitUpdateIndexCacheInfo(mode, blob_oid, path)`, `GitRemoveIndexPath(path)`, `GitWriteTree()`, and `GitCommitTree(tree_oid, parent_oid, message)`. None accepts or produces a target ref. `mode` is restricted to `100644` and `100755`; any other value is rejected before argv construction. A deletion uses `GitRemoveIndexPath`; a rename is represented and approved as a typed delete of the old canonical path followed by a typed add/update of the new path, never as an unvalidated Git similarity heuristic. Executable-bit changes and delete/rename actions carry the SPEC `REQUIRE_APPROVAL` decision and exact path binding before preparation. `closed_git_environment` gains an optional index-file parameter and injects `GIT_INDEX_FILE` only when one is supplied, and it pins `GIT_AUTHOR_*` and `GIT_COMMITTER_*` to fixed values so a prepared commit is reproducible and its OID is deterministic. No stdin channel is added to `GitSpawner`, because `hash-object -w -- <path>` reads the already-materialized file.
+
+`CandidatePreparationAdapter.prepare_task_candidate(*, run_id, task_id, attempt_id, run_head_oid, workspace, changed_paths, message) -> TaskCandidate` writes its temporary index under `.apexcrew/data/index/<run_id>/<attempt_id>.idx` and removes it on both success and failure. It reads the base tree from `run_head_oid`, hashes only changed additions/modifications, applies typed removals for deletions, and commits a rename as the approved delete-plus-add pair. Unchanged blobs are reused by Git through the base tree and are never rehashed. It records a Task Candidate only after the current Attempt binding, patch post-state, Task Evidence Bundle, Task Freshness Assessment, exact action approvals, and check-workspace digest all match the same Run Head. Preparation never updates a ref.
+
+`Admission.promote_task_candidate` then takes the persisted Task Candidate and issues one `RefCasIntent` with `ref_name=private_ref(run_id)`, `expected_old_oid=run_head_oid`, and `prepared_oid=task_candidate.prepared_oid`. It serializes this operation under the Run-ref lock, settles only the observed `PRIVATE_REF_INITIALIZED` result, and advances the durable Run Head only after the private ref post-state is proven. Private promotion cannot create a `TargetCasIntent`, consume the final Grant, or settle the Run as integrated. A conflict, failure, or unobservable result leaves the Task Candidate and intent recoverable and never mutates the target ref.
+
+`delivery/cli.py:645` loses its silent fallback. `integrate --preview` without a stored `prepared_oid` now refuses instead of returning `candidate_head_oid`, because that fallback is precisely what made a no-op integration report success.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_candidate_preparation.py::test_prepared_commit_parent_is_run_head` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_prepared_commit_contains_patched_bytes` → RED
+- `pytest tests/integration/test_task_candidate_promotion.py::test_private_promotion_changes_only_run_head` → RED
+- `pytest tests/integration/test_task_candidate_promotion.py::test_task_candidate_cannot_be_integrated_as_run_candidate` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_no_target_ref_is_touched` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_unchanged_blobs_reuse_base_tree` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_preparation_failure_yields_no_candidate` → RED
+- `pytest tests/integration/test_candidate_preparation.py::test_preview_refuses_without_prepared_oid` → RED (currently returns the head OID)
+- `pytest tests/integration/test_candidate_preparation.py::test_prepared_oid_is_deterministic_across_runs` → RED
+
+**Green evidence:** All selectors pass; `git cat-file -t <task_candidate.prepared_oid>` reports `commit`; its first parent is the exact Run Head and its patched path matches the Attempt workspace; the private Run Head changes only through the typed Ref CAS; the target ref and unrelated refs are byte-identical; no Task Candidate is accepted by the final-integration path; the temporary index file does not survive either outcome; `mypy`, `ruff`, `git diff --check` clean.
+
+---
+
+### R4.3-05 Run Candidate Freeze and Final Target CAS (REAL)
+
+**Files:** `src/apexcrew/domain/admission.py`; `src/apexcrew/adapters/state/sqlite.py`; `src/apexcrew/adapters/state/memory.py`; `src/apexcrew/application/runtime.py`; `src/apexcrew/delivery/cli.py`; `src/apexcrew/adapters/repository/target_cas.py`; `tests/integration/test_run_candidate.py` (new); `tests/integration/test_composed_runtime_lifecycle.py` (modify)
+
+**Closed design:** `prepare_run_candidate(run_id)` runs only after every required Task Candidate has been privately promoted. It records the exact current private Run Head as `H`, asserts the pinned target is still `T0`, and revalidates all Task Candidate Freshness Assessments and the complete run-wide Evidence Bundle against `H`. It then constructs a fresh independent prepared commit `R` whose complete tree is the Run Head tree and whose single parent is `T0`, using the typed temporary-index operations; `R` is not the private Run Head and is never obtained by assigning `H`. Each approved Run check executes against `R` with its own declared `Q_i union W_i` materialization and digest. Only after every check and the fresh run-wide Evidence Bundle are bound to `R` does it create the frozen `RunCandidate` row with `candidate_id`, `head_oid=H`, `prepared_oid=R`, `target_base_oid=T0`, evidence digest, and target-safety binding. The stored `prepared_oid` is required and must resolve to a commit whose first parent is exactly `T0`; absence, a parent mismatch, or an accidental reuse of `H` is an error rather than a fallback.
+
+`integrate_run_candidate` accepts only that frozen `RunCandidate` plus an exact unexpired final Approval Grant and Runtime Permit. It creates one `TargetCasIntent` with `expected_old_oid=T0` and `prepared_oid=R`; it never promotes a Task Candidate directly, never uses `candidate_head_oid` when `prepared_oid` is absent, and never updates the private ref as part of final integration. `GitTargetCasAdapter.apply` is the sole target-ref writer. A successful post-state proves the target ref equals the frozen `R`, then the Run records `COMPLETED` before administrative reservation cleanup; a conflict or unobservable result remains recoverable/`INDETERMINATE` and cannot be relabeled by pause or cancellation.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_run_candidate.py::test_run_candidate_requires_all_promoted_tasks_and_fresh_run_bundle` → RED
+- `pytest tests/integration/test_run_candidate.py::test_run_candidate_stores_prepared_oid_explicitly` → RED (current store writes `NULL`)
+- `pytest tests/integration/test_run_candidate.py::test_final_integration_refuses_missing_prepared_oid` → RED (current delivery falls back to the head)
+- `pytest tests/integration/test_run_candidate.py::test_final_cas_changes_target_once_from_pinned_old_oid` → RED
+- `pytest tests/integration/test_composed_runtime_lifecycle.py::test_composed_runtime_integrates_frozen_candidate_once` → RED (target OID remains unchanged until this task is implemented)
+
+**Green evidence:** All selectors pass; a Run Candidate exists only after all task candidates and the run-wide checks are fresh, its stored `prepared_oid=R` is non-null and resolves to the newly constructed frozen commit whose first parent is exactly `T0`, the private Run Head `H` is unchanged during final integration, the target ref changes exactly once from `T0` to `R`, and replay cannot issue another CAS. The tests assert `R` was constructed from the complete `H` tree rather than passing `H` through as the prepared OID, and all per-check `Q_i union W_i` digests are bound to `R`. `mypy`, `ruff`, `git diff --check`, and the existing recovery/CAS selectors are clean.
+
+---
+
+### R4.3-06 Acceptance Fixtures and Retention Purge (REAL)
+
+**Files:** `tests/integration/test_composed_runtime_lifecycle.py`; `tests/acceptance/test_money_unit_drift_run.py`; `tests/acceptance/test_timestamp_unit_drift_run.py`; `src/apexcrew/domain/retention.py`; `src/apexcrew/domain/commands.py`; `src/apexcrew/adapters/state/sqlite.py`; `src/apexcrew/adapters/state/memory.py`; `src/apexcrew/application/control.py`; `tests/integration/test_purge_prepare.py`; `tests/integration/test_purge_confirmation.py`; `tests/integration/test_redaction_and_retention.py`; `README.md`; `SECURITY.md`; `SPRINT.md`; `AGENT_LOG.md`
+
+**Closed design:** The lifecycle model drives `read -> patch -> check -> finish` through the real WorkerLoop and the real `Q union W` check snapshot. The integration assertion requires the target ref to differ from its pinned OID, the final commit's first parent to equal that pinned OID, and the repaired content to be present. Both fixture tests remove `xfail(strict=True)` and assert that the seeded Python money drift and TypeScript timestamp drift are corrected with zero remaining strict xfail.
+
+Purge inventory is metadata-first. `RetentionManager.purge_inventory(run_id) -> tuple[PurgeLocalArtifactEntry, ...]` returns every terminal-Run local artifact whose metadata is retained, expired, quarantined, or `DROPPED_BY_RETENTION`, sorted by `(relative_path, artifact_digest)`, without reading content or requiring a preview. `prepare_purge` includes that complete inventory in the frozen `PurgeManifestDocument`; an absent or already-evicted payload is a manifested idempotent deletion, not a purge blocker. Purge eligibility remains exactly the SPEC 10.4 authoritative-state test: terminal Run, no owner, no unsettled/recovery-required intent or `INDETERMINATE`, no live Pending Action/lease/usable Grant-delivery obligation, and settled Target Reservation cleanup. Confirmation deletes only the frozen database rows and validated local paths under the data root, never Git objects, refs, the reservation worktree, or user files; `PURGING` recovery resumes the same manifest.
+
+**Red evidence:**
+
+- `pytest tests/integration/test_composed_runtime_lifecycle.py::test_composed_runtime_integrates_frozen_candidate_once` -> RED until the real target CAS path is wired
+- `pytest tests/acceptance/test_money_unit_drift_run.py::test_money_unit_drift_is_detected_and_repaired_end_to_end` -> RED after removing `xfail`
+- `pytest tests/acceptance/test_timestamp_unit_drift_run.py::test_timestamp_unit_drift_is_detected_and_repaired_end_to_end` -> RED after removing `xfail`
+- `pytest tests/integration/test_purge_prepare.py::test_retained_quarantined_and_dropped_artifacts_enter_frozen_manifest` -> RED
+- `pytest tests/integration/test_purge_prepare.py::test_missing_retention_content_does_not_block_purge` -> RED
+- `pytest tests/integration/test_purge_confirmation.py::test_purge_recovery_is_idempotent_for_missing_artifact` -> RED
+
+**Green evidence:** The acceptance selectors pass in separate processes; the full offline suite reports zero xfail; the frozen purge manifest contains all eligible artifact metadata even when content is unavailable, purge is denied only for the SPEC-listed live/uncertain states, confirmation/recovery is idempotent, Tier 2/quarantined bytes never enter projections or exports, and the target/ref/worktree remain untouched by purge. README, SECURITY, SPRINT, and AGENT_LOG state the observed executor and retention behavior exactly.
+
+---
+
+### R4.3-07 Same-Revision Release Verification (REAL)
+
+**Files:** `.github/workflows/ci.yml`; `.github/workflows/release.yml`; `.gitlab-ci.yml`; `scripts/measure_performance.py`; `scripts/check_static_replay.py`; `scripts/check_required_ci_duration.py`; `tests/acceptance/test_delivery_contracts.py`; `tests/acceptance/test_performance_gate.py`; `tests/acceptance/test_webui_quality.py`; `README.md`; `SECURITY.md`; `AGENT_LOG.md`
+
+**Closed design:** The local release gate proves the exact committed source revision has the required Windows and Ubuntu CI jobs, the GitLab compatibility file has a `unit-test` job, the static replay remains under its declared size cap, maximum-shape performance stays within the recorded p95/offline-suite/MockLLM-onboarding limits, and the read-only WebUI is usable at exactly 360 and 1440 CSS pixels. Browser checks use the existing local static bundle and a real browser: load, keyboard-only traversal with visible focus, no horizontal overflow, required accessible names/landmarks, WCAG 2.2 AA, Lighthouse Accessibility >=95, non-color status/decision expression, and screenshots at both required viewports with no overlap or clipped controls. The check is read-only and produces no remote artifact or credential.
+
+`release.yml` remains fail-closed until a protected external workflow supplies one successful same-SHA `ci.yml` run with the exact final GitHub job set (`quality`, `unit-ubuntu`, `unit-windows`, `integration`, `build`, `pages`, `browser-quality`, `reference-performance`) and the required artifact digests/duration, and the same revision's `.gitlab-ci.yml:unit-test` definition is present and its observed result is recorded when a GitLab runner is available. The local test asserts that a different commit, missing Windows/Ubuntu job, missing `unit-test`, skipped browser/performance job, duplicate job, or stale artifact is rejected; it does not claim hosted CI or publication without owner authorization.
+
+**Red evidence:**
+
+- `pytest tests/acceptance/test_delivery_contracts.py::test_ci_has_windows_and_ubuntu_same_revision_jobs` -> RED before both platform jobs are asserted
+- `pytest tests/acceptance/test_performance_gate.py::test_maximum_shape_and_onboarding_limits_are_enforced` -> RED before observed measurements are wired
+- `pytest tests/acceptance/test_delivery_contracts.py::test_static_replay_size_gate_is_fail_closed` -> RED
+- `pytest tests/acceptance/test_webui_quality.py::test_webui_is_keyboard_accessible_and_responsive` -> RED before the browser-quality selector exists
+- `pytest tests/acceptance/test_delivery_contracts.py::test_release_verifier_requires_same_revision_final_job_set` -> RED
+
+**Green evidence:** `uv sync --frozen --all-groups`, `make test`, `make lint`, `make demo`, `make secret-scan`, `make web-build`, `make build`, `python scripts/measure_performance.py`, `python scripts/check_static_replay.py`, and the focused delivery/browser selectors all pass with observed output; Windows and Ubuntu workflow definitions are present; the local release verifier binds source/job/artifact evidence to one SHA and reports the external gate as pending when no owner-authorized hosted run exists. No push, PR merge, tag, credential, Pages deployment, package publication, or live provider request is performed by this task.
+
+---
+
+**Final state:** The Worker observes real repository bytes in an `R union D` context, writes a real patch in a separate `Q union W` check workspace through a no-follow atomic replacement, and receives objective Docker feedback. A verified Task Candidate is privately promoted through the Run Head; a separate fresh Run Candidate is frozen with a non-null prepared OID; the final human Grant drives exactly one target-ref CAS; both acceptance fixtures repair their seeded defect deterministically under `ScriptedMockLLM`; retention/purge remains metadata-first and idempotent; and local release gates cover performance, onboarding, static size, browser accessibility/responsive behavior, both CI platforms, and same-SHA evidence. `SPEC.md` is unmodified. Remaining debts are listed by their owning reviewed task; no host-executor escape or unsupported release claim is introduced.
