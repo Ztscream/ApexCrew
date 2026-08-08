@@ -280,7 +280,7 @@ class RecordingTools:
 
 
 class UncertainTools:
-    execution_count = 0
+    execution_count: int = 0
 
     def execute(self, intent: ToolIntent) -> ToolResult:
         self.execution_count += 1

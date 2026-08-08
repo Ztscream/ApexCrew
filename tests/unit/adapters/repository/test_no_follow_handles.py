@@ -545,6 +545,33 @@ def test_windows_stale_not_directory_status_cannot_enable_file_fallback() -> Non
     assert create.calls == 1
 
 
+class _PrefixReadKernel:
+    def SetFilePointerEx(self, *arguments: object) -> bool:
+        del arguments
+        return True
+
+    def ReadFile(
+        self,
+        handle: object,
+        buffer: object,
+        maximum: int,
+        read: object,
+        overlapped: object,
+    ) -> bool:
+        del handle, overlapped
+        payload = b"abcdef"[:maximum]
+        memmove(buffer, payload, len(payload))
+        cast(read, POINTER(wintypes.DWORD)).contents.value = len(payload)
+        return True
+
+
+def test_windows_prefix_read_keeps_bounded_prefix_for_oversize_file() -> None:
+    backend = WindowsNoFollowBackend.__new__(WindowsNoFollowBackend)
+    backend.__dict__["_kernel32"] = _PrefixReadKernel()
+
+    assert backend._read_file_handle_prefix(1, 3) == b"abc"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DLL signatures require Win32")
 def test_windows_wrapped_calls_have_explicit_ctypes_signatures() -> None:
     backend = WindowsNoFollowBackend()

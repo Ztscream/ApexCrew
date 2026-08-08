@@ -133,7 +133,7 @@ class AttemptPatchExecutor(PatchExecutorPort):
                     try:
                         tree.close()
                     except (OSError, RepositoryUnsafeError) as error:
-                        if mutation_started:
+                        if mutation_started or created_node is not None:
                             raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                         raise
 

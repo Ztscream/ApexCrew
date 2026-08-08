@@ -991,27 +991,9 @@ class ScopedToolRuntime:
                 lease, {str(path): action.unified_diff.encode("utf-8")}
             )
         except PatchExecutionUncertain:
-            return ToolResult(
-                code="INFRASTRUCTURE_UNCERTAINTY",
-                run_id=intent.run_id,
-                intent_id=intent.intent_id,
-                timed_out=True,
-                bounded_payload={
-                    "reason": "PATCH_RESULT_UNCERTAIN",
-                    "snapshot_digest": intent.snapshot_digest,
-                },
-            )
+            return self._uncertain_patch_result(intent)
         if result.code == "PATCH_RESULT_UNCERTAIN":
-            return ToolResult(
-                code="INFRASTRUCTURE_UNCERTAINTY",
-                run_id=intent.run_id,
-                intent_id=intent.intent_id,
-                timed_out=True,
-                bounded_payload={
-                    "reason": "PATCH_RESULT_UNCERTAIN",
-                    "snapshot_digest": intent.snapshot_digest,
-                },
-            )
+            return self._uncertain_patch_result(intent)
         if result.code != "PATCH_APPLIED":
             denial: ToolDenialCode = (
                 "SECRET_PATH_DENIED"
@@ -1028,6 +1010,19 @@ class ScopedToolRuntime:
                 "snapshot_digest": intent.snapshot_digest,
             },
             content_digest=result.post_tree_digest,
+        )
+
+    @staticmethod
+    def _uncertain_patch_result(intent: ToolIntent) -> ToolResult:
+        return ToolResult(
+            code="INFRASTRUCTURE_UNCERTAINTY",
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            timed_out=True,
+            bounded_payload={
+                "reason": "PATCH_RESULT_UNCERTAIN",
+                "snapshot_digest": intent.snapshot_digest,
+            },
         )
 
     def _check(self, intent: ToolIntent) -> ToolResult:

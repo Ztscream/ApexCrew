@@ -34,7 +34,12 @@ def apply_unified_diff(original: bytes, unified_diff: str) -> bytes:
             new_count = int(match.group(4) or "1")
         except ValueError as error:
             raise RepositoryUnsafeError("PROTECTED_PATCH_FORMAT_INVALID") from error
-        target_index = old_start - 1
+        if old_count == 0:
+            if old_start != 0:
+                raise RepositoryUnsafeError("PROTECTED_PATCH_CONTEXT_MISMATCH")
+            target_index = 0
+        else:
+            target_index = old_start - 1
         if target_index < source_index or target_index > len(source_lines):
             raise RepositoryUnsafeError("PROTECTED_PATCH_CONTEXT_MISMATCH")
         output.extend(source_lines[source_index:target_index])

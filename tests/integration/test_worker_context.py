@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -114,6 +115,10 @@ class _Store:
     def __init__(self, workspace: MaterializedWorkspace) -> None:
         self.binding = _binding()
         self.adapter = _WorkspaceAdapter(workspace)
+        self.contract = _contract()
+        self.goal = "repair the task"
+        self.constraints = ("offline",)
+        self.acceptance_criteria = ("check passes",)
 
     def current_worker_turn_binding(self, attempt_id: AttemptId) -> WorkerTurnBinding:
         assert attempt_id == self.binding.attempt_id
@@ -121,14 +126,14 @@ class _Store:
 
     def task_contracts(self, plan_digest: RevisionDigest) -> tuple[TaskContract, ...]:
         assert plan_digest == self.binding.plan_digest
-        return (_contract(),)
+        return (self.contract,)
 
     def bootstrap_inputs(self, run_id: RunId) -> RunBootstrapInputs:
         assert run_id == self.binding.run_id
         return RunBootstrapInputs(
-            goal="repair the task",
-            constraints=("offline",),
-            acceptance_criteria=("check passes",),
+            goal=self.goal,
+            constraints=self.constraints,
+            acceptance_criteria=self.acceptance_criteria,
         )
 
     def run_record(self, run_id: RunId) -> SimpleNamespace:
@@ -204,6 +209,24 @@ def test_context_excludes_secret_paths(tmp_path: Path) -> None:
     assert "private/token.key" not in capsule.content
     assert "TOP SECRET" not in capsule.content
     assert [item["path"] for item in json.loads(capsule.content)["files"]] == ["src/read.py"]
+
+
+def test_context_redacts_secret_metadata(tmp_path: Path) -> None:
+    context, store = _context(tmp_path, {"src/read.py": b"safe\n"})
+    store.goal = "repair private/config.key"
+    store.constraints = ("offline private/**",)
+    store.acceptance_criteria = ("check private/config.key",)
+    store.contract = replace(store.contract, constraints=("avoid private/config.key",))
+
+    capsule = context.build_current(store.binding.attempt_id)
+    payload = json.loads(capsule.content)
+
+    assert payload["goal"] == "[redacted]"
+    assert payload["constraints"] == ["[redacted]"]
+    assert payload["acceptance_criteria"] == ["[redacted]"]
+    assert payload["task_contract"]["constraints"] == ["[redacted]"]
+    assert "private/config.key" not in capsule.content
+    assert "private/**" not in capsule.content
 
 
 def test_context_truncation_is_marked(tmp_path: Path) -> None:

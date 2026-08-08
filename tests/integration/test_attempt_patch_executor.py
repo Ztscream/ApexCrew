@@ -83,7 +83,6 @@ def test_patch_writes_real_bytes(tmp_path: Path) -> None:
     assert result.post_tree_digest == memory_result.post_tree_digest
 
 
-@pytest.mark.skipif(os.name == "nt", reason="covers POSIX new-file handle readability")
 def test_patch_creates_real_file_and_binds_post_digest(tmp_path: Path) -> None:
     root = tmp_path / "check"
     (root / "src").mkdir(parents=True)
@@ -158,6 +157,40 @@ def test_new_file_creation_is_cleaned_up_when_prewrite_binding_fails(
 
     assert result.code == "LEASE_SCOPE_DENIED"
     assert not target.exists()
+
+
+def test_new_file_cleanup_and_close_uncertainty_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    original_assert = StableHandleTree.assert_name_bindings
+    calls = 0
+
+    def fail_after_create(tree: StableHandleTree) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RepositoryUnsafeError("injected binding failure")
+        original_assert(tree)
+
+    def fail_cleanup(tree: StableHandleTree, relative: str, expected: object) -> None:
+        del tree, relative, expected
+        raise RepositoryUnsafeError("injected cleanup failure")
+
+    def fail_close(tree: StableHandleTree) -> None:
+        del tree
+        raise OSError("injected close failure")
+
+    monkeypatch.setattr(StableHandleTree, "assert_name_bindings", fail_after_create)
+    monkeypatch.setattr(StableHandleTree, "remove_file", fail_cleanup)
+    monkeypatch.setattr(StableHandleTree, "close", fail_close)
+
+    with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
+        AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+            _lease("src/**"),
+            {"src/new.py": b"@@ -0,0 +1 @@\n+created\n"},
+        )
 
 
 def test_malformed_diff_denied_with_zero_side_effects(tmp_path: Path) -> None:

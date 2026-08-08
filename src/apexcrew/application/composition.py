@@ -218,11 +218,27 @@ def _contains_secret_context_token(token: str, secret_policy: SecretPathPolicy) 
     return False
 
 
-def _safe_context_argv(argv: tuple[str, ...], secret_policy: SecretPathPolicy) -> list[str]:
+def _redact_secret_context_argv(
+    argv: tuple[str, ...], secret_policy: SecretPathPolicy
+) -> list[str]:
     return [
         "[redacted]" if _contains_secret_context_token(token, secret_policy) else token
         for token in argv
     ]
+
+
+def _redact_secret_context_text(value: str, secret_policy: SecretPathPolicy) -> str:
+    lines: list[str] = []
+    for line in value.splitlines(keepends=True):
+        if any(
+            _contains_secret_context_token(token, secret_policy)
+            for token in re.findall(r"[^\s]+", line)
+        ):
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            lines.append("[redacted]" + ending)
+        else:
+            lines.append(line)
+    return "".join(lines)
 
 
 class _CompositionWorkerContext:
@@ -262,21 +278,9 @@ class _CompositionWorkerContext:
             run.repository_instance_digest,
             self._secret_policy,
         )
-        context_read_globs = tuple(
-            pattern
-            for pattern in contract.read_globs
-            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
-        )
-        context_dependency_globs = tuple(
-            pattern
-            for pattern in contract.dependency_globs
-            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
-        )
-        context_write_globs = tuple(
-            pattern
-            for pattern in contract.write_globs
-            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
-        )
+        context_read_globs = self._allowed_context_globs(contract.read_globs)
+        context_dependency_globs = self._allowed_context_globs(contract.dependency_globs)
+        context_write_globs = self._allowed_context_globs(contract.write_globs)
         workspace = adapter.materialize_context(
             attempt_id=attempt_id,
             base_oid=GitOid(binding.admissible_head),
@@ -288,22 +292,31 @@ class _CompositionWorkerContext:
         )
         checks = [
             {
-                "argv": _safe_context_argv(definition.argv, self._secret_policy),
+                "argv": _redact_secret_context_argv(definition.argv, self._secret_policy),
                 "check_id": _check_aliases(binding.task_id, ordinal)[0],
             }
             for ordinal, definition in enumerate(contract.checks)
         ]
         content = canonical_json(
             {
-                "acceptance_criteria": list(bootstrap.acceptance_criteria),
+                "acceptance_criteria": [
+                    _redact_secret_context_text(item, self._secret_policy)
+                    for item in bootstrap.acceptance_criteria
+                ],
                 "checks": checks,
-                "constraints": list(bootstrap.constraints),
+                "constraints": [
+                    _redact_secret_context_text(item, self._secret_policy)
+                    for item in bootstrap.constraints
+                ],
                 "context_tree_digest": str(workspace.tree_digest),
                 "dependency_fingerprint_basis": str(binding.dependency_fingerprint_basis),
                 "files": files,
-                "goal": bootstrap.goal,
+                "goal": _redact_secret_context_text(bootstrap.goal, self._secret_policy),
                 "task_contract": {
-                    "constraints": list(contract.constraints),
+                    "constraints": [
+                        _redact_secret_context_text(item, self._secret_policy)
+                        for item in contract.constraints
+                    ],
                     "dependency_globs": [item.value for item in context_dependency_globs],
                     "dependency_task_ids": [str(item) for item in contract.dependency_task_ids],
                     "read_globs": [item.value for item in context_read_globs],
@@ -364,7 +377,9 @@ class _CompositionWorkerContext:
                 dependencies.append(str(dependency_digest))
                 files.append(
                     {
-                        "content": raw.decode("utf-8", errors="replace"),
+                        "content": _redact_secret_context_text(
+                            raw.decode("utf-8", errors="replace"), self._secret_policy
+                        ),
                         "dependency_digest": str(dependency_digest),
                         "path": str(path),
                         "truncated": file_truncated,
@@ -377,6 +392,13 @@ class _CompositionWorkerContext:
         finally:
             tree.close()
         return files, tuple(dependencies), bool(reasons), sorted(set(reasons))
+
+    def _allowed_context_globs(self, patterns: tuple[GlobPattern, ...]) -> tuple[GlobPattern, ...]:
+        return tuple(
+            pattern
+            for pattern in patterns
+            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
+        )
 
     @staticmethod
     def _observed_dependency_digest(
