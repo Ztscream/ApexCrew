@@ -2330,3 +2330,12 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Execution constraint**: deadline 2026-08-10 23:59 with ~20-25 hours estimated remaining. Five complete REAL-depth tasks within that window is at high risk; prioritized R4.2-01 structure for handoff to followup agent/human.
 - **Artifacts**: PLAN.md revised section "M1-R4.2 Worker Integration and Prepared Commit Revision" with five-task ledger, closed design per task, red/green evidence selectors, and final-state description. Worktree branch `codex/m1-r4-2-git-objects` with skeleton code and test placeholders.
 - **Decision**: R4.2 is a valid corrective module that unblocks three major blocked tasks (R4-03B/R4-04B/R4-05B direct dependencies). Skeleton-depth infrastructure is adequate for inheritance by next execution phase. No push, PR, review, or credential action occurred. Skeleton commit `b4d802e` remains local to worktree pending spec/quality review and completion decision.
+
+## 2026-08-08 / M1-R4.3 document review gate
+
+- **Formal base**: `9e7648f` on `codex/m2-m4-final-production`; primary draft `3676526` and abandoned skeleton `b4d802e` remain diagnostic only.
+- **Review-input plan digests** (computed immediately before writing the PASS record): `PLAN.md` SHA-256 `98D0005BFB0930745A3A35369E6732260387D798F91844FC06EE26290F7398A5`; companion plan SHA-256 `21B6BD802224F9E950C6D25A60732D49D02493C619AF0EF39E274796EAB32E7C`.
+- **Independent reviewer**: `019fe0e5-77f9-7050-bde1-d3b42d1da1a1`, configured as `gpt-5.6-luna` with max reasoning (the requested `gpt-5.6-luna-max` reviewer configuration).
+- **Review sequence**: first review `BLOCKED`; corrections covered independent Run Candidate `R` parented by pinned target `T0`, clean-base red evidence, reviewed-plan ancestry, union filtering, per-check `Q_i`, typed delete/rename/mode approvals, per-task PR mapping, exact browser gates, `DEBT-M2-005`, and GitLab `unit-test`; second independent review returned `PASS` with zero Critical/High findings and no SPEC/AGENTS conflict.
+- **Owner decision**: `M1 GO` for R4.3 source work, subject to the docs-only reviewed-plan commit, per-task worktree/PR/review gates, and no-push/no-credential rules. No source/test/fixture/CI files were staged by this gate.
+- **Human changes**: none.
