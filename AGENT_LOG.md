@@ -2683,3 +2683,10 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Final quality review**: reviewer `019fe112-7865-7e90-a440-7c5c802bf78a`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High findings and one Low documentation marker finding.
 - **Correction**: added the required `# DEBT-M3-001` marker to the malformed-diff denial branch in `MemoryPatchExecutor`. No runtime behavior changed.
 - **Verification**: the final quality rerun is required against this marker-only correction; focused tests and static checks remain green. No provider credential, network request, push, remote PR, or live Docker request occurred.
+
+## 2026-08-08 / R4.3-00 final review closeout
+
+- **Final reviewed commit**: `654804a6c34474edf19745d2680191ea0cfc198c`; implementation chain is `3fb60c1d9e9151abb435370a05b63a4d64934cb9` with corrections `408f106f01efb1f43f322b81e64bf63dc3d80a8a` and `654804a6c34474edf19745d2680191ea0cfc198c`.
+- **Final quality rerun**: reviewer `019fe12c-1db4-70f0-bd7e-c53f244a238c`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High/Medium/Low findings.
+- **SPEC disposition**: the corrected behavioral commit `408f106f01efb1f43f322b81e64bf63dc3d80a8a` received rerun `PASS` with zero Critical/High/Medium findings; `654804a` is marker-only and does not alter runtime behavior.
+- **Ledger status**: R4.3-00 is `COMPLETED`; the next task must start from final reviewed commit `654804a6c34474edf19745d2680191ea0cfc198c` in a fresh worktree. No provider credential, network request, push, remote PR, or live Docker request occurred.
