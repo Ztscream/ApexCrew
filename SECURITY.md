@@ -51,6 +51,11 @@ quarantined content remain excluded from exports. The restricted executor
 launches only the closed digest-pinned Docker argv and reports daemon/process
 unavailability as a typed failure.
 
+`DEBT-M3-001`: malformed unified diffs in the offline demo are denied with the
+existing `LEASE_SCOPE_DENIED` result because the closed patch-result contract
+does not have a distinct malformed-diff code. The denial is fail-closed and
+requires a reviewed `SPEC.md` amendment before the result vocabulary changes.
+
 `DEBT-R4-RECOVERY-001`: the R4.1 action-class recovery and exact resolution paths
 are implemented and offline-verified. The remaining boundary is the explicitly
 authorized real-provider request; ordinary verification continues to use

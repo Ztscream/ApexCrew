@@ -164,6 +164,9 @@ The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python 
 
 Multi-intent recovery selects a member only from exactly one authoritative observation; ambiguity remains `INDETERMINATE`. Retention redacts/quarantines restricted diagnostics and applies the documented expiry/eviction order. The restricted executor launches only the digest-pinned, networkless Docker command and fails closed when Docker is unavailable.
 
-No active `DEBT-` markers remain in `src`; abstract Protocol methods are ports,
-not deferred production success paths. Real DeepSeek smoke, hosted Pages enablement,
-push, merge, and package publication remain explicit owner actions.
+`DEBT-M3-001` remains in the offline demo's malformed-unified-diff denial path:
+the closed `PatchExecutionResult` code set cannot distinguish malformed input
+from a lease-scope denial, so the path fails closed until a reviewed SPEC
+amendment changes that contract. Abstract Protocol methods are ports, not
+deferred production success paths. Real DeepSeek smoke, hosted Pages
+enablement, push, merge, and package publication remain explicit owner actions.
