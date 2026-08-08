@@ -2657,3 +2657,14 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner decision**: `M1 GO` for R4.3 source work, subject to the docs-only reviewed-plan commit, per-task worktree/PR/review gates, and no-push/no-credential rules. No source/test/fixture/CI files were staged by this gate.
 - **Reviewed-plan commit**: formal-base commit `e8461003ee3c8da888683fb1975bb1523803096c` contains only the approved plan, companion plan, and this review record. The current docs-only closeout is its descendant and is the immediate ancestor of R4.3-00 so the recorded commit identity is included in the implementation ancestry.
 - **Human changes**: none.
+
+## 2026-08-08 / R4.3-00 real demonstration feedback loop
+
+- **Worktree/branch/base**: `.worktrees/m1-r4-3-demo-loop` / `codex/m1-r4-3-demo-loop`, descended from docs-only closeout `d51cf806` and formal implementation base `9e7648f`.
+- **Subagent**: Codex implementation pass for R4.3-00. **Human-Changes**: none.
+- **Red evidence**: the four named demo selectors initially failed with missing trace fields (`loop_turns`, `tool_executions`, `feedback_role`, and `repaired_path`), and the memory-patch selector initially failed with `ModuleNotFoundError` for `memory_patch`.
+- **Implementation**: this task commit adds the shared strict unified-diff module and deterministic in-memory patch executor, delegates granted protected-patch application/reversal to the shared algorithm, and drives `build_demo_trace` through `WorkerLoopService`, `ScopedToolRuntime`, `FakeExecutor`, `ScriptedMockLLM`, and bounded structured feedback. The exact implementation SHA is recorded in the R4.3 ledger after ordered reviews.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_demo.py tests/unit/adapters/executor/test_memory_patch.py -q` -> `7 passed`; related granted workspace/patch/check/recovery selectors -> `19 passed, 2 skipped`; `python -m apexcrew.demo` repeated byte-identically; mypy, Ruff check/format, and `git diff --check` passed.
+- **Review configuration**: the independent SPEC and quality reviewers are configured as `gpt-5.6-luna-max` (the local reviewer record uses `gpt-5.6-luna` with max reasoning).
+- **Review status**: ordered independent SPEC-compliance review followed by independent code-quality review is pending against the task commit. No provider credential, network request, push, remote PR, or live Docker request occurred.
+- **Lesson**: the Worker feedback demonstration must exercise the same tool/runtime boundary as production; a prompt replacement can show a changed action without proving that the failed check or repair ever happened.
