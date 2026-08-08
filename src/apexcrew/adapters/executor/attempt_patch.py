@@ -71,6 +71,7 @@ class AttemptPatchExecutor(PatchExecutorPort):
         with self._lock:
             tree: StableHandleTree | None = None
             created_node: OpenedNode | None = None
+            creation_in_progress = False
             mutation_started = False
             post_tree_digest: Sha256DigestText | None = None
             try:
@@ -98,7 +99,9 @@ class AttemptPatchExecutor(PatchExecutorPort):
                     tree.open(parent, "directory")
                 tree.assert_name_bindings()
                 if node is None:
+                    creation_in_progress = True
                     node = tree.create_file(str(path))
+                    creation_in_progress = False
                     created_node = node
                 else:
                     expected_identity = node.identity
@@ -125,6 +128,8 @@ class AttemptPatchExecutor(PatchExecutorPort):
                         raise AttemptPatchExecutionError(
                             "PATCH_RESULT_UNCERTAIN"
                         ) from cleanup_error
+                if creation_in_progress:
+                    raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                 if mutation_started:
                     raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                 return PatchExecutionResult(code="LEASE_SCOPE_DENIED")
@@ -133,7 +138,7 @@ class AttemptPatchExecutor(PatchExecutorPort):
                     try:
                         tree.close()
                     except (OSError, RepositoryUnsafeError) as error:
-                        if mutation_started or created_node is not None:
+                        if mutation_started or created_node is not None or creation_in_progress:
                             raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN") from error
                         raise
 

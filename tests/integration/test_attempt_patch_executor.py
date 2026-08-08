@@ -193,6 +193,26 @@ def test_new_file_cleanup_and_close_uncertainty_is_typed(
         )
 
 
+def test_new_file_creation_side_effect_before_error_is_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    original_create = StableHandleTree.create_file
+
+    def create_then_fail(tree: StableHandleTree, relative: str) -> object:
+        original_create(tree, relative)
+        raise RepositoryUnsafeError("injected create result uncertainty")
+
+    monkeypatch.setattr(StableHandleTree, "create_file", create_then_fail)
+
+    with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
+        AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+            _lease("src/**"),
+            {"src/new.py": b"@@ -0,0 +1 @@\n+created\n"},
+        )
+
+
 def test_malformed_diff_denied_with_zero_side_effects(tmp_path: Path) -> None:
     root = tmp_path / "check"
     (root / "src").mkdir(parents=True)

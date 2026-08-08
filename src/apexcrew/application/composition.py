@@ -194,12 +194,30 @@ def _declared_check_definitions(
 
 MAX_WORKER_CONTEXT_FILE_BYTES = 131_072
 MAX_WORKER_CONTEXT_BYTES = 512 * 1024
+_CONTEXT_PATH_FRAGMENT = re.compile(
+    r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_.~+*-]+(?:/[A-Za-z0-9_.~+*-]+)+"
+)
+_CONTEXT_BARE_FRAGMENT = re.compile(r"[A-Za-z0-9_.~+*-]+")
+
+
+def _context_token_candidates(token: str) -> list[str]:
+    normalized = token.replace("\\", "/")
+    candidates = [normalized, *re.split(r"[=,:]", normalized)]
+    candidates.extend(match.group(0) for match in _CONTEXT_PATH_FRAGMENT.finditer(normalized))
+    candidates.extend(match.group(0) for match in _CONTEXT_BARE_FRAGMENT.finditer(normalized))
+    expanded: list[str] = []
+    for candidate in candidates:
+        parts = candidate.split("/")
+        expanded.extend("/".join(parts[index:]) for index in range(len(parts)))
+        trimmed = candidate.rstrip(".,;:!?)]}")
+        if trimmed != candidate:
+            trimmed_parts = trimmed.split("/")
+            expanded.extend("/".join(trimmed_parts[index:]) for index in range(len(trimmed_parts)))
+    return expanded
 
 
 def _contains_secret_context_token(token: str, secret_policy: SecretPathPolicy) -> bool:
-    normalized = token.replace("\\", "/")
-    candidates = [normalized, *re.split(r"[=,:]", normalized)]
-    for candidate in candidates:
+    for candidate in _context_token_candidates(token):
         candidate = candidate.strip("'\"`()[]{}<>,:;").lstrip("/")
         if not candidate:
             continue
@@ -230,10 +248,7 @@ def _redact_secret_context_argv(
 def _redact_secret_context_text(value: str, secret_policy: SecretPathPolicy) -> str:
     lines: list[str] = []
     for line in value.splitlines(keepends=True):
-        if any(
-            _contains_secret_context_token(token, secret_policy)
-            for token in re.findall(r"[^\s]+", line)
-        ):
+        if _contains_secret_context_token(line, secret_policy):
             ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
             lines.append("[redacted]" + ending)
         else:

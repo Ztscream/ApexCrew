@@ -35,9 +35,7 @@ def apply_unified_diff(original: bytes, unified_diff: str) -> bytes:
         except ValueError as error:
             raise RepositoryUnsafeError("PROTECTED_PATCH_FORMAT_INVALID") from error
         if old_count == 0:
-            if old_start != 0:
-                raise RepositoryUnsafeError("PROTECTED_PATCH_CONTEXT_MISMATCH")
-            target_index = 0
+            target_index = old_start
         else:
             target_index = old_start - 1
         if target_index < source_index or target_index > len(source_lines):

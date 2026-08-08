@@ -229,6 +229,24 @@ def test_context_redacts_secret_metadata(tmp_path: Path) -> None:
     assert "private/**" not in capsule.content
 
 
+def test_context_redacts_embedded_secret_paths(tmp_path: Path) -> None:
+    context, store = _context(tmp_path, {"src/read.py": b"safe\n"})
+    store.goal = 'repair read("private/config.key")'
+    store.constraints = (r"run C:\private\config.key",)
+    store.acceptance_criteria = ("check private/config.key.",)
+    store.contract = replace(store.contract, constraints=('avoid "private/config.key"',))
+
+    capsule = context.build_current(store.binding.attempt_id)
+    payload = json.loads(capsule.content)
+
+    assert payload["goal"] == "[redacted]"
+    assert payload["constraints"] == ["[redacted]"]
+    assert payload["acceptance_criteria"] == ["[redacted]"]
+    assert payload["task_contract"]["constraints"] == ["[redacted]"]
+    assert "private/config.key" not in capsule.content
+    assert "C:\\private\\config.key" not in capsule.content
+
+
 def test_context_truncation_is_marked(tmp_path: Path) -> None:
     context, store = _context(
         tmp_path,
