@@ -772,6 +772,7 @@ class ScopedToolRuntime:
         patch_executor: PatchExecutorPort | None = None,
         declared_checks: DeclaredCheckRegistry | None = None,
         sanitized_snapshot: SanitizedSnapshot | None = None,
+        materialized_snapshot_digest: Sha256DigestText | None = None,
         deadline_journal: CheckDeadlineJournal | None = None,
         deadline_authority: CheckDeadlineAuthority | None = None,
         workspace_lease: WorkspaceLease | None = None,
@@ -793,6 +794,13 @@ class ScopedToolRuntime:
         self._patch_executor = patch_executor
         self._declared_checks = declared_checks
         self._sanitized_snapshot = sanitized_snapshot
+        self._materialized_snapshot_digest = (
+            materialized_snapshot_digest
+            if materialized_snapshot_digest is not None
+            else sanitized_snapshot.tree_digest
+            if sanitized_snapshot is not None
+            else snapshot_digest
+        )
         self._deadline_journal = deadline_journal
         self._deadline_authority = deadline_authority
         self._workspace_lease = workspace_lease
@@ -1038,14 +1046,17 @@ class ScopedToolRuntime:
             return self._denied(intent, "LEASE_SCOPE_DENIED")
         definition = self._declared_checks.require(action.check_id)
         snapshot = self._sanitized_snapshot
+        allowed_snapshot_globs = definition.input_globs
+        if self._workspace_lease is not None:
+            allowed_snapshot_globs += self._workspace_lease.write_globs
         if (
             snapshot.repository_id != intent.repository_id
-            or snapshot.tree_digest != intent.snapshot_digest
+            or snapshot.tree_digest != self._materialized_snapshot_digest
             or any(
                 self._policy.classify(ReadAction(path=entry.path)) != "ALLOW"
                 or not any(
                     pattern.matches(CanonicalPath.parse(entry.path))
-                    for pattern in definition.input_globs
+                    for pattern in allowed_snapshot_globs
                 )
                 for entry in snapshot.entries
             )
@@ -1058,7 +1069,8 @@ class ScopedToolRuntime:
             or deadline.applicable_revision_digests != intent.applicable_revision_digests
             or deadline.action_class != ActionClass.DECLARED_CHECK
             or deadline.check_id != action.check_id
-            or deadline.snapshot_digest != snapshot.tree_digest
+            or deadline.snapshot_digest != intent.snapshot_digest
+            or deadline.snapshot_digest != self._snapshot_digest
         ):
             raise ToolValidationError("CURRENT_CHECK_DEADLINE_REQUIRED")
         timeout_seconds = int((deadline.expires_at - deadline.started_at).total_seconds())

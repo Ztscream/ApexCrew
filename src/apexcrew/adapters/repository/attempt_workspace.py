@@ -141,12 +141,18 @@ class AttemptWorkspaceAdapter:
         base_oid: GitOid,
         input_globs: Sequence[GlobPattern],
         write_globs: Sequence[GlobPattern],
+        workspace_key: str | None = None,
     ) -> MaterializedWorkspace:
+        kind = (
+            "check"
+            if workspace_key is None
+            else "check-" + sha256(workspace_key.encode("utf-8")).hexdigest()
+        )
         return self._materialize(
             attempt_id=attempt_id,
             base_oid=base_oid,
             globs=(*input_globs, *write_globs),
-            kind="check",
+            kind=kind,
         )
 
     def close(self) -> None:

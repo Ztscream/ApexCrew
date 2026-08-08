@@ -414,15 +414,7 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         assert check_snapshot.materialized_paths == ("src/task.py",)
         assert timeout_seconds == 600
         reservation = bundle.runtime._store.target_reservation_for_run(run_id)
-        workspace_file = (
-            root
-            / ".apexcrew"
-            / "data"
-            / "workspaces"
-            / reservation.reservation_id
-            / "src"
-            / "task.py"
-        )
+        workspace_file = check_snapshot.root / "src" / "task.py"
         assert workspace_file.read_text(encoding="utf-8") == "value = 2\n"
         assert tuple(path.name for path in reservation.path.iterdir()) == (".git",)
         deadline_row = bundle.runtime._store._connection.execute(  # type: ignore[attr-defined]

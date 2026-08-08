@@ -16,7 +16,7 @@ from apexcrew.adapters.repository.no_follow import (
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.adapters.repository.unified_diff import apply_unified_diff, reverse_unified_diff
-from apexcrew.domain.actions import RiskyAction
+from apexcrew.domain.actions import RiskyAction, ToolActionEnvelope
 from apexcrew.domain.admission import RepositoryEffectUncertain
 from apexcrew.domain.effects import canonical_json, sha256_digest
 from apexcrew.domain.plan import CanonicalPath
@@ -101,7 +101,22 @@ class GrantedWorkspaceAdapter:
         if self._is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
             raise RepositoryUnsafeError("GRANTED_REGULAR_FILE_REQUIRED")
         content = path.read_bytes()
-        if path.lstat() != metadata:
+        observed = path.lstat()
+        if (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_size,
+            observed.st_mtime_ns,
+            observed.st_ctime_ns,
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ):
             raise RepositoryUnsafeError("GRANTED_FILE_CHANGED_DURING_READ")
         return content, stat.S_IMODE(metadata.st_mode)
 
@@ -248,6 +263,26 @@ class GrantedWorkspaceAdapter:
                 state="UNAVAILABLE",
                 digest=self._observation_digest(action, "UNAVAILABLE", None, None, None),
             )
+
+    def expected_prestate(self, action: ToolActionEnvelope) -> ActionPreState:
+        if not isinstance(action, RiskyAction):
+            return ActionPreState()
+        source = self._path(action.path, require_protected=action.operation == "protected_patch")
+        source_entry = self._regular_if_present(source)
+        source_digest: Sha256DigestText | None = None
+        source_mode: int | None = None
+        if source_entry is not None:
+            source_content, source_mode = source_entry
+            source_digest = self._digest(source_content)
+        destination_absent = True
+        if action.destination is not None:
+            destination = self._path(action.destination)
+            destination_absent = self._regular_if_present(destination) is None
+        return ActionPreState(
+            source_digest=source_digest,
+            source_mode=source_mode,
+            destination_absent=destination_absent,
+        )
 
     def delete_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
         if os.name != "posix":

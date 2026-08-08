@@ -35,6 +35,40 @@ def _docker_image_digest() -> str:
     return digest
 
 
+def test_docker_executor_is_the_only_composed_check_path() -> None:
+    executor = RestrictedDockerExecutor(
+        ExecutorProfileDocument(
+            image_digest="sha256:" + "0" * 64,
+            platform="linux",
+            architecture="x86_64",
+            tool_versions=(ToolVersionDocument(name="python", version="3.12"),),
+            allowed_executables=("python",),
+            environment_allowlist=("PATH",),
+            run_as_uid=1000,
+            run_as_gid=1000,
+            root_filesystem_read_only=True,
+            network_mode="none",
+            cpu_limit=Decimal(1),
+            memory_limit_bytes=64 * 1024 * 1024,
+            pids_limit=64,
+            scratch_limit_bytes=1024 * 1024,
+            drop_all_capabilities=True,
+            no_new_privileges=True,
+        )
+    )
+
+    command = executor.command_for(("python", "-c", "pass"))
+
+    assert isinstance(executor, RestrictedDockerExecutor)
+    assert command[:3] == ("docker", "run", "--rm")
+    assert "--network=none" in command
+    assert "--read-only" in command
+    assert "--cap-drop=ALL" in command
+    assert "--security-opt=no-new-privileges" in command
+    assert "LocalSubprocessExecutor" not in type(executor).__name__
+    assert "APEXCREW_HOST_EXECUTOR" not in repr(executor)
+
+
 def test_committed_image_enforces_restricted_executor_boundary(tmp_path: Path) -> None:
     digest = _docker_image_digest()
     marker = "print('approved snapshot')\n"
