@@ -30707,7 +30707,7 @@ The local `.env` remains ignored and untracked. Push, PR merge, hosted release, 
 | Task | Module | Depth | PR | Worktree | Base (exact reviewed ancestor) | Implementation commit | Spec-Review | Quality-Review |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | formal-base docs-only closeout descended from `e8461003ee3c8da888683fb1975bb1523803096c` | COMPLETED: `3fb60c1d9e9151abb435370a05b63a4d64934cb9`; corrections `408f106f01efb1f43f322b81e64bf63dc3d80a8a`, `654804a6c34474edf19745d2680191ea0cfc198c` | PASS: `019fe10e-3452-7010-b209-efee65ff9a2b`, rerun `019fe120-bcac-7c31-8419-4f0d02302356`; `gpt-5.6-luna-max` | PASS: final `019fe12c-1db4-70f0-bd7e-c53f244a238c`; initial `019fe112-7865-7e90-a440-7c5c802bf78a` findings corrected |
-| R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit | pending | pending | pending |
+| R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit `654804a` | COMPLETED: `6f3d005`; correction `f18d3c0` | PASS: `019fe13f-fac3-7eb2-9861-92c0c9e94586` initial, rerun `019fe14a-9844-7722-ad6f-4446f6c35a52`; `gpt-5.6-luna-max` | PASS: `019fe14a-98fe-7830-a37a-a2577895d258` final; initial `019fe13f-fb93-72a2-8628-fc6b0169eaa8` findings corrected |
 | R4.3-02 | Attempt PatchExecutor and Worker context | REAL | PR-R4.3-02 | .worktrees/m1-r4-3-patch-context | R4.3-01 final-reviewed commit | pending | pending | pending |
 | R4.3-03 | Restricted Docker composition wiring | REAL | PR-R4.3-03 | .worktrees/m1-r4-3-executor-wiring | R4.3-02 final-reviewed commit | pending | pending | pending |
 | R4.3-04 | Task Candidate preparation and private promotion | REAL | PR-R4.3-04 | .worktrees/m1-r4-3-task-candidate | R4.3-03 final-reviewed commit | pending | pending | pending |
@@ -30797,6 +30797,14 @@ The reservation worktree is untouched by this adapter; that is asserted, not ass
 - `pytest tests/integration/test_attempt_workspace.py::test_reservation_worktree_is_not_written` → RED
 
 **Green evidence:** All selectors pass; context bytes equal `git cat-file blob` output for every `R union D` path, check bytes equal it for every `Q union W` path, the two digests remain distinct when the manifests differ, the reservation worktree is untouched, and all non-final refs remain unchanged; `mypy`, `ruff`, `git diff --check` clean.
+
+**Observed implementation evidence (2026-08-08):**
+
+- Fresh red selectors were run in `.worktrees/m1-r4-3-attempt-workspace` before implementation; all eight selectors failed at collection with `ModuleNotFoundError: No module named 'apexcrew.adapters.repository.attempt_workspace'`.
+- `6f3d005` added the materializer, composition factory, and eight named integration selectors. `f18d3c0` corrected case-fold collisions, size-first blob bounds/exact reads, and cumulative/depth-bounded partial-root cleanup after the first quality review.
+- Focused workspace tests passed with `11 passed, 1 skipped` on this Windows host; the POSIX symlink construction is the intentional skip. The full offline suite `uv run pytest -q` passed at 100%; the only output was the existing Starlette deprecation warning.
+- `uv run mypy src`, `uv run ruff check src tests/integration/test_attempt_workspace.py`, `uv run ruff format --check src tests/integration/test_attempt_workspace.py`, and `git diff --check` all passed.
+- Initial SPEC review passed with no findings; initial quality review found one High and two Medium boundary issues, all fixed in `f18d3c0`. The independent rerun SPEC and quality reviews both returned PASS with zero Critical/High/Medium/Low findings. Residual test gaps (cross-adapter concurrency, malformed Git responses, aggregate-limit cases, and Windows-only symlink execution) remain explicit follow-up coverage; runtime Worker wiring belongs to R4.3-02/R4.3-03.
 
 ---
 
