@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import apexcrew.adapters.executor.attempt_patch as attempt_patch_module
 from apexcrew.adapters.executor.attempt_patch import (
     AttemptPatchExecutionError,
     AttemptPatchExecutor,
@@ -80,6 +81,22 @@ def test_patch_writes_real_bytes(tmp_path: Path) -> None:
         {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
     )
     assert result.post_tree_digest == memory_result.post_tree_digest
+
+
+@pytest.mark.skipif(os.name == "nt", reason="covers POSIX new-file handle readability")
+def test_patch_creates_real_file_and_binds_post_digest(tmp_path: Path) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    executor = AttemptPatchExecutor(root, _secret_policy())
+
+    result = executor.apply_patch(
+        _lease("src/**"),
+        {"src/new.py": b"@@ -0,0 +1 @@\n+created\n"},
+    )
+
+    assert result.code == "PATCH_APPLIED"
+    assert result.post_tree_digest == _tree_digest({"src/new.py": b"created\n"})
+    assert (root / "src" / "new.py").read_bytes() == b"created\n"
 
 
 def test_patch_truncates_existing_file_through_handle(tmp_path: Path) -> None:
@@ -247,6 +264,30 @@ def test_digest_failure_after_replace_is_uncertain(
             {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
         )
     assert target.read_bytes() == b"value = 2\n"
+
+
+def test_post_tree_digest_enforces_cumulative_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "a.py").write_bytes(b"abc")
+    (root / "src" / "b.py").write_bytes(b"def")
+    monkeypatch.setattr(attempt_patch_module, "MAX_WORKSPACE_BYTES", 5, raising=False)
+
+    with pytest.raises(RepositoryUnsafeError, match="SNAPSHOT_BYTE_LIMIT"):
+        AttemptPatchExecutor(root, _secret_policy()).tree_digest()
+
+
+def test_post_tree_digest_enforces_depth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "check"
+    nested = root / "src" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "task.py").write_bytes(b"value = 1\n")
+    monkeypatch.setattr(attempt_patch_module, "MAX_CLEANUP_DEPTH", 1, raising=False)
+
+    with pytest.raises(RepositoryUnsafeError, match="SNAPSHOT_DEPTH_LIMIT"):
+        AttemptPatchExecutor(root, _secret_policy()).tree_digest()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="root replacement requires POSIX symlinks")

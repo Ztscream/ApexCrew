@@ -279,6 +279,20 @@ class RecordingTools:
         )
 
 
+class UncertainTools:
+    execution_count = 0
+
+    def execute(self, intent: ToolIntent) -> ToolResult:
+        self.execution_count += 1
+        return ToolResult(
+            code="INFRASTRUCTURE_UNCERTAINTY",
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            timed_out=True,
+            bounded_payload={"snapshot_digest": SHA, "reason": "PATCH_RESULT_UNCERTAIN"},
+        )
+
+
 class FailingThenPassingTools:
     def __init__(self) -> None:
         self.execution_count = 0
@@ -389,6 +403,38 @@ def test_one_typed_completion_executes_and_records_exactly_one_action() -> None:
     assert model.call_count == 1
     assert authority.authorization_count == 1
     assert attempts.recorded_intents == 1
+    assert tools.execution_count == 1
+    assert attempts.settled_results == 1
+
+
+def test_uncertain_patch_result_settles_before_worker_pauses() -> None:
+    attempts = RecordingAttempts()
+    tools = UncertainTools()
+    model = OneCompletion(
+        {
+            "kind": "patch",
+            "path": "src/a.py",
+            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+        }
+    )
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(lambda _binding, _action: ActionPreState(source_digest=SHA)),
+        authority=cast(object, AllowAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "STOP"
+    assert decision.stop_reason == "INFRASTRUCTURE_UNCERTAINTY"
+    assert decision.resulting_sequence == 2
     assert tools.execution_count == 1
     assert attempts.settled_results == 1
 

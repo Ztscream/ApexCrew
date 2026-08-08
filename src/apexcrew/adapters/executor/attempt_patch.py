@@ -7,6 +7,8 @@ from hashlib import sha256
 from pathlib import Path
 
 from apexcrew.adapters.repository.attempt_workspace import (
+    MAX_CLEANUP_DEPTH,
+    MAX_WORKSPACE_BYTES,
     MAX_WORKSPACE_FILE_BYTES,
     MaterializedWorkspace,
 )
@@ -26,12 +28,13 @@ from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
     PatchExecutionResult,
+    PatchExecutionUncertain,
     PatchExecutorPort,
     SnapshotUnavailable,
 )
 
 
-class AttemptPatchExecutionError(RuntimeError):
+class AttemptPatchExecutionError(PatchExecutionUncertain):
     """The replacement may have committed but its post-state is not observable."""
 
 
@@ -147,22 +150,31 @@ class AttemptPatchExecutor(PatchExecutorPort):
 
     def _tree_digest(self, tree: StableHandleTree) -> Sha256DigestText:
         files: dict[str, str] = {}
-        pending: list[tuple[str, OpenedNode]] = [("", tree.root_node)]
+        pending: list[tuple[str, OpenedNode, int]] = [("", tree.root_node, 0)]
+        visited_entries = 0
+        total_bytes = 0
         while pending:
-            parent, node = pending.pop()
+            parent, node, depth = pending.pop()
             for name in reversed(tree.list_names(node, MAX_SNAPSHOT_ENTRIES)):
+                visited_entries += 1
+                if visited_entries > MAX_SNAPSHOT_ENTRIES:
+                    raise RepositoryUnsafeError("SNAPSHOT_ENTRY_LIMIT")
                 relative = name if not parent else f"{parent}/{name}"
                 child = tree.try_open_any(relative)
                 if child is None:
                     raise RepositoryUnsafeError("SNAPSHOT_ENTRY_CHANGED")
                 if child.identity.kind == "directory":
-                    pending.append((relative, child))
+                    child_depth = depth + 1
+                    if child_depth > MAX_CLEANUP_DEPTH:
+                        raise RepositoryUnsafeError("SNAPSHOT_DEPTH_LIMIT")
+                    pending.append((relative, child, child_depth))
                 else:
                     path = CanonicalPath.parse(relative)
                     content = tree.read_bytes(child, MAX_WORKSPACE_FILE_BYTES)
+                    total_bytes += len(content)
+                    if total_bytes > MAX_WORKSPACE_BYTES:
+                        raise RepositoryUnsafeError("SNAPSHOT_BYTE_LIMIT")
                     files[str(path)] = "sha256:" + sha256(content).hexdigest()
-                if len(files) + len(pending) > MAX_SNAPSHOT_ENTRIES:
-                    raise RepositoryUnsafeError("SNAPSHOT_ENTRY_LIMIT")
         tree.assert_name_bindings()
         return sha256_digest(canonical_json(files))
 

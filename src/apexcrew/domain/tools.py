@@ -96,6 +96,10 @@ class SnapshotNoFollowDenied(RuntimeError):
     pass
 
 
+class PatchExecutionUncertain(RuntimeError):
+    pass
+
+
 class SnapshotEntry(FrozenDocument):
     path: str
     size: int = Field(ge=0)
@@ -317,7 +321,12 @@ class ExecutorPort(Protocol):
 
 
 class PatchExecutionResult(FrozenDocument):
-    code: Literal["PATCH_APPLIED", "LEASE_SCOPE_DENIED", "SECRET_PATH_DENIED"]
+    code: Literal[
+        "PATCH_APPLIED",
+        "PATCH_RESULT_UNCERTAIN",
+        "LEASE_SCOPE_DENIED",
+        "SECRET_PATH_DENIED",
+    ]
     post_tree_digest: Sha256DigestText | None = None
 
 
@@ -724,9 +733,17 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
         ):
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
         return
+    if not isinstance(tool_intent.action, PatchAction):
+        raise ToolEffectResultError("PATCH_RESULT_BINDING_INVALID")
+    if tool_result.code == "INFRASTRUCTURE_UNCERTAINTY":
+        if (
+            result.outcome != "INDETERMINATE"
+            or result.snapshot_digest != tool_intent.snapshot_digest
+        ):
+            raise ToolEffectResultError("PATCH_RESULT_BINDING_INVALID")
+        return
     if (
-        not isinstance(tool_intent.action, PatchAction)
-        or tool_result.code != "PATCH_APPLIED"
+        tool_result.code != "PATCH_APPLIED"
         or result.outcome != "COMPLETED"
         or result.snapshot_digest != tool_intent.snapshot_digest
     ):
@@ -969,9 +986,32 @@ class ScopedToolRuntime:
             pattern.matches(path) for pattern in lease.write_globs
         ):
             return self._denied(intent, "LEASE_SCOPE_DENIED")
-        result = self._patch_executor.apply_patch(
-            lease, {str(path): action.unified_diff.encode("utf-8")}
-        )
+        try:
+            result = self._patch_executor.apply_patch(
+                lease, {str(path): action.unified_diff.encode("utf-8")}
+            )
+        except PatchExecutionUncertain:
+            return ToolResult(
+                code="INFRASTRUCTURE_UNCERTAINTY",
+                run_id=intent.run_id,
+                intent_id=intent.intent_id,
+                timed_out=True,
+                bounded_payload={
+                    "reason": "PATCH_RESULT_UNCERTAIN",
+                    "snapshot_digest": intent.snapshot_digest,
+                },
+            )
+        if result.code == "PATCH_RESULT_UNCERTAIN":
+            return ToolResult(
+                code="INFRASTRUCTURE_UNCERTAINTY",
+                run_id=intent.run_id,
+                intent_id=intent.intent_id,
+                timed_out=True,
+                bounded_payload={
+                    "reason": "PATCH_RESULT_UNCERTAIN",
+                    "snapshot_digest": intent.snapshot_digest,
+                },
+            )
         if result.code != "PATCH_APPLIED":
             denial: ToolDenialCode = (
                 "SECRET_PATH_DENIED"

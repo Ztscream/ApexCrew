@@ -159,6 +159,10 @@ class WindowsNoFollowBackend:
             c_void_p,
         ]
         self._kernel32.WriteFile.restype = wintypes.BOOL
+        self._kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+        self._kernel32.SetEndOfFile.restype = wintypes.BOOL
+        self._kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        self._kernel32.FlushFileBuffers.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
         self._kernel32.SetFileInformationByHandle.argtypes = [
@@ -320,18 +324,25 @@ class WindowsNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_VOLUME_OPEN_DENIED")
         return self._identity(int(handle), (), "directory")
 
-    def _read_file_handle_bounded(self, handle: int, maximum: int) -> bytes:
-        buffer = create_string_buffer(maximum + 1)
+    def _read_file_handle_prefix(self, handle: int, maximum: int) -> bytes:
+        if maximum < 0:
+            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+        if maximum == 0:
+            return b""
+        buffer = create_string_buffer(maximum)
         read = wintypes.DWORD()
         if not self._kernel32.SetFilePointerEx(wintypes.HANDLE(handle), 0, None, 0):
             raise RepositoryUnsafeError("HANDLE_SEEK_FAILED")
-        if not self._kernel32.ReadFile(
-            wintypes.HANDLE(handle), buffer, maximum + 1, byref(read), None
-        ):
+        if not self._kernel32.ReadFile(wintypes.HANDLE(handle), buffer, maximum, byref(read), None):
             raise RepositoryUnsafeError("HANDLE_READ_FAILED")
-        if read.value > maximum:
-            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+
         return bytes(buffer.raw[: read.value])
+
+    def _read_file_handle_bounded(self, handle: int, maximum: int) -> bytes:
+        value = self._read_file_handle_prefix(handle, maximum + 1)
+        if len(value) > maximum:
+            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+        return value
 
     def _query_directory_handle_names(self, handle: int, maximum: int) -> tuple[str, ...]:
         if maximum < 0:
@@ -470,6 +481,9 @@ class WindowsNoFollowBackend:
 
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._read_file_handle_bounded(node.handle, maximum)
+
+    def read_prefix(self, node: OpenedNode, maximum: int) -> bytes:
+        return self._read_file_handle_prefix(node.handle, maximum)
 
     def write_bytes(self, node: OpenedNode, value: bytes) -> None:
         buffer = create_string_buffer(value)

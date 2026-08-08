@@ -129,7 +129,7 @@ class PosixNoFollowBackend:
         try:
             handle = os.open(
                 name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | close_on_exec | no_follow,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | close_on_exec | no_follow,
                 0o600,
                 dir_fd=parent.handle,
             )
@@ -165,6 +165,11 @@ class PosixNoFollowBackend:
         if len(value) > maximum:
             raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
         return value
+
+    def read_prefix(self, node: OpenedNode, maximum: int) -> bytes:
+        if _PREAD is None or maximum < 0:
+            raise RepositoryUnsafeError("POSIX_OPENAT_REQUIRED")
+        return _PREAD(node.handle, maximum, 0)
 
     def write_bytes(self, node: OpenedNode, value: bytes) -> None:
         if not stat.S_ISREG(os.fstat(node.handle).st_mode):

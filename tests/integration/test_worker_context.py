@@ -46,12 +46,12 @@ def _binding() -> WorkerTurnBinding:
 def _contract() -> TaskContract:
     return TaskContract.from_strings(
         "task-1",
-        ("src/read.py",),
-        ("src/write.py",),
-        dependency_globs=("src/dependency.py",),
+        ("src/read.py", "private/**"),
+        ("src/write.py", "private/**"),
+        dependency_globs=("src/dependency.py", "private/**"),
         checks=(
             CheckDefinition(
-                argv=("pytest", "-q"),
+                argv=("pytest", "-q", "private/config.key"),
                 input_globs=(GlobPattern.parse("tests/**"),),
             ),
         ),
@@ -136,7 +136,9 @@ class _Store:
         return SimpleNamespace(repository_instance_digest=_SHA)
 
 
-def _context(tmp_path: Path, files: dict[str, bytes], **kwargs: object):
+def _context(
+    tmp_path: Path, files: dict[str, bytes], **kwargs: object
+) -> tuple[_CompositionWorkerContext, _Store]:
     workspace = _workspace(tmp_path / "context", files)
     store = _Store(workspace)
     resources = _Resources(store.adapter)
@@ -171,14 +173,21 @@ def test_context_contains_task_contract_and_scoped_files(tmp_path: Path) -> None
     assert payload["task_contract"]["dependency_globs"] == ["src/dependency.py"]
     assert payload["task_contract"]["write_globs"] == ["src/write.py"]
     assert payload["task_contract"]["constraints"] == ["stay in src"]
-    assert payload["checks"] == [{"argv": ["pytest", "-q"], "check_id": "task-1:check-1"}]
+    assert payload["checks"] == [
+        {"argv": ["pytest", "-q", "[redacted]"], "check_id": "task-1:check-1"}
+    ]
+    assert "private/**" not in capsule.content
+    assert "private/config.key" not in capsule.content
     assert [item["path"] for item in payload["files"]] == [
         "src/dependency.py",
         "src/read.py",
     ]
     assert all("dependency_digest" in item for item in payload["files"])
     assert store.adapter.calls
-    assert capsule.dependencies == tuple(item["dependency_digest"] for item in payload["files"])
+    assert capsule.dependencies == (
+        str(_SHA),
+        *(item["dependency_digest"] for item in payload["files"]),
+    )
 
 
 def test_context_excludes_secret_paths(tmp_path: Path) -> None:
@@ -210,7 +219,17 @@ def test_context_truncation_is_marked(tmp_path: Path) -> None:
     assert payload["truncation"]["marker"] == "CONTEXT_TRUNCATED"
     assert payload["files"][0]["truncated"] is True
     assert len(payload["files"][0]["content"].encode("utf-8")) == 131_072
-    assert capsule.dependencies == (payload["files"][0]["dependency_digest"],)
+    assert capsule.dependencies == (str(_SHA), payload["files"][0]["dependency_digest"])
+
+
+def test_context_truncation_preserves_prefix_beyond_probe_limit(tmp_path: Path) -> None:
+    context, store = _context(tmp_path, {"src/read.py": b"abcdef"}, max_file_bytes=4)
+
+    capsule = context.build_current(store.binding.attempt_id)
+    payload = json.loads(capsule.content)
+
+    assert payload["files"][0]["content"] == "abcd"
+    assert payload["files"][0]["truncated"] is True
 
 
 def test_context_dependencies_bind_paths_even_when_bytes_match(tmp_path: Path) -> None:

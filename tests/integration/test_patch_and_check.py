@@ -1,22 +1,27 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from apexcrew.adapters.executor.attempt_patch import AttemptPatchExecutionError
 from apexcrew.adapters.executor.fake import FakeExecutor, FakeProcessResult
+from apexcrew.adapters.repository.snapshot import MemoryRepositorySnapshot
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.domain.actions import CheckAction, PatchAction
-from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision
+from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision, WorkspaceLease
 from apexcrew.domain.commands import ApplicableRevisionDigests
 from apexcrew.domain.effects import sha256_digest
 from apexcrew.domain.plan import CheckDefinition, GlobPattern
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.tools import (
     DeclaredCheckRegistry,
+    PatchExecutionResult,
     SanitizedSnapshot,
     SanitizedSnapshotEntry,
     ScopedToolRuntime,
     ToolIntent,
     ToolResult,
+    validate_tool_effect_result,
 )
 from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RunId, TaskId
 
@@ -66,6 +71,45 @@ def patch_intent() -> ToolIntent:
     )
 
 
+class UncertainPatchExecutor:
+    def apply_patch(
+        self, lease: WorkspaceLease, patches: Mapping[str, bytes]
+    ) -> PatchExecutionResult:
+        del lease, patches
+        raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN")
+
+
+def patch_runtime() -> ScopedToolRuntime:
+    now = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
+    return ScopedToolRuntime(
+        snapshot=MemoryRepositorySnapshot({"src/a.py": b"old\n"}),
+        read_globs=("src/**",),
+        secret_paths=secret_policy("private/**"),
+        authorization_binding_digest=SHA,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        repository_id="repository-1",
+        snapshot_digest=SHA,
+        scope_digest=SHA,
+        dependency_fingerprint_basis=SHA,
+        patch_executor=UncertainPatchExecutor(),
+        workspace_lease=WorkspaceLease(
+            lease_id="lease-1",
+            run_id=RunId("run-1"),
+            task_id=TaskId("task-1"),
+            attempt_id=AttemptId("attempt-1"),
+            generation=1,
+            base_head="a" * 40,
+            admissible_head="a" * 40,
+            task_contract_digest=SHA,
+            write_globs=(GlobPattern.parse("src/**"),),
+            sensitivity_globs=(),
+            issued_at=now,
+            expires_at=now + timedelta(minutes=15),
+            state="ACTIVE",
+        ),
+    )
+
+
 def sanitized_snapshot(tmp_path: Path) -> SanitizedSnapshot:
     return SanitizedSnapshot.from_regular_files(
         root=tmp_path,
@@ -80,6 +124,27 @@ def sanitized_snapshot(tmp_path: Path) -> SanitizedSnapshot:
             ),
         ),
         secret_paths=secret_policy("private/**"),
+    )
+
+
+def test_uncertain_patch_returns_settleable_result(tmp_path: Path) -> None:
+    del tmp_path
+    intent = patch_intent()
+
+    result = patch_runtime().execute(intent)
+
+    assert result.code == "INFRASTRUCTURE_UNCERTAINTY"
+    assert result.run_id == intent.run_id
+    assert result.intent_id == intent.intent_id
+    assert result.passed is None
+    assert result.timed_out is True
+    assert result.bounded_payload == {
+        "reason": "PATCH_RESULT_UNCERTAIN",
+        "snapshot_digest": intent.snapshot_digest,
+    }
+    validate_tool_effect_result(
+        intent.to_effect_intent(AuditSequence(1)),
+        result.to_effect_result(AuditSequence(2)),
     )
 
 

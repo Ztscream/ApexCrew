@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from contextvars import ContextVar
@@ -195,6 +196,35 @@ MAX_WORKER_CONTEXT_FILE_BYTES = 131_072
 MAX_WORKER_CONTEXT_BYTES = 512 * 1024
 
 
+def _contains_secret_context_token(token: str, secret_policy: SecretPathPolicy) -> bool:
+    normalized = token.replace("\\", "/")
+    candidates = [normalized, *re.split(r"[=,:]", normalized)]
+    for candidate in candidates:
+        candidate = candidate.strip("'\"`()[]{}<>,:;").lstrip("/")
+        if not candidate:
+            continue
+        try:
+            path = CanonicalPath.parse(candidate)
+        except ValueError:
+            try:
+                selector = GlobPattern.parse(candidate)
+            except ValueError:
+                continue
+            if secret_policy.inspect_selector(selector).code != "ALLOW":
+                return True
+        else:
+            if secret_policy.inspect(path).code != "ALLOW":
+                return True
+    return False
+
+
+def _safe_context_argv(argv: tuple[str, ...], secret_policy: SecretPathPolicy) -> list[str]:
+    return [
+        "[redacted]" if _contains_secret_context_token(token, secret_policy) else token
+        for token in argv
+    ]
+
+
 class _CompositionWorkerContext:
     def __init__(
         self,
@@ -242,6 +272,11 @@ class _CompositionWorkerContext:
             for pattern in contract.dependency_globs
             if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
         )
+        context_write_globs = tuple(
+            pattern
+            for pattern in contract.write_globs
+            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
+        )
         workspace = adapter.materialize_context(
             attempt_id=attempt_id,
             base_oid=GitOid(binding.admissible_head),
@@ -249,11 +284,11 @@ class _CompositionWorkerContext:
             dependency_globs=context_dependency_globs,
         )
         files, dependencies, truncated, reasons = self._read_files(
-            workspace, (*contract.read_globs, *contract.dependency_globs)
+            workspace, (*context_read_globs, *context_dependency_globs)
         )
         checks = [
             {
-                "argv": list(definition.argv),
+                "argv": _safe_context_argv(definition.argv, self._secret_policy),
                 "check_id": _check_aliases(binding.task_id, ordinal)[0],
             }
             for ordinal, definition in enumerate(contract.checks)
@@ -269,11 +304,11 @@ class _CompositionWorkerContext:
                 "goal": bootstrap.goal,
                 "task_contract": {
                     "constraints": list(contract.constraints),
-                    "dependency_globs": [item.value for item in contract.dependency_globs],
+                    "dependency_globs": [item.value for item in context_dependency_globs],
                     "dependency_task_ids": [str(item) for item in contract.dependency_task_ids],
-                    "read_globs": [item.value for item in contract.read_globs],
+                    "read_globs": [item.value for item in context_read_globs],
                     "task_id": str(contract.task_id),
-                    "write_globs": [item.value for item in contract.write_globs],
+                    "write_globs": [item.value for item in context_write_globs],
                 },
                 "task_id": str(binding.task_id),
                 "truncated": truncated,
@@ -286,7 +321,7 @@ class _CompositionWorkerContext:
             run_id=str(binding.run_id),
             task_id=str(binding.task_id),
             revision_digest=str(binding.plan_digest),
-            dependencies=dependencies,
+            dependencies=(str(binding.dependency_fingerprint_basis), *dependencies),
             content=content,
         )
 
@@ -363,19 +398,7 @@ class _CompositionWorkerContext:
         )
 
     def _read_bounded(self, tree: StableHandleTree, node: OpenedNode) -> tuple[bytes, bool]:
-        if os.name == "posix":
-            size = os.fstat(node.handle).st_size
-            if size > self._max_file_bytes:
-                pread = getattr(os, "pread", None)
-                if pread is None:
-                    raise RepositoryUnsafeError("BOUNDED_HANDLE_READ_UNAVAILABLE")
-                return pread(node.handle, self._max_file_bytes, 0), True
-        try:
-            raw = tree.read_bytes(node, self._max_file_bytes + 1)
-        except RepositoryUnsafeError as error:
-            if str(error) != "GIT_METADATA_TOO_LARGE":
-                raise
-            return b"", True
+        raw = tree.read_prefix(node, self._max_file_bytes + 1)
         return raw[: self._max_file_bytes], len(raw) > self._max_file_bytes
 
 
