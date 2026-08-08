@@ -21,7 +21,10 @@ from apexcrew.adapters.executor.restricted import RestrictedDockerExecutor
 from apexcrew.adapters.model.deepseek_responses import ClientFactory
 from apexcrew.adapters.model.factory import build_model_port
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
-from apexcrew.adapters.repository.attempt_workspace import AttemptWorkspaceAdapter
+from apexcrew.adapters.repository.attempt_workspace import (
+    AttemptWorkspaceAdapter,
+    MaterializedWorkspace,
+)
 from apexcrew.adapters.repository.bootstrap import (
     RepositoryBootstrapAuthorityService as RepositoryBootstrapAdapter,
 )
@@ -37,7 +40,11 @@ from apexcrew.adapters.repository.git import (
     NoFollowTargetReservationWorktreeGuard,
     RepositoryInstance,
 )
-from apexcrew.adapters.repository.no_follow import StableHandleTree
+from apexcrew.adapters.repository.no_follow import (
+    OpenedNode,
+    RepositoryUnsafeError,
+    StableHandleTree,
+)
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
 from apexcrew.adapters.repository.planning import GitPlanningSnapshotReader
@@ -121,7 +128,7 @@ from apexcrew.domain.effects import (
 )
 from apexcrew.domain.evidence import ContextCapsule
 from apexcrew.domain.model import DurableModelClient, ModelRequest, RecoveredModelAction
-from apexcrew.domain.plan import CanonicalPath, CheckDefinition, TaskContract
+from apexcrew.domain.plan import CanonicalPath, CheckDefinition, GlobPattern, TaskContract
 from apexcrew.domain.policy import PlanningPathPolicy, SecretPathPolicy
 from apexcrew.domain.projection import ProjectionService
 from apexcrew.domain.reservation_cleanup import CleanupObservation, CleanupObservationKind
@@ -184,9 +191,27 @@ def _declared_check_definitions(
     return definitions
 
 
+MAX_WORKER_CONTEXT_FILE_BYTES = 131_072
+MAX_WORKER_CONTEXT_BYTES = 512 * 1024
+
+
 class _CompositionWorkerContext:
-    def __init__(self, store: SqliteStateStore) -> None:
+    def __init__(
+        self,
+        store: SqliteStateStore,
+        resources: _CompositionRepositoryResources,
+        secret_policy: SecretPathPolicy,
+        *,
+        max_file_bytes: int = MAX_WORKER_CONTEXT_FILE_BYTES,
+        max_context_bytes: int = MAX_WORKER_CONTEXT_BYTES,
+    ) -> None:
+        if max_file_bytes <= 0 or max_context_bytes <= 0:
+            raise ValueError("WORKER_CONTEXT_LIMIT_INVALID")
         self._store = store
+        self._resources = resources
+        self._secret_policy = secret_policy
+        self._max_file_bytes = max_file_bytes
+        self._max_context_bytes = max_context_bytes
 
     def build_current(self, attempt_id: AttemptId) -> ContextCapsule:
         binding = self._store.current_worker_turn_binding(attempt_id)
@@ -200,22 +225,135 @@ class _CompositionWorkerContext:
         )
         if contract is None:
             raise RuntimeError("WORKER_TASK_CONTRACT_NOT_FOUND")
+        bootstrap = self._store.bootstrap_inputs(binding.run_id)
+        run = self._store.run_record(binding.run_id)
+        adapter = self._resources.attempt_workspace_adapter(
+            RepositoryId(binding.repository_id),
+            run.repository_instance_digest,
+            self._secret_policy,
+        )
+        context_read_globs = tuple(
+            pattern
+            for pattern in contract.read_globs
+            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
+        )
+        context_dependency_globs = tuple(
+            pattern
+            for pattern in contract.dependency_globs
+            if self._secret_policy.inspect_selector(pattern).code == "ALLOW"
+        )
+        workspace = adapter.materialize_context(
+            attempt_id=attempt_id,
+            base_oid=GitOid(binding.admissible_head),
+            read_globs=context_read_globs,
+            dependency_globs=context_dependency_globs,
+        )
+        files, dependencies, truncated, reasons = self._read_files(
+            workspace, (*contract.read_globs, *contract.dependency_globs)
+        )
+        checks = [
+            {
+                "argv": list(definition.argv),
+                "check_id": _check_aliases(binding.task_id, ordinal)[0],
+            }
+            for ordinal, definition in enumerate(contract.checks)
+        ]
+        content = canonical_json(
+            {
+                "acceptance_criteria": list(bootstrap.acceptance_criteria),
+                "checks": checks,
+                "constraints": list(bootstrap.constraints),
+                "context_tree_digest": str(workspace.tree_digest),
+                "dependency_fingerprint_basis": str(binding.dependency_fingerprint_basis),
+                "files": files,
+                "goal": bootstrap.goal,
+                "task_contract": {
+                    "dependency_globs": [item.value for item in contract.dependency_globs],
+                    "dependency_task_ids": [str(item) for item in contract.dependency_task_ids],
+                    "read_globs": [item.value for item in contract.read_globs],
+                    "task_id": str(contract.task_id),
+                    "write_globs": [item.value for item in contract.write_globs],
+                },
+                "task_id": str(binding.task_id),
+                "truncated": truncated,
+                "truncation": (
+                    {"marker": "CONTEXT_TRUNCATED", "reasons": reasons} if truncated else None
+                ),
+            }
+        )
         return ContextCapsule.create(
             run_id=str(binding.run_id),
             task_id=str(binding.task_id),
             revision_digest=str(binding.plan_digest),
-            dependencies=(str(binding.dependency_fingerprint_basis),),
-            content=canonical_json(
-                {
-                    "check_ids": [
-                        alias
-                        for ordinal, _definition in enumerate(contract.checks)
-                        for alias in _check_aliases(binding.task_id, ordinal)[:1]
-                    ],
-                    "message": "ApexCrew worker context is bounded to the persisted attempt binding.",
-                }
-            ),
+            dependencies=dependencies,
+            content=content,
         )
+
+    def _read_files(
+        self, workspace: MaterializedWorkspace, allowed_globs: tuple[GlobPattern, ...]
+    ) -> tuple[list[dict[str, object]], tuple[str, ...], bool, list[str]]:
+        backend = PosixNoFollowBackend() if os.name == "posix" else WindowsNoFollowBackend()
+        try:
+            tree = StableHandleTree(workspace.root, backend)
+        except (OSError, ValueError) as error:
+            raise RuntimeError("WORKER_CONTEXT_READ_DENIED") from error
+        files: list[dict[str, object]] = []
+        dependencies: list[str] = []
+        reasons: list[str] = []
+        total_bytes = 0
+        try:
+            for entry in workspace.entries:
+                path = CanonicalPath.parse(entry.path)
+                if not any(pattern.matches(path) for pattern in allowed_globs):
+                    continue
+                if self._secret_policy.inspect(path).code != "ALLOW":
+                    continue
+                try:
+                    node = tree.open(str(path), "file")
+                    raw, file_truncated = self._read_bounded(tree, node)
+                except (OSError, ValueError, RepositoryUnsafeError) as error:
+                    raise RuntimeError("WORKER_CONTEXT_READ_DENIED") from error
+                if file_truncated:
+                    reasons.append("FILE_LIMIT")
+                    raw = raw[: self._max_file_bytes]
+                remaining = self._max_context_bytes - total_bytes
+                if remaining < len(raw):
+                    raw = raw[: max(0, remaining)]
+                    file_truncated = True
+                    reasons.append("AGGREGATE_LIMIT")
+                total_bytes += len(raw)
+                dependencies.append(str(entry.content_digest))
+                files.append(
+                    {
+                        "content": raw.decode("utf-8", errors="replace"),
+                        "dependency_digest": str(entry.content_digest),
+                        "path": str(path),
+                        "truncated": file_truncated,
+                    }
+                )
+            try:
+                tree.assert_name_bindings()
+            except (OSError, RepositoryUnsafeError) as error:
+                raise RuntimeError("WORKER_CONTEXT_READ_DENIED") from error
+        finally:
+            tree.close()
+        return files, tuple(dependencies), bool(reasons), sorted(set(reasons))
+
+    def _read_bounded(self, tree: StableHandleTree, node: OpenedNode) -> tuple[bytes, bool]:
+        if os.name == "posix":
+            size = os.fstat(node.handle).st_size
+            if size > self._max_file_bytes:
+                pread = getattr(os, "pread", None)
+                if pread is None:
+                    raise RepositoryUnsafeError("BOUNDED_HANDLE_READ_UNAVAILABLE")
+                return pread(node.handle, self._max_file_bytes, 0), True
+        try:
+            raw = tree.read_bytes(node, self._max_file_bytes + 1)
+        except RepositoryUnsafeError as error:
+            if str(error) != "GIT_METADATA_TOO_LARGE":
+                raise
+            return b"", True
+        return raw[: self._max_file_bytes], len(raw) > self._max_file_bytes
 
 
 class _CompositionWorkerRequests:
@@ -1750,7 +1888,7 @@ def build_application_bundle(
         planning_revisions = _CompositionPlanningRevisionContext(store)
         worker = WorkerLoopService(
             attempts=store,
-            capsules=_CompositionWorkerContext(store),
+            capsules=_CompositionWorkerContext(store, resources, runtime_secret_policy),
             requests=_CompositionWorkerRequests(
                 store, selected_model_configuration, selected_budget
             ),
