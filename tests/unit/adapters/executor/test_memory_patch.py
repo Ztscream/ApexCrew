@@ -59,3 +59,16 @@ def test_memory_patch_rejects_malformed_diff_without_side_effect() -> None:
 
     assert result.code == "LEASE_SCOPE_DENIED"
     assert executor.workspace_files()["src/money.py"] == b"TOTAL_CENTS = 250\n"
+
+
+def test_memory_patch_rejects_oversized_hunk_header_without_side_effect() -> None:
+    executor = MemoryPatchExecutor(
+        {"src/money.py": b"TOTAL_CENTS = 250\n"},
+        secret_paths=SecretPathPolicy.from_host_rules((), b"k" * 32),
+    )
+    oversized_diff = b"--- a/src/money.py\n+++ b/src/money.py\n@@ -" + b"9" * 5000 + b" +1 @@\n"
+
+    result = executor.apply_patch(_lease(), {"src/money.py": oversized_diff})
+
+    assert result.code == "LEASE_SCOPE_DENIED"
+    assert executor.workspace_files()["src/money.py"] == b"TOTAL_CENTS = 250\n"

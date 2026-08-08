@@ -5,14 +5,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TypedDict
 
 from apexcrew.adapters.executor.fake import FakeExecutor, FakeProcessResult
 from apexcrew.adapters.executor.memory_patch import MemoryPatchExecutor
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.adapters.repository.snapshot import MemoryRepositorySnapshot
-from apexcrew.domain.actions import ActionEnvelope
+from apexcrew.domain.actions import ActionEnvelope, FailAction, FinishAction
 from apexcrew.domain.authority import (
     ActionClass,
     ActionDeadline,
@@ -22,14 +23,17 @@ from apexcrew.domain.authority import (
     ModelReservation,
     ModelReservationRequest,
     TaskBudgetState,
+    TaskStopDecision,
     TimeoutDecision,
     WorkspaceLease,
 )
-from apexcrew.domain.effects import canonical_json, sha256_digest
+from apexcrew.domain.commands import RuntimeDecision, RuntimePermit
+from apexcrew.domain.effects import EffectIntent, canonical_json, sha256_digest
 from apexcrew.domain.evidence import ContextCapsule, EvidenceReceipt
 from apexcrew.domain.freshness import FreshnessAssessment
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
+    LogicalTurnId,
     ModelBudgetAmounts,
     ModelCompletion,
     ModelCounters,
@@ -39,6 +43,7 @@ from apexcrew.domain.model import (
 )
 from apexcrew.domain.plan import CheckDefinition, GlobPattern
 from apexcrew.domain.policy import ActionPolicy, SecretPathPolicy
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import (
     ActionPreState,
     DeclaredCheckRegistry,
@@ -50,14 +55,9 @@ from apexcrew.domain.tools import (
 )
 from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RevisionDigest, RunId, TaskId
 from apexcrew.domain.worker import (
+    PendingActionFreeze,
     WorkerActionCodec,
-    WorkerAttemptState,
-    WorkerContextBuilder,
-    WorkerIdSource,
-    WorkerJournal,
     WorkerLoopService,
-    WorkerModelClient,
-    WorkerRequestFactory,
     WorkerTurnBinding,
     bounded_worker_feedback,
     validate_authorized_worker_action,
@@ -223,24 +223,111 @@ class _DemoAttempts:
             raise AssertionError("demo attempt mismatch")
         return self.feedback
 
-    def record_authorized_worker_action(self, **values: object) -> ToolIntent:
-        intent = cast(ToolIntent, values["intent"])
+    def record_malformed_worker_action(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action_digest: str,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        del logical_turn_id, action_digest, recovered_marker, permit
+        if binding != self.binding:
+            raise AssertionError("demo binding mismatch")
+        sequence = AuditSequence(int(expected_sequence) + 1)
+        self.journal.sequence = int(sequence)
+        return TaskStopDecision(
+            decision="PAUSE",
+            run_id=binding.run_id,
+            task_id=binding.task_id,
+            task_state="PAUSED",
+            pause_reason="REPEATED_INVALID_ACTION",
+            resulting_sequence=sequence,
+            attempt_state="FAILED",
+        )
+
+    def record_authorized_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> ToolIntent:
+        del recovered_marker, permit, expected_sequence
         validate_authorized_worker_action(
             self.binding,
             intent,
-            cast(AuthorizationRequest, values["request"]),
-            cast(AuthorizationDecision, values["decision"]),
-            cast(ActionPreState, values["expected_prestate"]),
+            request,
+            decision,
+            expected_prestate,
         )
         return intent
 
-    def settle_worker_action(self, **values: object) -> AuditSequence:
-        result = cast(ToolResult, values["result"])
+    def settle_recovered_action_denial(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        marker: EffectIntent,
+        permit: RuntimePermit,
+        decision: AuthorizationDecision,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        del binding, marker, permit, decision, expected_sequence
+        raise AssertionError("demo does not exercise recovered action denial")
+
+    def freeze_authorized_pending_action(
+        self,
+        *,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> PendingActionFreeze:
+        del request, decision, expected_prestate, recovered_marker, permit, expected_sequence
+        raise AssertionError("demo does not exercise pending action approval")
+
+    def settle_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        authorization: AuthorizationDecision,
+        result: ToolResult,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        del intent, authorization
         self.results.append(result)
-        self.journal.sequence += 1
+        sequence = AuditSequence(int(expected_sequence) + 1)
+        self.journal.sequence = int(sequence)
         if result.code == "CHECK_FAILED":
             self.feedback = bounded_worker_feedback(result)
-        return AuditSequence(self.journal.sequence)
+        return sequence
+
+    def finish_attempt(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action: FinishAction | FailAction,
+        action_digest: str,
+        authorization: AuthorizationDecision,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision:
+        del logical_turn_id, action, action_digest, authorization, recovered_marker, permit
+        if binding != self.binding:
+            raise AssertionError("demo binding mismatch")
+        sequence = AuditSequence(int(expected_sequence) + 1)
+        self.journal.sequence = int(sequence)
+        return RuntimeDecision(code="ACTION_RECORDED", resulting_sequence=sequence)
 
 
 class _DemoContext:
@@ -371,7 +458,7 @@ def _demo_loop() -> tuple[
     secret_paths = SecretPathPolicy.from_host_rules((), b"k" * 32)
     files = {"src/money.py": b"TOTAL_CENTS = 250\n"}
     snapshot = MemoryRepositorySnapshot(files)
-    content_digest = sha256_digest(canonical_json({"bytes": files["src/money.py"].decode()}))
+    content_digest = Sha256DigestText("sha256:" + sha256(files["src/money.py"]).hexdigest())
     sanitized_snapshot = SanitizedSnapshot.from_regular_files(
         root=Path("demo-workspace"),
         repository_id=binding.repository_id,
@@ -438,10 +525,10 @@ def _demo_loop() -> tuple[
     )
     model = _DemoModelClient(_DemoScriptedMockLLM())
     loop = WorkerLoopService(
-        attempts=cast(WorkerAttemptState, attempts),
-        capsules=cast(WorkerContextBuilder, _DemoContext()),
-        requests=cast(WorkerRequestFactory, _DemoRequests(_demo_request(binding))),
-        models=cast(WorkerModelClient, model),
+        attempts=attempts,
+        capsules=_DemoContext(),
+        requests=_DemoRequests(_demo_request(binding)),
+        models=model,
         actions=WorkerActionCodec(
             lambda current_binding, action: ActionPreState(
                 source_digest=current_binding.snapshot_digest
@@ -449,8 +536,8 @@ def _demo_loop() -> tuple[
         ),
         authority=authority,
         tools=runtime,
-        journal=cast(WorkerJournal, journal),
-        ids=cast(WorkerIdSource, _DemoIds()),
+        journal=journal,
+        ids=_DemoIds(),
         clock=lambda: _CLOCK,
     )
     return loop, attempts, model, patch_executor

@@ -2668,3 +2668,11 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Review configuration**: the independent SPEC and quality reviewers are configured as `gpt-5.6-luna-max` (the local reviewer record uses `gpt-5.6-luna` with max reasoning).
 - **Review status**: ordered independent SPEC-compliance review followed by independent code-quality review is pending against the task commit. No provider credential, network request, push, remote PR, or live Docker request occurred.
 - **Lesson**: the Worker feedback demonstration must exercise the same tool/runtime boundary as production; a prompt replacement can show a changed action without proving that the failed check or repair ever happened.
+
+## 2026-08-08 / R4.3-00 review corrections
+
+- **Initial SPEC review**: reviewer `019fe10e-3452-7010-b209-efee65ff9a2b`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero findings for `3fb60c1d9e9151abb435370a05b63a4d64934cb9`.
+- **Initial quality review**: reviewer `019fe112-7865-7e90-a440-7c5c802bf78a`, configured as `gpt-5.6-luna-max`, returned `BLOCKED` with one High and two Medium findings: oversized hunk numbers escaped typed denial; the demo attempt double hid unimplemented protocol branches behind casts; and the snapshot entry digest was not computed from raw bytes.
+- **Correction**: unified-diff integer parsing now maps conversion failures to `PROTECTED_PATCH_FORMAT_INVALID`; the demo attempt state implements the full WorkerAttemptState surface and removes its broad casts; snapshot content digests hash the exact file bytes; and an oversized-header zero-side-effect regression test was added.
+- **Correction evidence**: focused R4.3-00 selectors -> `8 passed`; related repository/patch/check/recovery selectors -> `27 passed, 2 skipped`; mypy, Ruff, format, diff, and byte-identical demo repeatability passed. The corrected implementation SHA is recorded after the rerun reviews.
+- **Rerun status**: the SPEC review is rerun because the patch-denial contract changed; the final quality review follows that ordered check. No provider credential, network request, push, remote PR, or live Docker request occurred.

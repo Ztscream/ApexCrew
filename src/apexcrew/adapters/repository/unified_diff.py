@@ -28,9 +28,12 @@ def apply_unified_diff(original: bytes, unified_diff: str) -> bytes:
         if match is None:
             raise RepositoryUnsafeError("PROTECTED_PATCH_FORMAT_INVALID")
         saw_hunk = True
-        old_start = int(match.group(1))
-        old_count = int(match.group(2) or "1")
-        new_count = int(match.group(4) or "1")
+        try:
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or "1")
+            new_count = int(match.group(4) or "1")
+        except ValueError as error:
+            raise RepositoryUnsafeError("PROTECTED_PATCH_FORMAT_INVALID") from error
         target_index = old_start - 1
         if target_index < source_index or target_index > len(source_lines):
             raise RepositoryUnsafeError("PROTECTED_PATCH_CONTEXT_MISMATCH")
@@ -69,10 +72,13 @@ def reverse_unified_diff(current: bytes, unified_diff: str) -> bytes:
     for line in unified_diff.splitlines(keepends=True):
         match = _HUNK_HEADER.match(line)
         if match is not None:
-            old_start = int(match.group(1))
-            old_count = int(match.group(2) or "1")
-            new_start = int(match.group(3))
-            new_count = int(match.group(4) or "1")
+            try:
+                old_start = int(match.group(1))
+                old_count = int(match.group(2) or "1")
+                new_start = int(match.group(3))
+                new_count = int(match.group(4) or "1")
+            except ValueError as error:
+                raise RepositoryUnsafeError("PROTECTED_PATCH_FORMAT_INVALID") from error
             newline = "\n" if line.endswith("\n") else ""
             reversed_lines.append(
                 f"@@ -{new_start},{new_count} +{old_start},{old_count} @@{newline}"
