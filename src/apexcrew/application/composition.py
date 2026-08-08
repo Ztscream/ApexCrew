@@ -21,6 +21,7 @@ from apexcrew.adapters.executor.restricted import RestrictedDockerExecutor
 from apexcrew.adapters.model.deepseek_responses import ClientFactory
 from apexcrew.adapters.model.factory import build_model_port
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.repository.attempt_workspace import AttemptWorkspaceAdapter
 from apexcrew.adapters.repository.bootstrap import (
     RepositoryBootstrapAuthorityService as RepositoryBootstrapAdapter,
 )
@@ -412,6 +413,16 @@ class _CompositionRepositoryResources:
         workspace = DetachedWorkspace(repository, runner, workspace_root, secret_policy)
         workspace.ensure_materialized(tree_oid)
         return workspace
+
+    def attempt_workspace_adapter(
+        self,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+        secret_policy: SecretPathPolicy,
+    ) -> AttemptWorkspaceAdapter:
+        self.validate_repository_binding(repository_id, repository_instance_digest)
+        repository, runner, _ = self._ensure()
+        return AttemptWorkspaceAdapter(repository, runner, self._data_root, secret_policy)
 
     def refresh(self) -> None:
         if self._repository is None:
