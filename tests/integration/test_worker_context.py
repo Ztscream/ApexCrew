@@ -209,4 +209,30 @@ def test_context_truncation_is_marked(tmp_path: Path) -> None:
     assert payload["truncation"]["marker"] == "CONTEXT_TRUNCATED"
     assert payload["files"][0]["truncated"] is True
     assert len(payload["files"][0]["content"].encode("utf-8")) == 131_072
-    assert capsule.dependencies == ("sha256:" + hashlib.sha256(b"x" * 131_073).hexdigest(),)
+    assert capsule.dependencies == (payload["files"][0]["dependency_digest"],)
+
+
+def test_context_dependencies_bind_paths_even_when_bytes_match(tmp_path: Path) -> None:
+    context, store = _context(
+        tmp_path,
+        {
+            "src/read.py": b"same\n",
+            "src/dependency.py": b"same\n",
+        },
+    )
+
+    payload = json.loads(context.build_current(store.binding.attempt_id).content)
+    dependencies = [item["dependency_digest"] for item in payload["files"]]
+
+    assert len(dependencies) == 2
+    assert dependencies[0] != dependencies[1]
+
+
+def test_context_dependencies_bind_bytes_observed_from_workspace(tmp_path: Path) -> None:
+    context, store = _context(tmp_path, {"src/read.py": b"before\n"})
+    first = context.build_current(store.binding.attempt_id)
+    (tmp_path / "context" / "src" / "read.py").write_bytes(b"after\n")
+
+    second = context.build_current(store.binding.attempt_id)
+
+    assert first.dependencies != second.dependencies

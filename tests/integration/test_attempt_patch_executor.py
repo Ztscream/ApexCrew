@@ -18,6 +18,7 @@ from apexcrew.domain.effects import canonical_json, sha256_digest
 from apexcrew.domain.plan import GlobPattern
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.tools import SnapshotUnavailable
 from apexcrew.domain.types import AttemptId, RunId, TaskId
 
 
@@ -81,6 +82,20 @@ def test_patch_writes_real_bytes(tmp_path: Path) -> None:
     assert result.post_tree_digest == memory_result.post_tree_digest
 
 
+def test_patch_truncates_existing_file_through_handle(tmp_path: Path) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    target = root / "src" / "task.py"
+    target.write_bytes(b"value = 123\n")
+    result = AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+        _lease("src/**"),
+        {"src/task.py": b"@@ -1 +1 @@\n-value = 123\n+x\n"},
+    )
+
+    assert result.code == "PATCH_APPLIED"
+    assert target.read_bytes() == b"x\n"
+
+
 def test_patch_outside_write_globs_denied_with_zero_side_effects(tmp_path: Path) -> None:
     root = tmp_path / "check"
     (root / "src").mkdir(parents=True)
@@ -119,6 +134,45 @@ def test_malformed_diff_denied_with_zero_side_effects(tmp_path: Path) -> None:
     assert tuple(root.glob("src/.task.py.*.tmp")) == ()
 
 
+def test_final_target_replacement_is_uncertain_without_overwriting_substitute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    source = root / "src"
+    source.mkdir(parents=True)
+    target = source / "task.py"
+    target.write_bytes(b"value = 1\n")
+    original_assert = StableHandleTree.assert_name_bindings
+    calls = 0
+
+    def replace_final_after_preflight(tree: StableHandleTree) -> None:
+        nonlocal calls
+        calls += 1
+        original_assert(tree)
+        if calls == 2:
+            moved = source / "task-original.py"
+            target.rename(moved)
+            target.write_bytes(b"substituted\n")
+
+    monkeypatch.setattr(StableHandleTree, "assert_name_bindings", replace_final_after_preflight)
+
+    if os.name == "nt":
+        result = AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+            _lease("src/**"),
+            {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
+        )
+        assert result.code == "LEASE_SCOPE_DENIED"
+        assert target.read_bytes() == b"value = 1\n"
+    else:
+        with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
+            AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+                _lease("src/**"),
+                {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
+            )
+        assert target.read_bytes() == b"substituted\n"
+        assert (source / "task-original.py").read_bytes() == b"value = 2\n"
+
+
 def test_post_replace_failure_is_uncertain_not_scope_denied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -144,6 +198,66 @@ def test_post_replace_failure_is_uncertain_not_scope_denied(
             {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
         )
     assert target.read_bytes() == b"value = 2\n"
+
+
+def test_digest_failure_after_replace_is_uncertain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    target = root / "src" / "task.py"
+    target.write_bytes(b"value = 1\n")
+    executor = AttemptPatchExecutor(root, _secret_policy())
+
+    def fail_digest() -> Sha256DigestText:
+        raise SnapshotUnavailable("injected digest failure")
+
+    monkeypatch.setattr(executor, "tree_digest", fail_digest)
+
+    with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
+        executor.apply_patch(
+            _lease("src/**"),
+            {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
+        )
+    assert target.read_bytes() == b"value = 2\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="root replacement requires POSIX symlinks")
+def test_digest_rejects_root_replacement_after_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "check"
+    (root / "src").mkdir(parents=True)
+    target = root / "src" / "task.py"
+    target.write_bytes(b"value = 1\n")
+    outside = tmp_path / "outside"
+    (outside / "src").mkdir(parents=True)
+    (outside / "src" / "task.py").write_bytes(b"outside\n")
+    original_assert = StableHandleTree.assert_name_bindings
+    calls = 0
+
+    def replace_root_after_post_probe(tree: StableHandleTree) -> None:
+        nonlocal calls
+        calls += 1
+        original_assert(tree)
+        if calls == 3:
+            moved = tmp_path / "check-real"
+            root.rename(moved)
+            root.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(StableHandleTree, "assert_name_bindings", replace_root_after_post_probe)
+    try:
+        with pytest.raises(AttemptPatchExecutionError, match="PATCH_RESULT_UNCERTAIN"):
+            AttemptPatchExecutor(root, _secret_policy()).apply_patch(
+                _lease("src/**"),
+                {"src/task.py": b"@@ -1 +1 @@\n-value = 1\n+value = 2\n"},
+            )
+    finally:
+        if root.is_symlink():
+            root.unlink()
+        moved = tmp_path / "check-real"
+        if moved.exists():
+            moved.rename(root)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="ancestor replacement requires POSIX symlinks")

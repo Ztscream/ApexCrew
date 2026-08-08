@@ -322,11 +322,14 @@ class _CompositionWorkerContext:
                     file_truncated = True
                     reasons.append("AGGREGATE_LIMIT")
                 total_bytes += len(raw)
-                dependencies.append(str(entry.content_digest))
+                dependency_digest = self._observed_dependency_digest(
+                    path, entry.content_digest, raw, file_truncated
+                )
+                dependencies.append(str(dependency_digest))
                 files.append(
                     {
                         "content": raw.decode("utf-8", errors="replace"),
-                        "dependency_digest": str(entry.content_digest),
+                        "dependency_digest": str(dependency_digest),
                         "path": str(path),
                         "truncated": file_truncated,
                     }
@@ -338,6 +341,25 @@ class _CompositionWorkerContext:
         finally:
             tree.close()
         return files, tuple(dependencies), bool(reasons), sorted(set(reasons))
+
+    @staticmethod
+    def _observed_dependency_digest(
+        path: CanonicalPath,
+        materialized_digest: Sha256DigestText,
+        raw: bytes,
+        truncated: bool,
+    ) -> Sha256DigestText:
+        return sha256_digest(
+            canonical_json(
+                {
+                    "materialized_digest": str(materialized_digest),
+                    "observed_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                    "observed_bytes": len(raw),
+                    "path": str(path),
+                    "truncated": truncated,
+                }
+            )
+        )
 
     def _read_bounded(self, tree: StableHandleTree, node: OpenedNode) -> tuple[bytes, bool]:
         if os.name == "posix":

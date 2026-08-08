@@ -480,6 +480,10 @@ class WindowsNoFollowBackend:
             wintypes.HANDLE(node.handle), buffer, len(value), byref(written), None
         ) or written.value != len(value):
             raise RepositoryUnsafeError("NO_FOLLOW_WRITE_DENIED")
+        if not self._kernel32.SetEndOfFile(wintypes.HANDLE(node.handle)):
+            raise RepositoryUnsafeError("NO_FOLLOW_TRUNCATE_DENIED")
+        if not self._kernel32.FlushFileBuffers(wintypes.HANDLE(node.handle)):
+            raise RepositoryUnsafeError("NO_FOLLOW_FLUSH_DENIED")
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._query_directory_handle_names(node.handle, maximum)
