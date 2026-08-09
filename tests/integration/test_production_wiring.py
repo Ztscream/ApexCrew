@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.composition import build_application_bundle
 from apexcrew.application.configuration import default_revision_documents
@@ -110,7 +112,7 @@ def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: 
         bundle.close()
 
 
-def test_production_bundle_keeps_injected_executor_on_worker_graph(tmp_path: Path) -> None:
+def test_production_bundle_rejects_test_executor_injection(tmp_path: Path) -> None:
     sentinel = SentinelExecutor()
     options = {
         "repository_authority": FixtureRepositoryAuthority(),
@@ -118,13 +120,6 @@ def test_production_bundle_keeps_injected_executor_on_worker_graph(tmp_path: Pat
             update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
         ),
         "scripted_model": ScriptedMockLLM(()),
-        "executor": sentinel,
     }
-    bundle = build_application_bundle(tmp_path, **options)
-    try:
-        coordinator = bundle.runtime._coordinator  # type: ignore[attr-defined]
-        worker = coordinator._workers  # type: ignore[attr-defined]
-        tools = worker._tools  # type: ignore[attr-defined]
-        assert tools._executor is sentinel  # type: ignore[attr-defined]
-    finally:
-        bundle.close()
+    with pytest.raises(TypeError):
+        build_application_bundle(tmp_path, **options, executor=sentinel)

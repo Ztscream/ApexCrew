@@ -10,7 +10,10 @@ from typer.testing import CliRunner
 
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.adapters.state.sqlite import SqliteStateStore
-from apexcrew.application.composition import build_application_bundle
+from apexcrew.application.composition import (
+    build_application_bundle,
+    build_test_application_bundle,
+)
 from apexcrew.application.configuration import default_revision_documents
 from apexcrew.delivery.cli import app as cli_app
 from apexcrew.domain.commands import (
@@ -280,7 +283,7 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
     )
     secret_policy = SecretPathPolicy.from_host_rules((), b"k" * 32)
     executor = _SuccessfulExecutor()
-    bundle = build_application_bundle(
+    bundle = build_test_application_bundle(
         root,
         model_configuration=model_configuration,
         scripted_model=_LifecycleModel(

@@ -26,6 +26,7 @@ from apexcrew.adapters.model.factory import build_model_port
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.adapters.repository.attempt_workspace import (
     AttemptWorkspaceAdapter,
+    AttemptWorkspaceError,
     MaterializedWorkspace,
 )
 from apexcrew.adapters.repository.bootstrap import (
@@ -555,6 +556,7 @@ class _CompositionRepositoryResources:
         self._runner: GitCommandRunner | None = None
         self._owns_runner = False
         self._data_handles: StableHandleTree | None = None
+        self._attempt_adapter: AttemptWorkspaceAdapter | None = None
         self._validated_binding: tuple[RepositoryId, Sha256DigestText] | None = None
         self._allowed_worktree_admin_entries: set[str] = set()
 
@@ -656,11 +658,16 @@ class _CompositionRepositoryResources:
     ) -> AttemptWorkspaceAdapter:
         self.validate_repository_binding(repository_id, repository_instance_digest)
         repository, runner, _ = self._ensure()
-        return AttemptWorkspaceAdapter(repository, runner, self._data_root, secret_policy)
+        if self._attempt_adapter is None:
+            self._attempt_adapter = AttemptWorkspaceAdapter(
+                repository, runner, self._data_root, secret_policy
+            )
+        return self._attempt_adapter
 
     def refresh(self) -> None:
         if self._repository is None:
             return
+        self._attempt_adapter = None
         self._repository = self._repository.refresh_after_verified_owned_transition()
 
     def reservation_adapters(
@@ -752,6 +759,7 @@ class _CompositionRepositoryResources:
 
     def close(self) -> None:
         first_error: BaseException | None = None
+        self._attempt_adapter = None
         if self._data_handles is not None:
             try:
                 self._data_handles.close()
@@ -856,7 +864,7 @@ class _TrackingGrantedWorkspace:
     def __init__(
         self,
         workspace: GrantedWorkspacePort,
-        after_result: Callable[[RiskyAction, ActionPreState, ToolResult], None],
+        after_result: Callable[[RiskyAction, ActionPreState, ToolResult], ToolResult],
     ) -> None:
         self._workspace = workspace
         self._after_result = after_result
@@ -867,8 +875,7 @@ class _TrackingGrantedWorkspace:
     def _record(
         self, action: RiskyAction, expected: ActionPreState, result: ToolResult
     ) -> ToolResult:
-        self._after_result(action, expected, result)
-        return result
+        return self._after_result(action, expected, result)
 
     def delete_regular_file(self, action: RiskyAction, expected: ActionPreState) -> ToolResult:
         return self._record(action, expected, self._workspace.delete_regular_file(action, expected))
@@ -944,40 +951,34 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         patch_executor: AttemptPatchExecutor | None = None
         granted_workspace: GrantedWorkspacePort | None = None
         runtime_executor: ExecutorPort | None = None
+        runtime_snapshot_digest = binding.snapshot_digest
         if isinstance(intent, ToolIntent) and isinstance(intent.action, CheckAction):
-            definition = declared_checks.require(intent.action.check_id)
-            ordinal = next(
-                (
-                    index
-                    for index, _definition in enumerate(contract.checks)
-                    if intent.action.check_id in _check_aliases(binding.task_id, index)
-                ),
-                None,
-            )
-            if ordinal is None:
-                raise RuntimeError("WORKER_CHECK_DEFINITION_NOT_BOUND")
-            check_state = self._check_workspace(
-                attempt_state,
-                binding,
-                lease,
-                check_id=check_id_for(binding.task_id, ordinal),
-                input_globs=definition.input_globs,
-                write_globs=contract.write_globs,
-            )
-            check_snapshot = self._build_sanitized_snapshot(
-                root=check_state.workspace.root,
-                repository_id=binding.repository_id,
-                tree_digest=check_state.tree_digest,
-                input_globs=definition.input_globs,
-                write_globs=contract.write_globs,
-                maximum_bytes=policy.executor_profile.scratch_limit_bytes,
-            )
-            patch_executor = check_state.patch_executor
+            definition = declared_checks.get(intent.action.check_id)
             runtime_executor = (
                 self._executor
                 if self._executor is not None
                 else RestrictedDockerExecutor(policy.executor_profile, self._secret_policy)
             )
+            if definition is not None:
+                ordinal = self._check_ordinal(binding.task_id, contract, intent.action.check_id)
+                check_state = self._check_workspace(
+                    attempt_state,
+                    binding,
+                    lease,
+                    check_id=check_id_for(binding.task_id, ordinal),
+                    input_globs=definition.input_globs,
+                    write_globs=contract.write_globs,
+                )
+                check_snapshot = self._build_sanitized_snapshot(
+                    root=check_state.workspace.root,
+                    repository_id=binding.repository_id,
+                    tree_digest=check_state.tree_digest,
+                    input_globs=definition.input_globs,
+                    write_globs=contract.write_globs,
+                    maximum_bytes=policy.executor_profile.scratch_limit_bytes,
+                )
+                patch_executor = check_state.patch_executor
+                runtime_snapshot_digest = check_state.tree_digest
         elif isinstance(intent, GrantedActionIntent):
             primary = self._primary_workspace(attempt_state, binding, lease, contract)
             patch_executor = primary.patch_executor
@@ -994,7 +995,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             authorization_binding_digest=Sha256DigestText(str(authorization_binding_digest)),
             applicable_revision_digests=binding.applicable_revision_digests,
             repository_id=binding.repository_id,
-            snapshot_digest=binding.snapshot_digest,
+            snapshot_digest=runtime_snapshot_digest,
             scope_digest=binding.scope_digest,
             dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
             denial_journal=self._store,
@@ -1023,9 +1024,52 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         contract = self._contract(binding)
         attempt_state = self._attempt_state(binding)
         primary = self._primary_workspace(attempt_state, binding, lease, contract)
-        return GrantedWorkspaceAdapter(
-            primary.workspace.root, self._secret_policy
-        ).expected_prestate(action)
+        try:
+            return GrantedWorkspaceAdapter(
+                primary.workspace.root, self._secret_policy
+            ).expected_prestate(action)
+        except (OSError, RepositoryUnsafeError, ValueError):
+            return ActionPreState()
+
+    def capture_snapshot_digest(
+        self, binding: WorkerTurnBinding, action: ToolActionEnvelope
+    ) -> Sha256DigestText:
+        if not isinstance(action, CheckAction):
+            return binding.snapshot_digest
+        lease = self._store.workspace_lease(binding.run_id, binding.lease_id)
+        if lease is None:
+            raise RuntimeError("WORKER_LEASE_NOT_FOUND")
+        contract = self._contract(binding)
+        declared_checks = DeclaredCheckRegistry(
+            _declared_check_definitions(binding.task_id, contract.checks)
+        )
+        definition = declared_checks.get(action.check_id)
+        if definition is None:
+            return binding.snapshot_digest
+        ordinal = self._check_ordinal(binding.task_id, contract, action.check_id)
+        state = self._attempt_state(binding)
+        return self._check_workspace(
+            state,
+            binding,
+            lease,
+            check_id=check_id_for(binding.task_id, ordinal),
+            input_globs=definition.input_globs,
+            write_globs=contract.write_globs,
+        ).tree_digest
+
+    @staticmethod
+    def _check_ordinal(task_id: TaskId, contract: TaskContract, check_id: str) -> int:
+        ordinal = next(
+            (
+                index
+                for index, _definition in enumerate(contract.checks)
+                if check_id in _check_aliases(task_id, index)
+            ),
+            None,
+        )
+        if ordinal is None:
+            raise RuntimeError("WORKER_CHECK_DEFINITION_NOT_BOUND")
+        return ordinal
 
     def _contract(self, binding: WorkerTurnBinding) -> TaskContract:
         contract = next(
@@ -1078,7 +1122,9 @@ class _CompositionWorkerTools(ScopedToolRuntime):
                 read_globs=read_globs,
                 dependency_globs=dependency_globs,
             )
-        self._verify_workspace_digest(state.context, "WORKER_CONTEXT_WORKSPACE_CHANGED")
+        self._verify_workspace_digest(
+            state.adapter, state.context, "WORKER_CONTEXT_WORKSPACE_CHANGED"
+        )
         return state.context
 
     def _check_workspace(
@@ -1102,6 +1148,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             input_globs=input_globs,
             write_globs=write_globs,
             workspace_key=self._workspace_key(cache_key),
+            reject_existing=True,
         )
         candidate = _CheckWorkspaceState(
             cache_key=cache_key,
@@ -1190,16 +1237,23 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         if state.patch_sync_uncertain:
             raise RuntimeError("WORKER_CHECK_WORKSPACE_SYNC_UNCERTAIN")
         try:
+            state.adapter.verify_workspace_identity(candidate.workspace)
             observed = candidate.patch_executor.tree_digest()
-        except (OSError, RepositoryUnsafeError, ValueError) as error:
+        except (AttemptWorkspaceError, OSError, RepositoryUnsafeError, ValueError) as error:
             raise RuntimeError("WORKER_CHECK_WORKSPACE_UNAVAILABLE") from error
         if observed != candidate.tree_digest:
             raise RuntimeError("WORKER_CHECK_WORKSPACE_CHANGED")
 
-    def _verify_workspace_digest(self, workspace: MaterializedWorkspace, reason: str) -> None:
+    def _verify_workspace_digest(
+        self,
+        adapter: AttemptWorkspaceAdapter,
+        workspace: MaterializedWorkspace,
+        reason: str,
+    ) -> None:
         try:
+            adapter.verify_workspace_identity(workspace)
             observed = AttemptPatchExecutor(workspace, self._secret_policy).tree_digest()
-        except (OSError, RepositoryUnsafeError, ValueError) as error:
+        except (AttemptWorkspaceError, OSError, RepositoryUnsafeError, ValueError) as error:
             raise RuntimeError("WORKER_WORKSPACE_UNAVAILABLE") from error
         if observed != workspace.tree_digest:
             raise RuntimeError(reason)
@@ -1211,7 +1265,9 @@ class _CompositionWorkerTools(ScopedToolRuntime):
     ) -> GrantedWorkspacePort:
         inner = GrantedWorkspaceAdapter(primary.workspace.root, self._secret_policy)
 
-        def after_result(action: RiskyAction, expected: ActionPreState, result: ToolResult) -> None:
+        def after_result(
+            action: RiskyAction, expected: ActionPreState, result: ToolResult
+        ) -> ToolResult:
             if result.code in {
                 "DELETED",
                 "RENAMED",
@@ -1225,35 +1281,43 @@ class _CompositionWorkerTools(ScopedToolRuntime):
                             continue
                         if not self._apply_granted_mutation(candidate, mutation):
                             state.patch_sync_uncertain = True
-                            return
+                            return self._granted_sync_uncertain(result)
                         candidate.tree_digest = candidate.patch_executor.tree_digest()
                     primary.tree_digest = primary.patch_executor.tree_digest()
                 except (OSError, RepositoryUnsafeError, ValueError):
                     state.patch_sync_uncertain = True
-                    return
+                    return self._granted_sync_uncertain(result)
                 state.mutation_history.append(mutation)
             elif result.code == "INDETERMINATE":
                 state.patch_sync_uncertain = True
+            return result
 
         return _TrackingGrantedWorkspace(inner, after_result)
+
+    @staticmethod
+    def _granted_sync_uncertain(result: ToolResult) -> ToolResult:
+        return ToolResult(
+            code="INFRASTRUCTURE_UNCERTAINTY",
+            run_id=result.run_id,
+            intent_id=result.intent_id,
+            timed_out=True,
+            bounded_payload={"reason": "WORKER_CHECK_WORKSPACE_SYNC_UNCERTAIN"},
+        )
 
     def _apply_granted_mutation(
         self, candidate: _CheckWorkspaceState, mutation: _GrantedMutation
     ) -> bool:
         workspace = GrantedWorkspaceAdapter(candidate.workspace.root, self._secret_policy)
-        handler = {
-            "delete": workspace.delete_regular_file,
-            "rename": workspace.rename_regular_file,
-            "set_executable": workspace.set_executable,
-            "protected_patch": workspace.apply_protected_patch,
+        handler, expected_code = {
+            "delete": (workspace.delete_regular_file, "DELETED"),
+            "rename": (workspace.rename_regular_file, "RENAMED"),
+            "set_executable": (workspace.set_executable, "EXECUTABLE_CHANGED"),
+            "protected_patch": (
+                workspace.apply_protected_patch,
+                "PROTECTED_PATCH_APPLIED",
+            ),
         }[mutation.action.operation]
         result = handler(mutation.action, mutation.expected)
-        expected_code = {
-            "delete": "DELETED",
-            "rename": "RENAMED",
-            "set_executable": "EXECUTABLE_CHANGED",
-            "protected_patch": "PROTECTED_PATCH_APPLIED",
-        }[mutation.action.operation]
         return result.code == expected_code
 
     def _build_sanitized_snapshot(
@@ -2317,6 +2381,65 @@ def build_application_bundle(
     secret_policy: SecretPathPolicy | None = None,
     response_schemas: Mapping[str, Mapping[str, object]] | None = None,
     client_factory: ClientFactory | None = None,
+    allow_live_provider: bool = False,
+) -> ApplicationBundle:
+    """Build the production application graph with the restricted executor boundary."""
+    return _build_application_bundle(
+        root,
+        repository_authority=repository_authority,
+        model_configuration=model_configuration,
+        budget=budget,
+        scripted_model=scripted_model,
+        credential_source=credential_source,
+        secret_policy=secret_policy,
+        response_schemas=response_schemas,
+        client_factory=client_factory,
+        executor=None,
+        allow_live_provider=allow_live_provider,
+    )
+
+
+def build_test_application_bundle(
+    root: Path,
+    *,
+    repository_authority: RepositoryBootstrapPort | None = None,
+    model_configuration: ModelConfigurationRevisionDocument | None = None,
+    budget: BudgetRevisionDocument | None = None,
+    scripted_model: ScriptedMockLLM | None = None,
+    credential_source: ModelCredentialPort | None = None,
+    secret_policy: SecretPathPolicy | None = None,
+    response_schemas: Mapping[str, Mapping[str, object]] | None = None,
+    client_factory: ClientFactory | None = None,
+    executor: ExecutorPort,
+    allow_live_provider: bool = False,
+) -> ApplicationBundle:
+    """Build the deterministic test seam with an explicitly supplied executor."""
+    return _build_application_bundle(
+        root,
+        repository_authority=repository_authority,
+        model_configuration=model_configuration,
+        budget=budget,
+        scripted_model=scripted_model,
+        credential_source=credential_source,
+        secret_policy=secret_policy,
+        response_schemas=response_schemas,
+        client_factory=client_factory,
+        executor=executor,
+        allow_live_provider=allow_live_provider,
+    )
+
+
+def _build_application_bundle(
+    root: Path,
+    *,
+    repository_authority: RepositoryBootstrapPort | None = None,
+    model_configuration: ModelConfigurationRevisionDocument | None = None,
+    budget: BudgetRevisionDocument | None = None,
+    scripted_model: ScriptedMockLLM | None = None,
+    credential_source: ModelCredentialPort | None = None,
+    secret_policy: SecretPathPolicy | None = None,
+    response_schemas: Mapping[str, Mapping[str, object]] | None = None,
+    client_factory: ClientFactory | None = None,
     executor: ExecutorPort | None = None,
     allow_live_provider: bool = False,
 ) -> ApplicationBundle:
@@ -2367,7 +2490,10 @@ def build_application_bundle(
                 store, selected_model_configuration, selected_budget
             ),
             models=worker_model,
-            actions=WorkerActionCodec(worker_tools.capture_expected_prestate),
+            actions=WorkerActionCodec(
+                worker_tools.capture_expected_prestate,
+                worker_tools.capture_snapshot_digest,
+            ),
             authority=authority,
             tools=worker_tools,
             journal=store,
@@ -2507,4 +2633,4 @@ def _worst_case_reservation(
     )
 
 
-__all__ = ["ApplicationBundle", "build_application_bundle"]
+__all__ = ["ApplicationBundle", "build_application_bundle", "build_test_application_bundle"]

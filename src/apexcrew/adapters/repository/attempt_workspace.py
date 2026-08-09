@@ -55,6 +55,7 @@ class MaterializedWorkspace:
     root: Path
     entries: tuple[SanitizedSnapshotEntry, ...]
     tree_digest: Sha256DigestText
+    identity_chain: tuple[HandleIdentity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +119,9 @@ class AttemptWorkspaceAdapter:
         self._data_root = data_root
         self._secret_paths = secret_paths
         self._materialization_lock = threading.RLock()
+        self._context_cache: dict[
+            tuple[str, str, tuple[str, ...], tuple[str, ...]], MaterializedWorkspace
+        ] = {}
 
     def materialize_context(
         self,
@@ -127,12 +131,25 @@ class AttemptWorkspaceAdapter:
         read_globs: Sequence[GlobPattern],
         dependency_globs: Sequence[GlobPattern],
     ) -> MaterializedWorkspace:
-        return self._materialize(
-            attempt_id=attempt_id,
-            base_oid=base_oid,
-            globs=(*read_globs, *dependency_globs),
-            kind="context",
-        )
+        read_values = tuple(pattern.value for pattern in read_globs)
+        dependency_values = tuple(pattern.value for pattern in dependency_globs)
+        cache_key = (str(attempt_id), str(base_oid), read_values, dependency_values)
+        with self._materialization_lock:
+            cached = self._context_cache.get(cache_key)
+            if cached is not None:
+                self.verify_workspace_identity(cached)
+                return cached
+            for key in tuple(self._context_cache):
+                if key[0] == cache_key[0]:
+                    del self._context_cache[key]
+            workspace = self._materialize(
+                attempt_id=attempt_id,
+                base_oid=base_oid,
+                globs=(*read_globs, *dependency_globs),
+                kind="context",
+            )
+            self._context_cache[cache_key] = workspace
+            return workspace
 
     def materialize_check(
         self,
@@ -142,6 +159,7 @@ class AttemptWorkspaceAdapter:
         input_globs: Sequence[GlobPattern],
         write_globs: Sequence[GlobPattern],
         workspace_key: str | None = None,
+        reject_existing: bool = False,
     ) -> MaterializedWorkspace:
         kind = (
             "check"
@@ -153,7 +171,27 @@ class AttemptWorkspaceAdapter:
             base_oid=base_oid,
             globs=(*input_globs, *write_globs),
             kind=kind,
+            reject_existing=reject_existing,
         )
+
+    def verify_workspace_identity(self, workspace: MaterializedWorkspace) -> None:
+        if not workspace.identity_chain:
+            return
+        try:
+            relative = workspace.root.relative_to(self._data_root).as_posix()
+        except ValueError as error:
+            raise AttemptWorkspaceError("WORKSPACE_ROOT_BINDING_INVALID") from error
+        with self._materialization_lock:
+            tree = self._tree()
+            try:
+                observed = tree.identity_chain(relative)
+                if observed != workspace.identity_chain:
+                    raise AttemptWorkspaceError("WORKSPACE_IDENTITY_CHANGED")
+                tree.assert_name_bindings()
+            except (NoFollowError, OSError, ValueError) as error:
+                raise AttemptWorkspaceError("WORKSPACE_IDENTITY_CHANGED") from error
+            finally:
+                tree.close()
 
     def close(self) -> None:
         """The repository and Git runner are borrowed from the composition root."""
@@ -165,6 +203,7 @@ class AttemptWorkspaceAdapter:
         base_oid: GitOid,
         globs: Sequence[GlobPattern],
         kind: str,
+        reject_existing: bool = False,
     ) -> MaterializedWorkspace:
         with self._materialization_lock:
             component = _attempt_component(attempt_id)
@@ -176,12 +215,15 @@ class AttemptWorkspaceAdapter:
             try:
                 tree.ensure_directory("attempts")
                 tree.ensure_directory(f"attempts/{component}")
+                if reject_existing and tree.try_open_any(relative_root) is not None:
+                    raise AttemptWorkspaceError("WORKSPACE_CACHE_STATE_UNAVAILABLE")
                 self._remove_existing_directory(tree, relative_root)
                 tree.ensure_directory(relative_root)
                 for entry, content in entries_and_content:
                     node = tree.create_file(f"{relative_root}/{entry.path}")
                     tree.write_bytes(node, content)
                 tree.assert_name_bindings()
+                identity_chain = tree.identity_chain(relative_root)
             except (NoFollowError, OSError, ValueError) as error:
                 raise AttemptWorkspaceError("WORKSPACE_WRITE_DENIED") from error
             finally:
@@ -191,6 +233,7 @@ class AttemptWorkspaceAdapter:
                 root=root,
                 entries=entries,
                 tree_digest=self._tree_digest(entries_and_content),
+                identity_chain=identity_chain,
             )
 
     def _load_manifest(

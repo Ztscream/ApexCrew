@@ -363,6 +363,9 @@ class DeclaredCheckRegistry:
         except KeyError as error:
             raise CheckDefinitionError("DECLARED_CHECK_NOT_FOUND") from error
 
+    def get(self, check_id: str) -> CheckDefinition | None:
+        return self._definitions.get(check_id)
+
 
 class CheckDeadlineJournal(Protocol):
     def action_deadline(self, intent_id: IntentId) -> ActionDeadline | None: ...
@@ -1044,7 +1047,9 @@ class ScopedToolRuntime:
             or self._deadline_authority is None
         ):
             return self._denied(intent, "LEASE_SCOPE_DENIED")
-        definition = self._declared_checks.require(action.check_id)
+        definition = self._declared_checks.get(action.check_id)
+        if definition is None:
+            return self._denied(intent, "SCOPE_DENIED")
         snapshot = self._sanitized_snapshot
         allowed_snapshot_globs = definition.input_globs
         if self._workspace_lease is not None:

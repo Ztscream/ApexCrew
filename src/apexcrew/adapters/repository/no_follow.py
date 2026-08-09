@@ -228,6 +228,16 @@ class StableHandleTree:
         if primary_error is not None:
             raise primary_error
 
+    def identity_chain(self, relative: str) -> tuple[HandleIdentity, ...]:
+        """Return the no-follow identity chain for one directory below the root."""
+        parts = tuple(relative.split("/"))
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            raise RepositoryUnsafeError("INVALID_HANDLE_RELATIVE_PATH")
+        self.open(relative, "directory")
+        return tuple(node.identity for node in self._root_chain) + tuple(
+            self._nodes[parts[: index + 1]].identity for index in range(len(parts))
+        )
+
     def close(self) -> None:
         owned = {node.handle: node for node in (*self._nodes.values(), *self._root_chain)}
         try:

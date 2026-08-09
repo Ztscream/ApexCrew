@@ -120,6 +120,59 @@ def test_check_materializes_input_and_write_union(tmp_path: Path) -> None:
         _close(adapter)
 
 
+def test_materialized_workspace_identity_rejects_same_content_root_replacement(
+    tmp_path: Path,
+) -> None:
+    root, base_oid = _repository(tmp_path)
+    adapter = _adapter(root, tmp_path)
+    try:
+        workspace = adapter.materialize_check(
+            attempt_id=AttemptId("attempt-1"),
+            base_oid=base_oid,
+            input_globs=(GlobPattern.parse("tests/**"),),
+            write_globs=(GlobPattern.parse("src/write.py"),),
+            workspace_key="check-1",
+        )
+        replacement = workspace.root.with_name("replacement")
+        workspace.root.rename(replacement)
+        shutil.copytree(replacement, workspace.root)
+
+        with pytest.raises(AttemptWorkspaceError, match="WORKSPACE_IDENTITY_CHANGED"):
+            adapter.verify_workspace_identity(workspace)
+    finally:
+        _close(adapter)
+
+
+def test_check_materialization_rejects_existing_root_without_erasing_patch(
+    tmp_path: Path,
+) -> None:
+    root, base_oid = _repository(tmp_path)
+    adapter = _adapter(root, tmp_path)
+    try:
+        workspace = adapter.materialize_check(
+            attempt_id=AttemptId("attempt-1"),
+            base_oid=base_oid,
+            input_globs=(GlobPattern.parse("tests/**"),),
+            write_globs=(GlobPattern.parse("src/write.py"),),
+            workspace_key="check-1",
+        )
+        patched = workspace.root / "src" / "write.py"
+        patched.write_bytes(b"write = 2\n")
+
+        with pytest.raises(AttemptWorkspaceError, match="WORKSPACE_CACHE_STATE_UNAVAILABLE"):
+            adapter.materialize_check(
+                attempt_id=AttemptId("attempt-1"),
+                base_oid=base_oid,
+                input_globs=(GlobPattern.parse("tests/**"),),
+                write_globs=(GlobPattern.parse("src/write.py"),),
+                workspace_key="check-1",
+                reject_existing=True,
+            )
+        assert patched.read_bytes() == b"write = 2\n"
+    finally:
+        _close(adapter)
+
+
 def test_context_and_check_digests_are_not_interchangeable(tmp_path: Path) -> None:
     root, base_oid = _repository(tmp_path)
     adapter = _adapter(root, tmp_path)

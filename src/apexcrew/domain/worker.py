@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from apexcrew.domain.actions import (
     ACTION_ADAPTER,
     ActionEnvelope,
+    CheckAction,
     FailAction,
     FinishAction,
     ToolActionEnvelope,
@@ -148,7 +149,10 @@ def validate_authorized_worker_action(
         or intent.authorization_binding_digest != decision.binding_digest
         or intent.applicable_revision_digests != binding.applicable_revision_digests
         or intent.repository_id != binding.repository_id
-        or intent.snapshot_digest != binding.snapshot_digest
+        or (
+            not isinstance(request.action, CheckAction)
+            and intent.snapshot_digest != binding.snapshot_digest
+        )
         or intent.scope_digest != binding.scope_digest
         or intent.dependency_fingerprint_basis != binding.dependency_fingerprint_basis
         or intent.expected_prestate_json != expected_prestate.canonical_json()
@@ -392,13 +396,20 @@ class WorkerActionPort(Protocol):
         self, binding: WorkerTurnBinding, action: ToolActionEnvelope
     ) -> ActionPreState: ...
 
+    def capture_snapshot_digest(
+        self, binding: WorkerTurnBinding, action: ToolActionEnvelope
+    ) -> Sha256DigestText: ...
+
 
 class WorkerActionCodec:
     def __init__(
         self,
         prestate: Callable[[WorkerTurnBinding, ToolActionEnvelope], ActionPreState],
+        snapshot_digest: Callable[[WorkerTurnBinding, ToolActionEnvelope], Sha256DigestText]
+        | None = None,
     ) -> None:
         self._prestate = prestate
+        self._snapshot_digest = snapshot_digest
 
     def parse_one(self, action: Mapping[str, object]) -> ToolActionEnvelope | None:
         try:
@@ -410,6 +421,13 @@ class WorkerActionCodec:
         self, binding: WorkerTurnBinding, action: ToolActionEnvelope
     ) -> ActionPreState:
         return self._prestate(binding, action)
+
+    def capture_snapshot_digest(
+        self, binding: WorkerTurnBinding, action: ToolActionEnvelope
+    ) -> Sha256DigestText:
+        if self._snapshot_digest is None:
+            return binding.snapshot_digest
+        return self._snapshot_digest(binding, action)
 
 
 class WorkerAttemptState(Protocol):
@@ -638,6 +656,7 @@ class WorkerLoopService:
                 stopped.resulting_sequence,
             )
         prestate = self._actions.capture_expected_prestate(binding, action)
+        snapshot_digest = self._actions.capture_snapshot_digest(binding, action)
         prestate_digest = sha256_digest(prestate.canonical_json())
         action_started_at = self._clock()
         timeout_seconds = (
@@ -715,7 +734,7 @@ class WorkerLoopService:
             authorization_binding_digest=decision.binding_digest,
             applicable_revision_digests=binding.applicable_revision_digests,
             repository_id=binding.repository_id,
-            snapshot_digest=binding.snapshot_digest,
+            snapshot_digest=snapshot_digest,
             scope_digest=binding.scope_digest,
             dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
             idempotency_key=(
