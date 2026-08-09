@@ -119,6 +119,17 @@ class _RecordingExecutor:
         )
 
 
+class _RaisingExecutor(_RecordingExecutor):
+    def run(
+        self,
+        argv: Sequence[str],
+        snapshot: SanitizedSnapshot,
+        timeout_seconds: int,
+    ) -> ExecutionResult:
+        self.calls.append((tuple(argv), snapshot, timeout_seconds))
+        raise RuntimeError("EXECUTOR_RUNTIME_FAILURE")
+
+
 def _envelope(request_id: str, sequence: int | None, payload: object) -> CommandEnvelope:
     return CommandEnvelope(
         request_id=request_id,
@@ -131,6 +142,8 @@ def _envelope(request_id: str, sequence: int | None, payload: object) -> Command
 def _prepare_worker_run(
     tmp_path: Path,
     worker_actions: Sequence[dict[str, object]],
+    *,
+    executor: _RecordingExecutor | None = None,
 ) -> tuple[object, RunId, _RecordingExecutor, Path, GitOid]:
     root = tmp_path / "repo"
     root.mkdir()
@@ -149,7 +162,7 @@ def _prepare_worker_run(
         update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
     )
     model = _WorkerModel(worker_actions)
-    executor = _RecordingExecutor()
+    executor = _RecordingExecutor() if executor is None else executor
     bundle = build_test_application_bundle(
         root,
         model_configuration=model_configuration,
@@ -291,7 +304,7 @@ def test_public_composition_binds_check_to_patched_workspace(tmp_path: Path) -> 
 
 
 def test_unknown_check_is_settled_as_a_durable_tool_denial(tmp_path: Path) -> None:
-    bundle, run_id, executor, _root, _target_oid = _prepare_worker_run(
+    bundle, run_id, executor, root, _target_oid = _prepare_worker_run(
         tmp_path,
         (
             {"kind": "check", "check_id": "task-01:unknown"},
@@ -303,15 +316,49 @@ def test_unknown_check_is_settled_as_a_durable_tool_denial(tmp_path: Path) -> No
         assert stop.reason.value == "AWAITING_FINAL_APPROVAL"
         assert executor.calls == []
         assert bundle.queries.get(run_id).sequence > 0
-        with sqlite3.connect(_root / ".apexcrew" / "state.db") as connection:
-            assert (
-                connection.execute(
-                    "SELECT 1 FROM effect_intents WHERE run_id = ? AND kind = 'check' "
-                    "AND state = 'SETTLED'",
-                    (run_id,),
-                ).fetchone()
-                is not None
-            )
+        with sqlite3.connect(root / ".apexcrew" / "state.db") as connection:
+            row = connection.execute(
+                "SELECT effect_intents.state, effect_results.result_class, "
+                "effect_results.result_json "
+                "FROM effect_intents JOIN effect_results USING (intent_id) "
+                "WHERE effect_intents.run_id = ? AND effect_intents.kind = 'check'",
+                (run_id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "SETTLED"
+        assert row[1] in {
+            "SCOPE_DENIED",
+            "LEASE_SCOPE_DENIED",
+        }
+        result = json.loads(str(row[2]))
+        assert result["outcome"] == "FAILED"
+        assert result["result_class"] == row[1]
+    finally:
+        bundle.close()
+
+
+def test_composed_tool_execution_failure_settles_the_recorded_intent(tmp_path: Path) -> None:
+    executor = _RaisingExecutor()
+    bundle, run_id, _executor, root, _target_oid = _prepare_worker_run(
+        tmp_path,
+        ({"kind": "check", "check_id": "task-01:check-1"},),
+        executor=executor,
+    )
+    try:
+        stop = bundle.runtime.run_until_blocked(run_id)
+        assert stop.reason.value == "PAUSED"
+        with sqlite3.connect(root / ".apexcrew" / "state.db") as connection:
+            row = connection.execute(
+                "SELECT effect_intents.state, effect_results.result_class, "
+                "effect_results.result_json "
+                "FROM effect_intents JOIN effect_results USING (intent_id) "
+                "WHERE effect_intents.run_id = ? AND effect_intents.kind = 'check'",
+                (run_id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "INDETERMINATE"
+        assert row[1] == "INFRASTRUCTURE_UNCERTAINTY"
+        assert '"intent_id"' in str(row[2])
     finally:
         bundle.close()
 

@@ -5075,7 +5075,7 @@ class InMemoryStateStore:
                 if (
                     decision.effect_result.intent_id != member_intent_id
                     or decision.effect_result.run_id != request.run_id
-                    or decision.effect_result.outcome != "COMPLETED"
+                    or decision.effect_result.outcome not in {"COMPLETED", "FAILED"}
                 ):
                     raise StateConflict("OBSERVED_RECOVERY_RESULT_BINDING_MISMATCH")
                 copied._effect_results[member_intent_id] = decision.effect_result

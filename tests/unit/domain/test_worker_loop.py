@@ -116,6 +116,7 @@ class StaticAttempts:
 class RecordingAttempts(StaticAttempts):
     recorded_intents: int = 0
     settled_results: int = 0
+    settled_result_code: str | None = None
     feedback: str | None = None
 
     def record_authorized_worker_action(self, **values: object) -> ToolIntent:
@@ -130,6 +131,7 @@ class RecordingAttempts(StaticAttempts):
         result = cast(ToolResult, values["result"])
         assert result.intent_id == intent.intent_id
         self.settled_results += 1
+        self.settled_result_code = result.code
         if result.code == "CHECK_FAILED":
             self.feedback = "CHECK_FAILED: expected 3.00, received 2.99"
         return AuditSequence(2)
@@ -293,6 +295,15 @@ class UncertainTools:
             timed_out=True,
             bounded_payload={"snapshot_digest": SHA, "reason": "PATCH_RESULT_UNCERTAIN"},
         )
+
+
+class ExplodingTools:
+    execution_count: int = 0
+
+    def execute(self, intent: ToolIntent) -> ToolResult:
+        del intent
+        self.execution_count += 1
+        raise RuntimeError("WORKER_TOOL_EXECUTION_FAILED")
 
 
 class FailingThenPassingTools:
@@ -476,6 +487,39 @@ def test_uncertain_patch_result_settles_before_worker_pauses() -> None:
     assert decision.resulting_sequence == 2
     assert tools.execution_count == 1
     assert attempts.settled_results == 1
+
+
+def test_tool_execution_failure_settles_before_worker_pauses() -> None:
+    attempts = RecordingAttempts()
+    tools = ExplodingTools()
+    model = OneCompletion(
+        {
+            "kind": "patch",
+            "path": "src/a.py",
+            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+        }
+    )
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(lambda _binding, _action: ActionPreState(source_digest=SHA)),
+        authority=cast(object, AllowAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "STOP"
+    assert decision.stop_reason == "INFRASTRUCTURE_UNCERTAINTY"
+    assert decision.resulting_sequence == 2
+    assert tools.execution_count == 1
+    assert attempts.settled_results == 1
+    assert attempts.settled_result_code == "INFRASTRUCTURE_UNCERTAINTY"
 
 
 def test_failed_check_feedback_reaches_next_model_request() -> None:

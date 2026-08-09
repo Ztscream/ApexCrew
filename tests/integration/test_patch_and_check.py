@@ -7,10 +7,11 @@ from apexcrew.adapters.executor.attempt_patch import AttemptPatchExecutionError
 from apexcrew.adapters.executor.fake import FakeExecutor, FakeProcessResult
 from apexcrew.adapters.repository.snapshot import MemoryRepositorySnapshot
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.application.runtime import ToolActionResolutionObserver
 from apexcrew.domain.actions import CheckAction, PatchAction
 from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision, WorkspaceLease
 from apexcrew.domain.commands import ApplicableRevisionDigests
-from apexcrew.domain.effects import sha256_digest
+from apexcrew.domain.effects import recover_observation, sha256_digest
 from apexcrew.domain.plan import CheckDefinition, GlobPattern
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.tools import (
@@ -33,14 +34,14 @@ def secret_policy(*rules: str) -> SecretPathPolicy:
     return SecretPathPolicy.from_host_rules(rules, installation_key=b"k" * 32)
 
 
-def check_intent(intent_id: str = "intent-check") -> ToolIntent:
+def check_intent(intent_id: str = "intent-check", check_id: str = "task-check-1") -> ToolIntent:
     return ToolIntent.for_authorized_worker_action(
         intent_id=IntentId(intent_id),
         run_id=RunId("run-1"),
         task_id=TaskId("task-1"),
         attempt_id=AttemptId("attempt-1"),
         action_id="action-check",
-        action=CheckAction(check_id="task-check-1"),
+        action=CheckAction(check_id=check_id),
         authorization_binding_digest=SHA,
         applicable_revision_digests=ApplicableRevisionDigests(),
         repository_id="repository-1",
@@ -248,6 +249,39 @@ def test_timed_out_check_returns_uncertainty_without_receipt(tmp_path: Path) -> 
     assert result.timed_out is True
     assert result.bounded_payload["retry_scope"] == ("task-check-1", SNAPSHOT_SHA)
     assert "receipt" not in result.model_dump(mode="json")
+
+
+class RecoveryJournal:
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        assert run_id == RunId("run-1")
+        return AuditSequence(2)
+
+
+def test_unknown_check_denial_is_an_exact_recovery_receipt(tmp_path: Path) -> None:
+    runtime = check_runtime(
+        tmp_path,
+        FakeProcessResult(exit_code=0, timed_out=False, timing_ms=1),
+    )
+    intent = check_intent("intent-unknown", "task-check-unknown")
+
+    state, result = runtime.observe_recovery(intent)
+
+    assert state == "EXACT_RECEIPT"
+    assert result is not None
+    assert result.code == "SCOPE_DENIED"
+    assert result.bounded_payload["check_id"] == "task-check-unknown"
+    assert result.bounded_payload["argv_digest"] == "sha256:" + "0" * 64
+    assert result.bounded_payload["snapshot_digest"] == intent.snapshot_digest
+    assert result.content_digest == result.bounded_payload["receipt_digest"]
+
+    observation = ToolActionResolutionObserver(RecoveryJournal(), runtime).observe(
+        intent.to_effect_intent(AuditSequence(1)),
+        recovery_generation=1,
+    )
+    decision = recover_observation(observation)
+    assert decision.kind.value == "COMPLETED"
+    assert decision.effect_result is not None
+    assert decision.effect_result.outcome == "FAILED"
 
 
 def test_failed_check_error_output_does_not_disclose_secret_path(tmp_path: Path) -> None:

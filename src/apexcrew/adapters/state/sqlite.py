@@ -8614,7 +8614,7 @@ class SqliteStateStore:
                 if (
                     decision.effect_result.intent_id != IntentId(selected_member.intent_id)
                     or decision.effect_result.run_id != request.run_id
-                    or decision.effect_result.outcome != "COMPLETED"
+                    or decision.effect_result.outcome not in {"COMPLETED", "FAILED"}
                 ):
                     raise StateConflict("OBSERVED_RECOVERY_RESULT_BINDING_MISMATCH")
                 if (

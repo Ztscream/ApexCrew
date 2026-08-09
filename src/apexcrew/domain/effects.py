@@ -1051,7 +1051,15 @@ class RecoveryObservation(FrozenDocument):
                     raise ValueError("TOOL_COMPLETION_PROOF_BINDING_MISMATCH")
                 expected_codes = {
                     RecoveryActionClass.PATCH: {"PATCH_APPLIED"},
-                    RecoveryActionClass.CHECK: {"CHECK_PASSED", "CHECK_FAILED"},
+                    RecoveryActionClass.CHECK: {
+                        "CHECK_PASSED",
+                        "CHECK_FAILED",
+                        "SECRET_PATH_DENIED",
+                        "SCOPE_DENIED",
+                        "LEASE_SCOPE_DENIED",
+                        "NO_FOLLOW_PATH_DENIED",
+                        "APPROVAL_REQUIRED",
+                    },
                 }
                 if tool_result.code not in expected_codes[self.kind]:
                     raise ValueError("TOOL_COMPLETION_PROOF_CODE_INVALID")
@@ -1111,7 +1119,7 @@ class RecoveryDecision:
         if self.kind is RecoveryDecisionKind.COMPLETED:
             assert self.effect_result is not None
             if (
-                self.effect_result.outcome != "COMPLETED"
+                self.effect_result.outcome not in {"COMPLETED", "FAILED"}
                 or self.effect_result.result_digest != self.result_digest
                 or self.effect_result.bounded_result_json != self.bounded_result_json
                 or self.effect_result.settled_sequence != self.settled_sequence
@@ -1215,10 +1223,23 @@ def _completed_decision(
     assert observation.run_id is not None
     assert observation.settled_sequence is not None
     assert observation.applicable_revision_digests is not None
+    outcome: Literal["COMPLETED", "FAILED"] = "COMPLETED"
+    if observation.kind is RecoveryActionClass.CHECK:
+        from apexcrew.domain.tools import ToolResult
+
+        tool_result = ToolResult.model_validate_json(bounded_result_json)
+        if tool_result.code in {
+            "SECRET_PATH_DENIED",
+            "SCOPE_DENIED",
+            "LEASE_SCOPE_DENIED",
+            "NO_FOLLOW_PATH_DENIED",
+            "APPROVAL_REQUIRED",
+        }:
+            outcome = "FAILED"
     effect_result = EffectResult(
         intent_id=observation.intent_id,
         run_id=observation.run_id,
-        outcome="COMPLETED",
+        outcome=outcome,
         result_class=reason,
         result_digest=result_digest,
         bounded_result_json=bounded_result_json,

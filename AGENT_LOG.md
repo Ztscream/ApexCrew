@@ -2714,3 +2714,38 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Quality-Review**: initial quality reviewer `019fe1e0-0753-7590-a902-2a893f50397f` returned PASS with judgement-call smells only. Ordered final quality reviewer `019fe1f2-0eee-7103-978e-3bd03eb4da3b` returned PASS with zero Critical/High code findings; its ledger Medium was closed by this documentation commit. All reviewers used `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
 - **Lesson**: uncertain external effects must be typed before any ordinary denial path, including a create call that may have committed a file before returning; context redaction must inspect embedded path syntax rather than relying on whitespace token boundaries.
 - **Owner-only actions not performed**: provider credentials/network requests, push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 post-intent settlement and denial recovery correction
+
+- **Base and task**: R4.3-03 correction started from `f7ce7ab` on
+  `codex/m1-r4-3-executor-wiring`; the implementation worktree is
+  `.worktrees/m1-r4-3-executor-wiring`.
+- **Subagent and human changes**: Codex implementation pass using
+  `andrej-karpathy-skills:karpathy-guidelines`; **Human-Changes: none**.
+- **Red evidence**: the post-intent selectors exited `2 failed` before the
+  correction: WorkerLoop propagated `WORKER_TOOL_EXECUTION_FAILED`, and the
+  composed executor failure left no joined settled effect result. The
+  unknown-check recovery selector first returned `UNAVAILABLE`; the recovery
+  proof then rejected its denial code.
+- **Implementation**: WorkerLoop converts post-intent tool exceptions into a
+  current-intent-bound `INFRASTRUCTURE_UNCERTAINTY` result before settlement.
+  Check denial recovery now emits an exact receipt with a stable sentinel
+  `argv_digest`, check ID, snapshot digest, and receipt digest. Recovery keeps
+  denial effects as `FAILED`, while both state adapters accept that observed
+  settled outcome. The composed unknown-check regression now asserts the
+  durable denial result and `FAILED/SETTLED` state.
+- **Green evidence**: focused Worker/composition/patch/check selectors ->
+  `20 passed`; recovery/runtime selectors -> `36 passed`; full
+  `uv run --python 3.12 pytest -q` exited `0` with the repository's existing
+  platform/Docker skips and Starlette deprecation warning. `mypy src`, Ruff
+  check/format, and `git diff --check` passed.
+- **Review status**: the prior SPEC rerun `019fe4ba-875e-7c80-aac4-6e57c52f65a7`
+  inspected the pre-correction `HEAD` and reported the now-fixed execution
+  exception High. A fresh final SPEC review and ordered quality review are
+  required against the correction commit.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because the restricted
+  Docker invocation was not observed in this environment. Workspace mutation
+  history remains process-local; restart recovery for an in-flight patched
+  workspace is a follow-up boundary and is not claimed closed by R4.3-03.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.

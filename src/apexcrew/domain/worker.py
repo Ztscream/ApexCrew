@@ -790,7 +790,19 @@ class WorkerLoopService:
     def _execute_and_settle(
         self, intent: ToolIntent, decision: AuthorizationDecision
     ) -> RuntimeDecision:
-        result = self._tools.execute(intent)
+        try:
+            result = self._tools.execute(intent)
+        except Exception:  # noqa: BLE001 - an execution fault must settle this intent
+            result = ToolResult(
+                code="INFRASTRUCTURE_UNCERTAINTY",
+                run_id=intent.run_id,
+                intent_id=intent.intent_id,
+                timed_out=True,
+                bounded_payload={
+                    "reason": "WORKER_TOOL_EXECUTION_UNCERTAIN",
+                    "snapshot_digest": intent.snapshot_digest,
+                },
+            )
         if result.code == "APPROVAL_REQUIRED":
             raise AssertionError("allowed intent returned approval-required")
         sequence = self._attempts.settle_worker_action(

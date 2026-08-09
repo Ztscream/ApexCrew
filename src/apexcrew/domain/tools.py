@@ -67,6 +67,16 @@ ToolDenialCode = Literal[
     "NO_FOLLOW_PATH_DENIED",
     "APPROVAL_REQUIRED",
 ]
+CHECK_DENIAL_CODES = frozenset(
+    {
+        "SECRET_PATH_DENIED",
+        "SCOPE_DENIED",
+        "LEASE_SCOPE_DENIED",
+        "NO_FOLLOW_PATH_DENIED",
+        "APPROVAL_REQUIRED",
+    }
+)
+UNKNOWN_CHECK_ARGV_DIGEST = Sha256DigestText("sha256:" + "0" * 64)
 MAX_EXECUTOR_OUTPUT_BYTES = 65_536
 
 
@@ -712,24 +722,17 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
     if tool_result.run_id != intent.run_id or tool_result.intent_id != intent.intent_id:
         raise ToolEffectResultError("TOOL_RESULT_BINDING_INVALID")
     if intent.kind == "check":
-        check_denials = {
-            "SECRET_PATH_DENIED",
-            "SCOPE_DENIED",
-            "LEASE_SCOPE_DENIED",
-            "NO_FOLLOW_PATH_DENIED",
-            "APPROVAL_REQUIRED",
-        }
         check_codes = {
             "CHECK_PASSED",
             "CHECK_FAILED",
             "EXECUTOR_UNAVAILABLE",
             "INFRASTRUCTURE_UNCERTAINTY",
-        } | check_denials
+        } | CHECK_DENIAL_CODES
         if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in check_codes:
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
         if result.snapshot_digest != tool_intent.snapshot_digest:
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
-        if tool_result.code in check_denials:
+        if tool_result.code in CHECK_DENIAL_CODES:
             if tool_result.bounded_payload.get("snapshot_digest") != tool_intent.snapshot_digest:
                 raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
             if result.outcome != "FAILED":
@@ -872,16 +875,16 @@ class ScopedToolRuntime:
             return "THIRD_STATE", None
         if isinstance(intent.action, CheckAction):
             result = self.execute(intent)
-            if result.code not in {"CHECK_PASSED", "CHECK_FAILED"}:
+            if result.code not in {"CHECK_PASSED", "CHECK_FAILED"} | CHECK_DENIAL_CODES:
                 return "UNAVAILABLE", None
             definition = (
-                self._declared_checks.require(intent.action.check_id)
-                if self._declared_checks
-                else None
+                self._declared_checks.get(intent.action.check_id) if self._declared_checks else None
             )
-            if definition is None:
-                return "UNAVAILABLE", None
-            argv_digest = sha256_digest(canonical_json({"argv": list(definition.argv)}))
+            argv_digest = (
+                UNKNOWN_CHECK_ARGV_DIGEST
+                if definition is None
+                else sha256_digest(canonical_json({"argv": list(definition.argv)}))
+            )
             receipt_digest = result.content_digest or sha256_digest(
                 canonical_json(result.model_dump(mode="json"))
             )
