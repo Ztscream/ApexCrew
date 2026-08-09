@@ -2750,6 +2750,37 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-09 / R4.3-03 quality correction: test support boundary
+
+- **Quality review**: independent reviewer `019fe53e-5288-7e92-937b-c80d68a42823`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with one Medium and no
+  Critical/High/Low findings. The restricted Docker selector imported
+  underscore-prefixed helpers from another test module and accessed private
+  production graph members, coupling collection to pytest import order.
+- **Red evidence**: the quality review identified the coupling at the
+  selector's import and graph-inspection lines; the selector itself passed in
+  isolation, so the red condition was review-level fragility rather than a
+  runtime assertion failure.
+- **Correction**: added dedicated `tests/helpers/composition_wiring.py`
+  support. It owns the minimal production graph setup and returns the actual
+  selected check executor; `test_restricted_executor_docker.py` now imports
+  only the public support function and asserts its type/host-fallback boundary.
+  The composition test module remains independent of the restricted test.
+  **Human-Changes: none**.
+- **Green evidence**: the five exact wiring selectors -> `5 passed`; the
+  restricted production selector -> `1 passed`; Ruff check/format (`166 files
+  already formatted`), `mypy src` (66 source files), and `git diff --check`
+  exited `0`.
+- **Review status**: the prior SPEC review passed at
+  `019fe538-49f7-7991-b7f6-7f0ee437a8b2`; a fresh independent quality rerun
+  is required against the correction commit. All reviewers use
+  `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no live
+  restricted Docker process was observed; workspace mutation history and
+  restart recovery remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
 ## 2026-08-09 / R4.3-03 SPEC selector placement correction
 
 - **SPEC rerun**: fresh reviewer `019fe52e-1fda-7701-99cf-5ac045e94f1f`,

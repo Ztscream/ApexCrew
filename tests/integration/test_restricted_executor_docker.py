@@ -8,14 +8,9 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from test_composed_worker_tools import (
-    _direct_intent,
-    _install_direct_worker_attempt,
-    _prepare_worker_run,
-)
+from helpers.composition_wiring import production_check_executor
 
 from apexcrew.adapters.executor.restricted import RestrictedDockerExecutor
-from apexcrew.domain.actions import CheckAction
 from apexcrew.domain.effects import sha256_digest
 from apexcrew.domain.revisions import ExecutorProfileDocument, ToolVersionDocument
 from apexcrew.domain.tools import SanitizedSnapshot, SanitizedSnapshotEntry
@@ -76,22 +71,10 @@ def test_restricted_executor_command_is_closed() -> None:
 
 
 def test_docker_executor_is_the_only_composed_check_path(tmp_path: Path) -> None:
-    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(
-        tmp_path, (), production=True
-    )
-    try:
-        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
-        action = CheckAction(check_id="task-01:check-1")
-        snapshot_digest = tools.capture_snapshot_digest(binding, action)
-        runtime = tools._runtime(  # type: ignore[attr-defined]
-            _direct_intent(binding, action, snapshot_digest)
-        )
-        production_tools_executor = runtime._executor  # type: ignore[attr-defined]
+    production_tools_executor = production_check_executor(tmp_path)
 
-        assert type(production_tools_executor).__name__ == "RestrictedDockerExecutor"
-        assert "LocalSubprocessExecutor" not in repr(production_tools_executor)
-    finally:
-        bundle.close()
+    assert type(production_tools_executor).__name__ == "RestrictedDockerExecutor"
+    assert "LocalSubprocessExecutor" not in repr(production_tools_executor)
 
 
 def test_committed_image_enforces_restricted_executor_boundary(tmp_path: Path) -> None:
