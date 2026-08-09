@@ -2750,6 +2750,31 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-09 / R4.3-03 final quality review and ledger closeout
+
+- **Quality rerun**: independent reviewer `019fe558-8441-7fc3-923f-f909f3b85a3e`,
+  configured as `gpt-5.6-luna-max`, reviewed the correction range
+  `e46c10d..2b98c9e` and returned `PASS` with zero findings. The review
+  confirmed that the prior Medium test-module coupling is removed and that
+  the support boundary introduces no Critical/High/Medium/Low issue.
+- **Correction evidence**: `tests/helpers/composition_wiring.py` now owns
+  the minimal production graph setup and exposes `production_check_executor()`;
+  `test_restricted_executor_docker.py` imports only that public helper and no
+  longer depends on another test module's private helpers or collection order.
+  **Human-Changes: none**.
+- **Observed green evidence**: affected selectors -> `14 passed, 1 skipped`;
+  `make test` -> `100%` pass; `make lint` -> Ruff format/check clean and
+  mypy clean for 66 source files; `git diff --check` -> exit `0`.
+- **Task closeout**: R4.3-03 is final-reviewed at `2b98c9e` with base
+  `a77a7f8`; the PLAN ledger now records the implementation and correction
+  chain plus the final SPEC and quality reviewer IDs. R4.3-04 may use this
+  reviewed commit as its exact base.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no live
+  restricted Docker process was observed; process-local workspace mutation
+  history and restart recovery remain follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
 ## 2026-08-09 / R4.3-03 quality correction: test support boundary
 
 - **Quality review**: independent reviewer `019fe53e-5288-7e92-937b-c80d68a42823`,
