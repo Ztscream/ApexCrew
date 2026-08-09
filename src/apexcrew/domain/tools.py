@@ -784,6 +784,7 @@ class ScopedToolRuntime:
         snapshot_digest: Sha256DigestText,
         scope_digest: Sha256DigestText,
         dependency_fingerprint_basis: Sha256DigestText,
+        recovery_snapshot_digest: Sha256DigestText | None = None,
         max_file_bytes: int = 131_072,
         max_search_matches: int = 200,
         max_search_bytes: int = 65_536,
@@ -806,6 +807,9 @@ class ScopedToolRuntime:
         self._applicable_revision_digests = applicable_revision_digests
         self._repository_id = repository_id
         self._snapshot_digest = snapshot_digest
+        self._recovery_snapshot_digest = (
+            snapshot_digest if recovery_snapshot_digest is None else recovery_snapshot_digest
+        )
         self._scope_digest = scope_digest
         self._dependency_fingerprint_basis = dependency_fingerprint_basis
         self._max_file_bytes = max_file_bytes
@@ -857,7 +861,8 @@ class ScopedToolRuntime:
             return "UNAVAILABLE", None
         if isinstance(intent.action, PatchAction):
             expected_post = intent.expected_poststate_digest
-            if expected_post is not None and self._snapshot_digest == expected_post:
+            observed_snapshot_digest = self._recovery_snapshot_digest
+            if expected_post is not None and observed_snapshot_digest == expected_post:
                 result = ToolResult(
                     code="PATCH_APPLIED",
                     run_id=intent.run_id,
@@ -870,7 +875,7 @@ class ScopedToolRuntime:
                     content_digest=expected_post,
                 )
                 return "EXACT_POST", result
-            if self._snapshot_digest == intent.snapshot_digest:
+            if observed_snapshot_digest == intent.snapshot_digest:
                 return "EXACT_PRE", None
             return "THIRD_STATE", None
         if isinstance(intent.action, CheckAction):

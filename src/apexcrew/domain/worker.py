@@ -15,6 +15,7 @@ from apexcrew.domain.actions import (
     CheckAction,
     FailAction,
     FinishAction,
+    PatchAction,
     ToolActionEnvelope,
 )
 from apexcrew.domain.authority import (
@@ -150,7 +151,7 @@ def validate_authorized_worker_action(
         or intent.applicable_revision_digests != binding.applicable_revision_digests
         or intent.repository_id != binding.repository_id
         or (
-            not isinstance(request.action, CheckAction)
+            not isinstance(request.action, (CheckAction, PatchAction))
             and intent.snapshot_digest != binding.snapshot_digest
         )
         or intent.scope_digest != binding.scope_digest

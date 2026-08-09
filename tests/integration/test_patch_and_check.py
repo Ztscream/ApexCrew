@@ -5,6 +5,7 @@ from pathlib import Path
 
 from apexcrew.adapters.executor.attempt_patch import AttemptPatchExecutionError
 from apexcrew.adapters.executor.fake import FakeExecutor, FakeProcessResult
+from apexcrew.adapters.repository.attempt_workspace import AttemptWorkspaceError
 from apexcrew.adapters.repository.snapshot import MemoryRepositorySnapshot
 from apexcrew.adapters.state.sqlite import SqliteStateStore
 from apexcrew.application.runtime import ToolActionResolutionObserver
@@ -28,6 +29,7 @@ from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RunId, Tas
 
 SHA = "sha256:" + "1" * 64
 SNAPSHOT_SHA = "sha256:" + "2" * 64
+PATCH_POST_SHA = "sha256:" + "3" * 64
 
 
 def secret_policy(*rules: str) -> SecretPathPolicy:
@@ -80,7 +82,7 @@ class UncertainPatchExecutor:
         raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN")
 
 
-def patch_runtime() -> ScopedToolRuntime:
+def patch_runtime(*, recovery_snapshot_digest: str | None = None) -> ScopedToolRuntime:
     now = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
     return ScopedToolRuntime(
         snapshot=MemoryRepositorySnapshot({"src/a.py": b"old\n"}),
@@ -93,6 +95,7 @@ def patch_runtime() -> ScopedToolRuntime:
         scope_digest=SHA,
         dependency_fingerprint_basis=SHA,
         patch_executor=UncertainPatchExecutor(),
+        recovery_snapshot_digest=recovery_snapshot_digest,
         workspace_lease=WorkspaceLease(
             lease_id="lease-1",
             run_id=RunId("run-1"),
@@ -109,6 +112,18 @@ def patch_runtime() -> ScopedToolRuntime:
             state="ACTIVE",
         ),
     )
+
+
+def test_patch_recovery_uses_current_workspace_digest() -> None:
+    intent = patch_intent().model_copy(update={"expected_poststate_digest": PATCH_POST_SHA})
+    runtime = patch_runtime(recovery_snapshot_digest=PATCH_POST_SHA)
+
+    state, result = runtime.observe_recovery(intent)
+
+    assert state == "EXACT_POST"
+    assert result is not None
+    assert result.code == "PATCH_APPLIED"
+    assert result.bounded_payload["post_tree_digest"] == PATCH_POST_SHA
 
 
 def sanitized_snapshot(tmp_path: Path) -> SanitizedSnapshot:
@@ -255,6 +270,20 @@ class RecoveryJournal:
     def audit_sequence(self, run_id: RunId) -> AuditSequence:
         assert run_id == RunId("run-1")
         return AuditSequence(2)
+
+
+def test_workspace_recovery_failure_is_bounded_as_unavailable() -> None:
+    class BrokenRecoveryTools:
+        def observe_recovery(self, intent: ToolIntent) -> tuple[str, ToolResult | None]:
+            del intent
+            raise AttemptWorkspaceError("WORKSPACE_IDENTITY_CHANGED")
+
+    observation = ToolActionResolutionObserver(RecoveryJournal(), BrokenRecoveryTools()).observe(
+        check_intent("intent-workspace-failure").to_effect_intent(AuditSequence(1)),
+        recovery_generation=1,
+    )
+
+    assert observation.state == "UNAVAILABLE"
 
 
 def test_unknown_check_denial_is_an_exact_recovery_receipt(tmp_path: Path) -> None:

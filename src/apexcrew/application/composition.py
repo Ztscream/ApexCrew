@@ -952,6 +952,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         granted_workspace: GrantedWorkspacePort | None = None
         runtime_executor: ExecutorPort | None = None
         runtime_snapshot_digest = binding.snapshot_digest
+        recovery_snapshot_digest = binding.snapshot_digest
         if isinstance(intent, ToolIntent) and isinstance(intent.action, CheckAction):
             definition = declared_checks.get(intent.action.check_id)
             runtime_executor = (
@@ -979,6 +980,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
                 )
                 patch_executor = check_state.patch_executor
                 runtime_snapshot_digest = check_state.tree_digest
+                recovery_snapshot_digest = check_state.tree_digest
         elif isinstance(intent, GrantedActionIntent):
             primary = self._primary_workspace(attempt_state, binding, lease, contract)
             patch_executor = primary.patch_executor
@@ -986,6 +988,8 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         elif isinstance(intent, ToolIntent) and isinstance(intent.action, PatchAction):
             primary = self._primary_workspace(attempt_state, binding, lease, contract)
             patch_executor = _AttemptPatchRouter(attempt_state, primary, self._secret_policy)
+            runtime_snapshot_digest = intent.snapshot_digest
+            recovery_snapshot_digest = primary.tree_digest
         return ScopedToolRuntime(
             snapshot=FilesystemRepositorySnapshot(context_workspace.root),
             read_globs=tuple(
@@ -996,6 +1000,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             applicable_revision_digests=binding.applicable_revision_digests,
             repository_id=binding.repository_id,
             snapshot_digest=runtime_snapshot_digest,
+            recovery_snapshot_digest=recovery_snapshot_digest,
             scope_digest=binding.scope_digest,
             dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
             denial_journal=self._store,
@@ -1034,12 +1039,15 @@ class _CompositionWorkerTools(ScopedToolRuntime):
     def capture_snapshot_digest(
         self, binding: WorkerTurnBinding, action: ToolActionEnvelope
     ) -> Sha256DigestText:
-        if not isinstance(action, CheckAction):
+        if not isinstance(action, (CheckAction, PatchAction)):
             return binding.snapshot_digest
         lease = self._store.workspace_lease(binding.run_id, binding.lease_id)
         if lease is None:
             raise RuntimeError("WORKER_LEASE_NOT_FOUND")
         contract = self._contract(binding)
+        state = self._attempt_state(binding)
+        if isinstance(action, PatchAction):
+            return self._primary_workspace(state, binding, lease, contract).tree_digest
         declared_checks = DeclaredCheckRegistry(
             _declared_check_definitions(binding.task_id, contract.checks)
         )
@@ -1047,7 +1055,6 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         if definition is None:
             return binding.snapshot_digest
         ordinal = self._check_ordinal(binding.task_id, contract, action.check_id)
-        state = self._attempt_state(binding)
         return self._check_workspace(
             state,
             binding,

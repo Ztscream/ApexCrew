@@ -2802,3 +2802,37 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Review status**: a fresh SPEC review and ordered quality review are required
   against the next correction commit; the previous FAIL remains open until both
   High findings are re-reviewed.
+
+## 2026-08-09 / R4.3-03 quality correction: current workspace digest binding
+
+- **Review finding**: quality reviewer `019fe501-cfd8-7053-b258-591872963906`,
+  configured as `gpt-5.6-luna-max`, found that recovery could compare a patch
+  against a stale configured digest, workspace/materialization failures could
+  escape as unbounded exceptions, and a PatchAction captured from the current
+  workspace was rejected by the Worker intent binding.
+- **Red evidence**: after applying the recovery correction, the exact composed
+  Worker selector `uv run pytest
+  tests/integration/test_composed_worker_tools.py::test_public_composition_binds_check_to_patched_workspace -q`
+  exited `1` with `expected AWAITING_FINAL_APPROVAL` but observed `PAUSED`.
+  The failure came from `validate_authorized_worker_action()` still requiring
+  every non-CheckAction snapshot digest to equal the initial attempt binding.
+- **Correction**: recovery now receives the current primary/check workspace
+  digest; the composition PatchAction runtime binds execution to the captured
+  current digest while observing recovery from the live primary workspace;
+  workspace `RuntimeError` is converted to bounded `UNAVAILABLE`; and both
+  CheckAction and PatchAction are allowed to carry their current workspace
+  digest through Worker intent validation. **Human-Changes: none**.
+- **Green evidence**: composed-worker, patch/check, and production-wiring
+  selectors -> `18 passed`; `make test` exited `0` at `100%`; `make lint`
+  exited `0` (`165 files already formatted`, Ruff clean, mypy clean for 66
+  source files); and `git diff --check` exited `0`.
+- **Review status**: this correction invalidates the prior quality FAIL
+  conclusion; a fresh independent SPEC review followed by an independent
+  quality review is required against the correction commit. All future
+  reviewers use `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no real
+  restricted Docker process invocation was observed; workspace mutation
+  history and restart recovery for an in-flight patched workspace remain
+  process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.

@@ -7,6 +7,7 @@ from base64 import b32encode
 from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.composition import (
@@ -14,6 +15,7 @@ from apexcrew.application.composition import (
     build_test_application_bundle,
 )
 from apexcrew.application.configuration import default_revision_documents
+from apexcrew.domain.actions import PatchAction
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     ApproveBudgetPayload,
@@ -148,6 +150,27 @@ def test_composition_worker_tools_delegates_recovery_observation() -> None:
 
     assert worker_tools.observe_recovery(intent) == ("EXACT_PRE", None)
     assert observed == [intent]
+
+
+def test_composition_patch_snapshot_digest_uses_primary_workspace() -> None:
+    worker_tools = object.__new__(_CompositionWorkerTools)
+    worker_tools._store = SimpleNamespace(workspace_lease=lambda _run_id, _lease_id: object())
+    worker_tools._contract = lambda _binding: object()
+    worker_tools._attempt_state = lambda _binding: object()
+    primary = SimpleNamespace(tree_digest="sha256:" + "4" * 64)
+    worker_tools._primary_workspace = lambda _state, _binding, _lease, _contract: primary
+    binding = SimpleNamespace(
+        run_id="run-1",
+        lease_id="lease-1",
+        snapshot_digest="sha256:" + "5" * 64,
+    )
+
+    digest = worker_tools.capture_snapshot_digest(
+        binding,
+        PatchAction(path="src/a.py", unified_diff="@@ -1 +1 @@\n-old\n+new\n"),
+    )
+
+    assert digest == primary.tree_digest
 
 
 def _envelope(request_id: str, sequence: int | None, payload: object) -> CommandEnvelope:

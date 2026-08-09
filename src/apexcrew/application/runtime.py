@@ -632,7 +632,7 @@ class ToolActionResolutionObserver(ResolutionObservationPort):
         try:
             tool_intent = ToolIntent.from_effect_intent(intent)
             state, result = self._tools.observe_recovery(tool_intent)
-        except (AttributeError, StateConflict, TypeError, ValueError):
+        except (AttributeError, RuntimeError, StateConflict, TypeError, ValueError):
             return _unavailable_resolution_observation(intent, recovery_generation)
         if tool_intent.action.kind == "patch":
             if state not in {"EXACT_PRE", "EXACT_POST", "THIRD_STATE"}:
