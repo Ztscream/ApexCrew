@@ -641,22 +641,24 @@ class WorkerLoopService:
             raise ValueError("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
         action = self._actions.parse_one(normalized_action)
         if action is None:
-            stopped = self._attempts.record_malformed_worker_action(
+            return self._record_malformed_worker_action(
                 binding=binding,
                 logical_turn_id=logical_turn_id,
                 action_digest=normalized_payload_digest,
                 recovered_marker=recovered_marker,
                 permit=permit,
-                expected_sequence=self._journal.audit_sequence(binding.run_id),
             )
-            if stopped.decision == "CONTINUE":
-                return RuntimeDecision.invalid_planning_action(stopped.resulting_sequence)
-            return RuntimeDecision.pause(
-                stopped.pause_reason or "TASK_ATTEMPT_PAUSED",
-                stopped.resulting_sequence,
+        try:
+            prestate = self._actions.capture_expected_prestate(binding, action)
+            snapshot_digest = self._actions.capture_snapshot_digest(binding, action)
+        except Exception:  # noqa: BLE001 - capture failures must settle as malformed actions
+            return self._record_malformed_worker_action(
+                binding=binding,
+                logical_turn_id=logical_turn_id,
+                action_digest=normalized_payload_digest,
+                recovered_marker=recovered_marker,
+                permit=permit,
             )
-        prestate = self._actions.capture_expected_prestate(binding, action)
-        snapshot_digest = self._actions.capture_snapshot_digest(binding, action)
         prestate_digest = sha256_digest(prestate.canonical_json())
         action_started_at = self._clock()
         timeout_seconds = (
@@ -760,6 +762,30 @@ class WorkerLoopService:
                 self._journal.audit_sequence(intent.run_id),
             )
         return self._execute_and_settle(intent, decision)
+
+    def _record_malformed_worker_action(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action_digest: str,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+    ) -> RuntimeDecision:
+        stopped = self._attempts.record_malformed_worker_action(
+            binding=binding,
+            logical_turn_id=logical_turn_id,
+            action_digest=action_digest,
+            recovered_marker=recovered_marker,
+            permit=permit,
+            expected_sequence=self._journal.audit_sequence(binding.run_id),
+        )
+        if stopped.decision == "CONTINUE":
+            return RuntimeDecision.invalid_planning_action(stopped.resulting_sequence)
+        return RuntimeDecision.pause(
+            stopped.pause_reason or "TASK_ATTEMPT_PAUSED",
+            stopped.resulting_sequence,
+        )
 
     def _execute_and_settle(
         self, intent: ToolIntent, decision: AuthorizationDecision

@@ -2122,7 +2122,10 @@ class AuthorityService:
             return LeaseAuthorization("DENY", "LEASE_GENERATION_MISMATCH")
         if lease.admissible_head != head:
             return LeaseAuthorization("DENY", "LEASE_HEAD_NOT_ADMISSIBLE")
-        canonical = CanonicalPath.parse(path)
+        try:
+            canonical = CanonicalPath.parse(path)
+        except ValueError:
+            return LeaseAuthorization("DENY", "WRITE_OUTSIDE_LEASE")
         if not any(pattern.matches(canonical) for pattern in lease.write_globs):
             return LeaseAuthorization("DENY", "WRITE_OUTSIDE_LEASE")
         return LeaseAuthorization("ALLOW", "AUTHORIZED")
@@ -2161,11 +2164,14 @@ class AuthorityService:
             reason = "LEASE_GENERATION_MISMATCH"
         elif lease.admissible_head != request.admissible_head:
             reason = "LEASE_HEAD_NOT_ADMISSIBLE"
-        elif request.action.path is not None and not any(
-            pattern.matches(CanonicalPath.parse(request.action.path))
-            for pattern in lease.write_globs
-        ):
-            reason = "ACTION_OUTSIDE_LEASE"
+        elif request.action.path is not None:
+            try:
+                canonical = CanonicalPath.parse(request.action.path)
+            except ValueError:
+                reason = "HARD_DENIAL"
+            else:
+                if not any(pattern.matches(canonical) for pattern in lease.write_globs):
+                    reason = "ACTION_OUTSIDE_LEASE"
         if reason != "AUTHORIZED":
             policy_decision = "DENY"
         elif request.action.kind == "target_cas":

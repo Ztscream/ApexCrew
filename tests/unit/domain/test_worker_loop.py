@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
+from apexcrew.domain.actions import ToolActionEnvelope
 from apexcrew.domain.authority import (
     ActionClass,
     ActionDeadline,
@@ -23,6 +24,7 @@ from apexcrew.domain.model import (
     ModelDispatchResult,
     ModelRequest,
 )
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RunId, TaskId
 from apexcrew.domain.worker import (
@@ -361,6 +363,43 @@ def test_action_batch_is_rejected_without_tool_execution() -> None:
     assert decision.resulting_sequence == 1
     assert attempts.malformed_count == 1
     assert model.call_count == 1
+    assert tools.execution_count == 0
+
+
+def test_workspace_capture_failure_is_recorded_as_malformed_action() -> None:
+    attempts = StaticAttempts()
+    tools = NeverTools()
+    model = OneCompletion(
+        {
+            "kind": "check",
+            "check_id": "task-1:check-1",
+        }
+    )
+
+    def fail_snapshot(_binding: WorkerTurnBinding, _action: ToolActionEnvelope) -> Sha256DigestText:
+        raise RuntimeError("WORKER_CHECK_WORKSPACE_UNAVAILABLE")
+
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(
+            lambda _binding, _action: ActionPreState(),
+            fail_snapshot,
+        ),
+        authority=cast(object, NeverAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "MALFORMED_ACTION"
+    assert decision.resulting_sequence == 1
+    assert attempts.malformed_count == 1
     assert tools.execution_count == 0
 
 

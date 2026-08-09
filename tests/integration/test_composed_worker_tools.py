@@ -323,3 +323,23 @@ def test_invalid_risky_prestate_reaches_authority_without_raising(tmp_path: Path
         assert stop.reason.value == "AWAITING_ACTION_APPROVAL"
     finally:
         bundle.close()
+
+
+def test_invalid_canonical_risky_path_is_durably_denied(tmp_path: Path) -> None:
+    bundle, run_id, executor, _root, _target_oid = _prepare_worker_run(
+        tmp_path,
+        (
+            {
+                "kind": "risky_action",
+                "path": "../src/task.py",
+                "operation": "delete",
+            },
+        ),
+    )
+    try:
+        stop = bundle.runtime.run_until_blocked(run_id)
+        assert stop.reason.value == "PAUSED"
+        assert executor.calls == []
+        assert bundle.queries.get(run_id).sequence > 0
+    finally:
+        bundle.close()
