@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from apexcrew.adapters.credentials.keyring import (
     KeyringSecretPolicyStore,
@@ -1383,6 +1383,14 @@ class _CompositionWorkerTools(ScopedToolRuntime):
 
     def execute(self, intent: ToolIntent) -> ToolResult:
         return self._runtime(intent).execute(intent)
+
+    def observe_recovery(
+        self, intent: ToolIntent
+    ) -> tuple[
+        Literal["EXACT_POST", "EXACT_PRE", "EXACT_RECEIPT", "THIRD_STATE", "UNAVAILABLE"],
+        ToolResult | None,
+    ]:
+        return self._runtime(intent).observe_recovery(intent)
 
     def observe_granted_action(self, intent: GrantedActionIntent) -> GrantedActionObservation:
         return self._runtime(intent).observe_granted_action(intent)

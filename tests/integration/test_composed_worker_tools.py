@@ -9,7 +9,10 @@ from hashlib import sha256
 from pathlib import Path
 
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
-from apexcrew.application.composition import build_test_application_bundle
+from apexcrew.application.composition import (
+    _CompositionWorkerTools,
+    build_test_application_bundle,
+)
 from apexcrew.application.configuration import default_revision_documents
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -128,6 +131,23 @@ class _RaisingExecutor(_RecordingExecutor):
     ) -> ExecutionResult:
         self.calls.append((tuple(argv), snapshot, timeout_seconds))
         raise RuntimeError("EXECUTOR_RUNTIME_FAILURE")
+
+
+def test_composition_worker_tools_delegates_recovery_observation() -> None:
+    observed: list[object] = []
+
+    class _RecoveryRuntime:
+        def observe_recovery(self, intent: object) -> tuple[str, None]:
+            observed.append(intent)
+            return "EXACT_PRE", None
+
+    runtime = _RecoveryRuntime()
+    worker_tools = object.__new__(_CompositionWorkerTools)
+    worker_tools._runtime = lambda _intent: runtime
+    intent = object()
+
+    assert worker_tools.observe_recovery(intent) == ("EXACT_PRE", None)
+    assert observed == [intent]
 
 
 def _envelope(request_id: str, sequence: int | None, payload: object) -> CommandEnvelope:

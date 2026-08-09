@@ -144,7 +144,7 @@
 | S10 预留清理 / 清除 | SKELETON | DONE | `cb3ec0d67da5408e53ae0d27a1eb5de409b81f2b` |
 | S11 保留分级 / 脱敏 | STUB | DONE | `e32927c82ed12cd775e326708311d06763a65659` |
 | S12 CLI | REAL | DONE | `eab0ea4d29358c8f1fc60189deb9a633c8c367b7` |
-| S13 受限 Docker 执行器 | SKELETON | DONE | `278c0077184107e819a96ffe3bf68b491a232103` |
+| S13 受限 Docker 执行器 | SKELETON | OPEN | `278c0077184107e819a96ffe3bf68b491a232103` + R4.3-03 `bcf9a99`; `DEBT-M2-005` live-process observation pending |
 | S14 双生态 fixture | SKELETON | DONE | `4d1c30ab397891cfaa0c3715545ad03330e17c54` |
 | S15 机制演示 | REAL | DONE | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` + correction `ee15003` |
 | S16 静态回放 + WebUI | SKELETON | DONE | `fafbd369019455087a529f54cdee1683d37f7389` |

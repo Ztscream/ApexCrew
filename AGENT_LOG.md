@@ -2775,3 +2775,30 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** without a live Docker
   process observation; workspace mutation history/restart recovery remains an
   explicitly documented process-local follow-up.
+
+## 2026-08-09 / R4.3-03 composed recovery and debt-status correction
+
+- **Review finding**: final SPEC reviewer `019fe4e5-221f-7f41-95a2-5b6ddfc5ac95`,
+  configured as `gpt-5.6-luna-max`, found two High issues on `bcf9a99`: the
+  composition adapter inherited placeholder `observe_recovery()` behavior, and
+  `DEBT-M2-005` was not synchronized across README, SECURITY, SPRINT, and the
+  audit log.
+- **Red evidence**: the exact forwarding selector
+  `uv run --python 3.12 pytest
+  tests/integration/test_composed_worker_tools.py::test_composition_worker_tools_delegates_recovery_observation -q --color=no`
+  exited `1`; the inherited method attempted placeholder authorization and
+  raised `AttributeError` before reaching the per-intent runtime.
+- **Correction**: `_CompositionWorkerTools.observe_recovery()` now delegates to
+  `_runtime(intent).observe_recovery(intent)`. The selector then exited `0` at
+  `100%`. README, SECURITY, and SPRINT now state `DEBT-M2-005` is **OPEN** until
+  a real restricted Docker process is observed; the process-local workspace
+  mutation/restart boundary is stated alongside it. **Human-Changes: none**.
+- **Final green evidence**: the composed-worker, patch/check-recovery, and
+  documentation selectors passed; the final offline
+  `uv run --python 3.12 pytest -q --color=no` run exited `0` at `100%` in
+  `211.6s` with only the existing Starlette deprecation warning. `uv run
+  --python 3.12 mypy src` exited `0` with no issues in 66 source files; Ruff
+  check/format and `git diff --check` exited `0`.
+- **Review status**: a fresh SPEC review and ordered quality review are required
+  against the next correction commit; the previous FAIL remains open until both
+  High findings are re-reviewed.

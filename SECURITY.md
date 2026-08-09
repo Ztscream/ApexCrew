@@ -51,6 +51,12 @@ quarantined content remain excluded from exports. The restricted executor
 launches only the closed digest-pinned Docker argv and reports daemon/process
 unavailability as a typed failure.
 
+`DEBT-M2-005` remains **OPEN**. This worktree has not observed a real restricted
+Docker process invocation; closure requires that observation and synchronized
+updates to `README.md`, `SECURITY.md`, `SPRINT.md`, and `AGENT_LOG.md`. Workspace
+mutation history and restart recovery for an in-flight patched workspace remain
+process-local follow-up boundaries.
+
 `DEBT-M3-001`: malformed unified diffs in the offline demo are denied with the
 existing `LEASE_SCOPE_DENIED` result because the closed patch-result contract
 does not have a distinct malformed-diff code. The denial is fail-closed and

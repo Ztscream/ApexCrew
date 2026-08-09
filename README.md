@@ -164,6 +164,12 @@ The course deadline is assumed to be 2026-08-10 23:59 Asia/Shanghai. The Python 
 
 Multi-intent recovery selects a member only from exactly one authoritative observation; ambiguity remains `INDETERMINATE`. Retention redacts/quarantines restricted diagnostics and applies the documented expiry/eviction order. The restricted executor launches only the digest-pinned, networkless Docker command and fails closed when Docker is unavailable.
 
+`DEBT-M2-005` remains **OPEN**: this worktree has not observed a real restricted
+Docker process invocation, so R4.3-03 does not claim closure of the Docker
+execution debt. Daemon/image absence remains typed uncertainty, and workspace
+mutation history plus restart recovery for an in-flight patched workspace remain
+process-local follow-up boundaries.
+
 `DEBT-M3-001` remains in the offline demo's malformed-unified-diff denial path:
 the closed `PatchExecutionResult` code set cannot distinguish malformed input
 from a lease-scope denial, so the path fails closed until a reviewed SPEC
