@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -74,6 +73,7 @@ from apexcrew.application.runtime import (
     LocalFileLockBackend,
     ModelResolutionObserver,
     PrivateRefInitializer,
+    PrivateRefPromotionDriver,
     ProcessRuntimeOwnerIds,
     RecoveredActionRouter,
     ResolutionObservationRegistry,
@@ -88,7 +88,6 @@ from apexcrew.application.runtime import (
 from apexcrew.domain.actions import CheckAction, PatchAction, RiskyAction, ToolActionEnvelope
 from apexcrew.domain.admission import (
     RefCasIntent,
-    RefEffectBinding,
     RuntimeStartBinding,
     StartGuardDecision,
     TargetCasIntent,
@@ -1632,6 +1631,20 @@ class _ProductionPrivateRefDriver:
             self._resources.refresh()
         return decision
 
+    def promote(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        run = self._store.run_record(run_id)
+        reservation = self._store.target_reservation_for_run(run_id)
+        guard = self._resources.private_ref_guard(
+            reservation=reservation,
+            repository_id=run.repository_id,
+            repository_instance_digest=run.repository_instance_digest,
+            target_safety_digest=self._store.target_authority_digest(run_id),
+        )
+        decision = PrivateRefPromotionDriver(self._store, guard).promote(run_id, permit)
+        if decision.phase_transition == "PRIVATE_REF_PROMOTED":
+            self._resources.refresh()
+        return decision
+
 
 class _ProductionTargetReservationResolutionObserver:
     """Project the existing reservation observer into bounded recovery evidence."""
@@ -1740,24 +1753,14 @@ class _ProductionRefResolutionObserver:
         from apexcrew.application.runtime import _unavailable_resolution_observation
 
         try:
-            payload = json.loads(intent.normalized_payload_json)
-            if intent.kind == "private_ref_init":
-                typed = RefCasIntent.from_effect_intent(intent)
-                repository_id = typed.repository_id
-                ref_name = typed.ref_name
-                expected_old_oid = typed.expected_old_oid
-                prepared_oid = typed.prepared_oid
-                safety_digest = typed.target_safety_digest
-                binding = typed.ref_effect_binding
-                reservation_id = typed.target_reservation_id
-            else:
-                repository_id = RepositoryId(str(payload["repository_id"]))
-                ref_name = str(payload["ref_name"])
-                expected_old_oid = payload.get("expected_old_oid")
-                prepared_oid = payload["prepared_oid"]
-                safety_digest = Sha256DigestText(str(payload["target_safety_digest"]))
-                binding = RefEffectBinding.model_validate(payload["ref_effect_binding"])
-                reservation_id = str(payload["target_reservation_id"])
+            typed = RefCasIntent.from_effect_intent(intent)
+            repository_id = typed.repository_id
+            ref_name = typed.ref_name
+            expected_old_oid = typed.expected_old_oid
+            prepared_oid = typed.prepared_oid
+            safety_digest = typed.target_safety_digest
+            binding = typed.ref_effect_binding
+            reservation_id = typed.target_reservation_id
             run = self._store.run_record(intent.run_id)
             reservation = self._store.target_reservation(reservation_id)
             guard = self._resources.private_ref_guard(
@@ -2570,6 +2573,7 @@ def _build_application_bundle(
             recovered_actions=RecoveredActionRouter(coordinator, worker),
             target_reservations=target_reservations,
             private_refs=_ProductionPrivateRefDriver(store, resources),
+            private_promotion=_ProductionPrivateRefDriver(store, resources),
             resolution=ResolutionRuntime(store, resolution_observers),
             integration=_CompositionIntegrationDriver(store, resources),
             cleanup=TerminalCleanupRuntime(store, _CompositionReservationCleanup(store, resources)),

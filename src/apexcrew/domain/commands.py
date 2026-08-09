@@ -401,7 +401,12 @@ class RuntimeDecision(FrozenDocument):
     stop_reason: str | None = None
     resulting_sequence: AuditSequence | None = None
     phase_transition: (
-        Literal["TARGET_RESERVATION_INITIALIZED", "PRIVATE_REF_INITIALIZED"] | None
+        Literal[
+            "TARGET_RESERVATION_INITIALIZED",
+            "PRIVATE_REF_INITIALIZED",
+            "PRIVATE_REF_PROMOTED",
+        ]
+        | None
     ) = None
 
     @classmethod

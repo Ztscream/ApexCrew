@@ -13,10 +13,12 @@ from apexcrew.domain.admission import (
     PrivateRefAdmissionPort,
     PrivateRefCasOutcome,
     RefCasIntent,
+    RefEffectBinding,
     RepositoryEffectUncertain,
     RuntimeStartBinding,
     StartGuard,
     TargetReservationBootstrapAdmissionService,
+    TaskCandidate,
     private_ref,
 )
 from apexcrew.domain.authority import (
@@ -26,6 +28,7 @@ from apexcrew.domain.authority import (
 )
 from apexcrew.domain.commands import (
     ActionApprovalPending,
+    ApplicableRevisionDigests,
     ApprovalPending,
     FinalApprovalPending,
     PlanApprovalPending,
@@ -79,12 +82,15 @@ from apexcrew.domain.tools import (
 )
 from apexcrew.domain.types import (
     AuditSequence,
+    CandidateId,
     IntentId,
     RunId,
     RunState,
     RunStopReason,
     RuntimeOwnerId,
 )
+
+MAX_RUNTIME_PHASE_STEPS = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +289,95 @@ class PrivateRefState(Protocol):
     ) -> AuditSequence: ...
 
     def audit_sequence(self, run_id: RunId) -> AuditSequence: ...
+
+    def pending_task_candidate(self, run_id: RunId) -> TaskCandidate | None: ...
+
+    def begin_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+        ref_effect_binding: RefEffectBinding | None = None,
+        permit_generation: int = 1,
+    ) -> RefCasIntent: ...
+
+    def settle_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence: ...
+
+
+class PrivateRefPromotionDriver:
+    def __init__(
+        self,
+        store: PrivateRefState,
+        admission: PrivateRefAdmissionPort,
+    ) -> None:
+        self._store = store
+        self._admission = admission
+
+    def promote(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        if (
+            permit.state != "CONSUMED"
+            or permit.run_id != run_id
+            or permit.allowed_phase not in {"ACTIVE", "PAUSED"}
+        ):
+            return RuntimeDecision.pause("PRIVATE_PROMOTION_PERMIT_INVALID")
+        candidate = self._store.pending_task_candidate(run_id)
+        if candidate is None:
+            return RuntimeDecision.pause(
+                "NO_READY_TASK_CANDIDATE", self._store.audit_sequence(run_id)
+            )
+        binding_provider = getattr(self._admission, "current_ref_effect_binding", None)
+        ref_effect_binding = binding_provider(run_id) if callable(binding_provider) else None
+        intent = self._store.begin_task_promotion(
+            run_id=run_id,
+            candidate_id=candidate.candidate_id,
+            applicable_revision_digests=permit.applicable_revision_digests,
+            expected_sequence=self._store.audit_sequence(run_id),
+            ref_effect_binding=ref_effect_binding,
+            permit_generation=permit.generation,
+        )
+        try:
+            outcome = self._admission.promote_private_ref(intent)
+        except RepositoryEffectUncertain:
+            outcome = PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=run_id,
+                result_class="PRIVATE_REF_UNOBSERVABLE",
+                observed_oid=None,
+            )
+        sequence = self._store.settle_task_promotion(
+            run_id=run_id,
+            candidate_id=candidate.candidate_id,
+            intent=intent,
+            outcome=outcome,
+            applicable_revision_digests=permit.applicable_revision_digests,
+            expected_sequence=self._store.audit_sequence(run_id),
+        )
+        if outcome.result_class == "PRIVATE_REF_PROMOTED":
+            return RuntimeDecision(
+                code="CONTINUE",
+                resulting_sequence=sequence,
+                phase_transition="PRIVATE_REF_PROMOTED",
+            )
+        if outcome.result_class == "PRIVATE_REF_UNOBSERVABLE":
+            return RuntimeDecision.pause("INDETERMINATE", sequence)
+        if outcome.result_class == "PRIVATE_REF_ABSENT_FAILED":
+            return RuntimeDecision.pause("PRIVATE_CAS_FAILED", sequence)
+        return RuntimeDecision.pause("PRIVATE_REF_CONFLICT", sequence)
+
+
+class PrivateRefPromotionPort(Protocol):
+    def promote(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision: ...
 
 
 class PrivateRefInitializer:
@@ -1077,10 +1172,12 @@ class RuntimePhaseDriverService:
         integration: FinalIntegrationDriver,
         cleanup: TerminalCleanupDriver,
         granted_actions: GrantedActionDriver | None = None,
+        private_promotion: PrivateRefPromotionPort | None = None,
     ) -> None:
         self._recovered_actions = recovered_actions
         self._target_reservations = target_reservations
         self._private_refs = private_refs
+        self._private_promotion = private_promotion
         self._resolution = resolution
         self._integration = integration
         self._cleanup = cleanup
@@ -1098,6 +1195,14 @@ class RuntimePhaseDriverService:
 
     def initialize_private_ref(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         return self._private_refs.initialize(run_id, permit)
+
+    def promote_private_ref(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
+        if self._private_promotion is None:
+            return RuntimeDecision.pause("PRIVATE_PROMOTION_DRIVER_NOT_INSTALLED")
+        return self._private_promotion.promote(run_id, permit)
+
+    def has_private_ref_promotion(self) -> bool:
+        return self._private_promotion is not None
 
     def resume_resolution(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
         return self._resolution.resume(run_id, permit)
@@ -1475,7 +1580,12 @@ class RuntimeService:
         self, run_id: RunId, permit: RuntimePermit, context: RuntimeFaultContext
     ) -> RunStop:
         draft_initialized = False
+        steps = 0
         while True:
+            steps += 1
+            if steps > MAX_RUNTIME_PHASE_STEPS:
+                state = self._store.load_runtime_state(run_id)
+                return _stop_for_state(run_id, state, RunStopReason.PAUSED)
             context.phase = "POST_BARRIER"
             owner_id = permit.consumed_owner_id
             if owner_id is None:
@@ -1528,8 +1638,18 @@ class RuntimeService:
                 context.phase = "PHASE_DRIVER"
                 decision = self._phase_drivers.initialize_private_ref(run_id, permit)
             elif state.state in {RunState.ACTIVE, RunState.PAUSED}:
-                context.phase = "WORKER_SCHEDULING"
-                decision = self._coordinator.schedule(run_id)
+                pending_candidate = getattr(
+                    self._store, "pending_task_candidate", lambda _run_id: None
+                )(run_id)
+                if (
+                    pending_candidate is not None
+                    and self._phase_drivers.has_private_ref_promotion()
+                ):
+                    context.phase = "PHASE_DRIVER"
+                    decision = self._phase_drivers.promote_private_ref(run_id, permit)
+                else:
+                    context.phase = "WORKER_SCHEDULING"
+                    decision = self._coordinator.schedule(run_id)
             elif state.state == RunState.INDETERMINATE:
                 context.phase = "PHASE_DRIVER"
                 decision = self._phase_drivers.resume_resolution(run_id, permit)

@@ -133,6 +133,9 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             reflog_message=self._reflog_message,
         )
 
+    def current_ref_effect_binding(self, run_id: RunId) -> RefEffectBinding:
+        return self._effect_binding(run_id)
+
     def inspect(
         self,
         *,
@@ -279,6 +282,79 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             result_class=result_class,
             observed_oid=oid,
         )
+
+    def promote_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
+        def outcome(
+            result_class: Literal[
+                "PRIVATE_REF_PROMOTED",
+                "PRIVATE_REF_ABSENT_FAILED",
+                "PRIVATE_REF_CONFLICT",
+                "PRIVATE_REF_UNOBSERVABLE",
+            ],
+            observed_oid: GitOid | None,
+        ) -> PrivateRefCasOutcome:
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class=result_class,
+                observed_oid=observed_oid,
+            )
+
+        try:
+            current_binding = self._effect_binding(intent.run_id)
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if (
+            intent.kind != "private_ref_cas"
+            or intent.run_id != self._reservation.run_id
+            or intent.repository_id != self._repository_id
+            or intent.expected_old_oid is None
+            or intent.target_safety_digest != self._target_safety_digest
+            or intent.target_reservation_id != self._reservation.reservation_id
+            or intent.ref_effect_binding != current_binding
+        ):
+            return outcome("PRIVATE_REF_CONFLICT", None)
+        try:
+            before = self._runner.run(self._repository, GitShowRefVerify(intent.ref_name))
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if before.returncode != 0:
+            return (
+                outcome("PRIVATE_REF_ABSENT_FAILED", None)
+                if before.returncode == 1
+                else outcome("PRIVATE_REF_UNOBSERVABLE", None)
+            )
+        try:
+            current_oid = GitOid(before.stdout.strip())
+        except ValueError:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if current_oid != intent.expected_old_oid:
+            return outcome("PRIVATE_REF_CONFLICT", current_oid)
+        try:
+            result = self._runner.run(
+                self._repository,
+                GitUpdatePrivateRefCas(
+                    direct_ref=intent.ref_name,
+                    prepared_oid=intent.prepared_oid,
+                    expected_old_oid=intent.expected_old_oid,
+                    reflog_message=intent.ref_effect_binding.reflog_message,
+                ),
+            )
+            self._repository = self._repository.refresh_after_verified_owned_transition()
+            after = self._runner.run(self._repository, GitShowRefVerify(intent.ref_name))
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if after.returncode != 0:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        try:
+            observed_oid = GitOid(after.stdout.strip())
+        except ValueError:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if observed_oid == intent.prepared_oid:
+            return outcome("PRIVATE_REF_PROMOTED", observed_oid)
+        if observed_oid == intent.expected_old_oid and result.returncode != 0:
+            return outcome("PRIVATE_REF_ABSENT_FAILED", observed_oid)
+        return outcome("PRIVATE_REF_CONFLICT", observed_oid)
 
     def observe_resolution(
         self,
@@ -937,6 +1013,21 @@ class RepositoryInstance:
         self.storage_snapshot.assert_current(self.handles)
 
     def assert_stable_for(self, operation: object) -> None:
+        if isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+            transition_entries = _private_ref_transition_entries(operation.direct_ref)
+            if transition_entries:
+                excluded_prefixes = tuple(
+                    relative for relative, kind in transition_entries if kind == "file"
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                self.storage_snapshot.assert_current(
+                    self.handles,
+                    excluded_prefixes=excluded_prefixes,
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                return
         if isinstance(operation, (GitWorktreeUnlock, GitWorktreeRemoveForce)):
             self.storage_snapshot.assert_current(
                 self.handles,
@@ -969,8 +1060,10 @@ class GitRepositoryPreflight:
             raise
 
 
-def closed_git_environment(trusted_empty_dir: Path) -> dict[str, str]:
-    return {
+def closed_git_environment(
+    trusted_empty_dir: Path, index_file: Path | None = None
+) -> dict[str, str]:
+    environment = {
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": str(trusted_empty_dir / "global.gitconfig"),
         "GIT_ATTR_NOSYSTEM": "1",
@@ -981,7 +1074,16 @@ def closed_git_environment(trusted_empty_dir: Path) -> dict[str, str]:
         "GIT_PAGER": "cat",
         "GIT_EDITOR": "false",
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_AUTHOR_NAME": "ApexCrew",
+        "GIT_AUTHOR_EMAIL": "apexcrew@localhost",
+        "GIT_COMMITTER_NAME": "ApexCrew",
+        "GIT_COMMITTER_EMAIL": "apexcrew@localhost",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
     }
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = str(index_file)
+    return environment
 
 
 @dataclass(frozen=True, slots=True)
@@ -1059,6 +1161,72 @@ class GitCatFileSize:
     blob_oid: GitOid
 
 
+@dataclass(frozen=True, slots=True)
+class GitReadTree:
+    base_oid: GitOid
+
+
+@dataclass(frozen=True, slots=True)
+class GitHashObjectWrite:
+    blob_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class GitUpdateIndexCacheInfo:
+    mode: str
+    blob_oid: GitOid
+    path: CanonicalPath
+
+
+@dataclass(frozen=True, slots=True)
+class GitRemoveIndexPath:
+    path: CanonicalPath
+
+
+@dataclass(frozen=True, slots=True)
+class GitWriteTree:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class GitCommitTree:
+    tree_oid: GitOid
+    parent_oid: GitOid
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class GitUpdatePrivateRefCas:
+    direct_ref: str
+    prepared_oid: GitOid
+    expected_old_oid: GitOid
+    reflog_message: str
+
+
+def _private_ref_transition_entries(
+    direct_ref: str,
+) -> tuple[tuple[str, Literal["file", "directory"]], ...]:
+    prefix = "refs/apexcrew/runs/"
+    component = direct_ref.removeprefix(prefix)
+    if (
+        not component
+        or len(component) > 128
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+            for character in component
+        )
+    ):
+        return ()
+    return (
+        (".git/refs/apexcrew/runs", "directory"),
+        (".git/logs/refs/apexcrew/runs", "directory"),
+        (f".git/refs/apexcrew/runs/{component}", "file"),
+        (f".git/refs/apexcrew/runs/{component}.lock", "file"),
+        (f".git/logs/refs/apexcrew/runs/{component}", "file"),
+        (f".git/logs/refs/apexcrew/runs/{component}.lock", "file"),
+    )
+
+
 type GitOperation = (
     GitStatusPorcelain
     | GitWorktreeListPorcelain
@@ -1073,6 +1241,13 @@ type GitOperation = (
     | GitLsTreePath
     | GitCatFileBlob
     | GitCatFileSize
+    | GitReadTree
+    | GitHashObjectWrite
+    | GitUpdateIndexCacheInfo
+    | GitRemoveIndexPath
+    | GitWriteTree
+    | GitCommitTree
+    | GitUpdatePrivateRefCas
 )
 
 
@@ -1193,21 +1368,34 @@ class GitCommandRunner:
             self._owned_trusted_empty_dir = None
 
     def run(
-        self, repository: RepositoryInstance, operation: GitOperation
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        result = self._run(repository, operation, text=True)
+        result = self._run(repository, operation, text=True, index_file=index_file)
         assert isinstance(result.stdout, str)
         return result
 
     def run_bytes(
-        self, repository: RepositoryInstance, operation: GitOperation
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        result = self._run(repository, operation, text=False)
+        result = self._run(repository, operation, text=False, index_file=index_file)
         assert isinstance(result.stdout, bytes)
         return result
 
     def _run(
-        self, repository: RepositoryInstance, operation: GitOperation, *, text: bool
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        text: bool,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
         if not isinstance(
             operation,
@@ -1225,30 +1413,77 @@ class GitCommandRunner:
                 GitLsTreePath,
                 GitCatFileBlob,
                 GitCatFileSize,
+                GitReadTree,
+                GitHashObjectWrite,
+                GitUpdateIndexCacheInfo,
+                GitRemoveIndexPath,
+                GitWriteTree,
+                GitCommitTree,
+                GitUpdatePrivateRefCas,
             ),
         ):
             raise RepositoryUnsafeError("RAW_GIT_ARGUMENTS_DENIED")
+        argv = self._argv_for(operation)
         repository.assert_stable_for(operation)
-        command = (
-            str(self._git),
-            "-c",
-            "core.hooksPath=" + str(self._trusted_empty_dir / "hooks"),
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "diff.external=",
-            "-c",
-            "credential.helper=",
-            *self._argv_for(operation),
+        transition_handles = self._open_private_ref_transition(repository, operation)
+        try:
+            command = (
+                str(self._git),
+                "-c",
+                "core.hooksPath=" + str(self._trusted_empty_dir / "hooks"),
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "diff.external=",
+                "-c",
+                "credential.helper=",
+                *argv,
+            )
+            return self._spawner.run(
+                command,
+                repository.root,
+                closed_git_environment(self._trusted_empty_dir, index_file),
+                text=text,
+            )
+        finally:
+            if transition_handles is not None:
+                transition_handles.close()
+
+    @staticmethod
+    def _open_private_ref_transition(
+        repository: RepositoryInstance,
+        operation: GitOperation,
+    ) -> StableHandleTree | None:
+        if not isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+            return None
+        if not isinstance(repository, RepositoryInstance):
+            return None
+        entries = _private_ref_transition_entries(operation.direct_ref)
+        if not entries:
+            return None
+        backend = (
+            WindowsNoFollowBackend(allow_delete_share=True)
+            if os.name == "nt"
+            else PosixNoFollowBackend()
         )
-        return self._spawner.run(
-            command,
-            repository.root,
-            closed_git_environment(self._trusted_empty_dir),
-            text=text,
-        )
+        handles = StableHandleTree(repository.root, backend)
+        expected = {node.relative: node.identity for node in repository.storage_snapshot.nodes}
+        try:
+            for relative, kind in entries:
+                if kind != "directory":
+                    continue
+                bound = expected.get(relative)
+                current = handles.try_open(relative, kind)
+                if (current is None) != (bound is None) or (
+                    current is not None and current.identity != bound
+                ):
+                    raise RepositoryUnsafeError("GIT_STORAGE_IDENTITY_CHANGED")
+            return handles
+        except BaseException:
+            handles.close()
+            raise
 
     def _argv_for(self, operation: GitOperation) -> tuple[str, ...]:
         match operation:
@@ -1310,6 +1545,61 @@ class GitCommandRunner:
                 return ("cat-file", "blob", self._require_oid(blob_oid))
             case GitCatFileSize(blob_oid=blob_oid):
                 return ("cat-file", "-s", self._require_oid(blob_oid))
+            case GitReadTree(base_oid=base_oid):
+                return ("read-tree", self._require_oid(base_oid))
+            case GitHashObjectWrite(blob_path=path):
+                self._require_operand_path(path)
+                return ("hash-object", "-w", "--", str(path))
+            case GitUpdateIndexCacheInfo(mode=mode, blob_oid=blob_oid, path=path):
+                if mode not in {"100644", "100755"}:
+                    raise RepositoryUnsafeError("GIT_INDEX_MODE_INVALID")
+                return (
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    ",".join(
+                        (
+                            mode,
+                            self._require_oid(blob_oid),
+                            self._require_canonical_path(path),
+                        )
+                    ),
+                )
+            case GitRemoveIndexPath(path=path):
+                return (
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    self._require_canonical_path(path),
+                )
+            case GitWriteTree():
+                return ("write-tree",)
+            case GitCommitTree(tree_oid=tree_oid, parent_oid=parent_oid, message=message):
+                self._require_commit_message(message)
+                return (
+                    "commit-tree",
+                    self._require_oid(tree_oid),
+                    "-p",
+                    self._require_oid(parent_oid),
+                    "-m",
+                    message,
+                )
+            case GitUpdatePrivateRefCas(
+                direct_ref=target,
+                prepared_oid=new_oid,
+                expected_old_oid=old_oid,
+                reflog_message=message,
+            ):
+                self._require_private_ref(target)
+                self._require_reason(message)
+                return (
+                    "update-ref",
+                    "-m",
+                    message,
+                    target,
+                    self._require_oid(new_oid),
+                    self._require_oid(old_oid),
+                )
         raise AssertionError("GIT_OPERATION_UNION_EXHAUSTIVENESS")
 
     @staticmethod
@@ -1355,6 +1645,18 @@ class GitCommandRunner:
         text = str(value)
         if not value.is_absolute() or text.startswith("-") or "\x00" in text:
             raise RepositoryUnsafeError("GIT_PATH_OPERAND_INVALID")
+
+    @staticmethod
+    def _require_canonical_path(value: CanonicalPath) -> str:
+        try:
+            return str(CanonicalPath.parse(str(value)))
+        except PathValidationError as error:
+            raise RepositoryUnsafeError("GIT_CANONICAL_PATH_INVALID") from error
+
+    @staticmethod
+    def _require_commit_message(value: str) -> None:
+        if not value or "\x00" in value or "\n" in value or "\r" in value:
+            raise RepositoryUnsafeError("GIT_COMMIT_MESSAGE_INVALID")
 
     @staticmethod
     def _require_reason(value: str) -> None:

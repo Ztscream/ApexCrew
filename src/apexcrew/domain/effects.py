@@ -188,6 +188,7 @@ class RunRecord:
     state: RunState
     target_ref: str
     pinned_target_oid: GitOid
+    run_head_oid: GitOid | None = None
     current_plan_digest: RevisionDigest | None = None
     current_policy_digest: RevisionDigest | None = None
     current_budget_digest: RevisionDigest | None = None

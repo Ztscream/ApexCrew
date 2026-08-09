@@ -635,6 +635,8 @@ def integrate(
             or context.candidate_head_oid is None
         ):
             raise StateConflict("FINAL_CANDIDATE_NOT_FOUND")
+        if context.prepared_oid is None:
+            raise StateConflict("FINAL_INTEGRATION_OID_NOT_FOUND")
         expected_code = _approval_confirmation_code(
             "integrate",
             RunId(run_id),
@@ -647,7 +649,7 @@ def integrate(
                 candidate_id=context.candidate_id,
                 evidence_bundle_digest=context.evidence_bundle_digest,
                 expected_target_oid=context.candidate_head_oid,
-                prepared_oid=context.prepared_oid or context.candidate_head_oid,
+                prepared_oid=context.prepared_oid,
                 confirmation_code=expected_code,
                 run_id=run_id,
             )

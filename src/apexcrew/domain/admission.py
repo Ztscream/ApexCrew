@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from secrets import token_hex
@@ -20,17 +20,93 @@ from apexcrew.domain.effects import (
 )
 from apexcrew.domain.revisions import FrozenDocument, Sha256DigestText
 from apexcrew.domain.types import (
+    AttemptId,
     AuditSequence,
+    CandidateId,
     GitOid,
     IntentId,
     RepositoryId,
     RunId,
     RunState,
     RuntimeOwnerId,
+    TaskId,
 )
 
 MAX_TARGET_RESERVATION_ID_ATTEMPTS = 16
 _TARGET_RESERVATION_ID_PREFIX = "reservation-"
+
+
+def _task_candidate_digest(values: Mapping[str, object]) -> Sha256DigestText:
+    return sha256_digest(canonical_json(values))
+
+
+class TaskCandidate(FrozenDocument):
+    """An immutable prepared Attempt change awaiting private-ref promotion."""
+
+    schema_version: Literal["task-candidate-v1"] = "task-candidate-v1"
+    candidate_id: CandidateId
+    run_id: RunId
+    task_id: TaskId
+    attempt_id: AttemptId
+    expected_run_head_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    prepared_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    changed_paths: tuple[str, ...]
+    state: Literal["READY", "PROMOTING", "PROMOTED", "CONFLICT", "INDETERMINATE"] = "READY"
+    candidate_digest: Sha256DigestText
+
+    @property
+    def run_head_oid(self) -> GitOid:
+        return self.expected_run_head_oid
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        expected_run_head_oid: GitOid,
+        prepared_oid: GitOid,
+        changed_paths: tuple[str, ...],
+    ) -> Self:
+        identity = {
+            "attempt_id": attempt_id,
+            "changed_paths": changed_paths,
+            "expected_run_head_oid": expected_run_head_oid,
+            "prepared_oid": prepared_oid,
+            "run_id": run_id,
+            "task_id": task_id,
+        }
+        digest = _task_candidate_digest(identity)
+        candidate_id = CandidateId("task-candidate-" + str(digest).removeprefix("sha256:")[:24])
+        return cls(
+            candidate_id=candidate_id,
+            run_id=run_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            expected_run_head_oid=expected_run_head_oid,
+            prepared_oid=prepared_oid,
+            changed_paths=changed_paths,
+            candidate_digest=_task_candidate_digest({**identity, "candidate_id": candidate_id}),
+        )
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> Self:
+        identity = {
+            "attempt_id": self.attempt_id,
+            "changed_paths": self.changed_paths,
+            "expected_run_head_oid": self.expected_run_head_oid,
+            "prepared_oid": self.prepared_oid,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+        }
+        expected_id = CandidateId(
+            "task-candidate-" + str(_task_candidate_digest(identity)).removeprefix("sha256:")[:24]
+        )
+        expected_digest = _task_candidate_digest({**identity, "candidate_id": expected_id})
+        if self.candidate_id != expected_id or self.candidate_digest != expected_digest:
+            raise ValueError("TASK_CANDIDATE_BINDING_MISMATCH")
+        return self
 
 
 class TargetReservationIdAllocationError(RuntimeError):
@@ -75,6 +151,7 @@ class PrivateRefCasOutcome(FrozenDocument):
     run_id: RunId
     result_class: Literal[
         "PRIVATE_REF_INITIALIZED",
+        "PRIVATE_REF_PROMOTED",
         "PRIVATE_REF_ABSENT_FAILED",
         "PRIVATE_REF_CONFLICT",
         "PRIVATE_REF_UNOBSERVABLE",
@@ -90,6 +167,7 @@ class PrivateRefCasOutcome(FrozenDocument):
                 Literal["COMPLETED", "FAILED", "CONFLICT", "INDETERMINATE"],
                 {
                     "PRIVATE_REF_INITIALIZED": "COMPLETED",
+                    "PRIVATE_REF_PROMOTED": "COMPLETED",
                     "PRIVATE_REF_ABSENT_FAILED": "FAILED",
                     "PRIVATE_REF_CONFLICT": "CONFLICT",
                     "PRIVATE_REF_UNOBSERVABLE": "INDETERMINATE",
@@ -133,7 +211,8 @@ class RefEffectBinding(FrozenDocument):
 class RefCasIntent(FrozenDocument):
     intent_id: IntentId
     run_id: RunId
-    kind: Literal["private_ref_init"]
+    kind: Literal["private_ref_init", "private_ref_cas"]
+    candidate_id: CandidateId | None = None
     repository_id: RepositoryId
     ref_name: str
     expected_old_oid: GitOid | None
@@ -147,8 +226,13 @@ class RefCasIntent(FrozenDocument):
 
     @model_validator(mode="after")
     def validate_binding(self) -> Self:
-        if self.ref_name != private_ref(self.run_id) or self.expected_old_oid is not None:
+        if self.ref_name != private_ref(self.run_id):
             raise ValueError("REF_CAS_KIND_BINDING_INVALID")
+        if self.kind == "private_ref_init":
+            if self.expected_old_oid is not None or self.candidate_id is not None:
+                raise ValueError("REF_CAS_INIT_BINDING_INVALID")
+        elif self.expected_old_oid is None or self.candidate_id is None:
+            raise ValueError("REF_CAS_PROMOTION_BINDING_INVALID")
         return self
 
     def to_effect_intent(self, recorded_sequence: AuditSequence) -> EffectIntent:
@@ -164,7 +248,8 @@ class RefCasIntent(FrozenDocument):
             recorded_sequence=recorded_sequence,
             expected_prestate_json=canonical_json(
                 {
-                    "expected_old_oid": None,
+                    "candidate_id": self.candidate_id,
+                    "expected_old_oid": self.expected_old_oid,
                     "ref_effect_binding": self.ref_effect_binding.model_dump(mode="json"),
                     "ref_name": self.ref_name,
                     "repository_id": self.repository_id,
@@ -279,6 +364,8 @@ class StartGuard(Protocol):
 
 class PrivateRefAdmissionPort(Protocol):
     def initialize_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome: ...
+
+    def promote_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome: ...
 
 
 class RepositoryEffectError(RuntimeError):

@@ -25,13 +25,16 @@ from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, Ri
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
+    RefEffectBinding,
     RuntimeStartBinding,
     StartGuard,
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
     TargetReservationIdAllocationError,
+    TaskCandidate,
     allocate_target_reservation_id,
+    private_ref,
     random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
@@ -188,6 +191,7 @@ from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    CandidateId,
     CommandStatus,
     GrantId,
     IntentId,
@@ -490,6 +494,8 @@ class InMemoryStateStore:
         self._plan_run_checks: dict[RevisionDigest, tuple[CheckDefinition, ...]] = {}
         self._plan_approvals: dict[RunId, PlanApproval] = {}
         self._run_refs: dict[tuple[RunId, str], RunRefRecord] = {}
+        self._task_candidates: dict[CandidateId, TaskCandidate] = {}
+        self._task_candidate_intents: dict[CandidateId, IntentId] = {}
         self._global_usage: dict[tuple[RunId, GlobalBudgetMetric], int | Decimal] = {}
         self._budget_warnings: dict[
             tuple[RunId, RevisionDigest, GlobalBudgetMetric, int], BudgetWarning
@@ -577,6 +583,8 @@ class InMemoryStateStore:
         copied._plan_run_checks = self._plan_run_checks.copy()
         copied._plan_approvals = self._plan_approvals.copy()
         copied._run_refs = self._run_refs.copy()
+        copied._task_candidates = self._task_candidates.copy()
+        copied._task_candidate_intents = self._task_candidate_intents.copy()
         copied._global_usage = self._global_usage.copy()
         copied._budget_warnings = self._budget_warnings.copy()
         copied._atomic_actions = self._atomic_actions.copy()
@@ -648,6 +656,8 @@ class InMemoryStateStore:
         self._plan_run_checks = copied._plan_run_checks
         self._plan_approvals = copied._plan_approvals
         self._run_refs = copied._run_refs
+        self._task_candidates = copied._task_candidates
+        self._task_candidate_intents = copied._task_candidate_intents
         self._global_usage = copied._global_usage
         self._budget_warnings = copied._budget_warnings
         self._atomic_actions = copied._atomic_actions
@@ -856,6 +866,7 @@ class InMemoryStateStore:
                 state=RunState.DRAFT,
                 target_ref=reservation.target_ref,
                 pinned_target_oid=reservation.pinned_target_oid,
+                run_head_oid=reservation.pinned_target_oid,
             )
             copied._new_dispatch_open[run_id] = True
             copied._target_reservations[reservation.reservation_id] = reservation
@@ -5938,6 +5949,7 @@ class InMemoryStateStore:
                 state=RunState.DRAFT,
                 target_ref=payload.target_ref,
                 pinned_target_oid=payload.expected_target_oid,
+                run_head_oid=payload.expected_target_oid,
                 current_policy_digest=digests["POLICY"],
                 current_budget_digest=digests["BUDGET"],
                 current_model_configuration_digest=digests["MODEL_CONFIGURATION"],
@@ -6892,6 +6904,10 @@ class InMemoryStateStore:
                 copied._run_refs[(intent.run_id, "PRIVATE")] = replace(
                     ref, state="PRESENT", current_oid=intent.prepared_oid
                 )
+                copied._runs[intent.run_id] = replace(
+                    run,
+                    run_head_oid=intent.prepared_oid,
+                )
             else:
                 copied._run_refs[(intent.run_id, "PRIVATE")] = replace(
                     ref,
@@ -6943,6 +6959,313 @@ class InMemoryStateStore:
                 result_class="PRIVATE_REF_UNOBSERVABLE",
                 observed_oid=None,
             ),
+            expected_sequence=expected_sequence,
+        )
+
+    def persist_task_candidate(
+        self,
+        candidate: TaskCandidate,
+        expected_sequence: AuditSequence | None = None,
+    ) -> TaskCandidate:
+        sequence = (
+            self.audit_sequence(candidate.run_id)
+            if expected_sequence is None
+            else expected_sequence
+        )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(candidate.run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if candidate.state != "READY":
+                raise StateConflict("TASK_CANDIDATE_STATE_INVALID")
+            if candidate.candidate_id in copied._task_candidates:
+                raise StateConflict("TASK_CANDIDATE_DUPLICATE")
+            if run.run_head_oid is not None and candidate.expected_run_head_oid != run.run_head_oid:
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            ref = copied._run_refs.get((candidate.run_id, "PRIVATE"))
+            if (
+                ref is not None
+                and ref.current_oid is not None
+                and candidate.expected_run_head_oid != ref.current_oid
+            ):
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            copied._task_candidates[candidate.candidate_id] = candidate
+
+        self._commit_state_and_event(
+            run_id=candidate.run_id,
+            expected_sequence=sequence,
+            event=AuditEvent.kind(
+                "TASK_CANDIDATE_READY",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                subject_digests=(candidate.candidate_digest,),
+            ),
+            mutate=mutate,
+        )
+        return candidate
+
+    def task_candidate(self, candidate_id: CandidateId) -> TaskCandidate:
+        with self._lock:
+            candidate = self._task_candidates.get(candidate_id)
+        if candidate is None:
+            raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+        return candidate
+
+    def task_candidates(self, run_id: RunId) -> tuple[TaskCandidate, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        candidate
+                        for candidate in self._task_candidates.values()
+                        if candidate.run_id == run_id
+                    ),
+                    key=lambda candidate: (str(candidate.task_id), str(candidate.candidate_id)),
+                )
+            )
+
+    def ready_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        candidates = tuple(
+            candidate for candidate in self.task_candidates(run_id) if candidate.state == "READY"
+        )
+        return candidates[0] if candidates else None
+
+    def pending_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        candidates = tuple(
+            candidate
+            for candidate in self.task_candidates(run_id)
+            if candidate.state in {"READY", "PROMOTING"}
+        )
+        return candidates[0] if candidates else None
+
+    def task_promotion_intent(self, candidate_id: CandidateId) -> RefCasIntent:
+        with self._lock:
+            intent_id = self._task_candidate_intents.get(candidate_id)
+            effect = None if intent_id is None else self._effect_intents.get(intent_id)
+        if effect is None:
+            raise StateConflict("TASK_PROMOTION_INTENT_NOT_FOUND")
+        try:
+            return RefCasIntent.from_effect_intent(effect)
+        except ValueError as error:
+            raise StateConflict("TASK_PROMOTION_INTENT_STORAGE_INVALID") from error
+
+    def begin_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+        ref_effect_binding: RefEffectBinding | None = None,
+        permit_generation: int = 1,
+    ) -> RefCasIntent:
+        candidate = self.task_candidate(candidate_id)
+        if candidate.run_id != run_id:
+            raise StateConflict("TASK_CANDIDATE_RUN_MISMATCH")
+        if candidate.state == "PROMOTING":
+            existing = self.task_promotion_intent(candidate_id)
+            if (
+                existing.applicable_revision_digests != applicable_revision_digests
+                or existing.permit_generation != permit_generation
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            return existing
+        if candidate.state != "READY":
+            raise StateConflict("TASK_CANDIDATE_NOT_READY")
+        if permit_generation < 1:
+            raise StateConflict("PRIVATE_PROMOTION_PERMIT_INVALID")
+        run = self.run_record(run_id)
+        ref = self.run_ref(run_id, "PRIVATE")
+        expected_old_oid = ref.current_oid or run.run_head_oid
+        if expected_old_oid is None or expected_old_oid != candidate.expected_run_head_oid:
+            raise StateConflict("PRIVATE_REF_HEAD_MISMATCH")
+        if ref.state != "PRESENT":
+            raise StateConflict("PRIVATE_REF_NOT_PRESENT")
+        self._require_current_revisions(run_id, applicable_revision_digests)
+        reservation = self.target_reservation_for_run(run_id)
+        if ref_effect_binding is None:
+            if ref.guard_binding_json is None:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE")
+            try:
+                ref_effect_binding = StartGuardBinding.model_validate_json(
+                    ref.guard_binding_json
+                ).ref_effect_binding
+            except ValueError as error:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE") from error
+        identity = canonical_json(
+            {
+                "candidate_digest": candidate.candidate_digest,
+                "candidate_id": candidate.candidate_id,
+                "expected_old_oid": expected_old_oid,
+                "permit_generation": permit_generation,
+                "prepared_oid": candidate.prepared_oid,
+                "ref_effect_binding": ref_effect_binding.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+        intent = RefCasIntent(
+            intent_id=IntentId("private-ref-cas-" + sha256(identity.encode("utf-8")).hexdigest()),
+            run_id=run_id,
+            kind="private_ref_cas",
+            candidate_id=candidate.candidate_id,
+            repository_id=run.repository_id,
+            ref_name=private_ref(run_id),
+            expected_old_oid=expected_old_oid,
+            prepared_oid=candidate.prepared_oid,
+            target_safety_digest=self.target_authority_digest(run_id),
+            ref_effect_binding=ref_effect_binding,
+            target_reservation_id=reservation.reservation_id,
+            permit_generation=permit_generation,
+            applicable_revision_digests=applicable_revision_digests,
+            idempotency_key=(
+                f"private-ref-cas:{run_id}:{candidate.candidate_id}:"
+                f"{expected_old_oid}:{candidate.prepared_oid}:{permit_generation}"
+            ),
+        )
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            stored = copied._task_candidates.get(candidate_id)
+            current_ref = copied._run_refs.get((run_id, "PRIVATE"))
+            current_run = copied._runs.get(run_id)
+            if (
+                stored != candidate
+                or stored.state != "READY"
+                or current_ref is None
+                or current_ref.state != "PRESENT"
+                or current_ref.current_oid != expected_old_oid
+                or current_run is None
+                or current_run.run_head_oid != expected_old_oid
+                or copied.current_revision_digests(run_id) != applicable_revision_digests
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            if effect.intent_id in copied._effect_intents or any(
+                item.idempotency_key == effect.idempotency_key
+                for item in copied._effect_intents.values()
+            ):
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._task_candidates[candidate_id] = candidate.model_copy(
+                update={"state": "PROMOTING"}
+            )
+            copied._task_candidate_intents[candidate_id] = effect.intent_id
+            copied._run_refs[(run_id, "PRIVATE")] = replace(
+                current_ref, last_intent_id=effect.intent_id
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_INTENT_RECORDED",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                applicable_revision_digests=applicable_revision_digests,
+                subject_digests=(candidate.candidate_digest, effect.payload_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if intent.run_id != run_id or intent.candidate_id != candidate_id:
+            raise StateConflict("TASK_PROMOTION_BINDING_MISMATCH")
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            candidate = copied._task_candidates.get(candidate_id)
+            stored_intent_id = copied._task_candidate_intents.get(candidate_id)
+            stored_effect = (
+                None if stored_intent_id is None else copied._effect_intents.get(stored_intent_id)
+            )
+            ref = copied._run_refs.get((run_id, "PRIVATE"))
+            run = copied._runs.get(run_id)
+            if (
+                candidate is None
+                or candidate.state != "PROMOTING"
+                or stored_intent_id != intent.intent_id
+                or stored_effect is None
+                or stored_effect != intent.to_effect_intent(stored_effect.recorded_sequence)
+                or intent.applicable_revision_digests != applicable_revision_digests
+                or ref is None
+                or ref.last_intent_id != intent.intent_id
+                or run is None
+                or intent.intent_id in copied._effect_results
+                or outcome.intent_id != intent.intent_id
+                or outcome.run_id != run_id
+            ):
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            copied._effect_results[intent.intent_id] = result
+            if outcome.result_class == "PRIVATE_REF_PROMOTED":
+                if outcome.observed_oid != intent.prepared_oid:
+                    raise StateConflict("PRIVATE_REF_OUTCOME_OID_MISMATCH")
+                copied._task_candidates[candidate_id] = candidate.model_copy(
+                    update={"state": "PROMOTED"}
+                )
+                copied._run_refs[(run_id, "PRIVATE")] = replace(
+                    ref, state="PRESENT", current_oid=intent.prepared_oid
+                )
+                copied._runs[run_id] = replace(run, run_head_oid=intent.prepared_oid)
+            elif outcome.result_class == "PRIVATE_REF_ABSENT_FAILED":
+                copied._task_candidates[candidate_id] = candidate.model_copy(
+                    update={"state": "READY"}
+                )
+                copied._runs[run_id] = replace(run, state=RunState.PAUSED)
+            elif outcome.result_class == "PRIVATE_REF_CONFLICT":
+                copied._task_candidates[candidate_id] = candidate.model_copy(
+                    update={"state": "CONFLICT"}
+                )
+                copied._runs[run_id] = replace(run, state=RunState.PAUSED)
+            elif outcome.result_class == "PRIVATE_REF_UNOBSERVABLE":
+                copied._task_candidates[candidate_id] = candidate.model_copy(
+                    update={"state": "INDETERMINATE"}
+                )
+                copied._runs[run_id] = replace(run, state=RunState.INDETERMINATE)
+            else:
+                raise StateConflict("TASK_PROMOTION_OUTCOME_INVALID")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_SETTLED",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=outcome.result_class,
+            ),
+            mutate=mutate,
+        )
+
+    def rollback_known_private_cas_failure(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        return self.settle_task_promotion(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            intent=intent,
+            outcome=PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=run_id,
+                result_class="PRIVATE_REF_ABSENT_FAILED",
+                observed_oid=None,
+            ),
+            applicable_revision_digests=applicable_revision_digests,
             expected_sequence=expected_sequence,
         )
 

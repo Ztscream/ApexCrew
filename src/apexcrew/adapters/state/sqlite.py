@@ -26,13 +26,16 @@ from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, Ri
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
+    RefEffectBinding,
     RuntimeStartBinding,
     StartGuard,
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
     TargetReservationIdAllocationError,
+    TaskCandidate,
     allocate_target_reservation_id,
+    private_ref,
     random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
@@ -1064,6 +1067,28 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        26,
+        (
+            """CREATE TABLE task_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                expected_run_head_oid TEXT NOT NULL,
+                prepared_oid TEXT NOT NULL,
+                changed_paths_json TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'READY','PROMOTING','PROMOTED','CONFLICT','INDETERMINATE'
+                )),
+                promotion_intent_id TEXT UNIQUE REFERENCES effect_intents(intent_id),
+                UNIQUE(run_id, task_id, attempt_id)
+            )""",
+            "UPDATE runs SET run_head_oid = pinned_target_oid WHERE run_head_oid IS NULL",
+            "CREATE INDEX task_candidates_run_state ON task_candidates(run_id, state)",
+        ),
+    ),
 )
 
 
@@ -1835,13 +1860,15 @@ class SqliteStateStore:
             try:
                 connection.execute(
                     "INSERT INTO runs(run_id, repository_id, repository_instance_digest, "
-                    "state, target_ref, pinned_target_oid) VALUES (?, ?, ?, ?, ?, ?)",
+                    "state, target_ref, pinned_target_oid, run_head_oid) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         repository_id,
                         repository_instance_digest,
                         RunState.DRAFT,
                         reservation.target_ref,
+                        reservation.pinned_target_oid,
                         reservation.pinned_target_oid,
                     ),
                 )
@@ -1889,6 +1916,7 @@ class SqliteStateStore:
             state=RunState(row["state"]),
             target_ref=row["target_ref"],
             pinned_target_oid=GitOid(row["pinned_target_oid"]),
+            run_head_oid=(None if row["run_head_oid"] is None else GitOid(row["run_head_oid"])),
             current_plan_digest=(
                 None
                 if row["current_plan_digest"] is None
@@ -9532,13 +9560,15 @@ class SqliteStateStore:
             reservation_path = self._data_root / "reservations" / reservation_id
             connection.execute(
                 "INSERT INTO runs(run_id, repository_id, repository_instance_digest, state, "
-                "target_ref, pinned_target_oid, current_policy_digest, current_budget_digest, "
-                "current_model_configuration_digest) VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
+                "target_ref, pinned_target_oid, run_head_oid, current_policy_digest, "
+                "current_budget_digest, current_model_configuration_digest) "
+                "VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     repository_id,
                     repository_instance_digest,
                     payload.target_ref,
+                    payload.expected_target_oid,
                     payload.expected_target_oid,
                     digests["POLICY"],
                     digests["BUDGET"],
@@ -11505,6 +11535,428 @@ class SqliteStateStore:
                 None if row["last_intent_id"] is None else IntentId(row["last_intent_id"])
             ),
             guard_binding_json=row["guard_binding_json"],
+        )
+
+    @staticmethod
+    def _task_candidate_from_row(row: sqlite3.Row) -> TaskCandidate:
+        try:
+            candidate = TaskCandidate.model_validate_json(str(row["candidate_json"]))
+        except ValueError as error:
+            raise StateConflict("TASK_CANDIDATE_STORAGE_INVALID") from error
+        if (
+            candidate.candidate_id != CandidateId(str(row["candidate_id"]))
+            or candidate.run_id != RunId(str(row["run_id"]))
+            or candidate.task_id != TaskId(str(row["task_id"]))
+            or candidate.attempt_id != AttemptId(str(row["attempt_id"]))
+            or candidate.expected_run_head_oid != GitOid(str(row["expected_run_head_oid"]))
+            or candidate.prepared_oid != GitOid(str(row["prepared_oid"]))
+            or candidate.state != row["state"]
+        ):
+            raise StateConflict("TASK_CANDIDATE_STORAGE_BINDING_MISMATCH")
+        try:
+            changed_paths = tuple(json.loads(str(row["changed_paths_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StateConflict("TASK_CANDIDATE_PATHS_INVALID") from error
+        if changed_paths != candidate.changed_paths:
+            raise StateConflict("TASK_CANDIDATE_PATHS_MISMATCH")
+        return candidate
+
+    def persist_task_candidate(
+        self,
+        candidate: TaskCandidate,
+        expected_sequence: AuditSequence | None = None,
+    ) -> TaskCandidate:
+        sequence = (
+            self.audit_sequence(candidate.run_id)
+            if expected_sequence is None
+            else expected_sequence
+        )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            run = connection.execute(
+                "SELECT run_head_oid, pinned_target_oid FROM runs WHERE run_id = ?",
+                (candidate.run_id,),
+            ).fetchone()
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if candidate.state != "READY":
+                raise StateConflict("TASK_CANDIDATE_STATE_INVALID")
+            if run["run_head_oid"] is not None and candidate.expected_run_head_oid != GitOid(
+                str(run["run_head_oid"])
+            ):
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            ref = connection.execute(
+                "SELECT current_oid FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (candidate.run_id,),
+            ).fetchone()
+            if (
+                ref is not None
+                and ref["current_oid"] is not None
+                and candidate.expected_run_head_oid != GitOid(str(ref["current_oid"]))
+            ):
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            try:
+                connection.execute(
+                    "INSERT INTO task_candidates("
+                    "candidate_id, run_id, task_id, attempt_id, expected_run_head_oid, "
+                    "prepared_oid, changed_paths_json, candidate_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY')",
+                    (
+                        candidate.candidate_id,
+                        candidate.run_id,
+                        candidate.task_id,
+                        candidate.attempt_id,
+                        candidate.expected_run_head_oid,
+                        candidate.prepared_oid,
+                        json.dumps(
+                            list(candidate.changed_paths),
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ),
+                        candidate.model_dump_json(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("TASK_CANDIDATE_DUPLICATE") from error
+
+        self._commit_state_and_event(
+            run_id=candidate.run_id,
+            expected_sequence=sequence,
+            event=AuditEvent.kind(
+                "TASK_CANDIDATE_READY",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                subject_digests=(candidate.candidate_digest,),
+            ),
+            mutate=mutate,
+        )
+        return candidate
+
+    def task_candidate(self, candidate_id: CandidateId) -> TaskCandidate:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+        return self._task_candidate_from_row(row)
+
+    def task_candidates(self, run_id: RunId) -> tuple[TaskCandidate, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? ORDER BY task_id, candidate_id",
+                (run_id,),
+            ).fetchall()
+        return tuple(self._task_candidate_from_row(row) for row in rows)
+
+    def ready_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? AND state = 'READY' "
+                "ORDER BY task_id, candidate_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else self._task_candidate_from_row(row)
+
+    def pending_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? "
+                "AND state IN ('READY', 'PROMOTING') "
+                "ORDER BY task_id, candidate_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else self._task_candidate_from_row(row)
+
+    def task_promotion_intent(self, candidate_id: CandidateId) -> RefCasIntent:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT effect_intents.* FROM task_candidates JOIN effect_intents "
+                "ON effect_intents.intent_id = task_candidates.promotion_intent_id "
+                "WHERE task_candidates.candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TASK_PROMOTION_INTENT_NOT_FOUND")
+        try:
+            return RefCasIntent.from_effect_intent(self._effect_intent_from_row(row))
+        except ValueError as error:
+            raise StateConflict("TASK_PROMOTION_INTENT_STORAGE_INVALID") from error
+
+    def begin_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+        ref_effect_binding: RefEffectBinding | None = None,
+        permit_generation: int = 1,
+    ) -> RefCasIntent:
+        candidate = self.task_candidate(candidate_id)
+        if candidate.run_id != run_id:
+            raise StateConflict("TASK_CANDIDATE_RUN_MISMATCH")
+        if candidate.state == "PROMOTING":
+            existing = self.task_promotion_intent(candidate_id)
+            if (
+                existing.applicable_revision_digests != applicable_revision_digests
+                or existing.permit_generation != permit_generation
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            return existing
+        if candidate.state != "READY":
+            raise StateConflict("TASK_CANDIDATE_NOT_READY")
+        if permit_generation < 1:
+            raise StateConflict("PRIVATE_PROMOTION_PERMIT_INVALID")
+        run = self.run_record(run_id)
+        ref = self.run_ref(run_id, "PRIVATE")
+        expected_old_oid = ref.current_oid or run.run_head_oid
+        if expected_old_oid is None or expected_old_oid != candidate.expected_run_head_oid:
+            raise StateConflict("PRIVATE_REF_HEAD_MISMATCH")
+        if ref.state != "PRESENT":
+            raise StateConflict("PRIVATE_REF_NOT_PRESENT")
+        if self.current_revision_digests(run_id) != applicable_revision_digests:
+            raise StateConflict("CURRENT_REVISION_BINDING_MISMATCH")
+        reservation = self.target_reservation_for_run(run_id)
+        if ref_effect_binding is None:
+            if ref.guard_binding_json is None:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE")
+            try:
+                ref_effect_binding = StartGuardBinding.model_validate_json(
+                    ref.guard_binding_json
+                ).ref_effect_binding
+            except ValueError as error:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE") from error
+        identity = canonical_json(
+            {
+                "candidate_digest": candidate.candidate_digest,
+                "candidate_id": candidate.candidate_id,
+                "expected_old_oid": expected_old_oid,
+                "permit_generation": permit_generation,
+                "prepared_oid": candidate.prepared_oid,
+                "ref_effect_binding": ref_effect_binding.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+        intent = RefCasIntent(
+            intent_id=IntentId("private-ref-cas-" + sha256(identity.encode("utf-8")).hexdigest()),
+            run_id=run_id,
+            kind="private_ref_cas",
+            candidate_id=candidate.candidate_id,
+            repository_id=run.repository_id,
+            ref_name=private_ref(run_id),
+            expected_old_oid=expected_old_oid,
+            prepared_oid=candidate.prepared_oid,
+            target_safety_digest=self.target_authority_digest(run_id),
+            ref_effect_binding=ref_effect_binding,
+            target_reservation_id=reservation.reservation_id,
+            permit_generation=permit_generation,
+            applicable_revision_digests=applicable_revision_digests,
+            idempotency_key=(
+                f"private-ref-cas:{run_id}:{candidate.candidate_id}:"
+                f"{expected_old_oid}:{candidate.prepared_oid}:{permit_generation}"
+            ),
+        )
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+            stored = self._task_candidate_from_row(row)
+            ref_row = connection.execute(
+                "SELECT state, current_oid FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (run_id,),
+            ).fetchone()
+            run_row = connection.execute(
+                "SELECT run_head_oid FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if (
+                stored != candidate
+                or stored.state != "READY"
+                or ref_row is None
+                or ref_row["state"] != "PRESENT"
+                or ref_row["current_oid"] != str(expected_old_oid)
+                or run_row is None
+                or run_row["run_head_oid"] != str(expected_old_oid)
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            self._require_current_revisions(connection, run_id, applicable_revision_digests)
+            if effect.intent_id in {
+                str(row["promotion_intent_id"])
+                for row in connection.execute(
+                    "SELECT promotion_intent_id FROM task_candidates "
+                    "WHERE promotion_intent_id IS NOT NULL"
+                )
+            }:
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            self._insert_effect_intent(connection, effect)
+            next_candidate = candidate.model_copy(update={"state": "PROMOTING"})
+            connection.execute(
+                "UPDATE task_candidates SET state = 'PROMOTING', candidate_json = ?, "
+                "promotion_intent_id = ? WHERE candidate_id = ? AND state = 'READY'",
+                (next_candidate.model_dump_json(), effect.intent_id, candidate_id),
+            )
+            connection.execute(
+                "UPDATE run_refs SET last_intent_id = ? WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (effect.intent_id, run_id),
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_INTENT_RECORDED",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                applicable_revision_digests=applicable_revision_digests,
+                subject_digests=(candidate.candidate_digest, effect.payload_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if intent.run_id != run_id or intent.candidate_id != candidate_id:
+            raise StateConflict("TASK_PROMOTION_BINDING_MISMATCH")
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+            candidate = self._task_candidate_from_row(row)
+            if candidate.state != "PROMOTING" or row["promotion_intent_id"] != str(
+                intent.intent_id
+            ):
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            effect_row = connection.execute(
+                "SELECT * FROM effect_intents WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            if effect_row is None:
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            stored_effect = self._effect_intent_from_row(effect_row)
+            if (
+                stored_effect != intent.to_effect_intent(stored_effect.recorded_sequence)
+                or intent.applicable_revision_digests != applicable_revision_digests
+                or outcome.intent_id != intent.intent_id
+                or outcome.run_id != run_id
+                or connection.execute(
+                    "SELECT last_intent_id FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (run_id,),
+                ).fetchone()[0]
+                != str(intent.intent_id)
+            ):
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            self._insert_effect_result(
+                connection,
+                run_id,
+                intent.intent_id,
+                result,
+                applicable_revision_digests,
+            )
+            run_state: RunState | None = None
+            if outcome.result_class == "PRIVATE_REF_PROMOTED":
+                if outcome.observed_oid != intent.prepared_oid:
+                    raise StateConflict("PRIVATE_REF_OUTCOME_OID_MISMATCH")
+                next_candidate = candidate.model_copy(update={"state": "PROMOTED"})
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'PROMOTED', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+                connection.execute(
+                    "UPDATE run_refs SET state = 'PRESENT', current_oid = ? "
+                    "WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (intent.prepared_oid, run_id),
+                )
+                connection.execute(
+                    "UPDATE runs SET run_head_oid = ? WHERE run_id = ?",
+                    (intent.prepared_oid, run_id),
+                )
+            elif outcome.result_class == "PRIVATE_REF_ABSENT_FAILED":
+                next_candidate = candidate.model_copy(update={"state": "READY"})
+                run_state = RunState.PAUSED
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'READY', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+            elif outcome.result_class == "PRIVATE_REF_CONFLICT":
+                next_candidate = candidate.model_copy(update={"state": "CONFLICT"})
+                run_state = RunState.PAUSED
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'CONFLICT', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+            elif outcome.result_class == "PRIVATE_REF_UNOBSERVABLE":
+                next_candidate = candidate.model_copy(update={"state": "INDETERMINATE"})
+                run_state = RunState.INDETERMINATE
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'INDETERMINATE', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+            else:
+                raise StateConflict("TASK_PROMOTION_OUTCOME_INVALID")
+            if run_state is not None:
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ?",
+                    (run_state, run_id),
+                )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_SETTLED",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=outcome.result_class,
+            ),
+            mutate=mutate,
+        )
+
+    def rollback_known_private_cas_failure(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        return self.settle_task_promotion(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            intent=intent,
+            outcome=PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=run_id,
+                result_class="PRIVATE_REF_ABSENT_FAILED",
+                observed_oid=None,
+            ),
+            applicable_revision_digests=applicable_revision_digests,
+            expected_sequence=expected_sequence,
         )
 
     def runtime_start_binding(self, run_id: RunId) -> RuntimeStartBinding:

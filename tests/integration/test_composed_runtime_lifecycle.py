@@ -429,6 +429,20 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
             cli_app,
             ["integrate", str(run_id), "--root", str(root), "--preview"],
         )
+        assert preview.exit_code == 1, preview.stdout
+        assert json.loads(preview.stdout) == {
+            "failed_invariant": "STATE_CONFLICT",
+            "status": "INTEGRATE_REJECTED",
+        }
+        bundle.runtime._store._connection.execute(  # type: ignore[attr-defined]
+            "UPDATE run_candidates SET prepared_oid = ? WHERE run_id = ?",
+            (target_oid, run_id),
+        )
+        bundle.runtime._store._connection.commit()  # type: ignore[attr-defined]
+        preview = runner.invoke(
+            cli_app,
+            ["integrate", str(run_id), "--root", str(root), "--preview"],
+        )
         assert preview.exit_code == 0, preview.stdout
         integration = json.loads(preview.stdout)
         command_args = [
