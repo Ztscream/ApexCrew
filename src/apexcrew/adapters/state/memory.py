@@ -2149,6 +2149,12 @@ class InMemoryStateStore:
             ):
                 raise StateConflict("WORKER_ACTION_SETTLEMENT_BINDING_MISMATCH")
             copied._effect_results[intent.intent_id] = effect_result
+            if effect_result.outcome == "INDETERMINATE":
+                copied._indeterminate_effect_intents.add(intent.intent_id)
+                copied._indeterminate_generations.setdefault(intent.intent_id, 1)
+                copied._runs[intent.run_id] = replace(
+                    copied._runs[intent.run_id], state=RunState.INDETERMINATE
+                )
             copied._worker_actions[intent.action_id] = replace(
                 action, result_intent_id=intent.intent_id
             )

@@ -2749,3 +2749,29 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   workspace is a follow-up boundary and is not claimed closed by R4.3-03.
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 memory recovery-set parity correction
+
+- **Review finding**: SPEC reviewer `019fe4d0-a59a-7710-b3b5-f250b724006b`,
+  configured as `gpt-5.6-luna-max`, found that the memory adapter's specialized
+  Worker settlement stored an `INDETERMINATE` result without adding the intent
+  to its unresolved recovery set or moving the Run to `INDETERMINATE`. SQLite
+  already performed both transitions.
+- **Red evidence**:
+  `uv run --python 3.12 pytest
+  tests/contract/test_state_store.py::test_worker_indeterminate_settlement_enters_recovery_set_identically -q`
+  exited `1` for `memory_store_factory` and passed for
+  `sqlite_store_factory`; the memory assertion was `unresolved is None`.
+- **Correction**: `InMemoryStateStore.settle_worker_action` now mirrors the
+  generic settlement transition for `INDETERMINATE`: it records the recovery
+  member/generation and changes the Run state atomically with the Worker result.
+  **Human-Changes: none**.
+- **Green evidence**: the exact contract selector -> `2 passed`; the three
+  post-intent/denial recovery selectors -> `3 passed`. The full offline
+  `uv run --python 3.12 pytest -q --color=no` run exited `0` at `100%` in
+  `192.1s`; `uv run --python 3.12 mypy src` exited `0` with no issues in 66
+  source files; Ruff check/format exited `0` (`All checks passed!`, 165 files
+  already formatted); and `git diff --check` exited `0`.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** without a live Docker
+  process observation; workspace mutation history/restart recovery remains an
+  explicitly documented process-local follow-up.

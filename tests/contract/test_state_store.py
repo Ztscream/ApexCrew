@@ -1036,6 +1036,81 @@ def test_worker_action_intent_result_and_feedback_are_bound_identically(
 
 
 @pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
+def test_worker_indeterminate_settlement_enters_recovery_set_identically(
+    tmp_path: Path,
+    store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
+) -> None:
+    store = store_factory(tmp_path)
+    run_id = RunId("run-worker-uncertain")
+    seed_command_run(store, tmp_path, str(run_id))
+    make_authority(store, str(run_id))
+    budget_digest, _ = store.current_approved_budget(run_id)
+    binding = worker_binding(
+        run_id=run_id,
+        attempt_id="attempt-1",
+        budget_digest=budget_digest,
+    )
+    store.install_worker_attempt_for_test(binding)
+    action = CheckAction(check_id="task-check-1")
+    request, prestate = _worker_authorization_request(
+        binding,
+        action=action,
+        action_id="action-uncertain",
+        logical_turn_id="turn-uncertain",
+        expected_sequence=store.audit_sequence(run_id),
+    )
+    decision = _worker_allow_decision(request)
+    intent = ToolIntent.for_authorized_worker_action(
+        intent_id=IntentId("intent-worker-uncertain"),
+        run_id=run_id,
+        task_id=binding.task_id,
+        attempt_id=binding.attempt_id,
+        action_id=request.action_id,
+        action=action,
+        authorization_binding_digest=decision.binding_digest,
+        applicable_revision_digests=binding.applicable_revision_digests,
+        repository_id=binding.repository_id,
+        snapshot_digest=binding.snapshot_digest,
+        scope_digest=binding.scope_digest,
+        dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
+        idempotency_key=f"worker-tool:{run_id}:{binding.attempt_id}:turn-uncertain",
+        expected_prestate_json=prestate.canonical_json(),
+    )
+    store.record_authorized_worker_action(
+        intent=intent,
+        request=request,
+        decision=decision,
+        expected_prestate=prestate,
+        recovered_marker=None,
+        permit=None,
+        expected_sequence=request.expected_sequence,
+    )
+    result = ToolResult(
+        code="INFRASTRUCTURE_UNCERTAINTY",
+        run_id=run_id,
+        intent_id=intent.intent_id,
+        timed_out=True,
+        bounded_payload={
+            "reason": "WORKER_TOOL_EXECUTION_UNCERTAIN",
+            "snapshot_digest": binding.snapshot_digest,
+        },
+    )
+
+    store.settle_worker_action(
+        intent=intent,
+        authorization=decision,
+        result=result,
+        expected_sequence=store.audit_sequence(run_id),
+    )
+
+    assert store.effect_result(intent.intent_id).outcome == "INDETERMINATE"
+    unresolved = store.unresolved_intent_set(run_id)
+    assert unresolved is not None
+    assert unresolved.intents == (str(intent.intent_id),)
+    assert store.run_record(run_id).state == RunState.INDETERMINATE
+
+
+@pytest.mark.parametrize("store_factory", [memory_store_factory, sqlite_store_factory])
 def test_worker_finish_succeeds_and_releases_lease_identically(
     tmp_path: Path,
     store_factory: Callable[[Path], InMemoryStateStore | SqliteStateStore],
