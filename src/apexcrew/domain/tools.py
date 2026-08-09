@@ -712,13 +712,29 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
     if tool_result.run_id != intent.run_id or tool_result.intent_id != intent.intent_id:
         raise ToolEffectResultError("TOOL_RESULT_BINDING_INVALID")
     if intent.kind == "check":
-        if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in {
+        check_denials = {
+            "SECRET_PATH_DENIED",
+            "SCOPE_DENIED",
+            "LEASE_SCOPE_DENIED",
+            "NO_FOLLOW_PATH_DENIED",
+            "APPROVAL_REQUIRED",
+        }
+        check_codes = {
             "CHECK_PASSED",
             "CHECK_FAILED",
             "EXECUTOR_UNAVAILABLE",
             "INFRASTRUCTURE_UNCERTAINTY",
-        }:
+        } | check_denials
+        if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in check_codes:
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+        if result.snapshot_digest != tool_intent.snapshot_digest:
+            raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+        if tool_result.code in check_denials:
+            if tool_result.bounded_payload.get("snapshot_digest") != tool_intent.snapshot_digest:
+                raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+            if result.outcome != "FAILED":
+                raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+            return
         expected_outcome = (
             "INDETERMINATE"
             if tool_result.code in {"EXECUTOR_UNAVAILABLE", "INFRASTRUCTURE_UNCERTAINTY"}
@@ -728,7 +744,6 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
         output_bytes = tool_result.bounded_payload.get("output_bytes", 0)
         if (
             result.outcome != expected_outcome
-            or result.snapshot_digest != tool_intent.snapshot_digest
             or not isinstance(output, str)
             or not isinstance(output_bytes, int)
             or output_bytes != len(output.encode("utf-8"))
@@ -1178,4 +1193,14 @@ class ScopedToolRuntime:
                 ),
                 self._denial_expected_sequence,
             )
-        return ToolResult(code=code, run_id=intent.run_id, intent_id=intent.intent_id)
+        bounded_payload = (
+            {"snapshot_digest": intent.snapshot_digest}
+            if isinstance(intent.action, CheckAction)
+            else {}
+        )
+        return ToolResult(
+            code=code,
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            bounded_payload=bounded_payload,
+        )

@@ -2172,6 +2172,19 @@ class AuthorityService:
             else:
                 if not any(pattern.matches(canonical) for pattern in lease.write_globs):
                     reason = "ACTION_OUTSIDE_LEASE"
+        if (
+            reason == "AUTHORIZED"
+            and lease is not None
+            and isinstance(request.action, RiskyAction)
+            and request.action.destination is not None
+        ):
+            try:
+                destination = CanonicalPath.parse(request.action.destination)
+            except ValueError:
+                reason = "HARD_DENIAL"
+            else:
+                if not any(pattern.matches(destination) for pattern in lease.write_globs):
+                    reason = "ACTION_OUTSIDE_LEASE"
         if reason != "AUTHORIZED":
             policy_decision = "DENY"
         elif request.action.kind == "target_cas":

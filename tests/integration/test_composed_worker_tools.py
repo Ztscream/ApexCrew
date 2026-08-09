@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from base64 import b32encode
 from collections.abc import Sequence
@@ -299,14 +300,23 @@ def test_unknown_check_is_settled_as_a_durable_tool_denial(tmp_path: Path) -> No
     )
     try:
         stop = bundle.runtime.run_until_blocked(run_id)
-        assert stop.reason.value == "PAUSED"
+        assert stop.reason.value == "AWAITING_FINAL_APPROVAL"
         assert executor.calls == []
         assert bundle.queries.get(run_id).sequence > 0
+        with sqlite3.connect(_root / ".apexcrew" / "state.db") as connection:
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM effect_intents WHERE run_id = ? AND kind = 'check' "
+                    "AND state = 'SETTLED'",
+                    (run_id,),
+                ).fetchone()
+                is not None
+            )
     finally:
         bundle.close()
 
 
-def test_invalid_risky_prestate_reaches_authority_without_raising(tmp_path: Path) -> None:
+def test_risky_workspace_capture_failure_is_recorded_without_approval(tmp_path: Path) -> None:
     bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(
         tmp_path,
         (
@@ -320,7 +330,8 @@ def test_invalid_risky_prestate_reaches_authority_without_raising(tmp_path: Path
     )
     try:
         stop = bundle.runtime.run_until_blocked(run_id)
-        assert stop.reason.value == "AWAITING_ACTION_APPROVAL"
+        assert stop.reason.value == "PAUSED"
+        assert bundle.queries.get(run_id).sequence > 0
     finally:
         bundle.close()
 
@@ -333,6 +344,27 @@ def test_invalid_canonical_risky_path_is_durably_denied(tmp_path: Path) -> None:
                 "kind": "risky_action",
                 "path": "../src/task.py",
                 "operation": "delete",
+            },
+        ),
+    )
+    try:
+        stop = bundle.runtime.run_until_blocked(run_id)
+        assert stop.reason.value == "PAUSED"
+        assert executor.calls == []
+        assert bundle.queries.get(run_id).sequence > 0
+    finally:
+        bundle.close()
+
+
+def test_risky_rename_destination_must_be_inside_lease(tmp_path: Path) -> None:
+    bundle, run_id, executor, _root, _target_oid = _prepare_worker_run(
+        tmp_path,
+        (
+            {
+                "kind": "risky_action",
+                "path": "src/task.py",
+                "operation": "rename",
+                "destination": "other/task.py",
             },
         ),
     )

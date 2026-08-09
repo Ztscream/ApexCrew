@@ -1023,12 +1023,12 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             raise RuntimeError("WORKER_LEASE_NOT_FOUND")
         contract = self._contract(binding)
         attempt_state = self._attempt_state(binding)
+        primary = self._primary_workspace(attempt_state, binding, lease, contract)
         try:
-            primary = self._primary_workspace(attempt_state, binding, lease, contract)
             return GrantedWorkspaceAdapter(
                 primary.workspace.root, self._secret_policy
             ).expected_prestate(action)
-        except (AttemptWorkspaceError, OSError, RepositoryUnsafeError, RuntimeError, ValueError):
+        except ValueError:
             return ActionPreState()
 
     def capture_snapshot_digest(
