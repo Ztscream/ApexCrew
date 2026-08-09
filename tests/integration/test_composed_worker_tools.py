@@ -12,10 +12,11 @@ from types import SimpleNamespace
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.composition import (
     _CompositionWorkerTools,
+    build_application_bundle,
     build_test_application_bundle,
 )
 from apexcrew.application.configuration import default_revision_documents
-from apexcrew.domain.actions import PatchAction
+from apexcrew.domain.actions import CheckAction, PatchAction
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
     ApproveBudgetPayload,
@@ -27,11 +28,13 @@ from apexcrew.domain.commands import (
     CreateRunPayload,
     StartPayload,
 )
+from apexcrew.domain.coordination import task_contract_digest
 from apexcrew.domain.model import ModelCompletion, ModelUsage, ProviderAttemptResult
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.revisions import revision_digest
-from apexcrew.domain.tools import ExecutionResult, SanitizedSnapshot
-from apexcrew.domain.types import GitOid, RunId
+from apexcrew.domain.tools import ExecutionResult, SanitizedSnapshot, ToolIntent
+from apexcrew.domain.types import AttemptId, AuditSequence, GitOid, IntentId, RunId, TaskId
+from apexcrew.domain.worker import WorkerTurnBinding
 
 
 def _git(root: Path, *argv: str) -> str:
@@ -82,7 +85,7 @@ class _WorkerModel(ScriptedMockLLM):
                             "constraints": ["keep the change scoped"],
                             "dependency_globs": [],
                             "dependency_task_ids": [],
-                            "read_globs": ["src/task.py"],
+                            "read_globs": ["src/**"],
                             "task_id": "task-01",
                             "write_globs": ["src/task.py"],
                         }
@@ -133,6 +136,88 @@ class _RaisingExecutor(_RecordingExecutor):
     ) -> ExecutionResult:
         self.calls.append((tuple(argv), snapshot, timeout_seconds))
         raise RuntimeError("EXECUTOR_RUNTIME_FAILURE")
+
+
+_COMPOSITION_TEST_SHA = "sha256:" + "9" * 64
+
+
+def _worker_graph(bundle: object) -> tuple[object, object]:
+    phase_drivers = bundle.runtime._phase_drivers  # type: ignore[attr-defined]
+    workers = phase_drivers._recovered_actions._workers
+    return workers._tools, workers._attempts
+
+
+def _install_direct_worker_attempt(
+    bundle: object, run_id: RunId
+) -> tuple[object, object, WorkerTurnBinding, object]:
+    tools, store = _worker_graph(bundle)
+    revisions = store.current_revision_digests(run_id)
+    assert revisions.plan_digest is not None
+    contract = next(
+        item
+        for item in store.task_contracts(revisions.plan_digest)
+        if item.task_id == TaskId("task-01")
+    )
+    model_configuration = store.current_revision_document(run_id, "MODEL_CONFIGURATION")
+    run = store.run_record(run_id)
+    binding = WorkerTurnBinding(
+        run_id=run_id,
+        task_id=TaskId("task-01"),
+        attempt_id=AttemptId("composition-direct-attempt"),
+        tranche_id="composition-direct-tranche",
+        lease_id="composition-direct-lease",
+        lease_generation=1,
+        admissible_head=str(run.pinned_target_oid),
+        task_contract_digest=task_contract_digest(contract),
+        plan_digest=revisions.plan_digest,
+        policy_digest=revisions.policy_digest,
+        budget_digest=revisions.budget_digest,
+        model_configuration_digest=revisions.model_configuration_digest,
+        tool_schema_digest=model_configuration.tool_schema_digest,
+        target_safety_digest=store.target_authority_digest(run_id),
+        credential_profile=None,
+        repository_id=str(run.repository_id),
+        snapshot_digest=_COMPOSITION_TEST_SHA,
+        scope_digest=_COMPOSITION_TEST_SHA,
+        dependency_fingerprint_basis=_COMPOSITION_TEST_SHA,
+    )
+    store.install_worker_attempt_for_test(binding)
+    return tools, store, binding, contract
+
+
+def _direct_intent(
+    binding: WorkerTurnBinding,
+    action: CheckAction | PatchAction,
+    snapshot_digest: str,
+) -> ToolIntent:
+    return ToolIntent.for_authorized_worker_action(
+        intent_id=IntentId(f"composition-direct-{action.kind}"),
+        run_id=binding.run_id,
+        task_id=binding.task_id,
+        attempt_id=binding.attempt_id,
+        action_id=f"composition-direct-{action.kind}",
+        action=action,
+        authorization_binding_digest=_COMPOSITION_TEST_SHA,
+        applicable_revision_digests=binding.applicable_revision_digests,
+        repository_id=binding.repository_id,
+        snapshot_digest=snapshot_digest,
+        scope_digest=binding.scope_digest,
+        dependency_fingerprint_basis=binding.dependency_fingerprint_basis,
+        idempotency_key=f"composition-direct:{action.kind}",
+        expected_prestate_json="{}",
+    )
+
+
+def _record_check_deadline(store: object, tools: object, intent: ToolIntent) -> None:
+    expected_sequence = store.audit_sequence(intent.run_id)
+    store.record_intent(
+        intent.to_effect_intent(AuditSequence(expected_sequence + 1)), expected_sequence
+    )
+    tools._authority.open_action_deadline(  # type: ignore[attr-defined]
+        intent.run_id,
+        intent.intent_id,
+        store.audit_sequence(intent.run_id),
+    )
 
 
 def test_composition_worker_tools_delegates_recovery_observation() -> None:
@@ -187,6 +272,7 @@ def _prepare_worker_run(
     worker_actions: Sequence[dict[str, object]],
     *,
     executor: _RecordingExecutor | None = None,
+    production: bool = False,
 ) -> tuple[object, RunId, _RecordingExecutor, Path, GitOid]:
     root = tmp_path / "repo"
     root.mkdir()
@@ -195,7 +281,8 @@ def _prepare_worker_run(
     _git(root, "config", "user.email", "apexcrew@example.test")
     (root / "src").mkdir()
     (root / "src" / "task.py").write_text("value = 1\n", encoding="utf-8")
-    _git(root, "add", "src/task.py")
+    (root / "src" / "context_only.py").write_text("context = True\n", encoding="utf-8")
+    _git(root, "add", "src/task.py", "src/context_only.py")
     _git(root, "commit", "-qm", "initial")
     target_oid = GitOid(_git(root, "rev-parse", "refs/heads/main"))
     _git(root, "checkout", "--detach", str(target_oid))
@@ -206,13 +293,21 @@ def _prepare_worker_run(
     )
     model = _WorkerModel(worker_actions)
     executor = _RecordingExecutor() if executor is None else executor
-    bundle = build_test_application_bundle(
-        root,
-        model_configuration=model_configuration,
-        scripted_model=model,
-        secret_policy=SecretPathPolicy.from_host_rules((), b"k" * 32),
-        executor=executor,
-    )
+    if production:
+        bundle = build_application_bundle(
+            root,
+            model_configuration=model_configuration,
+            scripted_model=model,
+            secret_policy=SecretPathPolicy.from_host_rules((), b"k" * 32),
+        )
+    else:
+        bundle = build_test_application_bundle(
+            root,
+            model_configuration=model_configuration,
+            scripted_model=model,
+            secret_policy=SecretPathPolicy.from_host_rules((), b"k" * 32),
+            executor=executor,
+        )
     outcome = bundle.control.handle(
         _envelope(
             "create",
@@ -317,6 +412,102 @@ def _prepare_worker_run(
     )
     assert start.status == "ACCEPTED"
     return bundle, run_id, executor, root, target_oid
+
+
+def test_check_id_derivation_is_shared(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(tmp_path, ())
+    try:
+        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
+        phase_drivers = bundle.runtime._phase_drivers  # type: ignore[attr-defined]
+        worker = phase_drivers._recovered_actions._workers
+        capsule = worker._capsules.build_current(binding.attempt_id)
+        context = json.loads(capsule.content)
+        assert context["checks"][0]["check_id"] == "task-01:check-1"
+
+        action = CheckAction(check_id="task-01:check-1")
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        runtime = tools._runtime(  # type: ignore[attr-defined]
+            _direct_intent(binding, action, snapshot_digest)
+        )
+        assert runtime._declared_checks.require("task-01:check-1").argv == (  # type: ignore[attr-defined]
+            "python",
+            "-m",
+            "pytest",
+        )
+    finally:
+        bundle.close()
+
+
+def test_composed_patch_is_not_lease_scope_denied(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(tmp_path, ())
+    try:
+        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
+        action = PatchAction(
+            path="src/task.py",
+            unified_diff="@@ -1 +1 @@\n-value = 1\n+value = 2\n",
+        )
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        result = tools.execute(_direct_intent(binding, action, snapshot_digest))
+
+        assert result.code == "PATCH_APPLIED"
+    finally:
+        bundle.close()
+
+
+def test_composed_check_resolves_declared_definition(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(tmp_path, ())
+    try:
+        tools, store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
+        action = CheckAction(check_id="task-01:check-1")
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        intent = _direct_intent(binding, action, snapshot_digest)
+        _record_check_deadline(store, tools, intent)
+        result = tools.execute(intent)
+
+        assert result.code == "CHECK_PASSED"
+        assert result.bounded_payload["snapshot_digest"] == snapshot_digest
+    finally:
+        bundle.close()
+
+
+def test_context_and_check_workspace_bindings_are_distinct(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(tmp_path, ())
+    try:
+        tools, _store, binding, contract = _install_direct_worker_attempt(bundle, run_id)
+        state = tools._attempt_state(binding)  # type: ignore[attr-defined]
+        context = tools._context_workspace(state, binding, contract)  # type: ignore[attr-defined]
+        action = CheckAction(check_id="task-01:check-1")
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        runtime = tools._runtime(  # type: ignore[attr-defined]
+            _direct_intent(binding, action, snapshot_digest)
+        )
+        check_snapshot = runtime._sanitized_snapshot  # type: ignore[attr-defined]
+
+        assert check_snapshot is not None
+        assert context.root != check_snapshot.root
+        assert context.tree_digest != check_snapshot.tree_digest
+        assert snapshot_digest == check_snapshot.tree_digest
+    finally:
+        bundle.close()
+
+
+def test_docker_executor_is_the_only_composed_check_path(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(
+        tmp_path, (), production=True
+    )
+    try:
+        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
+        action = CheckAction(check_id="task-01:check-1")
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        runtime = tools._runtime(  # type: ignore[attr-defined]
+            _direct_intent(binding, action, snapshot_digest)
+        )
+        production_tools_executor = runtime._executor  # type: ignore[attr-defined]
+
+        assert type(production_tools_executor).__name__ == "RestrictedDockerExecutor"
+        assert "LocalSubprocessExecutor" not in repr(production_tools_executor)
+    finally:
+        bundle.close()
 
 
 def test_public_composition_binds_check_to_patched_workspace(tmp_path: Path) -> None:

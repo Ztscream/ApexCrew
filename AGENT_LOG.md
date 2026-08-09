@@ -2750,6 +2750,41 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-09 / R4.3-03 SPEC selector evidence correction
+
+- **SPEC review**: independent reviewer `019fe517-f551-7943-97a1-028a4fbfd4d5`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with zero Critical/High
+  findings and one Medium: the task plan's five independent selectors were
+  absent, and the Docker test inspected only a directly constructed executor
+  instead of the production composition graph.
+- **Red evidence**: the plan selector command exited `1`; pytest reported
+  `not found` for `test_check_id_derivation_is_shared`,
+  `test_composed_patch_is_not_lease_scope_denied`,
+  `test_composed_check_resolves_declared_definition`, and
+  `test_context_and_check_workspace_bindings_are_distinct`. The existing
+  restricted executor selector was present but did not inspect composition.
+- **Correction**: added the five independent composition selectors and a
+  real SQLite run/lease/contract test seam. The selectors exercise the Worker
+  context and declared registry, direct composition patch/check execution,
+  distinct context/check roots and digests, and the production graph's
+  `RestrictedDockerExecutor`. The fixture now gives context an additional
+  file while retaining the check input scope. Existing dependency-layer
+  changes remain because they are required review remediations for the same
+  R4.3-03 end-to-end recovery/authority contract; reverting them would reopen
+  already observed spec failures. **Human-Changes: none**.
+- **Green evidence**: the five named selectors -> `5 passed`; the affected
+  composition, patch/check, production-wiring, and Docker test files ->
+  `24 passed, 1 skipped`; Ruff format/check, `mypy src` (66 source files),
+  and `git diff --check` exited `0`.
+- **Review status**: fresh SPEC review is required against this correction
+  commit; ordered quality review remains blocked until SPEC passes. The
+  prior quality FAIL findings remain corrected in `a8e29a3`.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no real
+  restricted Docker process invocation was observed; workspace mutation
+  history and restart recovery remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
 ## 2026-08-09 / R4.3-03 memory recovery-set parity correction
 
 - **Review finding**: SPEC reviewer `019fe4d0-a59a-7710-b3b5-f250b724006b`,
