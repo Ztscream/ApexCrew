@@ -738,6 +738,7 @@ class _CompositionRepositoryResources:
             reservation=reservation,
             target_safety_digest=target_safety_digest,
             reflog_message=f"apexcrew private run {reservation.run_id}",
+            private_data_root=self._data_root,
         )
 
     def target_cas(

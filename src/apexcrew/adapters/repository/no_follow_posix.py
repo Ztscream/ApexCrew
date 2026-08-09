@@ -109,6 +109,25 @@ class PosixNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_WRITE_OPEN_DENIED") from error
         return self._node(parent.components + (name,), handle, "file")
 
+    def open_child_for_lock(self, parent: OpenedNode, name: str) -> OpenedNode:
+        return self.open_child_for_write(parent, name)
+
+    @staticmethod
+    def lock_exclusive(node: OpenedNode) -> None:
+        fcntl = __import__("fcntl")
+        try:
+            fcntl.flock(node.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RepositoryUnsafeError("LOCK_ACQUIRE_FAILED") from error
+
+    @staticmethod
+    def unlock_exclusive(node: OpenedNode) -> None:
+        fcntl = __import__("fcntl")
+        try:
+            fcntl.flock(node.handle, fcntl.LOCK_UN)
+        except OSError as error:
+            raise RepositoryUnsafeError("LOCK_RELEASE_FAILED") from error
+
     def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self.open_child(parent, name, kind)
 

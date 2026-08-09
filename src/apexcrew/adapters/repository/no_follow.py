@@ -33,6 +33,9 @@ class NoFollowBackend(Protocol):
     def open_root_chain(self, root: Path) -> tuple[OpenedNode, ...]: ...
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode: ...
     def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode: ...
+    def open_child_for_lock(self, parent: OpenedNode, name: str) -> OpenedNode: ...
+    def lock_exclusive(self, node: OpenedNode) -> None: ...
+    def unlock_exclusive(self, node: OpenedNode) -> None: ...
     def open_child_for_delete(
         self, parent: OpenedNode, name: str, kind: NodeKind
     ) -> OpenedNode: ...
@@ -149,6 +152,20 @@ class StableHandleTree:
         node = self._backend.open_child_for_write(parent, parts[-1])
         self._nodes[parts] = node
         return node
+
+    def open_for_lock(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        self.release_cached(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        node = self._backend.open_child_for_lock(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def lock_exclusive(self, node: OpenedNode) -> None:
+        self._backend.lock_exclusive(node)
+
+    def unlock_exclusive(self, node: OpenedNode) -> None:
+        self._backend.unlock_exclusive(node)
 
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._backend.read_bytes(node, maximum)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from secrets import token_hex
 from typing import Literal, Protocol, Self, cast
@@ -23,6 +24,7 @@ from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CandidateId,
+    EvidenceBundleDigest,
     GitOid,
     IntentId,
     RepositoryId,
@@ -40,6 +42,118 @@ def _task_candidate_digest(values: Mapping[str, object]) -> Sha256DigestText:
     return sha256_digest(canonical_json(values))
 
 
+def _require_sha256_digest(value: str, field_name: str) -> None:
+    if (
+        len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise ValueError(f"{field_name.upper()}_INVALID")
+
+
+def task_candidate_lease_provenance_digest(
+    *,
+    attempt_id: AttemptId,
+    lease_id: str,
+    lease_generation: int,
+    lease_base_head_oid: GitOid,
+    lease_admissible_head_oid: GitOid,
+    lease_issued_at_utc: datetime,
+    lease_expires_at_utc: datetime,
+    prepared_at_utc: datetime,
+) -> Sha256DigestText:
+    return sha256_digest(
+        canonical_json(
+            {
+                "attempt_id": attempt_id,
+                "lease_admissible_head_oid": lease_admissible_head_oid,
+                "lease_base_head_oid": lease_base_head_oid,
+                "lease_expires_at_utc": lease_expires_at_utc,
+                "lease_generation": lease_generation,
+                "lease_id": lease_id,
+                "lease_issued_at_utc": lease_issued_at_utc,
+                "prepared_at_utc": prepared_at_utc,
+            }
+        )
+    )
+
+
+class TaskCandidateGateBinding(FrozenDocument):
+    """Immutable evidence and authority provenance for one prepared Attempt."""
+
+    schema_version: Literal["task-candidate-gate-v1"] = "task-candidate-gate-v1"
+    attempt_id: AttemptId
+    task_contract_digest: Sha256DigestText
+    base_run_head_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    post_tree_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    evidence_bundle_digest: EvidenceBundleDigest
+    freshness_assessment_digest: Sha256DigestText
+    freshness_status: Literal["FRESH", "STALE", "INDETERMINATE"]
+    applicable_revision_digests: ApplicableRevisionDigests
+    target_safety_digest: Sha256DigestText
+    scope_digest: Sha256DigestText
+    check_workspace_digest: Sha256DigestText
+    policy_decision: Literal["ALLOW", "REQUIRE_APPROVAL", "DENY"]
+    approval_binding_digest: Sha256DigestText | None = None
+    approval_sequence: AuditSequence | None = Field(default=None, ge=1)
+    lease_id: str = Field(min_length=1, max_length=256)
+    lease_generation: int = Field(ge=1)
+    lease_base_head_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    lease_admissible_head_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    lease_issued_at_utc: datetime
+    lease_expires_at_utc: datetime
+    prepared_at_utc: datetime
+    lease_provenance_digest: Sha256DigestText
+
+    @model_validator(mode="after")
+    def validate_gate(self) -> Self:
+        for field_name, value in (
+            ("task_contract_digest", self.task_contract_digest),
+            ("evidence_bundle_digest", self.evidence_bundle_digest),
+            ("freshness_assessment_digest", self.freshness_assessment_digest),
+            ("target_safety_digest", self.target_safety_digest),
+            ("scope_digest", self.scope_digest),
+            ("check_workspace_digest", self.check_workspace_digest),
+            ("lease_provenance_digest", self.lease_provenance_digest),
+        ):
+            _require_sha256_digest(str(value), field_name)
+        if any(digest is None for digest in self.applicable_revision_digests.model_dump().values()):
+            raise ValueError("TASK_CANDIDATE_REVISIONS_INCOMPLETE")
+        if self.freshness_status != "FRESH":
+            raise ValueError("TASK_CANDIDATE_FRESHNESS_NOT_FRESH")
+        if self.policy_decision == "DENY":
+            raise ValueError("TASK_CANDIDATE_POLICY_DENIED")
+        if (self.approval_binding_digest is None) != (self.approval_sequence is None):
+            raise ValueError("TASK_CANDIDATE_APPROVAL_BINDING_INVALID")
+        if self.approval_binding_digest is not None:
+            _require_sha256_digest(str(self.approval_binding_digest), "approval_binding_digest")
+        if self.policy_decision == "ALLOW" and self.approval_binding_digest is not None:
+            raise ValueError("TASK_CANDIDATE_UNEXPECTED_APPROVAL")
+        if self.policy_decision == "REQUIRE_APPROVAL" and self.approval_binding_digest is None:
+            raise ValueError("TASK_CANDIDATE_APPROVAL_REQUIRED")
+        if self.lease_base_head_oid != self.base_run_head_oid:
+            raise ValueError("TASK_CANDIDATE_LEASE_BASE_MISMATCH")
+        if self.lease_admissible_head_oid != self.base_run_head_oid:
+            raise ValueError("TASK_CANDIDATE_LEASE_HEAD_MISMATCH")
+        if self.prepared_at_utc < self.lease_issued_at_utc:
+            raise ValueError("TASK_CANDIDATE_LEASE_PROVENANCE_INVALID")
+        if self.prepared_at_utc >= self.lease_expires_at_utc:
+            raise ValueError("TASK_CANDIDATE_LEASE_EXPIRED_AT_PREPARATION")
+        expected = task_candidate_lease_provenance_digest(
+            attempt_id=self.attempt_id,
+            lease_id=self.lease_id,
+            lease_generation=self.lease_generation,
+            lease_base_head_oid=self.lease_base_head_oid,
+            lease_admissible_head_oid=self.lease_admissible_head_oid,
+            lease_issued_at_utc=self.lease_issued_at_utc,
+            lease_expires_at_utc=self.lease_expires_at_utc,
+            prepared_at_utc=self.prepared_at_utc,
+        )
+        if self.lease_provenance_digest != expected:
+            raise ValueError("TASK_CANDIDATE_LEASE_PROVENANCE_MISMATCH")
+        return self
+
+
 class TaskCandidate(FrozenDocument):
     """An immutable prepared Attempt change awaiting private-ref promotion."""
 
@@ -50,7 +164,9 @@ class TaskCandidate(FrozenDocument):
     attempt_id: AttemptId
     expected_run_head_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
     prepared_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
+    prepared_tree_oid: GitOid = Field(pattern=r"^[0-9a-f]{40}$")
     changed_paths: tuple[str, ...]
+    gate_binding: TaskCandidateGateBinding | None = None
     state: Literal["READY", "PROMOTING", "PROMOTED", "CONFLICT", "INDETERMINATE"] = "READY"
     candidate_digest: Sha256DigestText
 
@@ -68,12 +184,23 @@ class TaskCandidate(FrozenDocument):
         expected_run_head_oid: GitOid,
         prepared_oid: GitOid,
         changed_paths: tuple[str, ...],
+        prepared_tree_oid: GitOid | None = None,
+        gate_binding: TaskCandidateGateBinding | None = None,
     ) -> Self:
+        post_tree_oid = (
+            prepared_tree_oid
+            if prepared_tree_oid is not None
+            else (gate_binding.post_tree_oid if gate_binding is not None else prepared_oid)
+        )
         identity = {
             "attempt_id": attempt_id,
             "changed_paths": changed_paths,
+            "gate_binding": (
+                None if gate_binding is None else gate_binding.model_dump(mode="json")
+            ),
             "expected_run_head_oid": expected_run_head_oid,
             "prepared_oid": prepared_oid,
+            "prepared_tree_oid": post_tree_oid,
             "run_id": run_id,
             "task_id": task_id,
         }
@@ -86,7 +213,9 @@ class TaskCandidate(FrozenDocument):
             attempt_id=attempt_id,
             expected_run_head_oid=expected_run_head_oid,
             prepared_oid=prepared_oid,
+            prepared_tree_oid=post_tree_oid,
             changed_paths=changed_paths,
+            gate_binding=gate_binding,
             candidate_digest=_task_candidate_digest({**identity, "candidate_id": candidate_id}),
         )
 
@@ -95,8 +224,12 @@ class TaskCandidate(FrozenDocument):
         identity = {
             "attempt_id": self.attempt_id,
             "changed_paths": self.changed_paths,
+            "gate_binding": (
+                None if self.gate_binding is None else self.gate_binding.model_dump(mode="json")
+            ),
             "expected_run_head_oid": self.expected_run_head_oid,
             "prepared_oid": self.prepared_oid,
+            "prepared_tree_oid": self.prepared_tree_oid,
             "run_id": self.run_id,
             "task_id": self.task_id,
         }
@@ -106,6 +239,12 @@ class TaskCandidate(FrozenDocument):
         expected_digest = _task_candidate_digest({**identity, "candidate_id": expected_id})
         if self.candidate_id != expected_id or self.candidate_digest != expected_digest:
             raise ValueError("TASK_CANDIDATE_BINDING_MISMATCH")
+        if self.gate_binding is not None and (
+            self.gate_binding.attempt_id != self.attempt_id
+            or self.gate_binding.base_run_head_oid != self.expected_run_head_oid
+            or self.gate_binding.post_tree_oid != self.prepared_tree_oid
+        ):
+            raise ValueError("TASK_CANDIDATE_GATE_BINDING_MISMATCH")
         return self
 
 

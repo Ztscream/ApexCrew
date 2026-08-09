@@ -194,6 +194,7 @@ class DispatchCloseCause(StrEnum):
     IMMUTABLE_PLAN_INSUFFICIENCY = "IMMUTABLE_PLAN_INSUFFICIENCY"
     REVISION_REPLACEMENT = "REVISION_REPLACEMENT"
     RUNTIME_FAULT = "RUNTIME_FAULT"
+    RUNTIME_PHASE_CAP = "RUNTIME_PHASE_CAP"
     TASK_PAUSED = "TASK_PAUSED"
 
 
@@ -1193,8 +1194,25 @@ class TaskAuthority:
     attempt_id: AttemptId
 
 
-TaskLifecycleState = Literal["ACTIVE", "READY", "PAUSED"]
-AttemptLifecycleState = Literal["RUNNING", "FAILED"]
+TaskLifecycleState = Literal[
+    "ACTIVE",
+    "READY",
+    "CANDIDATE_READY",
+    "PROMOTED",
+    "PAUSED",
+]
+AttemptLifecycleState = Literal[
+    "CREATED",
+    "LEASED",
+    "RUNNING",
+    "WAITING_APPROVAL",
+    "VERIFYING",
+    "SUCCEEDED",
+    "FAILED",
+    "STALE",
+    "CANCELLED",
+    "INDETERMINATE",
+]
 
 
 @dataclass(frozen=True, slots=True)

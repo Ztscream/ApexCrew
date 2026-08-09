@@ -59,6 +59,8 @@ FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 OPEN_EXISTING = 3
 FILE_DISPOSITION_INFO = 4
+LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 INVALID_HANDLE_VALUE = c_void_p(-1).value
 FILE_ID_BOTH_DIRECTORY_INFORMATION = 37
 FILE_ID_BOTH_DIRECTORY_HEADER_SIZE = 104
@@ -95,6 +97,16 @@ class IO_STATUS_BLOCK(Structure):
     _fields_ = [("Status", c_long), ("Information", c_size_t)]
 
 
+class OVERLAPPED(Structure):
+    _fields_ = [
+        ("Internal", c_void_p),
+        ("InternalHigh", c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
 class BY_HANDLE_FILE_INFORMATION(Structure):
     _fields_ = [
         ("dwFileAttributes", wintypes.DWORD),
@@ -118,6 +130,7 @@ class WindowsNoFollowBackend:
         self._kernel32: CDLL = WinDLL("kernel32", use_last_error=True)
         self._ntdll: CDLL = WinDLL("ntdll")
         self._last_ntstatus: int | None = None
+        self._locks: dict[int, OVERLAPPED] = {}
         self._declare_native_signatures()
 
     def _declare_native_signatures(self) -> None:
@@ -165,6 +178,23 @@ class WindowsNoFollowBackend:
         self._kernel32.FlushFileBuffers.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.LockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            POINTER(OVERLAPPED),
+        ]
+        self._kernel32.LockFileEx.restype = wintypes.BOOL
+        self._kernel32.UnlockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            POINTER(OVERLAPPED),
+        ]
+        self._kernel32.UnlockFileEx.restype = wintypes.BOOL
         self._kernel32.SetFileInformationByHandle.argtypes = [
             wintypes.HANDLE,
             wintypes.DWORD,
@@ -452,6 +482,33 @@ class WindowsNoFollowBackend:
             write_access=True,
         )
 
+    def open_child_for_lock(self, parent: OpenedNode, name: str) -> OpenedNode:
+        return self.open_child_for_write(parent, name)
+
+    def lock_exclusive(self, node: OpenedNode) -> None:
+        if node.identity.kind != "file":
+            raise RepositoryUnsafeError("LOCK_TARGET_INVALID")
+        overlapped = OVERLAPPED()
+        if not self._kernel32.LockFileEx(
+            wintypes.HANDLE(node.handle),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            byref(overlapped),
+        ):
+            raise RepositoryUnsafeError("LOCK_ACQUIRE_FAILED")
+        self._locks[node.handle] = overlapped
+
+    def unlock_exclusive(self, node: OpenedNode) -> None:
+        overlapped = self._locks.pop(node.handle, None)
+        if overlapped is None:
+            return
+        if not self._kernel32.UnlockFileEx(
+            wintypes.HANDLE(node.handle), 0, 1, 0, byref(overlapped)
+        ):
+            raise RepositoryUnsafeError("LOCK_RELEASE_FAILED")
+
     def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self._open_relative(
             parent.handle,
@@ -525,5 +582,8 @@ class WindowsNoFollowBackend:
         self._delete_handle(expected)
 
     def close(self, node: OpenedNode) -> None:
+        overlapped = self._locks.pop(node.handle, None)
+        if overlapped is not None:
+            self._kernel32.UnlockFileEx(wintypes.HANDLE(node.handle), 0, 1, 0, byref(overlapped))
         if not self._kernel32.CloseHandle(wintypes.HANDLE(node.handle)):
             raise RepositoryUnsafeError("HANDLE_CLOSE_FAILED")

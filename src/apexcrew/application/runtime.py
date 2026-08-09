@@ -91,6 +91,7 @@ from apexcrew.domain.types import (
 )
 
 MAX_RUNTIME_PHASE_STEPS = 256
+RUNTIME_PHASE_STEP_CAP_REASON = "RUNTIME_PHASE_STEP_CAP"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1288,6 +1289,14 @@ class RuntimeStateStore(Protocol):
         candidate: RunStop,
         expected_sequence: AuditSequence,
     ) -> RunStop: ...
+
+    def record_runtime_phase_cap_pause(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> RunStop: ...
     def record_runtime_fault_and_classify_barrier(
         self,
         run_id: RunId,
@@ -1584,8 +1593,15 @@ class RuntimeService:
         while True:
             steps += 1
             if steps > MAX_RUNTIME_PHASE_STEPS:
-                state = self._store.load_runtime_state(run_id)
-                return _stop_for_state(run_id, state, RunStopReason.PAUSED)
+                owner_id = permit.consumed_owner_id
+                if owner_id is None:
+                    raise StateConflict("RUNTIME_OWNER_BINDING_MISSING")
+                return self._store.record_runtime_phase_cap_pause(
+                    run_id,
+                    owner_id,
+                    permit.generation,
+                    self._store.audit_sequence(run_id),
+                )
             context.phase = "POST_BARRIER"
             owner_id = permit.consumed_owner_id
             if owner_id is None:

@@ -11,16 +11,21 @@ from typing import Protocol
 from apexcrew.adapters.repository.git import (
     GitCommitTree,
     GitHashObjectWrite,
+    GitHashObjectWriteContent,
     GitReadTree,
     GitRemoveIndexPath,
     GitUpdateIndexCacheInfo,
     GitWriteTree,
     RepositoryInstance,
 )
-from apexcrew.adapters.repository.no_follow import RepositoryUnsafeError, StableHandleTree
+from apexcrew.adapters.repository.no_follow import (
+    HandleIdentity,
+    RepositoryUnsafeError,
+    StableHandleTree,
+)
 from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import WindowsNoFollowBackend
-from apexcrew.domain.admission import TaskCandidate
+from apexcrew.domain.admission import TaskCandidate, TaskCandidateGateBinding
 from apexcrew.domain.plan import CanonicalPath, PathValidationError
 from apexcrew.domain.types import AttemptId, GitOid, RunId, TaskId
 
@@ -67,6 +72,7 @@ class CandidatePreparationAdapter:
         workspace: Path | object,
         changed_paths: Sequence[str | CanonicalPath],
         message: str,
+        gate_binding: TaskCandidateGateBinding | None = None,
     ) -> TaskCandidate:
         run_component = self._component(run_id, "RUN_ID_INVALID")
         attempt_component = self._component(attempt_id, "ATTEMPT_ID_INVALID")
@@ -75,21 +81,31 @@ class CandidatePreparationAdapter:
         workspace_root = self._workspace_root(workspace)
         paths = self._canonical_paths(changed_paths)
         index_file = self._index_file(run_component, attempt_component)
-        self._reserve_index_path(index_file)
+        index_tree: StableHandleTree | None = None
+        index_identity: HandleIdentity | None = None
+        index_tree, index_identity = self._reserve_index_path(index_file)
         tree: StableHandleTree | None = None
         try:
             tree = self._open_workspace(workspace_root)
-            self._run(GitReadTree(run_head_oid), index_file=index_file)
+            self._run(GitReadTree(run_head_oid), index_file=index_file, index_tree=index_tree)
+            index_identity = self._capture_index_identity(index_tree, index_file)
             for path in paths:
-                self._prepare_path(tree, workspace_root, path, index_file)
+                index_identity = self._prepare_path(tree, path, index_file, index_tree)
             tree.assert_name_bindings()
             tree_oid = self._output_oid(
-                self._run(GitWriteTree(), index_file=index_file), "WRITE_TREE_FAILED"
+                self._run(GitWriteTree(), index_file=index_file, index_tree=index_tree),
+                "WRITE_TREE_FAILED",
             )
+            index_identity = self._capture_index_identity(index_tree, index_file)
             prepared_oid = self._output_oid(
-                self._run(GitCommitTree(tree_oid, run_head_oid, message), index_file=index_file),
+                self._run(
+                    GitCommitTree(tree_oid, run_head_oid, message),
+                    index_file=index_file,
+                    index_tree=index_tree,
+                ),
                 "COMMIT_TREE_FAILED",
             )
+            index_identity = self._capture_index_identity(index_tree, index_file)
             return TaskCandidate.create(
                 run_id=run_id,
                 task_id=task_id,
@@ -97,6 +113,8 @@ class CandidatePreparationAdapter:
                 expected_run_head_oid=run_head_oid,
                 prepared_oid=prepared_oid,
                 changed_paths=tuple(str(path) for path in paths),
+                prepared_tree_oid=tree_oid,
+                gate_binding=gate_binding,
             )
         except CandidatePreparationError:
             raise
@@ -105,43 +123,57 @@ class CandidatePreparationAdapter:
         finally:
             if tree is not None:
                 tree.close()
-            self._remove_index(index_file)
+            if index_tree is not None:
+                try:
+                    if index_identity is None:
+                        index_identity = self._maybe_index_identity(index_tree, index_file)
+                    if index_identity is not None:
+                        self._remove_index(index_tree, index_file, index_identity)
+                finally:
+                    index_tree.close()
 
     def _prepare_path(
         self,
         tree: StableHandleTree,
-        workspace_root: Path,
         path: CanonicalPath,
         index_file: Path,
-    ) -> None:
+        index_tree: StableHandleTree,
+    ) -> HandleIdentity:
         node = tree.try_open_any(str(path))
         if node is None:
-            self._run(GitRemoveIndexPath(path), index_file=index_file)
-            return
+            self._run(GitRemoveIndexPath(path), index_file=index_file, index_tree=index_tree)
+            return self._capture_index_identity(index_tree, index_file)
         if node.identity.kind != "file":
             raise CandidatePreparationError("WORKSPACE_ENTRY_NOT_REGULAR")
         content = tree.read_bytes(node, MAX_CANDIDATE_FILE_BYTES)
-        del content
         tree.assert_name_bindings()
         mode = "100644"
         if os.name == "posix" and stat.S_IMODE(os.fstat(node.handle).st_mode) & 0o111:
             mode = "100755"
-        blob_path = workspace_root.joinpath(*str(path).split("/"))
-        blob_result = self._run(GitHashObjectWrite(blob_path), index_file=index_file)
+        blob_result = self._run(
+            GitHashObjectWriteContent(content), index_file=index_file, index_tree=index_tree
+        )
+        self._capture_index_identity(index_tree, index_file)
         blob_oid = self._output_oid(blob_result, "HASH_OBJECT_FAILED")
         tree.assert_name_bindings()
         self._run(
             GitUpdateIndexCacheInfo(mode, blob_oid, path),
             index_file=index_file,
+            index_tree=index_tree,
         )
+        return self._capture_index_identity(index_tree, index_file)
 
     def _run(
         self,
         operation: object,
         *,
         index_file: Path,
+        index_tree: StableHandleTree | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
+            if index_tree is not None:
+                index_tree.assert_name_bindings()
+                self._release_index_cache(index_tree, index_file)
             result = self._runner.run(self._repository, operation, index_file=index_file)
         except (OSError, RepositoryUnsafeError, ValueError) as error:
             raise CandidatePreparationError("GIT_PREPARATION_DENIED") from error
@@ -155,6 +187,9 @@ class CandidatePreparationAdapter:
                 GitCommitTree: "COMMIT_TREE_FAILED",
             }.get(type(operation), "GIT_PREPARATION_FAILED")
             raise CandidatePreparationError(code)
+        if index_tree is not None:
+            self._validate_index_path(index_tree, index_file)
+            index_tree.assert_name_bindings()
         self._repository = self._repository.refresh_after_verified_owned_transition()
         return result
 
@@ -216,22 +251,95 @@ class CandidatePreparationAdapter:
         except (OSError, RepositoryUnsafeError) as error:
             raise CandidatePreparationError("WORKSPACE_ROOT_INVALID") from error
 
-    def _reserve_index_path(self, index_file: Path) -> None:
-        current = self._data_root
-        if current.exists() and (current.is_symlink() or not current.is_dir()):
-            raise CandidatePreparationError("CANDIDATE_DATA_ROOT_UNSAFE")
-        current.mkdir(parents=True, exist_ok=True)
-        index_root = index_file.parent
-        index_root.mkdir(parents=True, exist_ok=True)
-        if index_root.is_symlink() or not index_root.is_dir() or index_file.exists():
-            raise CandidatePreparationError("INDEX_PATH_UNSAFE")
+    def _reserve_index_path(
+        self, index_file: Path
+    ) -> tuple[StableHandleTree, HandleIdentity | None]:
+        tree = self._open_data_root()
+        relative = index_file.relative_to(tree.root).as_posix()
+        try:
+            if tree.try_open(relative, "file") is not None:
+                raise RepositoryUnsafeError("INDEX_PATH_ALREADY_EXISTS")
+            parent = "/".join(relative.split("/")[:-1])
+            tree.ensure_directory(parent)
+            tree.assert_name_bindings()
+            return tree, None
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            tree.close()
+            raise CandidatePreparationError("INDEX_PATH_UNSAFE") from error
 
     @staticmethod
-    def _remove_index(index_file: Path) -> None:
+    def _capture_index_identity(tree: StableHandleTree, index_file: Path) -> HandleIdentity:
         try:
-            if index_file.is_symlink() or index_file.exists():
-                index_file.unlink()
-        except OSError as error:
+            relative = index_file.relative_to(tree.root).as_posix()
+            node = tree.try_open(relative, "file")
+            if node is None:
+                raise RepositoryUnsafeError("INDEX_PATH_NOT_CREATED")
+            identity = node.identity
+            tree.release_cached(relative)
+            tree.assert_name_bindings()
+            return identity
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise CandidatePreparationError("INDEX_PATH_UNSAFE") from error
+
+    @staticmethod
+    def _maybe_index_identity(tree: StableHandleTree, index_file: Path) -> HandleIdentity | None:
+        try:
+            relative = index_file.relative_to(tree.root).as_posix()
+            node = tree.try_open(relative, "file")
+            if node is None:
+                return None
+            identity = node.identity
+            tree.release_cached(relative)
+            tree.assert_name_bindings()
+            return identity
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise CandidatePreparationError("INDEX_PATH_UNSAFE") from error
+
+    @staticmethod
+    def _release_index_cache(tree: StableHandleTree, index_file: Path) -> None:
+        try:
+            tree.release_cached(index_file.relative_to(tree.root).as_posix())
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise CandidatePreparationError("INDEX_PATH_UNSAFE") from error
+
+    @classmethod
+    def _validate_index_path(cls, tree: StableHandleTree, index_file: Path) -> None:
+        cls._capture_index_identity(tree, index_file)
+
+    def _open_data_root(self) -> StableHandleTree:
+        backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
+        current = self._data_root
+        missing: list[str] = []
+        while True:
+            try:
+                observed = os.lstat(current)
+            except FileNotFoundError:
+                parent = current.parent
+                if parent == current:
+                    raise CandidatePreparationError("CANDIDATE_DATA_ROOT_UNSAFE")
+                missing.append(current.name)
+                current = parent
+                continue
+            except OSError as error:
+                raise CandidatePreparationError("CANDIDATE_DATA_ROOT_UNSAFE") from error
+            if not stat.S_ISDIR(observed.st_mode):
+                raise CandidatePreparationError("CANDIDATE_DATA_ROOT_UNSAFE")
+            break
+        try:
+            tree = StableHandleTree(current, backend)
+            if missing:
+                tree.ensure_directory("/".join(reversed(missing)))
+            tree.assert_name_bindings()
+            return tree
+        except (OSError, RepositoryUnsafeError) as error:
+            raise CandidatePreparationError("CANDIDATE_DATA_ROOT_UNSAFE") from error
+
+    @staticmethod
+    def _remove_index(tree: StableHandleTree, index_file: Path, expected: HandleIdentity) -> None:
+        try:
+            relative = index_file.relative_to(tree.root).as_posix()
+            tree.remove_file(relative, expected)
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
             raise CandidatePreparationError("INDEX_CLEANUP_FAILED") from error
 
 

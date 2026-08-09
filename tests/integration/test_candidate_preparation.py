@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,18 @@ from apexcrew.adapters.repository.candidate_preparation import (
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
     GitHashObjectWrite,
+    GitHashObjectWriteContent,
     GitRepositoryPreflight,
 )
 from apexcrew.delivery.cli import _RunCommandContext
 from apexcrew.delivery.cli import app as cli_app
-from apexcrew.domain.admission import TaskCandidate
+from apexcrew.domain.admission import (
+    TaskCandidate,
+    TaskCandidateGateBinding,
+    task_candidate_lease_provenance_digest,
+)
 from apexcrew.domain.commands import ApplicableRevisionDigests
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
@@ -131,7 +138,7 @@ def test_prepared_commit_contains_patched_bytes(tmp_path: Path) -> None:
 
 
 def test_unchanged_blobs_reuse_base_tree(tmp_path: Path) -> None:
-    root, _workspace, head, runner, candidate = _prepare(tmp_path)
+    root, workspace, head, runner, candidate = _prepare(tmp_path)
 
     base_blob = _git(root, "rev-parse", f"{head}:README.md")
     prepared_blob = _git(root, "rev-parse", f"{candidate.prepared_oid}:README.md")
@@ -140,9 +147,81 @@ def test_unchanged_blobs_reuse_base_tree(tmp_path: Path) -> None:
         for operation in runner.operations
         if isinstance(operation, GitHashObjectWrite)
     ]
+    hashed_contents = [
+        operation.content
+        for operation in runner.operations
+        if isinstance(operation, GitHashObjectWriteContent)
+    ]
 
     assert prepared_blob == base_blob
-    assert hashed_paths == ["task.py"]
+    assert hashed_paths == []
+    assert hashed_contents == [(workspace / "src" / "task.py").read_bytes()]
+
+
+def test_preparation_preserves_complete_candidate_gate_binding(tmp_path: Path) -> None:
+    root, workspace, head, runner, data_root = _fixture(tmp_path)
+    adapter = _adapter(runner, root, data_root)
+    first = adapter.prepare_task_candidate(
+        run_id=RunId("run-01"),
+        task_id=TaskId("task-01"),
+        attempt_id=AttemptId("attempt-tree"),
+        run_head_oid=head,
+        workspace=workspace,
+        changed_paths=("src/task.py",),
+        message="prepare task-01",
+    )
+    issued = datetime(2026, 8, 9, tzinfo=UTC)
+    revisions = ApplicableRevisionDigests(
+        plan_digest="sha256:" + "1" * 64,
+        policy_digest="sha256:" + "2" * 64,
+        budget_digest="sha256:" + "3" * 64,
+        model_configuration_digest="sha256:" + "4" * 64,
+    )
+    gate = TaskCandidateGateBinding(
+        attempt_id=AttemptId("attempt-gated"),
+        task_contract_digest=Sha256DigestText("sha256:" + "5" * 64),
+        base_run_head_oid=head,
+        post_tree_oid=first.prepared_tree_oid,
+        evidence_bundle_digest=EvidenceBundleDigest("sha256:" + "6" * 64),
+        freshness_assessment_digest=Sha256DigestText("sha256:" + "7" * 64),
+        freshness_status="FRESH",
+        applicable_revision_digests=revisions,
+        target_safety_digest=Sha256DigestText("sha256:" + "8" * 64),
+        scope_digest=Sha256DigestText("sha256:" + "9" * 64),
+        check_workspace_digest=Sha256DigestText("sha256:" + "a" * 64),
+        policy_decision="ALLOW",
+        lease_id="lease-01",
+        lease_generation=1,
+        lease_base_head_oid=head,
+        lease_admissible_head_oid=head,
+        lease_issued_at_utc=issued,
+        lease_expires_at_utc=issued + timedelta(minutes=5),
+        prepared_at_utc=issued + timedelta(seconds=1),
+        lease_provenance_digest=task_candidate_lease_provenance_digest(
+            attempt_id=AttemptId("attempt-gated"),
+            lease_id="lease-01",
+            lease_generation=1,
+            lease_base_head_oid=head,
+            lease_admissible_head_oid=head,
+            lease_issued_at_utc=issued,
+            lease_expires_at_utc=issued + timedelta(minutes=5),
+            prepared_at_utc=issued + timedelta(seconds=1),
+        ),
+    )
+
+    candidate = adapter.prepare_task_candidate(
+        run_id=RunId("run-01"),
+        task_id=TaskId("task-01"),
+        attempt_id=AttemptId("attempt-gated"),
+        run_head_oid=head,
+        workspace=workspace,
+        changed_paths=("src/task.py",),
+        message="prepare task-01",
+        gate_binding=gate,
+    )
+
+    assert candidate.gate_binding == gate
+    assert candidate.prepared_tree_oid == gate.post_tree_oid
 
 
 def test_prepared_oid_is_deterministic_across_runs(tmp_path: Path) -> None:

@@ -7,7 +7,8 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
@@ -59,6 +60,7 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
         reservation: TargetReservation,
         target_safety_digest: Sha256DigestText,
         reflog_message: str,
+        private_data_root: Path | None = None,
     ) -> None:
         self._repository = repository
         self._repository_id = repository_id
@@ -68,6 +70,11 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
         self._reservation = reservation
         self._target_safety_digest = target_safety_digest
         self._reflog_message = reflog_message
+        self._private_data_root = (
+            reservation.path.parent if private_data_root is None else private_data_root
+        )
+        if not self._private_data_root.is_absolute():
+            raise ValueError("PRIVATE_DATA_ROOT_MUST_BE_ABSOLUTE")
 
     @staticmethod
     def _identity_binding(node: OpenedNode | None) -> RefPathBinding:
@@ -283,7 +290,58 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             observed_oid=oid,
         )
 
+    @contextmanager
+    def _private_ref_lock(self, run_id: RunId) -> Iterator[bool]:
+        backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
+        tree: StableHandleTree | None = None
+        node: OpenedNode | None = None
+        try:
+            tree = StableHandleTree(self._private_data_root, backend)
+            relative = f"run-ref-locks/{run_id!s}.lock"
+            tree.ensure_directory("run-ref-locks")
+            if tree.try_open(relative, "file") is None:
+                node = tree.create_file(relative)
+            else:
+                node = tree.open_for_lock(relative)
+            if not tree.read_prefix(node, 1):
+                tree.write_bytes(node, b"0")
+            tree.lock_exclusive(node)
+        except (ImportError, OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                tree.unlock_exclusive(node)
+            except (ImportError, OSError):
+                pass
+            finally:
+                if tree is not None:
+                    tree.close()
+
     def promote_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
+        try:
+            with self._private_ref_lock(intent.run_id) as locked:
+                if not locked:
+                    return PrivateRefCasOutcome(
+                        intent_id=intent.intent_id,
+                        run_id=intent.run_id,
+                        result_class="PRIVATE_REF_UNOBSERVABLE",
+                        observed_oid=None,
+                    )
+                return self._promote_private_ref_locked(intent)
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class="PRIVATE_REF_UNOBSERVABLE",
+                observed_oid=None,
+            )
+
+    def _promote_private_ref_locked(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
         def outcome(
             result_class: Literal[
                 "PRIVATE_REF_PROMOTED",
@@ -381,6 +439,8 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
                 current_oid = GitOid(result.stdout.strip())
                 if current_oid == prepared_oid:
                     return "EXACT_POST", current_oid, registration_digest
+                if expected_old_oid is not None and current_oid == expected_old_oid:
+                    return "EXACT_PRE", current_oid, registration_digest
                 return "THIRD_STATE", current_oid, registration_digest
             absent = result.returncode == 1 or (
                 result.returncode == 128 and result.stderr.strip().endswith("not a valid ref")
@@ -408,6 +468,7 @@ MAX_TARGET_RESERVATION_LOG_HEAD_BYTES = 65_536
 MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
 MAX_GIT_STDOUT_BYTES = 2_000_000
 MAX_GIT_STDERR_BYTES = 65_536
+MAX_GIT_STDIN_BYTES = 67_108_864
 _TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
 _TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES = frozenset({"logs", "refs"})
 _TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES = frozenset({"locked"})
@@ -1172,6 +1233,11 @@ class GitHashObjectWrite:
 
 
 @dataclass(frozen=True, slots=True)
+class GitHashObjectWriteContent:
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class GitUpdateIndexCacheInfo:
     mode: str
     blob_oid: GitOid
@@ -1243,6 +1309,7 @@ type GitOperation = (
     | GitCatFileSize
     | GitReadTree
     | GitHashObjectWrite
+    | GitHashObjectWriteContent
     | GitUpdateIndexCacheInfo
     | GitRemoveIndexPath
     | GitWriteTree
@@ -1259,6 +1326,7 @@ class GitSpawner(Protocol):
         environment: Mapping[str, str],
         *,
         text: bool,
+        input_bytes: bytes | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]: ...
 
 
@@ -1270,11 +1338,13 @@ class SubprocessGitSpawner:
         environment: Mapping[str, str],
         *,
         text: bool,
+        input_bytes: bytes | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
         process = subprocess.Popen(
             argv,
             cwd=cwd,
             env=dict(environment),
+            stdin=subprocess.PIPE if input_bytes is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1315,6 +1385,16 @@ class SubprocessGitSpawner:
         )
         for thread in threads:
             thread.start()
+        if input_bytes is not None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(input_bytes)
+                process.stdin.close()
+            except OSError:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
         try:
             returncode = process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -1415,6 +1495,7 @@ class GitCommandRunner:
                 GitCatFileSize,
                 GitReadTree,
                 GitHashObjectWrite,
+                GitHashObjectWriteContent,
                 GitUpdateIndexCacheInfo,
                 GitRemoveIndexPath,
                 GitWriteTree,
@@ -1441,10 +1522,21 @@ class GitCommandRunner:
                 "credential.helper=",
                 *argv,
             )
+            environment = closed_git_environment(self._trusted_empty_dir, index_file)
+            if isinstance(operation, GitHashObjectWriteContent):
+                if len(operation.content) > MAX_GIT_STDIN_BYTES:
+                    raise RepositoryUnsafeError("GIT_INPUT_LIMIT_EXCEEDED")
+                return self._spawner.run(
+                    command,
+                    repository.root,
+                    environment,
+                    text=text,
+                    input_bytes=operation.content,
+                )
             return self._spawner.run(
                 command,
                 repository.root,
-                closed_git_environment(self._trusted_empty_dir, index_file),
+                environment,
                 text=text,
             )
         finally:
@@ -1550,6 +1642,8 @@ class GitCommandRunner:
             case GitHashObjectWrite(blob_path=path):
                 self._require_operand_path(path)
                 return ("hash-object", "-w", "--", str(path))
+            case GitHashObjectWriteContent():
+                return ("hash-object", "-w", "--stdin")
             case GitUpdateIndexCacheInfo(mode=mode, blob_oid=blob_oid, path=path):
                 if mode not in {"100644", "100755"}:
                     raise RepositoryUnsafeError("GIT_INDEX_MODE_INVALID")

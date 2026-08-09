@@ -5,6 +5,8 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, replace
+from datetime import date, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -23,25 +25,57 @@ from apexcrew.domain.admission import (
     RefEffectBinding,
     RefPathBinding,
     TaskCandidate,
+    TaskCandidateGateBinding,
     private_ref,
+    task_candidate_lease_provenance_digest,
 )
 from apexcrew.domain.commands import ApplicableRevisionDigests
+from apexcrew.domain.coordination import task_contract_digest, task_contract_json
 from apexcrew.domain.effects import (
     AuditEvent,
     ReservationObservation,
     RunRefRecord,
     TargetReservation,
 )
-from apexcrew.domain.revisions import Sha256DigestText
+from apexcrew.domain.plan import TaskContract
+from apexcrew.domain.revisions import (
+    BudgetRevisionDocument,
+    ModelPricingEntryDocument,
+    Sha256DigestText,
+)
 from apexcrew.domain.types import (
     AttemptId,
     CandidateId,
     GitOid,
     RepositoryId,
+    RevisionDigest,
     RunId,
     RunState,
     TaskId,
 )
+from apexcrew.domain.worker import WorkerTurnBinding
+
+
+def _fixture_budget() -> BudgetRevisionDocument:
+    return BudgetRevisionDocument(
+        schema_version="budget-revision-v1",
+        active_run_seconds_ceiling=28_800,
+        task_ceiling=12,
+        planning_request_ceiling=8,
+        model_call_ceiling=240,
+        input_token_ceiling=2_000_000,
+        output_token_ceiling=200_000,
+        cost_reserve_usd=Decimal(1),
+        concurrent_worker_ceiling=3,
+        pricing_observed_on=date(2026, 8, 5),
+        pricing_entries=(
+            ModelPricingEntryDocument(
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
+            ),
+        ),
+    )
 
 
 def _git(root: Path, *argv: str) -> str:
@@ -135,6 +169,8 @@ def _fixture(
         path=tmp_path / "reservation",
         phase="ALLOCATED",
     )
+    private_data_root = tmp_path / "private-data"
+    private_data_root.mkdir()
     observer = _ReservationObserver(reservation, reservation.admin_binding_digest)
     guard = GitPrivateRefStartGuard(
         repository=repository,
@@ -145,6 +181,7 @@ def _fixture(
         reservation=reservation,
         target_safety_digest=Sha256DigestText("sha256:" + "c" * 64),
         reflog_message="apexcrew private run run-01",
+        private_data_root=private_data_root,
     )
     binding = guard._effect_binding(RunId("run-01"))  # type: ignore[attr-defined]
     intent = RefCasIntent(
@@ -177,6 +214,15 @@ def test_private_promotion_changes_only_run_head(tmp_path: Path) -> None:
     assert _git(root, "rev-parse", "refs/heads/main") == str(head)
     assert _git(root, "rev-parse", "refs/heads/unrelated") == str(head)
     assert _git(root, "rev-parse", private_ref(RunId("run-01"))) == str(prepared)
+
+
+def test_private_promotion_uses_canonical_private_data_root_lock(tmp_path: Path) -> None:
+    _root, _head, _prepared, guard, intent = _fixture(tmp_path)
+
+    outcome = guard.promote_private_ref(intent)
+
+    assert outcome.result_class == "PRIVATE_REF_PROMOTED"
+    assert (tmp_path / "private-data" / "run-ref-locks" / "run-01.lock").is_file()
 
 
 def test_private_promotion_conflict_does_not_change_any_ref(tmp_path: Path) -> None:
@@ -227,12 +273,27 @@ def _promotion_ref_binding() -> RefEffectBinding:
     )
 
 
+def _fixture_digest(character: str) -> Sha256DigestText:
+    return Sha256DigestText("sha256:" + character * 64)
+
+
 def _state_fixture(
     tmp_path: Path, store: InMemoryStateStore | SqliteStateStore
 ) -> tuple[TaskCandidate, ApplicableRevisionDigests, RefEffectBinding]:
     run_id = RunId("run-01")
     head = GitOid("1" * 40)
     prepared = GitOid("2" * 40)
+    revisions = ApplicableRevisionDigests(
+        plan_digest=RevisionDigest(str(_fixture_digest("1"))),
+        policy_digest=RevisionDigest(str(_fixture_digest("2"))),
+        budget_digest=RevisionDigest(str(_fixture_digest("3"))),
+        model_configuration_digest=RevisionDigest(str(_fixture_digest("4"))),
+    )
+    contract = TaskContract.from_strings(
+        "task-01",
+        read_globs=("src/**",),
+        write_globs=("src/**",),
+    )
     reservation = TargetReservation(
         reservation_id="reservation-01",
         run_id=run_id,
@@ -259,8 +320,18 @@ def _state_fixture(
                 admin_binding_digest=Sha256DigestText("sha256:" + "a" * 64),
             )
             copied._runs[run_id] = replace(
-                copied._runs[run_id], state=RunState.ACTIVE, run_head_oid=head
+                copied._runs[run_id],
+                state=RunState.ACTIVE,
+                run_head_oid=head,
+                current_plan_digest=revisions.plan_digest,
+                current_policy_digest=revisions.policy_digest,
+                current_budget_digest=revisions.budget_digest,
+                current_model_configuration_digest=revisions.model_configuration_digest,
             )
+            copied._approved_budgets[run_id] = (revisions.budget_digest, _fixture_budget())
+            copied._plan_task_contracts[revisions.plan_digest] = (contract,)
+            copied._plan_dependency_edges[revisions.plan_digest] = ()
+            copied._plan_hazard_edges[revisions.plan_digest] = ()
             copied._run_refs[(run_id, "PRIVATE")] = RunRefRecord(
                 run_id,
                 "PRIVATE",
@@ -285,6 +356,48 @@ def _state_fixture(
                 (head, run_id),
             )
             connection.execute(
+                "UPDATE runs SET current_plan_digest = ?, current_policy_digest = ?, "
+                "current_budget_digest = ?, current_model_configuration_digest = ? "
+                "WHERE run_id = ?",
+                (
+                    revisions.plan_digest,
+                    revisions.policy_digest,
+                    revisions.budget_digest,
+                    revisions.model_configuration_digest,
+                    run_id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO approved_budgets_for_test(run_id, budget_digest, budget_json) "
+                "VALUES (?, ?, ?)",
+                (run_id, revisions.budget_digest, _fixture_budget().model_dump_json()),
+            )
+            connection.execute(
+                "INSERT INTO plans(run_id, plan_digest, base_run_head_oid, policy_digest, "
+                "budget_digest, model_configuration_digest, run_check_set_digest, "
+                "planning_request_count, state, proposal_json) VALUES (?, ?, ?, ?, ?, ?, ?, 1, "
+                "'APPROVED', '{}')",
+                (
+                    run_id,
+                    revisions.plan_digest,
+                    head,
+                    revisions.policy_digest,
+                    revisions.budget_digest,
+                    revisions.model_configuration_digest,
+                    _fixture_digest("5"),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_contracts(plan_digest, task_id, task_revision, "
+                "contract_digest, contract_json, state) VALUES (?, ?, 1, ?, ?, 'READY')",
+                (
+                    revisions.plan_digest,
+                    contract.task_id,
+                    task_contract_digest(contract),
+                    task_contract_json(contract),
+                ),
+            )
+            connection.execute(
                 "INSERT INTO run_refs(run_id, ref_kind, ref_name, expected_old_oid, current_oid, state) "
                 "VALUES (?, 'PRIVATE', ?, ?, ?, 'PRESENT')",
                 (run_id, private_ref(run_id), head, head),
@@ -296,17 +409,92 @@ def _state_fixture(
         event=AuditEvent.kind("TEST_PRIVATE_REF_PRESENT"),
         mutate=mutate,
     )
+    target_safety_digest = store.target_authority_digest(run_id)
+    binding = WorkerTurnBinding(
+        run_id=run_id,
+        task_id=contract.task_id,
+        attempt_id=AttemptId("attempt-01"),
+        tranche_id="tranche-01",
+        lease_id="lease-01",
+        lease_generation=1,
+        admissible_head=str(head),
+        task_contract_digest=task_contract_digest(contract),
+        plan_digest=revisions.plan_digest,
+        policy_digest=revisions.policy_digest,
+        budget_digest=revisions.budget_digest,
+        model_configuration_digest=revisions.model_configuration_digest,
+        tool_schema_digest=_fixture_digest("9"),
+        target_safety_digest=target_safety_digest,
+        credential_profile=None,
+        repository_id="repository-01",
+        snapshot_digest=_fixture_digest("7"),
+        scope_digest=_fixture_digest("6"),
+        dependency_fingerprint_basis=_fixture_digest("8"),
+    )
+    store.install_worker_attempt_for_test(binding)
+    if isinstance(store, InMemoryStateStore):
+        store._worker_attempts[binding.attempt_id] = replace(
+            store._worker_attempts[binding.attempt_id], state="SUCCEEDED"
+        )
+        store._workspace_leases[(run_id, binding.lease_id)] = replace(
+            store._workspace_leases[(run_id, binding.lease_id)], state="RELEASED"
+        )
+    else:
+        with store._transaction("IMMEDIATE") as connection:
+            connection.execute(
+                "UPDATE worker_attempts SET state = 'SUCCEEDED' WHERE attempt_id = ?",
+                (binding.attempt_id,),
+            )
+            connection.execute(
+                "UPDATE workspace_leases SET state = 'RELEASED' WHERE lease_id = ?",
+                (binding.lease_id,),
+            )
+    lease = store.workspace_lease(run_id, binding.lease_id)
+    assert lease is not None
+    prepared_at = lease.issued_at + timedelta(seconds=1)
+    gate = TaskCandidateGateBinding(
+        attempt_id=binding.attempt_id,
+        task_contract_digest=binding.task_contract_digest,
+        base_run_head_oid=head,
+        post_tree_oid=GitOid("3" * 40),
+        evidence_bundle_digest="sha256:" + "a" * 64,
+        freshness_assessment_digest=_fixture_digest("b"),
+        freshness_status="FRESH",
+        applicable_revision_digests=revisions,
+        target_safety_digest=target_safety_digest,
+        scope_digest=binding.scope_digest,
+        check_workspace_digest=binding.snapshot_digest,
+        policy_decision="ALLOW",
+        lease_id=binding.lease_id,
+        lease_generation=lease.generation,
+        lease_base_head_oid=GitOid(lease.base_head),
+        lease_admissible_head_oid=GitOid(lease.admissible_head),
+        lease_issued_at_utc=lease.issued_at,
+        lease_expires_at_utc=lease.expires_at,
+        prepared_at_utc=prepared_at,
+        lease_provenance_digest=task_candidate_lease_provenance_digest(
+            attempt_id=binding.attempt_id,
+            lease_id=binding.lease_id,
+            lease_generation=lease.generation,
+            lease_base_head_oid=GitOid(lease.base_head),
+            lease_admissible_head_oid=GitOid(lease.admissible_head),
+            lease_issued_at_utc=lease.issued_at,
+            lease_expires_at_utc=lease.expires_at,
+            prepared_at_utc=prepared_at,
+        ),
+    )
     candidate = TaskCandidate.create(
         run_id=run_id,
-        task_id=TaskId("task-01"),
-        attempt_id=AttemptId("attempt-01"),
+        task_id=contract.task_id,
+        attempt_id=binding.attempt_id,
         expected_run_head_oid=head,
         prepared_oid=prepared,
+        prepared_tree_oid=gate.post_tree_oid,
         changed_paths=("src/task.py",),
+        gate_binding=gate,
     )
     store.persist_task_candidate(candidate, store.audit_sequence(run_id))
-    binding = _promotion_ref_binding()
-    return candidate, ApplicableRevisionDigests(), binding
+    return candidate, revisions, _promotion_ref_binding()
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
