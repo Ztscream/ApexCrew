@@ -2750,6 +2750,36 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-09 / R4.3-03 SPEC selector placement correction
+
+- **SPEC rerun**: fresh reviewer `019fe52e-1fda-7701-99cf-5ac045e94f1f`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with zero
+  Critical/High/Low findings and one Medium. The production-only executor
+  selector was in the composition test module, while the plan explicitly
+  assigns that selector to `tests/integration/test_restricted_executor_docker.py`.
+- **Red evidence**: the exact plan command still exercised the old direct
+  constructor at `test_restricted_executor_docker.py::test_docker_executor_is_the_only_composed_check_path`; the production graph assertion lived only in the other module.
+- **Correction**: moved the named selector into the restricted executor test
+  module. It now builds the production application graph, installs a real
+  SQLite Worker attempt/lease, constructs the current check runtime, and
+  asserts the selected executor is `RestrictedDockerExecutor` with no local
+  subprocess escape. The prior low-level Docker command assertions remain in
+  a separate test. **Human-Changes: none**.
+- **Green evidence**: the five exact plan selectors -> `5 passed`; affected
+  composition, patch/check, production-wiring, and Docker files ->
+  `24 passed, 1 skipped`; Ruff check/format, `mypy src` (66 source files),
+  and `git diff --check` exited `0`.
+- **Review status**: a fresh SPEC rerun is required against this placement
+  correction; ordered quality review remains blocked until it passes. The
+  previous scope observation was explicitly judged not a violation because
+  the dependency-layer edits close the same R4.3-03 recovery/authority
+  contract.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** without an observed
+  restricted Docker process; workspace mutation history and restart recovery
+  remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
 ## 2026-08-09 / R4.3-03 SPEC selector evidence correction
 
 - **SPEC review**: independent reviewer `019fe517-f551-7943-97a1-028a4fbfd4d5`,

@@ -8,8 +8,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from test_composed_worker_tools import (
+    _direct_intent,
+    _install_direct_worker_attempt,
+    _prepare_worker_run,
+)
 
 from apexcrew.adapters.executor.restricted import RestrictedDockerExecutor
+from apexcrew.domain.actions import CheckAction
 from apexcrew.domain.effects import sha256_digest
 from apexcrew.domain.revisions import ExecutorProfileDocument, ToolVersionDocument
 from apexcrew.domain.tools import SanitizedSnapshot, SanitizedSnapshotEntry
@@ -35,7 +41,7 @@ def _docker_image_digest() -> str:
     return digest
 
 
-def test_docker_executor_is_the_only_composed_check_path() -> None:
+def test_restricted_executor_command_is_closed() -> None:
     executor = RestrictedDockerExecutor(
         ExecutorProfileDocument(
             image_digest="sha256:" + "0" * 64,
@@ -67,6 +73,25 @@ def test_docker_executor_is_the_only_composed_check_path() -> None:
     assert "--security-opt=no-new-privileges" in command
     assert "LocalSubprocessExecutor" not in type(executor).__name__
     assert "APEXCREW_HOST_EXECUTOR" not in repr(executor)
+
+
+def test_docker_executor_is_the_only_composed_check_path(tmp_path: Path) -> None:
+    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(
+        tmp_path, (), production=True
+    )
+    try:
+        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
+        action = CheckAction(check_id="task-01:check-1")
+        snapshot_digest = tools.capture_snapshot_digest(binding, action)
+        runtime = tools._runtime(  # type: ignore[attr-defined]
+            _direct_intent(binding, action, snapshot_digest)
+        )
+        production_tools_executor = runtime._executor  # type: ignore[attr-defined]
+
+        assert type(production_tools_executor).__name__ == "RestrictedDockerExecutor"
+        assert "LocalSubprocessExecutor" not in repr(production_tools_executor)
+    finally:
+        bundle.close()
 
 
 def test_committed_image_enforces_restricted_executor_boundary(tmp_path: Path) -> None:

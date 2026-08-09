@@ -491,25 +491,6 @@ def test_context_and_check_workspace_bindings_are_distinct(tmp_path: Path) -> No
         bundle.close()
 
 
-def test_docker_executor_is_the_only_composed_check_path(tmp_path: Path) -> None:
-    bundle, run_id, _executor, _root, _target_oid = _prepare_worker_run(
-        tmp_path, (), production=True
-    )
-    try:
-        tools, _store, binding, _contract = _install_direct_worker_attempt(bundle, run_id)
-        action = CheckAction(check_id="task-01:check-1")
-        snapshot_digest = tools.capture_snapshot_digest(binding, action)
-        runtime = tools._runtime(  # type: ignore[attr-defined]
-            _direct_intent(binding, action, snapshot_digest)
-        )
-        production_tools_executor = runtime._executor  # type: ignore[attr-defined]
-
-        assert type(production_tools_executor).__name__ == "RestrictedDockerExecutor"
-        assert "LocalSubprocessExecutor" not in repr(production_tools_executor)
-    finally:
-        bundle.close()
-
-
 def test_public_composition_binds_check_to_patched_workspace(tmp_path: Path) -> None:
     bundle, run_id, executor, root, _target_oid = _prepare_worker_run(
         tmp_path,
