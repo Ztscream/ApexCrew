@@ -1,41 +1,49 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from apexcrew.adapters.executor.attempt_patch import AttemptPatchExecutionError
 from apexcrew.adapters.executor.fake import FakeExecutor, FakeProcessResult
+from apexcrew.adapters.repository.attempt_workspace import AttemptWorkspaceError
+from apexcrew.adapters.repository.snapshot import MemoryRepositorySnapshot
 from apexcrew.adapters.state.sqlite import SqliteStateStore
+from apexcrew.application.runtime import ToolActionResolutionObserver
 from apexcrew.domain.actions import CheckAction, PatchAction
-from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision
+from apexcrew.domain.authority import ActionClass, ActionDeadline, TimeoutDecision, WorkspaceLease
 from apexcrew.domain.commands import ApplicableRevisionDigests
-from apexcrew.domain.effects import sha256_digest
+from apexcrew.domain.effects import recover_observation, sha256_digest
 from apexcrew.domain.plan import CheckDefinition, GlobPattern
 from apexcrew.domain.policy import SecretPathPolicy
 from apexcrew.domain.tools import (
     DeclaredCheckRegistry,
+    PatchExecutionResult,
     SanitizedSnapshot,
     SanitizedSnapshotEntry,
     ScopedToolRuntime,
     ToolIntent,
     ToolResult,
+    validate_tool_effect_result,
 )
 from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RunId, TaskId
 
 SHA = "sha256:" + "1" * 64
 SNAPSHOT_SHA = "sha256:" + "2" * 64
+PATCH_POST_SHA = "sha256:" + "3" * 64
 
 
 def secret_policy(*rules: str) -> SecretPathPolicy:
     return SecretPathPolicy.from_host_rules(rules, installation_key=b"k" * 32)
 
 
-def check_intent(intent_id: str = "intent-check") -> ToolIntent:
+def check_intent(intent_id: str = "intent-check", check_id: str = "task-check-1") -> ToolIntent:
     return ToolIntent.for_authorized_worker_action(
         intent_id=IntentId(intent_id),
         run_id=RunId("run-1"),
         task_id=TaskId("task-1"),
         attempt_id=AttemptId("attempt-1"),
         action_id="action-check",
-        action=CheckAction(check_id="task-check-1"),
+        action=CheckAction(check_id=check_id),
         authorization_binding_digest=SHA,
         applicable_revision_digests=ApplicableRevisionDigests(),
         repository_id="repository-1",
@@ -66,6 +74,58 @@ def patch_intent() -> ToolIntent:
     )
 
 
+class UncertainPatchExecutor:
+    def apply_patch(
+        self, lease: WorkspaceLease, patches: Mapping[str, bytes]
+    ) -> PatchExecutionResult:
+        del lease, patches
+        raise AttemptPatchExecutionError("PATCH_RESULT_UNCERTAIN")
+
+
+def patch_runtime(*, recovery_snapshot_digest: str | None = None) -> ScopedToolRuntime:
+    now = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
+    return ScopedToolRuntime(
+        snapshot=MemoryRepositorySnapshot({"src/a.py": b"old\n"}),
+        read_globs=("src/**",),
+        secret_paths=secret_policy("private/**"),
+        authorization_binding_digest=SHA,
+        applicable_revision_digests=ApplicableRevisionDigests(),
+        repository_id="repository-1",
+        snapshot_digest=SHA,
+        scope_digest=SHA,
+        dependency_fingerprint_basis=SHA,
+        patch_executor=UncertainPatchExecutor(),
+        recovery_snapshot_digest=recovery_snapshot_digest,
+        workspace_lease=WorkspaceLease(
+            lease_id="lease-1",
+            run_id=RunId("run-1"),
+            task_id=TaskId("task-1"),
+            attempt_id=AttemptId("attempt-1"),
+            generation=1,
+            base_head="a" * 40,
+            admissible_head="a" * 40,
+            task_contract_digest=SHA,
+            write_globs=(GlobPattern.parse("src/**"),),
+            sensitivity_globs=(),
+            issued_at=now,
+            expires_at=now + timedelta(minutes=15),
+            state="ACTIVE",
+        ),
+    )
+
+
+def test_patch_recovery_uses_current_workspace_digest() -> None:
+    intent = patch_intent().model_copy(update={"expected_poststate_digest": PATCH_POST_SHA})
+    runtime = patch_runtime(recovery_snapshot_digest=PATCH_POST_SHA)
+
+    state, result = runtime.observe_recovery(intent)
+
+    assert state == "EXACT_POST"
+    assert result is not None
+    assert result.code == "PATCH_APPLIED"
+    assert result.bounded_payload["post_tree_digest"] == PATCH_POST_SHA
+
+
 def sanitized_snapshot(tmp_path: Path) -> SanitizedSnapshot:
     return SanitizedSnapshot.from_regular_files(
         root=tmp_path,
@@ -80,6 +140,27 @@ def sanitized_snapshot(tmp_path: Path) -> SanitizedSnapshot:
             ),
         ),
         secret_paths=secret_policy("private/**"),
+    )
+
+
+def test_uncertain_patch_returns_settleable_result(tmp_path: Path) -> None:
+    del tmp_path
+    intent = patch_intent()
+
+    result = patch_runtime().execute(intent)
+
+    assert result.code == "INFRASTRUCTURE_UNCERTAINTY"
+    assert result.run_id == intent.run_id
+    assert result.intent_id == intent.intent_id
+    assert result.passed is None
+    assert result.timed_out is True
+    assert result.bounded_payload == {
+        "reason": "PATCH_RESULT_UNCERTAIN",
+        "snapshot_digest": intent.snapshot_digest,
+    }
+    validate_tool_effect_result(
+        intent.to_effect_intent(AuditSequence(1)),
+        result.to_effect_result(AuditSequence(2)),
     )
 
 
@@ -183,6 +264,53 @@ def test_timed_out_check_returns_uncertainty_without_receipt(tmp_path: Path) -> 
     assert result.timed_out is True
     assert result.bounded_payload["retry_scope"] == ("task-check-1", SNAPSHOT_SHA)
     assert "receipt" not in result.model_dump(mode="json")
+
+
+class RecoveryJournal:
+    def audit_sequence(self, run_id: RunId) -> AuditSequence:
+        assert run_id == RunId("run-1")
+        return AuditSequence(2)
+
+
+def test_workspace_recovery_failure_is_bounded_as_unavailable() -> None:
+    class BrokenRecoveryTools:
+        def observe_recovery(self, intent: ToolIntent) -> tuple[str, ToolResult | None]:
+            del intent
+            raise AttemptWorkspaceError("WORKSPACE_IDENTITY_CHANGED")
+
+    observation = ToolActionResolutionObserver(RecoveryJournal(), BrokenRecoveryTools()).observe(
+        check_intent("intent-workspace-failure").to_effect_intent(AuditSequence(1)),
+        recovery_generation=1,
+    )
+
+    assert observation.state == "UNAVAILABLE"
+
+
+def test_unknown_check_denial_is_an_exact_recovery_receipt(tmp_path: Path) -> None:
+    runtime = check_runtime(
+        tmp_path,
+        FakeProcessResult(exit_code=0, timed_out=False, timing_ms=1),
+    )
+    intent = check_intent("intent-unknown", "task-check-unknown")
+
+    state, result = runtime.observe_recovery(intent)
+
+    assert state == "EXACT_RECEIPT"
+    assert result is not None
+    assert result.code == "SCOPE_DENIED"
+    assert result.bounded_payload["check_id"] == "task-check-unknown"
+    assert result.bounded_payload["argv_digest"] == "sha256:" + "0" * 64
+    assert result.bounded_payload["snapshot_digest"] == intent.snapshot_digest
+    assert result.content_digest == result.bounded_payload["receipt_digest"]
+
+    observation = ToolActionResolutionObserver(RecoveryJournal(), runtime).observe(
+        intent.to_effect_intent(AuditSequence(1)),
+        recovery_generation=1,
+    )
+    decision = recover_observation(observation)
+    assert decision.kind.value == "COMPLETED"
+    assert decision.effect_result is not None
+    assert decision.effect_result.outcome == "FAILED"
 
 
 def test_failed_check_error_output_does_not_disclose_secret_path(tmp_path: Path) -> None:

@@ -2,6 +2,13 @@
 
 **目标:** 14-20 小时内让 M1-M4 端到端可运行,课程交付物齐全。边缘情况与部分安全强化标记为已知债务,之后再优化。
 
+> **2026-08-06 final-production branch status:** The historical SKELETON/STUB
+> labels and old roadmap warning below describe the pre-finalization baseline.
+> On `codex/m2-m4-final-production`, M2-M4 local capabilities are tracked by
+> `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md` and its
+> task evidence in `AGENT_LOG.md`; no hosted release or live provider request is
+> claimed without owner action.
+
 **这份文件的地位:** 短程执行清单,规定**做什么、做到什么深度、如何验证**。详细需求契约仍以 `PLAN.md` 和冻结的 `SPEC.md` 为准——遇到语义问题查那两份,不要自己发明。本文件与 `PLAN.md` 的 Streamlined Execution Protocol 一致。
 
 **执行模式:** 连续执行,按顺序做完整个清单。遇到阻塞记录到 `AGENT_LOG.md` 后跳过继续,不要停下来等人回答。**唯一例外是 push 和 PR 创建,那是仓库所有者的动作。**
@@ -104,13 +111,18 @@
 - [x] `grep -rn "DEBT-" src/` 的每一条在 README 或 `SECURITY.md` 里有对应记录
 - [x] 每个任务一个 commit,带完整 trailer;M1-M4 模块交付 PR #13 已创建并推送,本地任务提交与 trailers 已完成
 
-## 六、说话的边界
+## 六、说话的边界（历史基线）
+
+本节原文记录 final-production 分支建立前的 SKELETON/STUB 边界。对
+`codex/m2-m4-final-production`，顶部状态说明、最终生产计划和 `AGENT_LOG.md`
+中的 M2-M4 审计记录优先；本分支的本地 M2-M4 能力可以在离线证据支持下描述为已实现，
+但真实 DeepSeek、Pages 启用、push、合并和包发布仍然只能由 owner 执行。
 
 做完这轮,可以说的是:
 
-> **M1-M4 端到端可运行,harness 内核与治理机制有 mock-LLM 确定性测试;边缘情况、多意图恢复消解、保留分级、运行时 OS 锁标记为已知债务。**
+> **历史基线：M1-M4 端到端可运行,harness 内核与治理机制有 mock-LLM 确定性测试;边缘情况、多意图恢复消解、保留分级、运行时 OS 锁标记为已知债务。**
 
-**不可以说 M2-M4 完成,不可以说生产可用,不可以把 STUB 描述成已实现。** 诚实标注债务是加分项——本项目已有一次"独立评审推翻自己全绿交付"的记录,那才是可信度的来源。
+以上“不可宣称 M2-M4 完成”的限制属于历史基线，不适用于已通过最终生产计划审计的本分支；仍不得把 owner-only 的外部动作描述成已完成。
 
 ---
 
@@ -132,7 +144,7 @@
 | S10 预留清理 / 清除 | SKELETON | DONE | `cb3ec0d67da5408e53ae0d27a1eb5de409b81f2b` |
 | S11 保留分级 / 脱敏 | STUB | DONE | `e32927c82ed12cd775e326708311d06763a65659` |
 | S12 CLI | REAL | DONE | `eab0ea4d29358c8f1fc60189deb9a633c8c367b7` |
-| S13 受限 Docker 执行器 | SKELETON | DONE | `278c0077184107e819a96ffe3bf68b491a232103` |
+| S13 受限 Docker 执行器 | SKELETON | OPEN | `278c0077184107e819a96ffe3bf68b491a232103` + R4.3-03 `bcf9a99`; `DEBT-M2-005` live-process observation pending |
 | S14 双生态 fixture | SKELETON | DONE | `4d1c30ab397891cfaa0c3715545ad03330e17c54` |
 | S15 机制演示 | REAL | DONE | `3d3894fa2a47b9bde190778eb70352a5dfdd69fd` + correction `ee15003` |
 | S16 静态回放 + WebUI | SKELETON | DONE | `fafbd369019455087a529f54cdee1683d37f7389` |

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
 from apexcrew.adapters.credentials.model_key import MemoryCredentialStore
 from apexcrew.adapters.model.deepseek_responses import DeepSeekResponsesAdapter
+from apexcrew.adapters.model.factory import _default_response_schema
 from apexcrew.domain.model import (
     LogicalModelTurn,
     ModelRequest,
@@ -32,14 +34,29 @@ RESPONSE_SCHEMA: dict[str, object] = {
 }
 
 
+def test_default_schema_uses_deepseek_compatible_root_union() -> None:
+    schema = _default_response_schema()
+
+    assert schema["type"] == "object"
+    assert schema["properties"] == {"kind": {"type": "string"}}
+    assert "anyOf" in schema
+    assert "oneOf" not in schema
+    assert isinstance(schema["anyOf"], list)
+
+
 class RecordingResponsesClient:
     def __init__(self, response: object) -> None:
         self.response = response
         self.requests: list[dict[str, object]] = []
+        self.retrieved: list[str] = []
         self.responses = self
 
     def create(self, **request: object) -> object:
         self.requests.append(dict(request))
+        return self.response
+
+    def retrieve(self, response_id: str) -> object:
+        self.retrieved.append(response_id)
         return self.response
 
 
@@ -99,6 +116,8 @@ def _request() -> ModelRequest:
         max_input_tokens=1_000,
         max_output_tokens=200,
         reserved_cost_usd=Decimal("0.01"),
+        temperature=0.0,
+        reasoning_effort="medium",
     )
 
 
@@ -106,6 +125,7 @@ def _adapter(
     response: object,
     *,
     allowed_returned_model_ids: frozenset[str] | None = None,
+    provider_storage_enabled: bool = False,
 ) -> tuple[DeepSeekResponsesAdapter, RecordingClientFactory, RecordingResponsesClient]:
     client = RecordingResponsesClient(response)
     factory = RecordingClientFactory(client)
@@ -115,11 +135,32 @@ def _adapter(
             response_schemas={SCHEMA_DIGEST: RESPONSE_SCHEMA},
             pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
             client_factory=factory,
+            live_provider_authorized=True,
             allowed_returned_model_ids=allowed_returned_model_ids,
+            provider_storage_enabled=provider_storage_enabled,
         ),
         factory,
         client,
     )
+
+
+def test_lookup_returns_only_the_exact_retrieved_provider_response() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()), provider_storage_enabled=True)
+
+    result = adapter.lookup(_request(), "response-1")
+
+    assert result is not None
+    assert result.kind == "COMPLETED"
+    assert result.completion is not None
+    assert result.completion.response_id == "response-1"
+    assert client.retrieved == ["response-1"]
+
+
+def test_disabled_provider_storage_fails_closed_without_lookup() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    assert adapter.lookup(_request(), "response-1") is None
+    assert client.retrieved == []
 
 
 def test_request_pins_no_sdk_retries_and_deepseek_parameters() -> None:
@@ -147,6 +188,42 @@ def test_request_pins_no_sdk_retries_and_deepseek_parameters() -> None:
             "store": False,
         }
     ]
+
+
+def test_inference_parameters_follow_the_bound_model_request() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    result = adapter.complete(replace(_request(), temperature=0.7, reasoning_effort="high"))
+
+    assert result.kind == "COMPLETED"
+    assert client.requests[0]["temperature"] == 0.7
+    assert client.requests[0]["reasoning"] == {"effort": "high"}
+
+
+def test_missing_inference_parameters_fail_closed() -> None:
+    adapter, _, client = _adapter(_response(usage=_usage()))
+
+    result = adapter.complete(replace(_request(), temperature=None, reasoning_effort=None))
+
+    assert result.kind == "UNKNOWN_OUTCOME"
+    assert result.reason_code == "INFERENCE_SETTINGS_MISSING"
+    assert client.requests == []
+
+
+def test_effective_inference_parameters_remain_in_settled_attempt_request() -> None:
+    adapter, _, _ = _adapter(_response(usage=_usage()))
+    request = replace(_request(), temperature=0.3, reasoning_effort="low")
+    result = adapter.complete(request)
+    assert result.completion is not None
+
+    intent = ModelRequestIntent.reserve(LogicalModelTurn.new(request), request)
+    settled = SettledModelAttempt.from_result(
+        intent,
+        result,
+    )
+
+    assert settled.request.temperature == 0.3
+    assert settled.request.reasoning_effort == "low"
 
 
 def test_returned_model_mismatch_releases_no_action() -> None:
@@ -229,6 +306,7 @@ def test_schema_length_constraint_fails_closed() -> None:
         response_schemas={SCHEMA_DIGEST: schema},
         pricing_usd_per_million={"deepseek-v4-flash": (Decimal("0.28"), Decimal("0.56"))},
         client_factory=RecordingClientFactory(client),
+        live_provider_authorized=True,
     )
 
     result = adapter.complete(_request())
@@ -294,6 +372,8 @@ def test_model_configuration_accepts_deepseek_origin() -> None:
         inference_settings=InferenceSettingsDocument(
             max_input_tokens=32_000,
             max_output_tokens=4_096,
+            temperature=0.0,
+            reasoning_effort="medium",
             provider_storage_enabled=False,
         ),
         tool_schema_digest=SCHEMA_DIGEST,

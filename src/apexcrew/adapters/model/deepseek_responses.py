@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 
 from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, OpenAI
 
-from apexcrew.adapters.credentials.model_key import ModelCredentialPort
+from apexcrew.adapters.credentials.model_key import ModelCredentialError, ModelCredentialPort
 from apexcrew.domain.model import (
     ModelCompletion,
     ModelRequest,
@@ -24,13 +24,14 @@ DEEPSEEK_PROFILE = "deepseek"
 DEFAULT_INSTRUCTIONS = (
     "Return exactly one JSON object matching the supplied ApexCrew action schema."
 )
-DEFAULT_REASONING_EFFORT = "medium"
-DEFAULT_TEMPERATURE = 0.0
 _MISSING = object()
 
 
 class ResponsesAPI(Protocol):
     def create(self, **request: object) -> Any:
+        raise NotImplementedError
+
+    def retrieve(self, response_id: str) -> Any:
         raise NotImplementedError
 
 
@@ -198,12 +199,11 @@ class DeepSeekResponsesAdapter:
         profile: str = DEEPSEEK_PROFILE,
         client_factory: ClientFactory | None = None,
         instructions: str = DEFAULT_INSTRUCTIONS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         allowed_returned_model_ids: frozenset[str] | None = None,
         max_input_tokens: int | None = None,
         max_output_tokens: int | None = None,
         provider_storage_enabled: bool = False,
+        live_provider_authorized: bool = False,
     ) -> None:
         self._credentials = credential_source
         self._response_schemas = dict(response_schemas)
@@ -213,12 +213,11 @@ class DeepSeekResponsesAdapter:
             cast(ClientFactory, OpenAI) if client_factory is None else client_factory
         )
         self._instructions = instructions
-        self._temperature = temperature
-        self._reasoning_effort = reasoning_effort
         self._allowed_returned_model_ids = allowed_returned_model_ids
         self._max_input_tokens = max_input_tokens
         self._max_output_tokens = max_output_tokens
         self._provider_storage_enabled = provider_storage_enabled
+        self._live_provider_authorized = live_provider_authorized
 
     @classmethod
     def from_approved_configuration(
@@ -229,6 +228,7 @@ class DeepSeekResponsesAdapter:
         credential_source: ModelCredentialPort,
         response_schemas: Mapping[str, Mapping[str, object]],
         client_factory: ClientFactory | None = None,
+        live_provider_authorized: bool = False,
     ) -> DeepSeekResponsesAdapter:
         """Build only from a complete, already validated revision pair."""
         if model_configuration.provider != "deepseek_responses":
@@ -267,9 +267,12 @@ class DeepSeekResponsesAdapter:
             max_input_tokens=settings.max_input_tokens,
             max_output_tokens=settings.max_output_tokens,
             provider_storage_enabled=settings.provider_storage_enabled,
+            live_provider_authorized=live_provider_authorized,
         )
 
     def complete(self, request: ModelRequest) -> ProviderAttemptResult:
+        if not self._live_provider_authorized:
+            return ProviderAttemptResult.unknown("LIVE_PROVIDER_NOT_AUTHORIZED")
         schema = self._response_schemas.get(request.tool_schema_digest)
         if schema is None:
             return ProviderAttemptResult.unknown("TOOL_SCHEMA_MISSING")
@@ -289,6 +292,8 @@ class DeepSeekResponsesAdapter:
             and request.max_output_tokens > self._max_output_tokens
         ):
             return ProviderAttemptResult.unknown("INFERENCE_SETTINGS_EXCEEDED")
+        if request.temperature is None or request.reasoning_effort not in {"low", "medium", "high"}:
+            return ProviderAttemptResult.unknown("INFERENCE_SETTINGS_MISSING")
 
         api_key = self._credentials.resolve(self._profile)
         client = self._client_factory(
@@ -302,9 +307,9 @@ class DeepSeekResponsesAdapter:
                 input=list(request.prompt),
                 instructions=self._instructions,
                 max_output_tokens=request.max_output_tokens,
-                temperature=self._temperature,
+                temperature=request.temperature,
                 text={"format": schema},
-                reasoning={"effort": self._reasoning_effort},
+                reasoning={"effort": request.reasoning_effort},
                 store=False,
             )
         except APIStatusError as error:
@@ -322,6 +327,39 @@ class DeepSeekResponsesAdapter:
         except APIError:
             return ProviderAttemptResult.unknown("PROVIDER_ERROR_OUTCOME_UNKNOWN")
 
+        return self._result_from_response(request, response)
+
+    def lookup(
+        self, request: ModelRequest, provider_response_id: str | None
+    ) -> ProviderAttemptResult | None:
+        if not self._provider_storage_enabled or not provider_response_id:
+            return None
+        try:
+            api_key = self._credentials.resolve(self._profile)
+            client = self._client_factory(
+                api_key=api_key,
+                base_url=DEEPSEEK_BASE_URL,
+                max_retries=0,
+            )
+            response = client.responses.retrieve(provider_response_id)
+        except (
+            APIStatusError,
+            APITimeoutError,
+            APIConnectionError,
+            APIError,
+            ModelCredentialError,
+        ):
+            return None
+        if getattr(response, "id", None) != provider_response_id:
+            return None
+        return self._result_from_response(request, response)
+
+    def _result_from_response(
+        self, request: ModelRequest, response: object
+    ) -> ProviderAttemptResult:
+        schema = self._response_schemas.get(request.tool_schema_digest)
+        if schema is None:
+            return ProviderAttemptResult.unknown("TOOL_SCHEMA_MISSING")
         response_id = getattr(response, "id", None)
         returned_model_id = getattr(response, "model", None)
         status = getattr(response, "status", None)

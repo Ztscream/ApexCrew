@@ -3,10 +3,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from apexcrew.domain.revisions import Sha256DigestText
+
 
 class CleanupStatus(StrEnum):
     CLEANED = "CLEANED"
     ALREADY_CLEANED = "ALREADY_CLEANED"
+
+
+class CleanupObservationKind(StrEnum):
+    BOTH_ABSENT = "BOTH_ABSENT"
+    BOTH_EXACT_LOCKED = "BOTH_EXACT_LOCKED"
+    BOTH_EXACT_UNLOCKED = "BOTH_EXACT_UNLOCKED"
+    PATH_ONLY_EXACT_GITFILE = "PATH_ONLY_EXACT_GITFILE"
+    ADMIN_ONLY_EXACT = "ADMIN_ONLY_EXACT"
+    CONFLICT = "CONFLICT"
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupObservation:
+    kind: CleanupObservationKind
+    reservation_id: str
+    path_identity_digest: str | None = None
+    gitfile_digest: Sha256DigestText | None = None
+    admin_identity_digest: Sha256DigestText | None = None
+    lock_digest: Sha256DigestText | None = None
 
 
 @dataclass(frozen=True, slots=True)

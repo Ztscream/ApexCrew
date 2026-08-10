@@ -32,6 +32,13 @@ class OpenedNode:
 class NoFollowBackend(Protocol):
     def open_root_chain(self, root: Path) -> tuple[OpenedNode, ...]: ...
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode: ...
+    def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode: ...
+    def open_child_for_lock(self, parent: OpenedNode, name: str) -> OpenedNode: ...
+    def lock_exclusive(self, node: OpenedNode) -> None: ...
+    def unlock_exclusive(self, node: OpenedNode) -> None: ...
+    def open_child_for_delete(
+        self, parent: OpenedNode, name: str, kind: NodeKind
+    ) -> OpenedNode: ...
     def create_child_directory(self, parent: OpenedNode, name: str) -> OpenedNode: ...
     def create_child_file(self, parent: OpenedNode, name: str) -> OpenedNode: ...
     def try_open_child(
@@ -39,8 +46,16 @@ class NoFollowBackend(Protocol):
     ) -> OpenedNode | None: ...
     def try_open_child_any(self, parent: OpenedNode, name: str) -> OpenedNode | None: ...
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes: ...
+    def read_prefix(self, node: OpenedNode, maximum: int) -> bytes: ...
     def write_bytes(self, node: OpenedNode, value: bytes) -> None: ...
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]: ...
+
+    def unlink_child(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None: ...
+
+    def remove_child_directory(
+        self, parent: OpenedNode, name: str, expected: OpenedNode
+    ) -> None: ...
+
     def close(self, node: OpenedNode) -> None: ...
 
 
@@ -108,11 +123,92 @@ class StableHandleTree:
             parent = node
         return parent
 
+    def ensure_directory(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative) if relative else ()
+        if not parts:
+            return self.root_node
+        existing = self.try_open("/".join(parts), "directory")
+        if existing is not None:
+            return existing
+        parent = self.ensure_directory("/".join(parts[:-1]))
+        node = self._backend.create_child_directory(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def create_file(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        existing = self.try_open("/".join(parts), "file")
+        if existing is not None:
+            raise RepositoryUnsafeError("NO_FOLLOW_FILE_ALREADY_EXISTS")
+        parent = self.ensure_directory("/".join(parts[:-1]))
+        node = self._backend.create_child_file(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def open_for_write(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        self.release_cached(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        node = self._backend.open_child_for_write(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def open_for_lock(self, relative: str) -> OpenedNode:
+        parts = self._parts(relative)
+        self.release_cached(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        node = self._backend.open_child_for_lock(parent, parts[-1])
+        self._nodes[parts] = node
+        return node
+
+    def lock_exclusive(self, node: OpenedNode) -> None:
+        self._backend.lock_exclusive(node)
+
+    def unlock_exclusive(self, node: OpenedNode) -> None:
+        self._backend.unlock_exclusive(node)
+
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._backend.read_bytes(node, maximum)
 
+    def read_prefix(self, node: OpenedNode, maximum: int) -> bytes:
+        return self._backend.read_prefix(node, maximum)
+
+    def write_bytes(self, node: OpenedNode, value: bytes) -> None:
+        self._backend.write_bytes(node, value)
+
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._backend.list_names(node, maximum)
+
+    def remove_file(self, relative: str, expected: HandleIdentity) -> None:
+        parts = self._parts(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        self.release_cached(relative)
+        node = self._backend.open_child_for_delete(parent, parts[-1], "file")
+        try:
+            if node.identity != expected:
+                raise RepositoryUnsafeError("DELETE_IDENTITY_CHANGED")
+            self._backend.unlink_child(parent, parts[-1], node)
+        finally:
+            self._backend.close(node)
+
+    def remove_directory(self, relative: str, expected: HandleIdentity) -> None:
+        parts = self._parts(relative)
+        parent = self.open("/".join(parts[:-1]), "directory") if len(parts) > 1 else self.root_node
+        self.release_cached(relative)
+        node = self._backend.open_child_for_delete(parent, parts[-1], "directory")
+        try:
+            if node.identity != expected:
+                raise RepositoryUnsafeError("DELETE_IDENTITY_CHANGED")
+            self._backend.remove_child_directory(parent, parts[-1], node)
+        finally:
+            self._backend.close(node)
+
+    @staticmethod
+    def _parts(relative: str) -> tuple[str, ...]:
+        parts = tuple(relative.split("/"))
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            raise RepositoryUnsafeError("INVALID_HANDLE_RELATIVE_PATH")
+        return parts
 
     def assert_name_bindings(self) -> None:
         self._retry_pending_closes()
@@ -148,6 +244,16 @@ class StableHandleTree:
                     primary_error.add_note(f"probe cleanup failed: {cleanup_error}")
         if primary_error is not None:
             raise primary_error
+
+    def identity_chain(self, relative: str) -> tuple[HandleIdentity, ...]:
+        """Return the no-follow identity chain for one directory below the root."""
+        parts = tuple(relative.split("/"))
+        if not parts or any(part in {"", ".", ".."} or "\\" in part for part in parts):
+            raise RepositoryUnsafeError("INVALID_HANDLE_RELATIVE_PATH")
+        self.open(relative, "directory")
+        return tuple(node.identity for node in self._root_chain) + tuple(
+            self._nodes[parts[: index + 1]].identity for index in range(len(parts))
+        )
 
     def close(self) -> None:
         owned = {node.handle: node for node in (*self._nodes.values(), *self._root_chain)}

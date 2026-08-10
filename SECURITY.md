@@ -35,28 +35,43 @@ any exposed credential outside this repository before sharing diagnostic metadat
 
 ## Delivery Status
 
-M1-M4 delivery artifacts are present at the depth recorded in `SPRINT.md` and
-`AGENT_LOG.md`. SKELETON and STUB tasks are intentionally not described as
-production-complete. The secret scanner checks the tracked tree and reachable
-history; replay/WebUI delivery is projection-only; Docker argv construction is
-closed but its process runner remains a debt.
+M2-M4 local delivery artifacts and production boundaries are implemented at the
+depth recorded in the final-production plan and `AGENT_LOG.md`. The secret
+scanner checks the tracked tree and reachable history; replay/WebUI delivery is
+projection-only; Docker execution remains fail-closed when the daemon or image
+is unavailable.
 
-## Known Runtime Debt
+## Known Operational Boundaries
 
-`DEBT-M2-001`: multiple unresolved effects are represented as `INDETERMINATE`
-because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
-Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
-builds a restricted digest-pinned argv but does not launch a Docker process.
+Observed multi-intent members are selectable only when exactly one member is
+identified by authoritative external observation; no observation or multiple
+observations remain `INDETERMINATE`. Tier 2 export, retention, and eviction are
+implemented fail-closed through the typed retention manager; Tier 2 and
+quarantined content remain excluded from exports. The restricted executor
+launches only the closed digest-pinned Docker argv and reports daemon/process
+unavailability as a typed failure.
 
-`DEBT-R4-RECOVERY-001`: the composed resolution boundary currently records
-unsettled effects as `INDETERMINATE` and requires authoritative recovery; it does
-not yet implement the class-specific read, check, file, or ref replay strategies
-from SPEC section 5.8.
+`DEBT-M2-005` remains **OPEN**. This worktree has not observed a real restricted
+Docker process invocation; closure requires that observation and synchronized
+updates to `README.md`, `SECURITY.md`, `SPRINT.md`, and `AGENT_LOG.md`. Workspace
+mutation history and restart recovery for an in-flight patched workspace remain
+process-local follow-up boundaries.
 
-`DEBT-R4-CLEANUP-001`: terminal cleanup executes the exact fully-observed
-registration/path sequence, but exact-admin-only and exact-path-only mixed crash
-states remain fail-closed and require operator repair before a new cleanup retry.
-The terminal Run state is preserved while cleanup is unresolved.
+`DEBT-M3-001`: malformed unified diffs in the offline demo are denied with the
+existing `LEASE_SCOPE_DENIED` result because the closed patch-result contract
+does not have a distinct malformed-diff code. The denial is fail-closed and
+requires a reviewed `SPEC.md` amendment before the result vocabulary changes.
+
+`DEBT-R4-RECOVERY-001`: the R4.1 action-class recovery and exact resolution paths
+are implemented and offline-verified. The remaining boundary is the explicitly
+authorized real-provider request; ordinary verification continues to use
+`ScriptedMockLLM`.
+
+`DEBT-R4-CLEANUP-001`: terminal cleanup now handles exact path-only and admin-only
+crash states with no-follow, identity/digest-bound deletion. Mixed, altered,
+malformed, and unobservable states remain fail-closed, record a conflict, and
+require operator repair before a new cleanup retry. The terminal Run state is
+preserved while cleanup is unresolved.
 
 The production runtime requires an unconsumed Runtime Permit before attempting
 the per-Run OS lock, then validates and consumes that Permit in the SQLite
@@ -70,3 +85,9 @@ resolves a provider credential. `tests/integration/test_live_provider_smoke.py`
 requires `APEXCREW_LIVE_SMOKE=1`, performs at most one provider request, and does
 not print credential or prompt bytes. The CLI remains the writable control surface;
 WebUI and Pages replay remain read-only projections.
+
+The production composition root passes that gate into the DeepSeek adapter, and
+`CrewRuntime` rechecks it after locating a Runtime Permit but before acquiring
+ownership or consuming the Permit. An unauthorized `run` therefore cannot create
+runtime ownership, consume a Permit, resolve a credential, construct a provider
+client, or dispatch a request.

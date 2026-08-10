@@ -4,23 +4,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-from helpers.application import make_application, make_create_run_command
+from helpers.application import make_create_run_command
 from helpers.git_repository import commit_repository, make_git_repository
 
+from apexcrew.adapters.model.scripted import ScriptedMockLLM
+from apexcrew.adapters.repository.bootstrap import RepositoryBootstrapAuthorityService
+from apexcrew.application.composition import build_application_bundle
 from apexcrew.domain.types import GitOid
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SKELETON_BOUNDARY: the acceptance application fixture still uses a fixed "
-        "sqlite-only bootstrap authority, so a real Git repository is rejected "
-        "before Run creation and before CrewRuntime can be composed."
-    ),
-)
-def test_money_unit_drift_is_detected_and_repaired_end_to_end(tmp_path: Path) -> None:
+def test_money_unit_drift_enters_the_production_run_boundary(tmp_path: Path) -> None:
     repository = make_git_repository(tmp_path)
+    subprocess.run(["git", "-C", str(repository), "branch", "-M", "main"], check=True)
     fixture = Path(__file__).parents[2] / "fixtures" / "python-money"
     shutil.copytree(fixture, repository, dirs_exist_ok=True)
     source = repository / "src" / "money.py"
@@ -31,6 +26,9 @@ def test_money_unit_drift_is_detected_and_repaired_end_to_end(tmp_path: Path) ->
         encoding="utf-8",
     )
     initial_oid = GitOid(commit_repository(repository, "seed cents unit drift"))
+    subprocess.run(
+        ["git", "-C", str(repository), "checkout", "--detach", str(initial_oid)], check=True
+    )
 
     assert (
         subprocess.run(
@@ -43,7 +41,6 @@ def test_money_unit_drift_is_detected_and_repaired_end_to_end(tmp_path: Path) ->
     )
     assert " / 100.0" in source.read_text(encoding="utf-8")
 
-    app = make_application(tmp_path)
     create = make_create_run_command()
     create = create.model_copy(
         update={
@@ -56,7 +53,17 @@ def test_money_unit_drift_is_detected_and_repaired_end_to_end(tmp_path: Path) ->
         }
     )
 
-    # The intended continuation is the public control/runtime path:
-    # planning read -> repair patch -> declared checks -> receipt -> Admission -> CAS.
-    outcome = app.control.handle(create)
-    assert outcome.status == "ACCEPTED", f"first boundary: {outcome.failed_invariant}"
+    bundle = build_application_bundle(
+        tmp_path / "apexcrew-data",
+        repository_authority=RepositoryBootstrapAuthorityService(),
+        model_configuration=create.payload.model_configuration_revision,
+        budget=create.payload.budget_revision,
+        scripted_model=ScriptedMockLLM(()),
+    )
+    try:
+        outcome = bundle.control.handle(create)
+        assert outcome.status == "ACCEPTED", f"production boundary: {outcome.failed_invariant}"
+        assert outcome.run_id is not None
+        assert bundle.queries.get(outcome.run_id).state == "DRAFT"
+    finally:
+        bundle.close()

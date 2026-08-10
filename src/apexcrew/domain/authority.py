@@ -23,7 +23,7 @@ from apexcrew.domain.model import (
     ModelRequestIntent,
 )
 from apexcrew.domain.plan import CanonicalPath, GlobPattern, TaskContract
-from apexcrew.domain.policy import ActionPolicy
+from apexcrew.domain.policy import ActionPolicy, SecretPathPolicy
 from apexcrew.domain.revisions import BudgetRevisionDocument, Sha256DigestText
 from apexcrew.domain.types import (
     AttemptId,
@@ -194,6 +194,7 @@ class DispatchCloseCause(StrEnum):
     IMMUTABLE_PLAN_INSUFFICIENCY = "IMMUTABLE_PLAN_INSUFFICIENCY"
     REVISION_REPLACEMENT = "REVISION_REPLACEMENT"
     RUNTIME_FAULT = "RUNTIME_FAULT"
+    RUNTIME_PHASE_CAP = "RUNTIME_PHASE_CAP"
     TASK_PAUSED = "TASK_PAUSED"
 
 
@@ -1099,6 +1100,11 @@ class Authority(Protocol):
     def reserve_model_attempt(self, request: ModelReservationRequest) -> ModelReservation:
         raise NotImplementedError
 
+    def open_action_deadline(
+        self, run_id: RunId, intent_id: IntentId, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceLease:
@@ -1188,8 +1194,25 @@ class TaskAuthority:
     attempt_id: AttemptId
 
 
-TaskLifecycleState = Literal["ACTIVE", "READY", "PAUSED"]
-AttemptLifecycleState = Literal["RUNNING", "FAILED"]
+TaskLifecycleState = Literal[
+    "ACTIVE",
+    "READY",
+    "CANDIDATE_READY",
+    "PROMOTED",
+    "PAUSED",
+]
+AttemptLifecycleState = Literal[
+    "CREATED",
+    "LEASED",
+    "RUNNING",
+    "WAITING_APPROVAL",
+    "VERIFYING",
+    "SUCCEEDED",
+    "FAILED",
+    "STALE",
+    "CANCELLED",
+    "INDETERMINATE",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1726,9 +1749,15 @@ def _resume_revision_binding_matches(
 
 
 class AuthorityService:
-    def __init__(self, journal: AuthorityState, utc_clock: UtcClock | None = None) -> None:
+    def __init__(
+        self,
+        journal: AuthorityState,
+        utc_clock: UtcClock | None = None,
+        secret_paths: SecretPathPolicy | None = None,
+    ) -> None:
         self._journal = journal
         self._utc_clock = utc_clock or SystemUtcClock()
+        self._secret_paths = secret_paths
 
     def _utc_now(self) -> datetime:
         now = self._utc_clock.now()
@@ -2111,7 +2140,10 @@ class AuthorityService:
             return LeaseAuthorization("DENY", "LEASE_GENERATION_MISMATCH")
         if lease.admissible_head != head:
             return LeaseAuthorization("DENY", "LEASE_HEAD_NOT_ADMISSIBLE")
-        canonical = CanonicalPath.parse(path)
+        try:
+            canonical = CanonicalPath.parse(path)
+        except ValueError:
+            return LeaseAuthorization("DENY", "WRITE_OUTSIDE_LEASE")
         if not any(pattern.matches(canonical) for pattern in lease.write_globs):
             return LeaseAuthorization("DENY", "WRITE_OUTSIDE_LEASE")
         return LeaseAuthorization("ALLOW", "AUTHORIZED")
@@ -2150,11 +2182,27 @@ class AuthorityService:
             reason = "LEASE_GENERATION_MISMATCH"
         elif lease.admissible_head != request.admissible_head:
             reason = "LEASE_HEAD_NOT_ADMISSIBLE"
-        elif request.action.path is not None and not any(
-            pattern.matches(CanonicalPath.parse(request.action.path))
-            for pattern in lease.write_globs
+        elif request.action.path is not None:
+            try:
+                canonical = CanonicalPath.parse(request.action.path)
+            except ValueError:
+                reason = "HARD_DENIAL"
+            else:
+                if not any(pattern.matches(canonical) for pattern in lease.write_globs):
+                    reason = "ACTION_OUTSIDE_LEASE"
+        if (
+            reason == "AUTHORIZED"
+            and lease is not None
+            and isinstance(request.action, RiskyAction)
+            and request.action.destination is not None
         ):
-            reason = "ACTION_OUTSIDE_LEASE"
+            try:
+                destination = CanonicalPath.parse(request.action.destination)
+            except ValueError:
+                reason = "HARD_DENIAL"
+            else:
+                if not any(pattern.matches(destination) for pattern in lease.write_globs):
+                    reason = "ACTION_OUTSIDE_LEASE"
         if reason != "AUTHORIZED":
             policy_decision = "DENY"
         elif request.action.kind == "target_cas":
@@ -2169,7 +2217,7 @@ class AuthorityService:
         }:
             policy_decision = "REQUIRE_APPROVAL"
         else:
-            policy_decision = ActionPolicy.default().classify(request.action)
+            policy_decision = ActionPolicy.default(self._secret_paths).classify(request.action)
         action_classes: dict[str, AuthorizedActionClass] = {
             "read": "READ",
             "search": "SEARCH",

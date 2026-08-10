@@ -26,13 +26,16 @@ from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, Ri
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
+    RefEffectBinding,
     RuntimeStartBinding,
     StartGuard,
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
     TargetReservationIdAllocationError,
+    TaskCandidate,
     allocate_target_reservation_id,
+    private_ref,
     random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
@@ -124,6 +127,7 @@ from apexcrew.domain.commands import (
     ProposePolicyPayload,
     PublicRunSnapshot,
     ReconcileCleanupPayload,
+    ResolveIndeterminatePayload,
     ResumePayload,
     RunStop,
     RuntimeAllowedPhase,
@@ -153,6 +157,7 @@ from apexcrew.domain.coordination import (
     validate_plan_proposal,
 )
 from apexcrew.domain.effects import (
+    ApplyResolutionRequest,
     AuditEvent,
     EffectIntent,
     EffectResult,
@@ -164,12 +169,24 @@ from apexcrew.domain.effects import (
     StateCommitFault,
     StateConflict,
     TargetReservation,
+    abandon_observation,
+    abandon_successor_for,
     canonical_json,
     classify_reservation_creation,
+    observation_set_digest,
+    recover_observation,
+    recovery_action_class_for_intent,
     sha256_digest,
 )
 from apexcrew.domain.evidence import ContextCapsule, EvidenceReceipt
 from apexcrew.domain.freshness import FreshnessAssessment, promote_candidate
+from apexcrew.domain.indeterminate import (
+    ResolutionApplication,
+    ResolutionSelection,
+    UnresolvedIntentBinding,
+    UnresolvedIntentSet,
+    run_state_for_resolution_successor,
+)
 from apexcrew.domain.limits import V01_MECHANISM_LIMITS
 from apexcrew.domain.model import (
     CommittedModelTurn,
@@ -195,6 +212,7 @@ from apexcrew.domain.model import (
     model_request_to_json,
 )
 from apexcrew.domain.plan import (
+    CanonicalPath,
     CheckDefinition,
     GlobPattern,
     PlanRevision,
@@ -225,6 +243,7 @@ from apexcrew.domain.types import (
     RevisionDigest,
     RunId,
     RunState,
+    RunStopReason,
     RuntimeOwnerId,
     TaskId,
 )
@@ -1038,6 +1057,50 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         24,
         ("ALTER TABLE run_candidates ADD COLUMN evidence_json TEXT NOT NULL DEFAULT ''",),
     ),
+    (
+        25,
+        (
+            "ALTER TABLE runtime_permits ADD COLUMN resolution_subject_json TEXT",
+            """CREATE TABLE indeterminate_members (
+                intent_id TEXT PRIMARY KEY REFERENCES effect_intents(intent_id),
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                recovery_generation INTEGER NOT NULL CHECK(recovery_generation >= 1),
+                state TEXT NOT NULL CHECK(state IN ('PENDING','ABANDONED','SETTLED'))
+            )""",
+        ),
+    ),
+    (
+        26,
+        (
+            """CREATE TABLE task_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                expected_run_head_oid TEXT NOT NULL,
+                prepared_oid TEXT NOT NULL,
+                changed_paths_json TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN (
+                    'READY','PROMOTING','PROMOTED','CONFLICT','INDETERMINATE'
+                )),
+                promotion_intent_id TEXT UNIQUE REFERENCES effect_intents(intent_id),
+                UNIQUE(run_id, task_id, attempt_id)
+            )""",
+            "UPDATE runs SET run_head_oid = pinned_target_oid WHERE run_head_oid IS NULL",
+            "CREATE INDEX task_candidates_run_state ON task_candidates(run_id, state)",
+        ),
+    ),
+    (
+        27,
+        (
+            """CREATE TABLE runtime_phase_pauses (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                pause_sequence INTEGER NOT NULL,
+                pause_reason TEXT NOT NULL CHECK(pause_reason = 'RUNTIME_PHASE_STEP_CAP')
+            )""",
+        ),
+    ),
 )
 
 
@@ -1809,13 +1872,15 @@ class SqliteStateStore:
             try:
                 connection.execute(
                     "INSERT INTO runs(run_id, repository_id, repository_instance_digest, "
-                    "state, target_ref, pinned_target_oid) VALUES (?, ?, ?, ?, ?, ?)",
+                    "state, target_ref, pinned_target_oid, run_head_oid) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         repository_id,
                         repository_instance_digest,
                         RunState.DRAFT,
                         reservation.target_ref,
+                        reservation.pinned_target_oid,
                         reservation.pinned_target_oid,
                     ),
                 )
@@ -1863,6 +1928,7 @@ class SqliteStateStore:
             state=RunState(row["state"]),
             target_ref=row["target_ref"],
             pinned_target_oid=GitOid(row["pinned_target_oid"]),
+            run_head_oid=(None if row["run_head_oid"] is None else GitOid(row["run_head_oid"])),
             current_plan_digest=(
                 None
                 if row["current_plan_digest"] is None
@@ -3008,8 +3074,18 @@ class SqliteStateStore:
                 "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
                 (run_id, task_id),
             ).fetchone()
+            candidate = connection.execute(
+                "SELECT state FROM task_candidates WHERE run_id = ? AND task_id = ? "
+                "ORDER BY candidate_id DESC LIMIT 1",
+                (run_id, task_id),
+            ).fetchone()
         if row is None:
             raise StateConflict("TASK_NOT_FOUND")
+        if candidate is not None:
+            if candidate["state"] == "PROMOTED":
+                return "PROMOTED"
+            if candidate["state"] in {"READY", "PROMOTING"}:
+                return "CANDIDATE_READY"
         state: TaskLifecycleState = row["state"]
         return state
 
@@ -3017,14 +3093,21 @@ class SqliteStateStore:
         self, run_id: RunId, attempt_id: AttemptId
     ) -> AttemptLifecycleState:
         with self._read_transaction() as connection:
+            worker = connection.execute(
+                "SELECT state FROM worker_attempts WHERE run_id = ? AND attempt_id = ?",
+                (run_id, attempt_id),
+            ).fetchone()
             row = connection.execute(
                 "SELECT state FROM attempts WHERE run_id = ? AND attempt_id = ?",
                 (run_id, attempt_id),
             ).fetchone()
+        if worker is not None:
+            state: AttemptLifecycleState = worker["state"]
+            return state
         if row is None:
             raise StateConflict("ATTEMPT_NOT_FOUND")
-        state: AttemptLifecycleState = row["state"]
-        return state
+        fallback_state: AttemptLifecycleState = row["state"]
+        return fallback_state
 
     @staticmethod
     def _task_pause_from_row(row: sqlite3.Row) -> TaskPauseBinding:
@@ -3595,11 +3678,13 @@ class SqliteStateStore:
         run_id: RunId,
         attempt_id: AttemptId,
         terminal_sequence: AuditSequence,
+        *,
+        terminal_state: Literal["RELEASED", "REVOKED"] = "REVOKED",
     ) -> None:
         connection.execute(
-            "UPDATE workspace_leases SET state = 'REVOKED', terminal_sequence = ? "
+            "UPDATE workspace_leases SET state = ?, terminal_sequence = ? "
             "WHERE run_id = ? AND attempt_id = ? AND state = 'ACTIVE'",
-            (terminal_sequence, run_id, attempt_id),
+            (terminal_state, terminal_sequence, run_id, attempt_id),
         )
         if (
             connection.execute(
@@ -4697,6 +4782,15 @@ class SqliteStateStore:
         with self._read_transaction() as connection:
             return self._granted_action_in_transaction(connection, intent_id)
 
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._read_transaction() as connection:
+            intent = self._granted_action_in_transaction(
+                connection, intent_id, require_unsettled=False
+            )
+        if intent.state != "INDETERMINATE":
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        return intent
+
     def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
         with self._read_transaction() as connection:
             row = connection.execute(
@@ -5020,6 +5114,7 @@ class SqliteStateStore:
                 binding.run_id,
                 binding.attempt_id,
                 AuditSequence(expected_sequence + 1),
+                terminal_state="RELEASED" if isinstance(action, FinishAction) else "REVOKED",
             )
             self._settle_recovered_worker_marker(
                 connection,
@@ -8242,6 +8337,17 @@ class SqliteStateStore:
             != 1
         ):
             raise StateConflict("EFFECT_INTENT_SETTLE_COMPARE_AND_SET_FAILED")
+        if result.outcome == "INDETERMINATE":
+            connection.execute(
+                "INSERT INTO indeterminate_members(intent_id, run_id, recovery_generation, state) "
+                "VALUES (?, ?, 1, 'PENDING') "
+                "ON CONFLICT(intent_id) DO UPDATE SET state = 'PENDING'",
+                (intent_id, run_id),
+            )
+            connection.execute(
+                "UPDATE runs SET state = 'INDETERMINATE' WHERE run_id = ?",
+                (run_id,),
+            )
 
     def settle_intent(
         self,
@@ -8331,6 +8437,334 @@ class SqliteStateStore:
                 (run_id,),
             ).fetchall()
         return tuple(self._effect_intent_from_row(row) for row in rows)
+
+    def indeterminate_intents(self, run_id: RunId) -> tuple[EffectIntent, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT effect_intents.* FROM effect_intents "
+                "JOIN indeterminate_members USING(intent_id) "
+                "WHERE effect_intents.run_id = ? AND indeterminate_members.state = 'PENDING' "
+                "ORDER BY created_sequence, intent_id",
+                (run_id,),
+            ).fetchall()
+        return tuple(self._effect_intent_from_row(row) for row in rows)
+
+    def unresolved_intent_set(self, run_id: RunId) -> UnresolvedIntentSet | None:
+        with self._read_transaction() as connection:
+            return self._unresolved_intent_set_in_transaction(connection, run_id)
+
+    def _unresolved_intent_set_in_transaction(
+        self, connection: sqlite3.Connection, run_id: RunId
+    ) -> UnresolvedIntentSet | None:
+        rows = connection.execute(
+            "SELECT effect_intents.*, indeterminate_members.recovery_generation "
+            "FROM effect_intents JOIN indeterminate_members USING(intent_id) "
+            "WHERE effect_intents.run_id = ? AND indeterminate_members.state = 'PENDING' "
+            "ORDER BY effect_intents.created_sequence, effect_intents.intent_id",
+            (run_id,),
+        ).fetchall()
+        members = tuple(
+            UnresolvedIntentBinding(
+                intent_id=str(row["intent_id"]),
+                recovery_generation=int(row["recovery_generation"]),
+                intent_digest=self._effect_intent_from_row(row).payload_digest,
+            )
+            for row in rows
+        )
+        return None if not members else UnresolvedIntentSet.from_members(members)
+
+    def apply_indeterminate_resolution(
+        self, request: ApplyResolutionRequest
+    ) -> ResolutionApplication:
+        current = self.unresolved_intent_set(request.run_id)
+        if current is None or current.set_digest != request.selection.unresolved_set_digest:
+            raise StateConflict("STALE_UNRESOLVED_SET")
+        expected_intent_ids = tuple(
+            IntentId(member.intent_id) for member in current.member_bindings
+        )
+        expected_payload_digests = tuple(member.intent_digest for member in current.member_bindings)
+        expected_generations = tuple(
+            member.recovery_generation for member in current.member_bindings
+        )
+        if (
+            request.intent_ids != expected_intent_ids
+            or request.payload_digests != expected_payload_digests
+            or request.recovery_generations != expected_generations
+        ):
+            raise StateConflict("STALE_UNRESOLVED_BINDINGS")
+        if request.observation_set_digest != observation_set_digest(request.observations):
+            raise StateConflict("STALE_OBSERVATION_SET")
+        observations = {observation.intent_id: observation for observation in request.observations}
+        expected_observation_count = (
+            len(current.member_bindings)
+            if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}
+            else 1
+        )
+        if len(request.observations) != expected_observation_count:
+            if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            raise StateConflict("OBSERVATION_SET_CARDINALITY_MISMATCH")
+        if request.selection.resolution in {"FAIL_RUN", "CANCEL_RUN"}:
+            if set(observations) != set(current.intents):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            try:
+                for set_member in current.member_bindings:
+                    set_observation = observations[IntentId(set_member.intent_id)]
+                    intent = self.effect_intent(IntentId(set_member.intent_id))
+                    if (
+                        set_observation.recovery_generation != set_member.recovery_generation
+                        or set_observation.source_payload_digest != intent.payload_digest
+                        or recovery_action_class_for_intent(intent) != set_observation.kind
+                    ):
+                        raise ValueError("OBSERVATION_BINDING_MISMATCH")
+                    abandon_observation(set_observation, abandon_successor_for(set_observation))
+            except (KeyError, ValueError):
+                return ResolutionApplication(
+                    status="DENIED",
+                    resulting_sequence=request.expected_sequence,
+                    remaining_set_digest=current.set_digest,
+                    successor="INDETERMINATE",
+                )
+            set_result: list[ResolutionApplication] = []
+
+            def close_set(connection: sqlite3.Connection) -> None:
+                transaction_current = self._unresolved_intent_set_in_transaction(
+                    connection, request.run_id
+                )
+                if (
+                    transaction_current is None
+                    or transaction_current.set_digest != request.selection.unresolved_set_digest
+                    or tuple(
+                        IntentId(member.intent_id) for member in transaction_current.member_bindings
+                    )
+                    != request.intent_ids
+                    or tuple(member.intent_digest for member in transaction_current.member_bindings)
+                    != request.payload_digests
+                    or tuple(
+                        member.recovery_generation for member in transaction_current.member_bindings
+                    )
+                    != request.recovery_generations
+                ):
+                    raise StateConflict("STALE_UNRESOLVED_BINDINGS")
+                permit, _ = self._require_consumed_runtime_owner(
+                    connection,
+                    request.run_id,
+                    request.owner_id,
+                    request.permit_generation,
+                )
+                if (
+                    permit.allowed_phase != "INDETERMINATE"
+                    or permit.resolution_selection != request.selection
+                ):
+                    raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
+                for member in current.member_bindings:
+                    intent_id = IntentId(member.intent_id)
+                    connection.execute(
+                        "UPDATE indeterminate_members SET state = 'ABANDONED' WHERE intent_id = ?",
+                        (intent_id,),
+                    )
+                next_state = "FAILED" if request.selection.resolution == "FAIL_RUN" else "CANCELLED"
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ?",
+                    (next_state, request.run_id),
+                )
+                set_result.append(
+                    ResolutionApplication(
+                        status="SETTLED",
+                        resulting_sequence=AuditSequence(request.expected_sequence + 1),
+                        remaining_set_digest=None,
+                        successor=next_state,
+                    )
+                )
+
+            self._commit_state_and_event(
+                run_id=request.run_id,
+                expected_sequence=request.expected_sequence,
+                event=AuditEvent.kind(
+                    "INDETERMINATE_SET_RESOLUTION_APPLIED",
+                    subject_digests=(
+                        request.selection.unresolved_set_digest,
+                        request.observation_set_digest,
+                    ),
+                ),
+                mutate=close_set,
+            )
+            return set_result[0]
+        assert request.selection.intent_id is not None
+        selected_member = next(
+            (
+                item
+                for item in current.member_bindings
+                if item.intent_id == request.selection.intent_id
+            ),
+            None,
+        )
+        if (
+            selected_member is None
+            or selected_member.recovery_generation != request.selection.recovery_generation
+        ):
+            raise StateConflict("STALE_UNRESOLVED_MEMBER")
+        observation = observations.get(IntentId(selected_member.intent_id))
+        intent = self.effect_intent(IntentId(selected_member.intent_id))
+        if (
+            observation is None
+            or observation.recovery_generation != selected_member.recovery_generation
+            or observation.source_payload_digest != intent.payload_digest
+            or recovery_action_class_for_intent(intent) != observation.kind
+        ):
+            raise StateConflict("OBSERVATION_BINDING_MISMATCH")
+        if request.selection.resolution == "RECONCILE_OBSERVED":
+            decision = recover_observation(observation)
+            if decision.kind.value != "COMPLETED" or decision.effect_result is None:
+                raise StateConflict("OBSERVED_RECOVERY_COMPLETION_REQUIRED")
+            if decision.effect_result.settled_sequence != AuditSequence(
+                request.expected_sequence + 1
+            ):
+                raise StateConflict("OBSERVED_RECOVERY_SEQUENCE_MISMATCH")
+        elif request.selection.resolution == "RETRY_SAME_INTENT":
+            decision = recover_observation(observation)
+            if decision.kind.value != "RETRY_SAME_INTENT":
+                raise StateConflict("RETRY_RECOVERY_PROOF_REQUIRED")
+        else:
+            decision = abandon_observation(observation, abandon_successor_for(observation))
+        result: list[ResolutionApplication] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            transaction_current = self._unresolved_intent_set_in_transaction(
+                connection, request.run_id
+            )
+            if (
+                transaction_current is None
+                or transaction_current.set_digest != request.selection.unresolved_set_digest
+                or tuple(
+                    IntentId(member.intent_id) for member in transaction_current.member_bindings
+                )
+                != request.intent_ids
+                or tuple(member.intent_digest for member in transaction_current.member_bindings)
+                != request.payload_digests
+                or tuple(
+                    member.recovery_generation for member in transaction_current.member_bindings
+                )
+                != request.recovery_generations
+            ):
+                raise StateConflict("STALE_UNRESOLVED_BINDINGS")
+            permit, _ = self._require_consumed_runtime_owner(
+                connection,
+                request.run_id,
+                request.owner_id,
+                request.permit_generation,
+            )
+            if (
+                permit.allowed_phase != "INDETERMINATE"
+                or permit.resolution_selection != request.selection
+            ):
+                raise StateConflict("INDETERMINATE_PERMIT_BINDING_MISMATCH")
+            if request.selection.resolution == "RECONCILE_OBSERVED":
+                assert decision.effect_result is not None
+                if (
+                    decision.effect_result.intent_id != IntentId(selected_member.intent_id)
+                    or decision.effect_result.run_id != request.run_id
+                    or decision.effect_result.outcome not in {"COMPLETED", "FAILED"}
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_RESULT_BINDING_MISMATCH")
+                if (
+                    connection.execute(
+                        "UPDATE effect_results SET result_class = ?, result_json = ?, "
+                        "snapshot_digest = ?, settled_sequence = ? WHERE intent_id = ?",
+                        (
+                            decision.effect_result.result_class,
+                            effect_result_to_storage_json(decision.effect_result),
+                            decision.effect_result.snapshot_digest,
+                            decision.effect_result.settled_sequence,
+                            selected_member.intent_id,
+                        ),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_RESULT_NOT_CURRENT")
+                if (
+                    connection.execute(
+                        "UPDATE effect_intents SET state = 'SETTLED' "
+                        "WHERE intent_id = ? AND run_id = ? AND state = 'INDETERMINATE'",
+                        (selected_member.intent_id, request.run_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("OBSERVED_RECOVERY_INTENT_NOT_CURRENT")
+                connection.execute(
+                    "UPDATE indeterminate_members SET state = 'SETTLED' WHERE intent_id = ?",
+                    (selected_member.intent_id,),
+                )
+            elif request.selection.resolution == "RETRY_SAME_INTENT":
+                connection.execute(
+                    "DELETE FROM effect_results WHERE intent_id = ?",
+                    (selected_member.intent_id,),
+                )
+                connection.execute(
+                    "UPDATE effect_intents SET state = 'UNSETTLED' WHERE intent_id = ?",
+                    (selected_member.intent_id,),
+                )
+                connection.execute(
+                    "UPDATE indeterminate_members SET recovery_generation = ?, state = 'PENDING' "
+                    "WHERE intent_id = ?",
+                    (selected_member.recovery_generation + 1, selected_member.intent_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE indeterminate_members SET state = 'ABANDONED' WHERE intent_id = ?",
+                    (selected_member.intent_id,),
+                )
+            remaining = self._unresolved_intent_set_in_transaction(connection, request.run_id)
+            successor = (
+                "INDETERMINATE" if remaining is not None else (decision.successor or "PAUSED")
+            )
+            connection.execute(
+                "UPDATE runs SET state = ? WHERE run_id = ?",
+                (
+                    RunState.INDETERMINATE
+                    if remaining is not None
+                    else run_state_for_resolution_successor(successor),
+                    request.run_id,
+                ),
+            )
+            status_by_resolution: dict[str, Literal["SETTLED", "RETRY", "ABANDONED", "DENIED"]] = {
+                "RECONCILE_OBSERVED": "SETTLED",
+                "RETRY_SAME_INTENT": "RETRY",
+                "ABANDON_INTENT": "ABANDONED",
+            }
+            status = status_by_resolution[request.selection.resolution]
+            result.append(
+                ResolutionApplication(
+                    status=status,
+                    resulting_sequence=AuditSequence(request.expected_sequence + 1),
+                    remaining_set_digest=None if remaining is None else remaining.set_digest,
+                    successor=successor,
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=request.run_id,
+            expected_sequence=request.expected_sequence,
+            event=AuditEvent.kind(
+                "INDETERMINATE_RESOLUTION_APPLIED",
+                subject_digests=(
+                    request.selection.unresolved_set_digest,
+                    request.observation_set_digest,
+                ),
+            ),
+            mutate=mutate,
+        )
+        return result[0]
 
     @staticmethod
     def _current_revision_digests_in_transaction(
@@ -8565,6 +8999,11 @@ class SqliteStateStore:
                 if row["consumed_sequence"] is None
                 else AuditSequence(row["consumed_sequence"])
             ),
+            resolution_selection=(
+                None
+                if row["resolution_subject_json"] is None
+                else ResolutionSelection.model_validate_json(str(row["resolution_subject_json"]))
+            ),
         )
 
     def runtime_permit(self, run_id: RunId, generation: int) -> RuntimePermit:
@@ -8637,14 +9076,24 @@ class SqliteStateStore:
             target_authority_digest=target_authority_digest,
             expected_runtime_progress_generation=int(row["runtime_progress_generation"]),
             state="UNCONSUMED",
+            resolution_selection=(
+                ResolutionSelection(
+                    resolution=command.payload.resolution,
+                    unresolved_set_digest=command.payload.unresolved_set_digest,
+                    intent_id=command.payload.intent_id,
+                    recovery_generation=command.payload.recovery_generation,
+                )
+                if isinstance(command.payload, ResolveIndeterminatePayload)
+                else None
+            ),
         )
         try:
             connection.execute(
                 "INSERT INTO runtime_permits(run_id, generation, source_request_id, "
                 "source_envelope_digest, issued_sequence, allowed_phase, "
                 "applicable_revision_digests_json, target_authority_digest, "
-                "expected_runtime_progress_generation, state) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNCONSUMED')",
+                "expected_runtime_progress_generation, state, resolution_subject_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'UNCONSUMED', ?)",
                 (
                     permit.run_id,
                     permit.generation,
@@ -8655,6 +9104,9 @@ class SqliteStateStore:
                     applicable_revision_digests_to_json(permit.applicable_revision_digests),
                     permit.target_authority_digest,
                     permit.expected_runtime_progress_generation,
+                    None
+                    if permit.resolution_selection is None
+                    else permit.resolution_selection.model_dump_json(),
                 ),
             )
         except sqlite3.IntegrityError as error:
@@ -9140,13 +9592,15 @@ class SqliteStateStore:
             reservation_path = self._data_root / "reservations" / reservation_id
             connection.execute(
                 "INSERT INTO runs(run_id, repository_id, repository_instance_digest, state, "
-                "target_ref, pinned_target_oid, current_policy_digest, current_budget_digest, "
-                "current_model_configuration_digest) VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)",
+                "target_ref, pinned_target_oid, run_head_oid, current_policy_digest, "
+                "current_budget_digest, current_model_configuration_digest) "
+                "VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     repository_id,
                     repository_instance_digest,
                     payload.target_ref,
+                    payload.expected_target_oid,
                     payload.expected_target_oid,
                     digests["POLICY"],
                     digests["BUDGET"],
@@ -9622,6 +10076,100 @@ class SqliteStateStore:
                 "RUNTIME_DELIVERY_PENDING",
                 "CONTROL_COMMAND_REJECTED",
             )
+
+    def _apply_runtime_resume(
+        self,
+        command: CommandEnvelope,
+        run_id: RunId,
+        target_authority: TargetAuthorityDigestService,
+    ) -> CommandOutcome:
+        expected_sequence = command.expected_sequence
+        if expected_sequence is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        payload = command.payload
+        if not isinstance(payload, ResumePayload) or payload.task_id is not None:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "RUN_RESUME_NOT_OWNED_BY_RUNTIME_CAP",
+                "CONTROL_COMMAND_REJECTED",
+            )
+        with self._read_transaction() as connection:
+            pause = connection.execute(
+                "SELECT pause_sequence, pause_reason FROM runtime_phase_pauses WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            current = self._current_revision_digests_in_transaction(connection, run_id)
+            target_digest = self._target_authority_digest_in_transaction(connection, run_id)
+        if (
+            command.applicable_revision_digests != current
+            or pause is None
+            or AuditSequence(pause["pause_sequence"]) != payload.pause_sequence
+            or str(pause["pause_reason"]) != payload.pause_reason
+            or target_authority.current_for(run_id) != target_digest
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.STALE,
+                "RUNTIME_PHASE_PAUSE_BINDING_MISMATCH",
+                "CONTROL_COMMAND_REJECTED",
+            )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            stored = connection.execute(
+                "SELECT pause_sequence, pause_reason FROM runtime_phase_pauses WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if (
+                stored is None
+                or AuditSequence(stored["pause_sequence"]) != payload.pause_sequence
+                or str(stored["pause_reason"]) != payload.pause_reason
+                or self._current_revision_digests_in_transaction(connection, run_id) != current
+                or self._target_authority_digest_in_transaction(connection, run_id) != target_digest
+            ):
+                raise StateConflict("RUNTIME_PHASE_PAUSE_BINDING_MISMATCH")
+            is_open, causes, prior_json = self._dispatch_state_for_update(connection, run_id)
+            if DispatchCloseCause.RUNTIME_PHASE_CAP not in causes:
+                raise StateConflict("RUNTIME_PHASE_PAUSE_BINDING_MISMATCH")
+            remaining = causes - {DispatchCloseCause.RUNTIME_PHASE_CAP}
+            next_json = dispatch_close_causes_to_json(remaining)
+            if (
+                connection.execute(
+                    "DELETE FROM runtime_phase_pauses WHERE run_id = ? AND pause_sequence = ?",
+                    (run_id, payload.pause_sequence),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("RUNTIME_PHASE_PAUSE_BINDING_MISMATCH")
+            if (
+                connection.execute(
+                    "UPDATE runs SET new_dispatch_open = ?, dispatch_close_causes_json = ? "
+                    "WHERE run_id = ? AND new_dispatch_open = ? "
+                    "AND dispatch_close_causes_json = ?",
+                    (int(not remaining), next_json, run_id, int(is_open), prior_json),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("DISPATCH_OPEN_COMPARE_AND_SET_FAILED")
+            self._issue_runtime_permit_in_transaction(
+                connection,
+                command,
+                "PAUSED",
+                current,
+                target_digest,
+                AuditSequence(expected_sequence + 1),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "RUNTIME_PHASE_RESUME_AND_PERMIT_ISSUED",
+            mutate,
+        )
 
     def _apply_task_resume(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
         expected_sequence = command.expected_sequence
@@ -10189,6 +10737,65 @@ class SqliteStateStore:
             if grant_outcome is None:
                 raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
             return grant_outcome
+        if isinstance(command.payload, ResolveIndeterminatePayload):
+            current = self.unresolved_intent_set(run_id)
+            if state != RunState.INDETERMINATE or current is None:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.INVALID,
+                    "INDETERMINATE_RESOLUTION_REQUIRES_INDETERMINATE_RUN",
+                    "CONTROL_COMMAND_REJECTED",
+                )
+            member = next(
+                (
+                    item
+                    for item in current.member_bindings
+                    if item.intent_id == command.payload.intent_id
+                ),
+                None,
+            )
+            binding_valid = (
+                command.applicable_revision_digests == self.current_revision_digests(run_id)
+                and target_authority.current_for(run_id) == self.target_authority_digest(run_id)
+                and command.payload.unresolved_set_digest == current.set_digest
+                and (
+                    command.payload.intent_id is None
+                    or (
+                        member is not None
+                        and member.recovery_generation == command.payload.recovery_generation
+                    )
+                )
+            )
+            if not binding_valid:
+                outcome = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=sequence,
+                    failed_invariant="STALE_INDETERMINATE_RESOLUTION_BINDING",
+                )
+                with self._transaction("IMMEDIATE") as connection:
+                    return self._record_unsequenced_control_outcome(connection, command, outcome)
+
+            def issue(connection: sqlite3.Connection) -> None:
+                self._issue_runtime_permit_in_transaction(
+                    connection,
+                    command,
+                    "INDETERMINATE",
+                    self._current_revision_digests_in_transaction(connection, run_id),
+                    self._target_authority_digest_in_transaction(connection, run_id),
+                    AuditSequence(sequence + 1),
+                )
+
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.ACCEPTED,
+                None,
+                "RUNTIME_PERMIT_ISSUED",
+                issue,
+            )
         if isinstance(command.payload, ReconcileCleanupPayload):
             if state not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
                 return self._record_control_outcome(
@@ -10257,6 +10864,8 @@ class SqliteStateStore:
                     "RESUME_REQUIRES_PAUSED",
                     "CONTROL_COMMAND_REJECTED",
                 )
+            if command.payload.task_id is None:
+                return self._apply_runtime_resume(command, run_id, target_authority)
             return self._apply_task_resume(command, run_id)
         return self._record_control_outcome(
             command,
@@ -10341,6 +10950,35 @@ class SqliteStateStore:
             run_id=run_id,
             expected_sequence=expected_sequence,
             event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_SETTLED"),
+            mutate=mutate,
+        )
+
+    def record_terminal_cleanup_conflict(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit, run = self._require_consumed_runtime_owner(
+                connection, run_id, owner_id, permit_generation
+            )
+            if permit.allowed_phase != "TERMINAL_ADMINISTRATION" or run["state"] not in {
+                RunState.COMPLETED,
+                RunState.FAILED,
+                RunState.CANCELLED,
+            }:
+                raise StateConflict("TERMINAL_CLEANUP_PERMIT_BINDING_MISMATCH")
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            if reservation.phase != "REGISTERED_LOCKED":
+                raise StateConflict("TARGET_RESERVATION_CLEANUP_PHASE_INVALID")
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("TARGET_RESERVATION_CLEANUP_CONFLICT"),
             mutate=mutate,
         )
 
@@ -10803,6 +11441,47 @@ class SqliteStateStore:
         )
         return result[0]
 
+    def record_runtime_phase_cap_pause(
+        self,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> RunStop:
+        result: list[RunStop] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._require_consumed_runtime_owner(connection, run_id, owner_id, permit_generation)
+            existing = connection.execute(
+                "SELECT 1 FROM runtime_phase_pauses WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if existing is not None:
+                raise StateConflict("RUNTIME_PHASE_CAP_ALREADY_RECORDED")
+            self._close_new_dispatch(connection, run_id, DispatchCloseCause.RUNTIME_PHASE_CAP)
+            connection.execute("UPDATE runs SET state = 'PAUSED' WHERE run_id = ?", (run_id,))
+            pause_sequence = AuditSequence(expected_sequence + 1)
+            connection.execute(
+                "INSERT INTO runtime_phase_pauses(run_id, pause_sequence, pause_reason) "
+                "VALUES (?, ?, 'RUNTIME_PHASE_STEP_CAP')",
+                (run_id, pause_sequence),
+            )
+            result.append(
+                RunStop(
+                    run_id=run_id,
+                    state=RunState.PAUSED,
+                    reason=RunStopReason.PAUSED,
+                    last_sequence=pause_sequence,
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("RUNTIME_PHASE_CAP_PAUSED"),
+            mutate=mutate,
+        )
+        return result[0]
+
     def record_runtime_fault_and_classify_barrier(
         self,
         run_id: RunId,
@@ -10878,6 +11557,11 @@ class SqliteStateStore:
         return RuntimeFault(row["phase"], row["fault_code"], row["fingerprint"])
 
     def recorded_stop_reason(self, run_id: RunId) -> str | None:
+        pause = self._connection.execute(
+            "SELECT pause_reason FROM runtime_phase_pauses WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if pause is not None:
+            return str(pause[0])
         fault = self._connection.execute(
             "SELECT fault_code FROM runtime_faults WHERE run_id = ? "
             "ORDER BY resulting_sequence DESC LIMIT 1",
@@ -10893,6 +11577,15 @@ class SqliteStateStore:
             "SELECT pending_stop_reason FROM runtime_barriers WHERE run_id = ?", (run_id,)
         ).fetchone()
         return None if barrier is None else barrier[0]
+
+    def runtime_phase_pause(self, run_id: RunId) -> tuple[AuditSequence, str]:
+        row = self._connection.execute(
+            "SELECT pause_sequence, pause_reason FROM runtime_phase_pauses WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise StateConflict("RUNTIME_PHASE_CAP_NOT_FOUND")
+        return AuditSequence(row[0]), str(row[1])
 
     def next_recoverable_model_turn(self, run_id: RunId) -> CommittedModelTurn | None:
         row = self._connection.execute(
@@ -10939,6 +11632,20 @@ class SqliteStateStore:
         expected_sequence = command.expected_sequence
         if expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        state, _sequence = self._run_state_and_sequence(run_id)
+        if state not in {
+            RunState.PLANNING,
+            RunState.ACTIVE,
+            RunState.VERIFYING_RUN,
+            RunState.APPLYING,
+        }:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.INVALID,
+                "RUNTIME_CONTINUE_NOT_ALLOWED_FOR_STATE",
+                "CONTROL_COMMAND_REJECTED",
+            )
         current = self.current_revision_digests(run_id)
         target_digest = self.target_authority_digest(run_id)
 
@@ -11025,6 +11732,627 @@ class SqliteStateStore:
                 None if row["last_intent_id"] is None else IntentId(row["last_intent_id"])
             ),
             guard_binding_json=row["guard_binding_json"],
+        )
+
+    @staticmethod
+    def _task_candidate_from_row(row: sqlite3.Row) -> TaskCandidate:
+        try:
+            candidate = TaskCandidate.model_validate_json(str(row["candidate_json"]))
+        except ValueError as error:
+            raise StateConflict("TASK_CANDIDATE_STORAGE_INVALID") from error
+        if (
+            candidate.candidate_id != CandidateId(str(row["candidate_id"]))
+            or candidate.run_id != RunId(str(row["run_id"]))
+            or candidate.task_id != TaskId(str(row["task_id"]))
+            or candidate.attempt_id != AttemptId(str(row["attempt_id"]))
+            or candidate.expected_run_head_oid != GitOid(str(row["expected_run_head_oid"]))
+            or candidate.prepared_oid != GitOid(str(row["prepared_oid"]))
+            or candidate.state != row["state"]
+        ):
+            raise StateConflict("TASK_CANDIDATE_STORAGE_BINDING_MISMATCH")
+        try:
+            changed_paths = tuple(json.loads(str(row["changed_paths_json"])))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StateConflict("TASK_CANDIDATE_PATHS_INVALID") from error
+        if changed_paths != candidate.changed_paths:
+            raise StateConflict("TASK_CANDIDATE_PATHS_MISMATCH")
+        return candidate
+
+    def _validate_task_candidate_gate(
+        self,
+        connection: sqlite3.Connection,
+        candidate: TaskCandidate,
+    ) -> None:
+        gate = candidate.gate_binding
+        if gate is None:
+            raise StateConflict("TASK_CANDIDATE_GATE_REQUIRED")
+        if gate.attempt_id != candidate.attempt_id:
+            raise StateConflict("TASK_CANDIDATE_ATTEMPT_BINDING_MISMATCH")
+        run = connection.execute(
+            "SELECT run_head_oid FROM runs WHERE run_id = ?",
+            (candidate.run_id,),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT * FROM worker_attempts WHERE attempt_id = ?",
+            (candidate.attempt_id,),
+        ).fetchone()
+        lease_row = connection.execute(
+            "SELECT * FROM workspace_leases WHERE run_id = ? AND lease_id = ?",
+            (candidate.run_id, gate.lease_id),
+        ).fetchone()
+        if run is None or attempt is None or lease_row is None:
+            raise StateConflict("TASK_CANDIDATE_PROVENANCE_NOT_FOUND")
+        if (
+            attempt["run_id"] != str(candidate.run_id)
+            or attempt["task_id"] != str(candidate.task_id)
+            or attempt["state"] != "SUCCEEDED"
+            or attempt["task_contract_digest"] != str(gate.task_contract_digest)
+            or attempt["base_run_head_oid"] != str(candidate.expected_run_head_oid)
+            or attempt["target_safety_digest"] != str(gate.target_safety_digest)
+            or attempt["plan_digest"] != str(gate.applicable_revision_digests.plan_digest)
+            or attempt["policy_digest"] != str(gate.applicable_revision_digests.policy_digest)
+            or attempt["budget_digest"] != str(gate.applicable_revision_digests.budget_digest)
+            or attempt["model_configuration_digest"]
+            != str(gate.applicable_revision_digests.model_configuration_digest)
+            or attempt["scope_digest"] != str(gate.scope_digest)
+            or attempt["snapshot_digest"] != str(gate.check_workspace_digest)
+        ):
+            raise StateConflict("TASK_CANDIDATE_ATTEMPT_BINDING_MISMATCH")
+        try:
+            lease = _workspace_lease_from_row(lease_row)
+        except StateConflict as error:
+            raise StateConflict("TASK_CANDIDATE_LEASE_PROVENANCE_INVALID") from error
+        if (
+            lease.run_id != candidate.run_id
+            or lease.task_id != candidate.task_id
+            or lease.attempt_id != candidate.attempt_id
+            or lease.generation != gate.lease_generation
+            or lease.base_head != str(gate.lease_base_head_oid)
+            or lease.admissible_head != str(gate.lease_admissible_head_oid)
+            or lease.task_contract_digest != gate.task_contract_digest
+            or lease.issued_at != gate.lease_issued_at_utc
+            or lease.expires_at != gate.lease_expires_at_utc
+            or lease.state == "REVOKED"
+        ):
+            raise StateConflict("TASK_CANDIDATE_LEASE_PROVENANCE_INVALID")
+        if self._target_authority_digest_in_transaction(connection, candidate.run_id) != (
+            gate.target_safety_digest
+        ):
+            raise StateConflict("TASK_CANDIDATE_TARGET_BINDING_CHANGED")
+        if self._current_revision_digests_in_transaction(connection, candidate.run_id) != (
+            gate.applicable_revision_digests
+        ):
+            raise StateConflict("TASK_CANDIDATE_REVISION_BINDING_CHANGED")
+        plan_digest = gate.applicable_revision_digests.plan_digest
+        if plan_digest is None:
+            raise StateConflict("TASK_CANDIDATE_REVISIONS_INCOMPLETE")
+        contract = next(
+            (
+                item
+                for item in self._task_contracts_in_transaction(connection, plan_digest)
+                if item.task_id == candidate.task_id
+            ),
+            None,
+        )
+        if contract is None or task_contract_digest(contract) != gate.task_contract_digest:
+            raise StateConflict("TASK_CANDIDATE_CONTRACT_BINDING_MISMATCH")
+        try:
+            changed_paths = tuple(CanonicalPath.parse(path) for path in candidate.changed_paths)
+        except ValueError as error:
+            raise StateConflict("TASK_CANDIDATE_PATHS_INVALID") from error
+        if any(
+            not any(pattern.matches(path) for pattern in contract.write_globs)
+            for path in changed_paths
+        ):
+            raise StateConflict("TASK_CANDIDATE_WRITE_SCOPE_MISMATCH")
+
+    def _validate_task_promotion_gate(
+        self,
+        connection: sqlite3.Connection,
+        candidate: TaskCandidate,
+    ) -> None:
+        self._validate_task_candidate_gate(connection, candidate)
+        gate = candidate.gate_binding
+        assert gate is not None
+        plan_digest = gate.applicable_revision_digests.plan_digest
+        assert plan_digest is not None
+        for predecessor, successor in self._task_edges_in_transaction(
+            connection, "hazard_edges", plan_digest
+        ):
+            if successor != candidate.task_id:
+                continue
+            promoted = connection.execute(
+                "SELECT 1 FROM task_candidates WHERE run_id = ? AND task_id = ? "
+                "AND state = 'PROMOTED' LIMIT 1",
+                (candidate.run_id, predecessor),
+            ).fetchone()
+            if promoted is None:
+                raise StateConflict("TASK_PROMOTION_HAZARD_PREDECESSOR_UNFINISHED")
+        contract = next(
+            (
+                item
+                for item in self._task_contracts_in_transaction(connection, plan_digest)
+                if item.task_id == candidate.task_id
+            ),
+            None,
+        )
+        if contract is None:
+            raise StateConflict("TASK_CANDIDATE_CONTRACT_BINDING_MISMATCH")
+        candidate_inputs = (
+            contract.read_globs
+            + contract.dependency_globs
+            + tuple(pattern for check in contract.checks for pattern in check.input_globs)
+        )
+        for row in connection.execute(
+            "SELECT * FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE'",
+            (candidate.run_id,),
+        ):
+            lease = _workspace_lease_from_row(row)
+            if lease.task_id == candidate.task_id:
+                continue
+            if any(
+                may_overlap(left, right) for left in lease.write_globs for right in candidate_inputs
+            ):
+                raise StateConflict("TASK_PROMOTION_INPUT_SCOPE_BUSY")
+        run = connection.execute(
+            "SELECT run_head_oid FROM runs WHERE run_id = ?",
+            (candidate.run_id,),
+        ).fetchone()
+        if run is None or run["run_head_oid"] != str(candidate.expected_run_head_oid):
+            raise StateConflict("TASK_PROMOTION_HEAD_CHANGED")
+
+    def persist_task_candidate(
+        self,
+        candidate: TaskCandidate,
+        expected_sequence: AuditSequence | None = None,
+    ) -> TaskCandidate:
+        sequence = (
+            self.audit_sequence(candidate.run_id)
+            if expected_sequence is None
+            else expected_sequence
+        )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            run = connection.execute(
+                "SELECT run_head_oid, pinned_target_oid FROM runs WHERE run_id = ?",
+                (candidate.run_id,),
+            ).fetchone()
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if candidate.state != "READY":
+                raise StateConflict("TASK_CANDIDATE_STATE_INVALID")
+            if run["run_head_oid"] is not None and candidate.expected_run_head_oid != GitOid(
+                str(run["run_head_oid"])
+            ):
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            ref = connection.execute(
+                "SELECT current_oid FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (candidate.run_id,),
+            ).fetchone()
+            if (
+                ref is not None
+                and ref["current_oid"] is not None
+                and candidate.expected_run_head_oid != GitOid(str(ref["current_oid"]))
+            ):
+                raise StateConflict("TASK_CANDIDATE_PARENT_MISMATCH")
+            self._validate_task_candidate_gate(connection, candidate)
+            task = connection.execute(
+                "SELECT state FROM tasks WHERE run_id = ? AND task_id = ?",
+                (candidate.run_id, candidate.task_id),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT task_id, state FROM attempts WHERE run_id = ? AND attempt_id = ?",
+                (candidate.run_id, candidate.attempt_id),
+            ).fetchone()
+            if task is None or task["state"] != "ACTIVE":
+                raise StateConflict("TASK_CANDIDATE_TASK_STATE_INVALID")
+            if (
+                attempt is None
+                or attempt["task_id"] != str(candidate.task_id)
+                or attempt["state"] != "RUNNING"
+            ):
+                raise StateConflict("TASK_CANDIDATE_ATTEMPT_STATE_INVALID")
+            plan_digest = candidate.gate_binding.applicable_revision_digests.plan_digest  # type: ignore[union-attr]
+            if (
+                connection.execute(
+                    "UPDATE task_contracts SET state = 'CANDIDATE_READY' "
+                    "WHERE plan_digest = ? AND task_id = ? AND state IN ('READY', 'ACTIVE')",
+                    (plan_digest, candidate.task_id),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("TASK_CANDIDATE_TASK_STATE_INVALID")
+            try:
+                connection.execute(
+                    "INSERT INTO task_candidates("
+                    "candidate_id, run_id, task_id, attempt_id, expected_run_head_oid, "
+                    "prepared_oid, changed_paths_json, candidate_json, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY')",
+                    (
+                        candidate.candidate_id,
+                        candidate.run_id,
+                        candidate.task_id,
+                        candidate.attempt_id,
+                        candidate.expected_run_head_oid,
+                        candidate.prepared_oid,
+                        json.dumps(
+                            list(candidate.changed_paths),
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ),
+                        candidate.model_dump_json(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateConflict("TASK_CANDIDATE_DUPLICATE") from error
+
+        self._commit_state_and_event(
+            run_id=candidate.run_id,
+            expected_sequence=sequence,
+            event=AuditEvent.kind(
+                "TASK_CANDIDATE_READY",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                subject_digests=(candidate.candidate_digest,),
+            ),
+            mutate=mutate,
+        )
+        return candidate
+
+    def task_candidate(self, candidate_id: CandidateId) -> TaskCandidate:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+        return self._task_candidate_from_row(row)
+
+    def task_candidates(self, run_id: RunId) -> tuple[TaskCandidate, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? ORDER BY task_id, candidate_id",
+                (run_id,),
+            ).fetchall()
+        return tuple(self._task_candidate_from_row(row) for row in rows)
+
+    def ready_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? AND state = 'READY' "
+                "ORDER BY task_id, candidate_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else self._task_candidate_from_row(row)
+
+    def pending_task_candidate(self, run_id: RunId) -> TaskCandidate | None:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE run_id = ? "
+                "AND state IN ('READY', 'PROMOTING') "
+                "ORDER BY task_id, candidate_id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return None if row is None else self._task_candidate_from_row(row)
+
+    def task_promotion_intent(self, candidate_id: CandidateId) -> RefCasIntent:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT effect_intents.* FROM task_candidates JOIN effect_intents "
+                "ON effect_intents.intent_id = task_candidates.promotion_intent_id "
+                "WHERE task_candidates.candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        if row is None:
+            raise StateConflict("TASK_PROMOTION_INTENT_NOT_FOUND")
+        try:
+            return RefCasIntent.from_effect_intent(self._effect_intent_from_row(row))
+        except ValueError as error:
+            raise StateConflict("TASK_PROMOTION_INTENT_STORAGE_INVALID") from error
+
+    def begin_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+        ref_effect_binding: RefEffectBinding | None = None,
+        permit_generation: int = 1,
+    ) -> RefCasIntent:
+        candidate = self.task_candidate(candidate_id)
+        if candidate.run_id != run_id:
+            raise StateConflict("TASK_CANDIDATE_RUN_MISMATCH")
+        if candidate.state == "PROMOTING":
+            existing = self.task_promotion_intent(candidate_id)
+            if (
+                existing.applicable_revision_digests != applicable_revision_digests
+                or existing.permit_generation != permit_generation
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            return existing
+        if candidate.state != "READY":
+            raise StateConflict("TASK_CANDIDATE_NOT_READY")
+        if permit_generation < 1:
+            raise StateConflict("PRIVATE_PROMOTION_PERMIT_INVALID")
+        run = self.run_record(run_id)
+        ref = self.run_ref(run_id, "PRIVATE")
+        expected_old_oid = ref.current_oid or run.run_head_oid
+        if expected_old_oid is None or expected_old_oid != candidate.expected_run_head_oid:
+            raise StateConflict("PRIVATE_REF_HEAD_MISMATCH")
+        if ref.state != "PRESENT":
+            raise StateConflict("PRIVATE_REF_NOT_PRESENT")
+        if self.current_revision_digests(run_id) != applicable_revision_digests:
+            raise StateConflict("CURRENT_REVISION_BINDING_MISMATCH")
+        with self._read_transaction() as connection:
+            self._validate_task_promotion_gate(connection, candidate)
+        reservation = self.target_reservation_for_run(run_id)
+        if ref_effect_binding is None:
+            if ref.guard_binding_json is None:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE")
+            try:
+                ref_effect_binding = StartGuardBinding.model_validate_json(
+                    ref.guard_binding_json
+                ).ref_effect_binding
+            except ValueError as error:
+                raise StateConflict("PRIVATE_REF_BINDING_UNAVAILABLE") from error
+        identity = canonical_json(
+            {
+                "candidate_digest": candidate.candidate_digest,
+                "candidate_id": candidate.candidate_id,
+                "expected_old_oid": expected_old_oid,
+                "permit_generation": permit_generation,
+                "prepared_oid": candidate.prepared_oid,
+                "ref_effect_binding": ref_effect_binding.model_dump(mode="json"),
+                "run_id": run_id,
+            }
+        )
+        intent = RefCasIntent(
+            intent_id=IntentId("private-ref-cas-" + sha256(identity.encode("utf-8")).hexdigest()),
+            run_id=run_id,
+            kind="private_ref_cas",
+            candidate_id=candidate.candidate_id,
+            repository_id=run.repository_id,
+            ref_name=private_ref(run_id),
+            expected_old_oid=expected_old_oid,
+            prepared_oid=candidate.prepared_oid,
+            target_safety_digest=self.target_authority_digest(run_id),
+            ref_effect_binding=ref_effect_binding,
+            target_reservation_id=reservation.reservation_id,
+            permit_generation=permit_generation,
+            applicable_revision_digests=applicable_revision_digests,
+            idempotency_key=(
+                f"private-ref-cas:{run_id}:{candidate.candidate_id}:"
+                f"{expected_old_oid}:{candidate.prepared_oid}:{permit_generation}"
+            ),
+        )
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+            stored = self._task_candidate_from_row(row)
+            ref_row = connection.execute(
+                "SELECT state, current_oid FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (run_id,),
+            ).fetchone()
+            run_row = connection.execute(
+                "SELECT run_head_oid FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if (
+                stored != candidate
+                or stored.state != "READY"
+                or ref_row is None
+                or ref_row["state"] != "PRESENT"
+                or ref_row["current_oid"] != str(expected_old_oid)
+                or run_row is None
+                or run_row["run_head_oid"] != str(expected_old_oid)
+            ):
+                raise StateConflict("TASK_PROMOTION_BINDING_CHANGED")
+            self._require_current_revisions(connection, run_id, applicable_revision_digests)
+            self._validate_task_promotion_gate(connection, stored)
+            if effect.intent_id in {
+                str(row["promotion_intent_id"])
+                for row in connection.execute(
+                    "SELECT promotion_intent_id FROM task_candidates "
+                    "WHERE promotion_intent_id IS NOT NULL"
+                )
+            }:
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            self._insert_effect_intent(connection, effect)
+            next_candidate = candidate.model_copy(update={"state": "PROMOTING"})
+            connection.execute(
+                "UPDATE task_candidates SET state = 'PROMOTING', candidate_json = ?, "
+                "promotion_intent_id = ? WHERE candidate_id = ? AND state = 'READY'",
+                (next_candidate.model_dump_json(), effect.intent_id, candidate_id),
+            )
+            connection.execute(
+                "UPDATE run_refs SET last_intent_id = ? WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (effect.intent_id, run_id),
+            )
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_INTENT_RECORDED",
+                task_id=candidate.task_id,
+                attempt_id=candidate.attempt_id,
+                applicable_revision_digests=applicable_revision_digests,
+                subject_digests=(candidate.candidate_digest, effect.payload_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_task_promotion(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        outcome: PrivateRefCasOutcome,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if intent.run_id != run_id or intent.candidate_id != candidate_id:
+            raise StateConflict("TASK_PROMOTION_BINDING_MISMATCH")
+        result = outcome.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT * FROM task_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise StateConflict("TASK_CANDIDATE_NOT_FOUND")
+            candidate = self._task_candidate_from_row(row)
+            if candidate.state != "PROMOTING" or row["promotion_intent_id"] != str(
+                intent.intent_id
+            ):
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            effect_row = connection.execute(
+                "SELECT * FROM effect_intents WHERE intent_id = ?",
+                (intent.intent_id,),
+            ).fetchone()
+            if effect_row is None:
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            stored_effect = self._effect_intent_from_row(effect_row)
+            if (
+                stored_effect != intent.to_effect_intent(stored_effect.recorded_sequence)
+                or intent.applicable_revision_digests != applicable_revision_digests
+                or outcome.intent_id != intent.intent_id
+                or outcome.run_id != run_id
+                or connection.execute(
+                    "SELECT last_intent_id FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (run_id,),
+                ).fetchone()[0]
+                != str(intent.intent_id)
+            ):
+                raise StateConflict("TASK_PROMOTION_INTENT_NOT_CURRENT")
+            self._insert_effect_result(
+                connection,
+                run_id,
+                intent.intent_id,
+                result,
+                applicable_revision_digests,
+            )
+            run_state: RunState | None = None
+            if outcome.result_class == "PRIVATE_REF_PROMOTED":
+                if outcome.observed_oid != intent.prepared_oid:
+                    raise StateConflict("PRIVATE_REF_OUTCOME_OID_MISMATCH")
+                self._validate_task_promotion_gate(connection, candidate)
+                next_candidate = candidate.model_copy(update={"state": "PROMOTED"})
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'PROMOTED', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+                connection.execute(
+                    "UPDATE run_refs SET state = 'PRESENT', current_oid = ? "
+                    "WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                    (intent.prepared_oid, run_id),
+                )
+                connection.execute(
+                    "UPDATE runs SET run_head_oid = ? WHERE run_id = ?",
+                    (intent.prepared_oid, run_id),
+                )
+                plan_digest = candidate.gate_binding.applicable_revision_digests.plan_digest  # type: ignore[union-attr]
+                if (
+                    connection.execute(
+                        "UPDATE task_contracts SET state = 'PROMOTED' "
+                        "WHERE plan_digest = ? AND task_id = ? AND state = 'CANDIDATE_READY'",
+                        (plan_digest, candidate.task_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("TASK_PROMOTION_TASK_STATE_INVALID")
+            elif outcome.result_class == "PRIVATE_REF_ABSENT_FAILED":
+                next_candidate = candidate.model_copy(update={"state": "READY"})
+                run_state = RunState.PAUSED
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'READY', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+            elif outcome.result_class == "PRIVATE_REF_CONFLICT":
+                next_candidate = candidate.model_copy(update={"state": "CONFLICT"})
+                run_state = RunState.PAUSED
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'CONFLICT', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+                if (
+                    connection.execute(
+                        "UPDATE tasks SET state = 'READY', pause_reason = NULL, pause_counter = NULL "
+                        "WHERE run_id = ? AND task_id = ? AND state = 'ACTIVE'",
+                        (run_id, candidate.task_id),
+                    ).rowcount
+                    != 1
+                ):
+                    raise StateConflict("TASK_PROMOTION_TASK_STATE_INVALID")
+                plan_digest = candidate.gate_binding.applicable_revision_digests.plan_digest  # type: ignore[union-attr]
+                connection.execute(
+                    "UPDATE task_contracts SET state = 'READY' "
+                    "WHERE plan_digest = ? AND task_id = ? AND state = 'CANDIDATE_READY'",
+                    (plan_digest, candidate.task_id),
+                )
+            elif outcome.result_class == "PRIVATE_REF_UNOBSERVABLE":
+                next_candidate = candidate.model_copy(update={"state": "INDETERMINATE"})
+                run_state = RunState.INDETERMINATE
+                connection.execute(
+                    "UPDATE task_candidates SET state = 'INDETERMINATE', candidate_json = ? "
+                    "WHERE candidate_id = ? AND state = 'PROMOTING'",
+                    (next_candidate.model_dump_json(), candidate_id),
+                )
+            else:
+                raise StateConflict("TASK_PROMOTION_OUTCOME_INVALID")
+            if run_state is not None:
+                connection.execute(
+                    "UPDATE runs SET state = ? WHERE run_id = ?",
+                    (run_state, run_id),
+                )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TASK_PROMOTION_SETTLED",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=outcome.result_class,
+            ),
+            mutate=mutate,
+        )
+
+    def rollback_known_private_cas_failure(
+        self,
+        *,
+        run_id: RunId,
+        candidate_id: CandidateId,
+        intent: RefCasIntent,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        return self.settle_task_promotion(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            intent=intent,
+            outcome=PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=run_id,
+                result_class="PRIVATE_REF_ABSENT_FAILED",
+                observed_oid=None,
+            ),
+            applicable_revision_digests=applicable_revision_digests,
+            expected_sequence=expected_sequence,
         )
 
     def runtime_start_binding(self, run_id: RunId) -> RuntimeStartBinding:

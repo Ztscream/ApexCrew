@@ -54,9 +54,13 @@ FILE_READ_DATA = 0x0001
 FILE_WRITE_DATA = 0x0002
 FILE_LIST_DIRECTORY = 0x0001
 FILE_READ_ATTRIBUTES = 0x0080
+DELETE = 0x00010000
 FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 OPEN_EXISTING = 3
+FILE_DISPOSITION_INFO = 4
+LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 INVALID_HANDLE_VALUE = c_void_p(-1).value
 FILE_ID_BOTH_DIRECTORY_INFORMATION = 37
 FILE_ID_BOTH_DIRECTORY_HEADER_SIZE = 104
@@ -93,6 +97,16 @@ class IO_STATUS_BLOCK(Structure):
     _fields_ = [("Status", c_long), ("Information", c_size_t)]
 
 
+class OVERLAPPED(Structure):
+    _fields_ = [
+        ("Internal", c_void_p),
+        ("InternalHigh", c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
 class BY_HANDLE_FILE_INFORMATION(Structure):
     _fields_ = [
         ("dwFileAttributes", wintypes.DWORD),
@@ -116,6 +130,7 @@ class WindowsNoFollowBackend:
         self._kernel32: CDLL = WinDLL("kernel32", use_last_error=True)
         self._ntdll: CDLL = WinDLL("ntdll")
         self._last_ntstatus: int | None = None
+        self._locks: dict[int, OVERLAPPED] = {}
         self._declare_native_signatures()
 
     def _declare_native_signatures(self) -> None:
@@ -157,8 +172,36 @@ class WindowsNoFollowBackend:
             c_void_p,
         ]
         self._kernel32.WriteFile.restype = wintypes.BOOL
+        self._kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+        self._kernel32.SetEndOfFile.restype = wintypes.BOOL
+        self._kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+        self._kernel32.FlushFileBuffers.restype = wintypes.BOOL
         self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.LockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            POINTER(OVERLAPPED),
+        ]
+        self._kernel32.LockFileEx.restype = wintypes.BOOL
+        self._kernel32.UnlockFileEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            POINTER(OVERLAPPED),
+        ]
+        self._kernel32.UnlockFileEx.restype = wintypes.BOOL
+        self._kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            c_void_p,
+            wintypes.DWORD,
+        ]
+        self._kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
         self._ntdll.NtCreateFile.argtypes = [
             POINTER(wintypes.HANDLE),
             wintypes.ULONG,
@@ -217,6 +260,8 @@ class WindowsNoFollowBackend:
         kind: NodeKind,
         *,
         create: bool = False,
+        delete_access: bool = False,
+        write_access: bool = False,
     ) -> OpenedNode:
         encoded_name = name.encode("utf-16-le")
         if len(encoded_name) > 65_532:
@@ -245,7 +290,9 @@ class WindowsNoFollowBackend:
         self._last_ntstatus = None
         access = FILE_READ_ATTRIBUTES | SYNCHRONIZE
         access |= FILE_LIST_DIRECTORY if kind == "directory" else FILE_READ_DATA
-        if create and kind == "file":
+        if delete_access:
+            access |= DELETE
+        if (create or write_access) and kind == "file":
             access |= FILE_WRITE_DATA
         share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE
         if getattr(self, "_allow_delete_share", False):
@@ -307,18 +354,25 @@ class WindowsNoFollowBackend:
             raise RepositoryUnsafeError("NO_FOLLOW_VOLUME_OPEN_DENIED")
         return self._identity(int(handle), (), "directory")
 
-    def _read_file_handle_bounded(self, handle: int, maximum: int) -> bytes:
-        buffer = create_string_buffer(maximum + 1)
+    def _read_file_handle_prefix(self, handle: int, maximum: int) -> bytes:
+        if maximum < 0:
+            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+        if maximum == 0:
+            return b""
+        buffer = create_string_buffer(maximum)
         read = wintypes.DWORD()
         if not self._kernel32.SetFilePointerEx(wintypes.HANDLE(handle), 0, None, 0):
             raise RepositoryUnsafeError("HANDLE_SEEK_FAILED")
-        if not self._kernel32.ReadFile(
-            wintypes.HANDLE(handle), buffer, maximum + 1, byref(read), None
-        ):
+        if not self._kernel32.ReadFile(wintypes.HANDLE(handle), buffer, maximum, byref(read), None):
             raise RepositoryUnsafeError("HANDLE_READ_FAILED")
-        if read.value > maximum:
-            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+
         return bytes(buffer.raw[: read.value])
+
+    def _read_file_handle_bounded(self, handle: int, maximum: int) -> bytes:
+        value = self._read_file_handle_prefix(handle, maximum + 1)
+        if len(value) > maximum:
+            raise RepositoryUnsafeError("GIT_METADATA_TOO_LARGE")
+        return value
 
     def _query_directory_handle_names(self, handle: int, maximum: int) -> tuple[str, ...]:
         if maximum < 0:
@@ -419,6 +473,51 @@ class WindowsNoFollowBackend:
     def open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
         return self._open_relative(parent.handle, name, parent.components + (name,), kind)
 
+    def open_child_for_write(self, parent: OpenedNode, name: str) -> OpenedNode:
+        return self._open_relative(
+            parent.handle,
+            name,
+            parent.components + (name,),
+            "file",
+            write_access=True,
+        )
+
+    def open_child_for_lock(self, parent: OpenedNode, name: str) -> OpenedNode:
+        return self.open_child_for_write(parent, name)
+
+    def lock_exclusive(self, node: OpenedNode) -> None:
+        if node.identity.kind != "file":
+            raise RepositoryUnsafeError("LOCK_TARGET_INVALID")
+        overlapped = OVERLAPPED()
+        if not self._kernel32.LockFileEx(
+            wintypes.HANDLE(node.handle),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            byref(overlapped),
+        ):
+            raise RepositoryUnsafeError("LOCK_ACQUIRE_FAILED")
+        self._locks[node.handle] = overlapped
+
+    def unlock_exclusive(self, node: OpenedNode) -> None:
+        overlapped = self._locks.pop(node.handle, None)
+        if overlapped is None:
+            return
+        if not self._kernel32.UnlockFileEx(
+            wintypes.HANDLE(node.handle), 0, 1, 0, byref(overlapped)
+        ):
+            raise RepositoryUnsafeError("LOCK_RELEASE_FAILED")
+
+    def open_child_for_delete(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode:
+        return self._open_relative(
+            parent.handle,
+            name,
+            parent.components + (name,),
+            kind,
+            delete_access=True,
+        )
+
     def try_open_child(self, parent: OpenedNode, name: str, kind: NodeKind) -> OpenedNode | None:
         try:
             return self.open_child(parent, name, kind)
@@ -440,6 +539,9 @@ class WindowsNoFollowBackend:
     def read_bytes(self, node: OpenedNode, maximum: int) -> bytes:
         return self._read_file_handle_bounded(node.handle, maximum)
 
+    def read_prefix(self, node: OpenedNode, maximum: int) -> bytes:
+        return self._read_file_handle_prefix(node.handle, maximum)
+
     def write_bytes(self, node: OpenedNode, value: bytes) -> None:
         buffer = create_string_buffer(value)
         written = wintypes.DWORD()
@@ -449,10 +551,39 @@ class WindowsNoFollowBackend:
             wintypes.HANDLE(node.handle), buffer, len(value), byref(written), None
         ) or written.value != len(value):
             raise RepositoryUnsafeError("NO_FOLLOW_WRITE_DENIED")
+        if not self._kernel32.SetEndOfFile(wintypes.HANDLE(node.handle)):
+            raise RepositoryUnsafeError("NO_FOLLOW_TRUNCATE_DENIED")
+        if not self._kernel32.FlushFileBuffers(wintypes.HANDLE(node.handle)):
+            raise RepositoryUnsafeError("NO_FOLLOW_FLUSH_DENIED")
 
     def list_names(self, node: OpenedNode, maximum: int) -> tuple[str, ...]:
         return self._query_directory_handle_names(node.handle, maximum)
 
+    def _delete_handle(self, expected: OpenedNode) -> None:
+        disposition = c_ubyte(1)
+        if not self._kernel32.SetFileInformationByHandle(
+            wintypes.HANDLE(expected.handle),
+            FILE_DISPOSITION_INFO,
+            byref(disposition),
+            sizeof(disposition),
+        ):
+            raise RepositoryUnsafeError("DELETE_FAILED")
+
+    def unlink_child(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        del parent
+        if expected.identity.kind != "file" or not name or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        self._delete_handle(expected)
+
+    def remove_child_directory(self, parent: OpenedNode, name: str, expected: OpenedNode) -> None:
+        del parent
+        if expected.identity.kind != "directory" or not name or "/" in name or "\\" in name:
+            raise RepositoryUnsafeError("DELETE_TARGET_INVALID")
+        self._delete_handle(expected)
+
     def close(self, node: OpenedNode) -> None:
+        overlapped = self._locks.pop(node.handle, None)
+        if overlapped is not None:
+            self._kernel32.UnlockFileEx(wintypes.HANDLE(node.handle), 0, 1, 0, byref(overlapped))
         if not self._kernel32.CloseHandle(wintypes.HANDLE(node.handle)):
             raise RepositoryUnsafeError("HANDLE_CLOSE_FAILED")

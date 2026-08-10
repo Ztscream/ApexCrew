@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from apexcrew.adapters.repository.no_follow import (
     RepositoryUnsafeError,
     StableHandleTree,
 )
+from apexcrew.adapters.repository.no_follow_posix import PosixNoFollowBackend
 from apexcrew.adapters.repository.no_follow_windows import (
     IO_STATUS_BLOCK,
     OBJECT_ATTRIBUTES,
@@ -245,6 +247,33 @@ def test_stable_handle_tree_retries_failed_probe_close_after_closing_all_probes(
     backend.fail_close_handles.remove(backend.volume_handle)
     tree.assert_name_bindings()
     tree.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX prefix read contract")
+def test_stable_handle_tree_retries_failed_close_of_pending_handle() -> None:
+    backend = recording_posix_backend()
+    tree = StableHandleTree(backend.absolute_root, backend)
+    node = tree.open(".git/config", "file")
+    backend.fail_close_handles.add(node.handle)
+
+    with pytest.raises(RepositoryUnsafeError, match="HANDLE_CLOSE_FAILED"):
+        tree.close()
+
+    assert node.handle not in backend.closed_handles
+    backend.fail_close_handles.remove(node.handle)
+    tree.close()
+    assert node.handle in backend.closed_handles
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX prefix read contract")
+def test_posix_prefix_read_keeps_bounded_prefix_for_oversize_file(tmp_path: Path) -> None:
+    (tmp_path / "payload").write_bytes(b"abcdef")
+    tree = StableHandleTree(tmp_path, PosixNoFollowBackend())
+    try:
+        node = tree.open("payload", "file")
+        assert tree.read_prefix(node, 3) == b"abc"
+    finally:
+        tree.close()
 
 
 def test_control_path_guard_retries_failed_temporary_probe_close() -> None:
@@ -516,6 +545,33 @@ def test_windows_stale_not_directory_status_cannot_enable_file_fallback() -> Non
     assert create.calls == 1
 
 
+class _PrefixReadKernel:
+    def SetFilePointerEx(self, *arguments: object) -> bool:
+        del arguments
+        return True
+
+    def ReadFile(
+        self,
+        handle: object,
+        buffer: object,
+        maximum: int,
+        read: object,
+        overlapped: object,
+    ) -> bool:
+        del handle, overlapped
+        payload = b"abcdef"[:maximum]
+        memmove(buffer, payload, len(payload))
+        cast(read, POINTER(wintypes.DWORD)).contents.value = len(payload)
+        return True
+
+
+def test_windows_prefix_read_keeps_bounded_prefix_for_oversize_file() -> None:
+    backend = WindowsNoFollowBackend.__new__(WindowsNoFollowBackend)
+    backend.__dict__["_kernel32"] = _PrefixReadKernel()
+
+    assert backend._read_file_handle_prefix(1, 3) == b"abc"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows DLL signatures require Win32")
 def test_windows_wrapped_calls_have_explicit_ctypes_signatures() -> None:
     backend = WindowsNoFollowBackend()
@@ -525,7 +581,11 @@ def test_windows_wrapped_calls_have_explicit_ctypes_signatures() -> None:
         (backend._kernel32.GetFileInformationByHandle, wintypes.BOOL),
         (backend._kernel32.SetFilePointerEx, wintypes.BOOL),
         (backend._kernel32.ReadFile, wintypes.BOOL),
+        (backend._kernel32.WriteFile, wintypes.BOOL),
+        (backend._kernel32.SetEndOfFile, wintypes.BOOL),
+        (backend._kernel32.FlushFileBuffers, wintypes.BOOL),
         (backend._kernel32.CloseHandle, wintypes.BOOL),
+        (backend._kernel32.SetFileInformationByHandle, wintypes.BOOL),
         (backend._ntdll.NtCreateFile, c_long),
         (backend._ntdll.NtQueryDirectoryFile, c_long),
     ]

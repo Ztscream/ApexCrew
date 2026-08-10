@@ -277,6 +277,8 @@ def fixture_model_configuration(
         inference_settings=InferenceSettingsDocument(
             max_input_tokens=4_096,
             max_output_tokens=1_024,
+            temperature=0.0,
+            reasoning_effort="medium",
             provider_storage_enabled=False,
         ),
         tool_schema_digest=FIXTURE_TOOL_SCHEMA_DIGEST,

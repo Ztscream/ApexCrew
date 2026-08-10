@@ -11,7 +11,7 @@ from typing import Literal
 import pytest
 
 from apexcrew.adapters.repository.granted_workspace import GrantedWorkspaceAdapter
-from apexcrew.application.runtime import GrantedActionRuntime
+from apexcrew.application.runtime import GrantedActionResolutionObserver, GrantedActionRuntime
 from apexcrew.domain.actions import RiskyAction
 from apexcrew.domain.admission import RepositoryEffectUncertain
 from apexcrew.domain.authority import (
@@ -104,6 +104,11 @@ class RecordingJournal:
         return self.intent if self.intent.bindings.run_id == run_id else None
 
     def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent:
+        if self.intent.intent_id != intent_id:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        return self.intent
+
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent:
         if self.intent.intent_id != intent_id:
             raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
         return self.intent
@@ -209,6 +214,22 @@ def test_exact_post_recovery_settles_without_replaying_the_handler() -> None:
     assert tools.execute_count == 0
     assert journal.dispatch_count == 0
     assert journal.settlement_count == 1
+
+
+def test_resolution_observer_uses_the_current_audit_sequence() -> None:
+    action = RiskyAction(operation="rename", path="src/old.py", destination="src/new.py")
+    intent = granted_intent(action, ActionPreState(source_digest=SHA, destination_absent=True))
+    journal = RecordingJournal(intent)
+    tools = RecordingTools(
+        GrantedActionObservation(
+            state="EXACT_POST", digest=SHA, post_result=ToolResult(code="RENAMED")
+        )
+    )
+    effect = intent.to_effect_intent(AuditSequence(1))
+
+    observation = GrantedActionResolutionObserver(journal, tools).observe(effect, 1)
+
+    assert observation.settled_sequence == AuditSequence(journal.sequence + 1)
 
 
 @pytest.mark.parametrize("state", ("INTENT_RECORDED", "DISPATCHED"))

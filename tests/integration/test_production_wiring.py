@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.composition import build_application_bundle
 from apexcrew.application.configuration import default_revision_documents
 from apexcrew.application.control import BootstrapRepositoryAuthority
 from apexcrew.domain.commands import ApplicableRevisionDigests, CommandEnvelope, CreateRunPayload
 from apexcrew.domain.types import GitOid, RepositoryId
+
+
+class SentinelExecutor:
+    def run(self, argv, snapshot, timeout_seconds):  # type: ignore[no-untyped-def]
+        raise AssertionError("sentinel executor must only be inspected in this test")
 
 
 class FixtureRepositoryAuthority:
@@ -69,3 +76,50 @@ def test_reopened_bundle_preserves_run_bindings(tmp_path: Path) -> None:
         assert after == before
     finally:
         second.close()
+
+
+def test_production_bundle_uses_concrete_resolution_observer_registry(tmp_path: Path) -> None:
+    options = {
+        "repository_authority": FixtureRepositoryAuthority(),
+        "model_configuration": default_revision_documents().model_configuration.model_copy(
+            update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
+        ),
+        "scripted_model": ScriptedMockLLM(()),
+    }
+    bundle = build_application_bundle(tmp_path, **options)
+    try:
+        resolution = bundle.runtime._phase_drivers._resolution  # type: ignore[attr-defined]
+        assert type(resolution).__name__ == "ResolutionRuntime"
+        assert type(resolution._observer).__name__ == "ResolutionObservationRegistry"
+        assert set(resolution._observer._observers) == {  # type: ignore[attr-defined]
+            "granted_risky_action",
+            "model",
+            "model_request",
+            "read",
+            "search",
+            "patch",
+            "check",
+            "private_ref_init",
+            "private_ref_cas",
+            "target_ref_cas",
+            "target_reservation_creation",
+        }
+        assert all(
+            observer is not resolution._observer  # type: ignore[attr-defined]
+            for observer in resolution._observer._observers.values()  # type: ignore[attr-defined]
+        )
+    finally:
+        bundle.close()
+
+
+def test_production_bundle_rejects_test_executor_injection(tmp_path: Path) -> None:
+    sentinel = SentinelExecutor()
+    options = {
+        "repository_authority": FixtureRepositoryAuthority(),
+        "model_configuration": default_revision_documents().model_configuration.model_copy(
+            update={"provider": "scripted_mock", "provider_base_origin": "mock://scripted"}
+        ),
+        "scripted_model": ScriptedMockLLM(()),
+    }
+    with pytest.raises(TypeError):
+        build_application_bundle(tmp_path, **options, executor=sentinel)

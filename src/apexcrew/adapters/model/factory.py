@@ -53,6 +53,8 @@ def _default_response_schema() -> dict[str, object]:
     if not isinstance(worker_branches, list) or not isinstance(planning_branches, list):
         raise ModelFactoryError("MODEL_ACTION_SCHEMA_INVALID")
     return {
+        "type": "object",
+        "properties": {"kind": {"type": "string"}},
         "$defs": definitions,
         "discriminator": {
             "propertyName": "kind",
@@ -65,7 +67,9 @@ def _default_response_schema() -> dict[str, object]:
                 },
             },
         },
-        "oneOf": worker_branches
+        # DeepSeek's structured-output validator accepts a root union through
+        # anyOf/type/$ref, but rejects a root oneOf without a sibling type.
+        "anyOf": worker_branches
         + [
             branch
             for branch in planning_branches
@@ -84,6 +88,7 @@ def build_model_port(
     credential_source: ModelCredentialPort | None = None,
     response_schemas: Mapping[str, Mapping[str, object]] | None = None,
     client_factory: ClientFactory | None = None,
+    allow_live_provider: bool = False,
 ) -> ModelPort:
     """Select one provider from the exact model configuration revision."""
     if model_configuration.provider == "scripted_mock":
@@ -113,6 +118,7 @@ def build_model_port(
             credential_source=credentials,
             response_schemas=schemas,
             client_factory=client_factory,
+            live_provider_authorized=allow_live_provider,
         )
     except ValueError as error:
         raise ModelFactoryError(str(error)) from error

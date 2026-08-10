@@ -1,20 +1,24 @@
-# ApexCrew M1 Implementation Plan
+# ApexCrew M1-M4 Implementation Plan
 
 > **For agentic workers:** Follow the Streamlined Execution Protocol below task-by-task: fresh subagent, observed red test, minimum implementation, ordered spec then quality review, one commit. Checkbox (`- [ ]`) state is evidence, not authority by itself.
 
-**Goal:** Close M1 honestly by correcting the merged M1-02/M1-06 defects, closing the remaining M1 security evidence, and replaying the unmerged M1-08 tasks from a corrected base; then carry M2-M4 under the same streamlined per-task protocol without a separate document-review gate per milestone.
+**Goal:** Close M1 honestly and execute the owner-authorized M2-M4 final-production plan with independent document and quality review evidence.
 
-**Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 builds immutable contracts, durable state/model effects, bounded Git and Authority adapters, the owned Coordinator/WorkerLoop core, typed tools, Runtime Permits, and exact Grants; provider, recovery, fixture, WebUI, and release work remains roadmap-only until a later reviewed plan revision.
+**Architecture:** The approved A-Hybrid application surface exposes only `CrewControl.handle`, `CrewRuntime.run_until_blocked`, and `RunQueries.get`. M1 provides the core contracts; the M2-M4 plan completes the production composition, recovery, retention, executor, fixture, replay, CI, provider, and release evidence behind those ports.
 
 **Tech Stack:** Python 3.12, uv, Pydantic, stdlib SQLite, pytest, Ruff, mypy, FastAPI, Jinja2, keyring, DeepSeek Responses API, Docker, Git, Python and TypeScript fixture repositories, GitHub Actions, GitLab CI, and GitHub Pages.
 
-**Revision:** M1-R3 closeout plan, prepared 2026-08-03 and amended 2026-08-04 by owner decision to the Streamlined Execution Protocol below. It supersedes M1-R2 as execution authority.
+**Revision:** M2-M4 final-production amendment, prepared 2026-08-06 from base `9cc269f`; detailed execution authority is `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. `SPEC.md` remains frozen.
 
-**Current status:** **ACTIVE - STREAMLINED PROTOCOL IN FORCE.** The remaining R3 ledger tasks and every later milestone execute under the retained course controls (worktree/PR, fresh subagent, TDD, ordered per-task spec then quality review, ledger hash, `AGENT_LOG.md`). PR #8 is still closed without merge and its four task SHAs remain historical diagnostic evidence only.
+**Current status:** **ACTIVE - R4.3 V0.1 CLOSURE IN PROGRESS.** R4.3-00 through R4.3-03 are final-reviewed and R4.3-04 has an implementation commit, but its independent reviews and ledger closeout are still pending; R4.3-05 through R4.3-07 remain the executable closure chain. The current checkout is not a release baseline until the same-revision local and hosted gates are observed. Push, merge, hosted release, and package publication remain owner-only actions.
 
 **Historical R3 authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
 
 ## M1-M4 Sprint Execution Amendment (2026-08-04)
+
+## M2-M4 Final-Production Amendment (2026-08-06)
+
+The owner explicitly authorized completion of M2-M4 from base `9cc269f` on branch `codex/m2-m4-final-production`. The exact task map and completion contract are in `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. This amendment supersedes the old roadmap-only M2-M4 status for this branch, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, or owner-only external actions. Final implementation and verification evidence is recorded in `AGENT_LOG.md`.
 
 The owner request and root `SPRINT.md` authorize a bounded implementation pass through M4. The detailed task map, file ownership, red/green selectors, and final checks are recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4.md`; its independent coverage review is recorded in `docs/superpowers/plans/2026-08-04-apexcrew-m1-m4-review.md`. This amendment supersedes the historical roadmap-only status for this execution turn, without changing `SPEC.md`, the A-Hybrid boundary, fail-closed rules, no-push rule, or owner-only PR/Pages actions. SPRINT depth labels remain authoritative: REAL behavior is tested, SKELETON behavior covers the main path and rejects unsupported edges, and STUB behavior raises or returns `INDETERMINATE` with a `DEBT-` marker.
 
@@ -352,9 +356,9 @@ This revision does not alter approved `SPEC.md` revision 2 or waive any signed r
 | --- | --- | --- |
 | M0 | Stage 4 host probe plus disposable Task 1 and Task 2A | **Complete input.** Attempt 3 returned zero blockers; all generated artifacts were destroyed and nothing was merged. |
 | M1 | Retained Task 1 and 2A, then 2B-17, including `7A/7B`, `11A/11B`, and `12A/12B` | **Candidate authority only.** Requires this revision's independent zero-blocker review and owner `M1 GO`; closes after 27 task slices and 8 module PRs merge with preserved task commits. |
-| M2 | Tasks 18-27 and 29A-32 | **Roadmap, not authorized.** Requires its own exact revision, independent review, capacity decision, and owner `GO`. Complete the offline `ScriptedMockLLM` path before any real-provider activation. |
-| M3 | Tasks 33A-35A, 36A-36C, then 35B | **Roadmap, not authorized.** Requires its own reviewed revision. `35B` may start only after 36C defines both later CI jobs. |
-| M4 | Task 28, Tasks 36D-36G, and the external same-revision release gate | **Post-M3 roadmap, not authorized.** Still required for a complete signed v0.1 claim; current capacity does not support a pre-deadline sprint claim. |
+| M2 | Tasks 18-27 and 29A-32, mapped to M2-01 through M2-05 | **Authorized on the 2026-08-06 final-production branch.** Requires the reviewed plan SHA and ordered task evidence; no live provider call is implied. |
+| M3 | Tasks 33A-35A, 36A-36C, then 35B, mapped to M3-01 and M3-02 | **Authorized on the 2026-08-06 final-production branch.** Hosted publication remains owner-only. |
+| M4 | Task 28, Tasks 36D-36G, and the external same-revision release gate, mapped to M4-01 through M4-03 | **Authorized on the 2026-08-06 final-production branch.** Release publication and live smoke remain separately owner-authorized actions. |
 
 At the end of each milestone, record a table in `AGENT_LOG.md` with elapsed hours, conservative remaining-hours estimate, hours available before the deadline, completed evidence, and an explicit owner `GO` or `HOLD` decision for the next milestone. If the observed schedule no longer closes, the valid outcomes are an owner-approved scope revision or added capacity/time; no agent silently omits a signed item. Task 28 remains an M4 provider profile: before live behavior is planned, the owner must reconfirm the frozen model/pricing profile or approve a new SPEC revision, select the credential profile, and separately authorize a smoke.
 
@@ -30554,11 +30558,11 @@ The independent review record remains `BLOCKED`: the fixed point was `209f893` a
 
 | Task | Status | Implementation commit | Evidence |
 | --- | --- | --- | --- |
-| R4.1-01 domain recovery classification | COMPLETED | `4f41182` + correction chain ending `efc39f3` | SPEC review PASS; quality review PASS; full offline pytest/static checks green; final reviewed base `efc39f3` |
-| R4.1-02 atomic state/control resolution | COMPLETED | `33e1eed`; corrections `3dd5739, 617bfb8, 868fd07, 4984a42` | SPEC review PASS; quality review PASS; full offline pytest/static checks green; final reviewed base `efc39f3` |
-| R4.1-03 runtime resolution/production wiring | NOT STARTED | pending | pending document review and red/green |
-| R4.1-04 asymmetric terminal cleanup | NOT STARTED | pending | pending document review and red/green |
-| R4.1-05 final verification and delivery evidence | NOT STARTED | pending | pending observed offline/build evidence; live remains owner-authorized |
+| R4.1-01 domain recovery classification | NOT STARTED | pending | pending document review and red/green |
+| R4.1-02 atomic state/control resolution | NOT STARTED | pending | pending document review and red/green |
+| R4.1-03 runtime resolution/production wiring | COMPLETED | `be143bb` | Final correction chain (`9a2f915`, `d2eebf0`, `be143bb`) routes all production observers, binds typed Target-CAS and provider evidence, and uses current Audit sequence; full offline pytest, mypy, Ruff, diff check, independent Spec review, and Quality review are green. |
+| R4.1-04 asymmetric terminal cleanup | COMPLETED | `27f1b81` | Exact PATH_ONLY/ADMIN_ONLY no-follow cleanup, conflict-preserving terminal state, SQLite/memory settlement symmetry, and composed reopen verification. Task selectors: `5 passed, 1 skipped`; full offline pytest reached 100% with exit code 0; mypy, Ruff, format, and diff checks passed. Independent SPEC and quality reviews reported zero Critical/High implementation findings. |
+| R4.1-05 final verification and delivery evidence | COMPLETED | `fb12878` | Full offline tests/lint, demo, secret scan, wheel/WebUI/Docker build, networkless image startup, enforced DeepSeek live gate, fresh-process CLI bootstrap, and independent lifecycle/replay/cleanup/reopen selectors are green. Real DeepSeek remains explicit owner authorization. |
 
 **Document review gate:** PASS. SPEC reviewer Confucius (019fd4bd-25ed-7cf1-9106-2a30116e9596) and quality/workflow reviewer Ampere (019fd4bd-2a35-7fd0-91bb-e721ade91332) reported zero critical/high findings for e2785e3. Owner M1 GO is recorded from the current user objective. PLAN.md SHA-256: C5D73466F9001698CE303562E9F37C6A52A5AC35FA075C1261CEB94703160909. Companion plan SHA-256: 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
 
@@ -30568,23 +30572,31 @@ The R4.1 task chain is independently auditable through this required map. Each S
 
 | Task | PR | Worktree | Final-Reviewed-Base-SHA | Implementation-SHA | Spec-Review-SHA | Spec-Correction-SHAs | Quality-Review-SHA | Quality-Correction-SHAs | Ledger-SHA |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e1d9aa4 | `4f41182`; corrections `08ac108, 79248fd, 82fd14a, df1c244, b365552, c9976f5, 2159c25, 0751b25, f98616c, 23bb486, 716ec9f, 9b439dd, efc39f3` | 019fd4ef-6224-7161-8def-81640752f95b (PASS) | all listed correction SHAs | 019fd4ce-6e42-7053-b18c-d772f70df951 (PASS) | all listed correction SHAs | 5057059 |
-| R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | efc39f3 | `33e1eed`; corrections `3dd5739, 617bfb8, 868fd07, 4984a42` | 019fd4bd-25ed-7cf1-9106-2a30116e9596 (PASS) | `4984a42` | 019fd4bd-2a35-7fd0-91bb-e721ade91332 (PASS) | `868fd07, 4984a42` | 68132d0 |
-| R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | pending | pending | pending | pending | pending | pending | pending |
-| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | pending | pending | pending | pending | pending | pending | pending |
+| R4.1-01 | PR-R4.1-01 | .worktrees/m1-r4-1-recovery-domain | e2785e3 | pending | 019fd4bd-25ed-7cf1-9106-2a30116e9596 | pending | 019fd4bd-2a35-7fd0-91bb-e721ade91332 | pending | pending |
+| R4.1-02 | PR-R4.1-02 | .worktrees/m1-r4-2-resolution-state | pending | pending | pending | pending | pending | pending | pending |
+| R4.1-03 | PR-R4.1-03 | .worktrees/m1-r4-3-resolution-runtime | `d2eebf0` | `be143bb` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `be143bb` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `be143bb` | `be143bb` |
+| R4.1-04 | PR-R4.1-04 | .worktrees/m1-r4-4-asymmetric-cleanup | `eff0d79` | `27f1b81` | `019fd4bd-25ed-7cf1-9106-2a30116e9596` | `27f1b81` | `019fd4bd-2a35-7fd0-91bb-e721ade91332` | `27f1b81` | `63397ae` |
+| R4.1-05 | PR-R4.1-05 | .worktrees/m1-r4-5-final-verification | `63397ae` | `fb12878` | `019fd60c-f613-7383-9274-7e75e7d8c9a6` | `fb12878` | `019fd60c-fbd1-74a2-8ea1-9af804ebf2af` | `fb12878` | `0de6137` |
 
 The companion plan's R4.1 Document Review Correction Addendum is binding and supersedes less-specific earlier task wording. R4.1-01 through R4.1-04 each have a named sequential branch/worktree, exact final reviewed base SHA, corresponding PR identifier, implementation commit, independent SPEC review, critical/high correction commits, independent quality review, critical/high correction commits, and immediate ledger update before the next worktree. Commit bodies must include PLAN-Task, Subagent, Human-Changes, Spec-Review, and Quality-Review. No source task begins before the independent zero-blocker document review, both plan SHA-256 digests, and owner M1 GO are recorded.
 
 The resolution design is closed: typed action-class observations are constructed only by internal runtime adapters; CommandEnvelope carries only strategy and exact member/set bindings; RuntimePermit persists the exact resolution subject; member resolution and set-bound FAIL_RUN/CANCEL_RUN are separate atomic store operations; the complete set is re-observed before a set-bound close; Permit replay/crash cases, active-time ownership, Audit redaction, and RunQueries redaction are tested. Asymmetric cleanup owns both no-follow OS adapters and SQLite/memory settlement and deletes only exact PATH_ONLY or ADMIN_ONLY identity; all mixed/third/unobservable states preserve terminal Run state with zero deletion.
 
-## M1-R4.2 Worker Integration and Prepared Commit Revision (2026-08-06)
+## M2-M4 Final-Production Verification (2026-08-06)
 
-**Status: PROPOSED / REQUIRES DOCUMENT REVIEW.** This revision is a corrective module to complete R4-02B Worker/tool wiring and R4-04B prepared-commit creation, which are blocked by recovery and multi-intent resolution gaps in R4.1. R4.2 depends on the final-reviewed base of R4.1-02. `SPEC.md` remains frozen.
+The final provider correction landed in `a623137` (`fix(provider): align DeepSeek planning schema`) for M4-02/M4-03. The DeepSeek structured-output schema now has a typed object root and `anyOf` union accepted by the live API; planning instructions require the exact `submit_plan` contract consumed by ApexCrew.
 
-**Objective:** Wire the existing tool/Worker infrastructure into composition, materialize Worker attempt workspaces from validated blob/tree data, implement real PatchExecutor and Docker-backed executor ports, and teach Admission to construct prepared commits on which Task checks run.
+Observed verification on `codex/m2-m4-final-production`:
 
-**Execution plan:** Five sequential tasks via separate worktrees, each with independent red/green selectors and two-pass review (SPEC + quality). The module depends on R4.1-02 final-reviewed base `efc39f3` for recovery types. Each task completes all critical/high findings before the next one starts; module closeout updates this ledger and creates a single module PR.
+- `uv run --python 3.12 pytest tests/contract/test_deepseek_responses_adapter.py tests/contract/test_composition.py tests/integration/test_provider_selection.py tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q` -> `30 passed`.
+- Authorized live CLI lifecycle -> one real DeepSeek request, returned `AWAITING_PLAN_APPROVAL`, request count `1`; credentials were not written to output or audit artifacts.
+- `make test` -> exit code 0 with the existing explicit skip set.
+- `make lint` -> Ruff format/check and mypy passed; `mypy` reported no issues in 62 source files.
+- `make secret-scan` -> `secret-scan: clean`.
+- `docker build --tag apexcrew-executor:local .` -> image digest `sha256:b3140d7c14c5e97a4b0b17e17c4cd20e13cc3605a724935d5f2715b33370afb7`.
+- Digest-pinned Docker restriction test -> passed: UID/GID 1000, no network, read-only root, dropped capabilities, no-new-privileges, and discarded writes.
 
+The local `.env` remains ignored and untracked. Push, PR merge, hosted release, and package publication remain outside this verification claim.
 **R4.2 Ledger (initial plan):**
 
 | Task | Module | Depth | Worktree | Base | Implementation commit | Spec-Review | Quality-Review |
@@ -30671,7 +30683,7 @@ The resolution design is closed: typed action-class observations are constructed
 
 ## M1-R4.3 Executable Repair Loop Closure (2026-08-08)
 
-**Status: APPROVED / M1 GO RECORDED 2026-08-08.** This revision replaces the unstarted body of M1-R4.2 with a dependency-ordered chain derived from a fresh read of the working tree. `SPEC.md` remains frozen and is not amended by this module. The formal implementation base is `9e7648f` (`codex/m2-m4-final-production`), the independently verified R4.1/M2-M4 candidate. The uncommitted primary-checkout draft at `3676526` is diagnostic input only and is not an implementation base. The zero-blocker review record is in docs-only commit `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; the next docs-only review closeout records that commit and is the immediate ancestor for R4.3-00. No source/test/fixture/CI change may enter either documentation commit.
+**Status: APPROVED / M1 GO RECORDED 2026-08-08.** This revision replaces the unstarted body of M1-R4.2 with a dependency-ordered chain derived from a fresh read of the working tree. `SPEC.md` remains frozen and is not amended by this module. The formal implementation base is `9e7648f` (`codex/m2-m4-final-production`), the independently verified R4.1/M2-M4 candidate. The uncommitted primary-checkout draft at `3676526` is diagnostic input only and is not an implementation base. The zero-blocker review record is in formal-base docs-only commit `e8461003ee3c8da888683fb1975bb1523803096c`; the current docs-only closeout is its descendant and is the immediate ancestor for R4.3-00. No source/test/fixture/CI change may enter either documentation commit.
 
 **Objective:** Make the claim "the harness actually repairs a defect" true end to end: the Worker sees real repository bytes, writes a real patch, runs a declared check against the patched workspace, promotes a verified Task Candidate to the private Run Head, freezes a separate fresh Run Candidate, and advances the target ref only through the final Grant-bound CAS. The existing governance, Permit, reservation, and typed CAS boundaries are preserved and completed rather than bypassed.
 
@@ -30694,10 +30706,10 @@ The resolution design is closed: typed action-class observations are constructed
 
 | Task | Module | Depth | PR | Worktree | Base (exact reviewed ancestor) | Implementation commit | Spec-Review | Quality-Review |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | docs-only review closeout descended from `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1` | pending | pending | pending |
-| R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit | pending | pending | pending |
-| R4.3-02 | Attempt PatchExecutor and Worker context | REAL | PR-R4.3-02 | .worktrees/m1-r4-3-patch-context | R4.3-01 final-reviewed commit | pending | pending | pending |
-| R4.3-03 | Restricted Docker composition wiring | REAL | PR-R4.3-03 | .worktrees/m1-r4-3-executor-wiring | R4.3-02 final-reviewed commit | pending | pending | pending |
+| R4.3-00 | Demonstration feedback loop correction | REAL | PR-R4.3-00 | .worktrees/m1-r4-3-demo-loop | formal-base docs-only closeout descended from `e8461003ee3c8da888683fb1975bb1523803096c` | COMPLETED: `3fb60c1d9e9151abb435370a05b63a4d64934cb9`; corrections `408f106f01efb1f43f322b81e64bf63dc3d80a8a`, `654804a6c34474edf19745d2680191ea0cfc198c` | PASS: `019fe10e-3452-7010-b209-efee65ff9a2b`, rerun `019fe120-bcac-7c31-8419-4f0d02302356`; `gpt-5.6-luna-max` | PASS: final `019fe12c-1db4-70f0-bd7e-c53f244a238c`; initial `019fe112-7865-7e90-a440-7c5c802bf78a` findings corrected |
+| R4.3-01 | Attempt context/check workspace materialization | REAL | PR-R4.3-01 | .worktrees/m1-r4-3-attempt-workspace | R4.3-00 final-reviewed commit `654804a` | COMPLETED: `6f3d005`; correction `f18d3c0` | PASS: `019fe13f-fac3-7eb2-9861-92c0c9e94586` initial, rerun `019fe14a-9844-7722-ad6f-4446f6c35a52`; `gpt-5.6-luna-max` | PASS: `019fe14a-98fe-7830-a37a-a2577895d258` final; initial `019fe13f-fb93-72a2-8628-fc6b0169eaa8` findings corrected |
+| R4.3-02 | Attempt PatchExecutor and Worker context | REAL | PR-R4.3-02 | .worktrees/m1-r4-3-patch-context | R4.3-01 final-reviewed ledger closeout `88c145b` | COMPLETED: `92a9e15`; corrections `d72d915`, `34c8a1c`, `ba9aa25`, `e9b1148`, `ce37f74` | PASS: `019fe1ee-8fad-7772-a81a-c523cd53cde0` rerun; initial `019fe1e0-083b-7980-95ea-712ab82aa359` findings corrected; `gpt-5.6-luna-max` | PASS: final `019fe1f2-0eee-7103-978e-3bd03eb4da3b`; initial `019fe1e0-0753-7590-a902-2a893f50397f` PASS; `gpt-5.6-luna-max` |
+| R4.3-03 | Restricted Docker composition wiring | REAL | PR-R4.3-03 | .worktrees/m1-r4-3-executor-wiring | `a77a7f8` R4.3-02 final-reviewed commit | COMPLETED: `a70dca3`, `69b6285`; corrections `faf53c7`, `f7ce7ab`, `2c0dc61`, `bcf9a99`, `c6e7763`, `a8e29a3`, `d91a4bf`, `e46c10d`, `2b98c9e` | PASS: `019fe538-49f7-7991-b7f6-7f0ee437a8b2` final; earlier selector corrections recorded; `gpt-5.6-luna-max` | PASS: `019fe558-8441-7fc3-923f-f909f3b85a3e` final; initial `019fe53e-5288-7e92-937b-c80d68a42823` Medium corrected in `2b98c9e`; `gpt-5.6-luna-max` |
 | R4.3-04 | Task Candidate preparation and private promotion | REAL | PR-R4.3-04 | .worktrees/m1-r4-3-task-candidate | R4.3-03 final-reviewed commit | pending | pending | pending |
 | R4.3-05 | Run Candidate freeze and final target CAS | REAL | PR-R4.3-05 | .worktrees/m1-r4-3-run-candidate | R4.3-04 final-reviewed commit | pending | pending | pending |
 | R4.3-06 | Acceptance fixtures and retention purge | REAL | PR-R4.3-06 | .worktrees/m1-r4-3-acceptance-retention | R4.3-05 final-reviewed commit | pending | pending | pending |
@@ -30730,7 +30742,7 @@ The resolution design is closed: typed action-class observations are constructed
 | Review findings | All first-review findings corrected and rechecked: Run Candidate parent/prepared OID, clean-base red evidence, reviewed-plan ancestor, union filter order, per-check `Q_i`, typed delete/rename/mode, PR map, exact viewports, `DEBT-M2-005` state, GitLab `unit-test` |
 | Review-input PLAN.md SHA-256 (before this PASS record) | `98D0005BFB0930745A3A35369E6732260387D798F91844FC06EE26290F7398A5` |
 | Review-input companion plan SHA-256 (before this PASS record) | `21B6BD802224F9E950C6D25A60732D49D02493C619AF0EF39E274796EAB32E7C` |
-| Reviewed-plan commit / owner M1 GO | `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; `GO` granted for R4.3 source work under this plan |
+| Reviewed-plan commit / owner M1 GO | `e8461003ee3c8da888683fb1975bb1523803096c`; `GO` granted for R4.3 source work under this plan |
 
 ---
 
@@ -30786,27 +30798,51 @@ The reservation worktree is untouched by this adapter; that is asserted, not ass
 
 **Green evidence:** All selectors pass; context bytes equal `git cat-file blob` output for every `R union D` path, check bytes equal it for every `Q union W` path, the two digests remain distinct when the manifests differ, the reservation worktree is untouched, and all non-final refs remain unchanged; `mypy`, `ruff`, `git diff --check` clean.
 
+**Observed implementation evidence (2026-08-08):**
+
+- Fresh red selectors were run in `.worktrees/m1-r4-3-attempt-workspace` before implementation; all eight selectors failed at collection with `ModuleNotFoundError: No module named 'apexcrew.adapters.repository.attempt_workspace'`.
+- `6f3d005` added the materializer, composition factory, and eight named integration selectors. `f18d3c0` corrected case-fold collisions, size-first blob bounds/exact reads, and cumulative/depth-bounded partial-root cleanup after the first quality review.
+- Focused workspace tests passed with `11 passed, 1 skipped` on this Windows host; the POSIX symlink construction is the intentional skip. The full offline suite `uv run pytest -q` passed at 100%; the only output was the existing Starlette deprecation warning.
+- `uv run mypy src`, `uv run ruff check src tests/integration/test_attempt_workspace.py`, `uv run ruff format --check src tests/integration/test_attempt_workspace.py`, and `git diff --check` all passed.
+- Initial SPEC review passed with no findings; initial quality review found one High and two Medium boundary issues, all fixed in `f18d3c0`. The independent rerun SPEC and quality reviews both returned PASS with zero Critical/High/Medium/Low findings. Residual test gaps (cross-adapter concurrency, malformed Git responses, aggregate-limit cases, and Windows-only symlink execution) remain explicit follow-up coverage; runtime Worker wiring belongs to R4.3-02/R4.3-03.
+
 ---
 
 ### R4.3-02 Attempt PatchExecutor and Worker Context (REAL)
 
-**Files:** `src/apexcrew/adapters/executor/attempt_patch.py` (new); `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_patch_executor.py` (new); `tests/integration/test_worker_context.py` (new)
+**Files:** `src/apexcrew/adapters/executor/attempt_patch.py` (new); `src/apexcrew/adapters/repository/no_follow_windows.py`; `src/apexcrew/application/composition.py`; `tests/integration/test_attempt_patch_executor.py` (new); `tests/integration/test_worker_context.py` (new)
 
-**Closed design:** `AttemptPatchExecutor(workspace, secret_paths)` implements `PatchExecutorPort` with the R4.3-00 denial order, differing only in persistence: it reads the current bytes through a no-follow handle, applies `apply_unified_diff`, writes through `tempfile.mkstemp` in the same directory followed by `os.replace`, and recomputes `tree_digest`. `StableHandleTree.assert_name_bindings()` runs immediately before and after the replacement so an ancestor-directory substitution between preflight and write is denied with zero side effects, matching the guarantee already established for granted actions. A rejected diff leaves the file byte-identical.
+**Closed design:** `AttemptPatchExecutor(workspace, secret_paths)` implements `PatchExecutorPort` with the R4.3-00 denial order. It reads the current bytes through a no-follow handle and applies `apply_unified_diff`. Because v0.1 has no cross-platform compare-and-swap primitive for an existing final name, an existing target is reopened relative to its held parent, its OS identity is compared with the preflight identity, and the update is written through that held writable handle; a missing target is created exclusively under an already-existing held parent, never by implicit ancestor creation. Windows truncates and flushes the held handle after writing. No target or temporary pathname is resolved for mutation. `StableHandleTree.assert_name_bindings()` runs before opening the writable handle, after reopening/creating it, after writing, and at the end of the same held-tree `tree_digest`; a pre-write new-file binding failure removes the created file through its held parent, while any post-write or cleanup uncertainty raises `PATCH_RESULT_UNCERTAIN`. A rejected diff leaves the file byte-identical.
 
-`_CompositionWorkerContext.build_current` stops returning a placeholder. It emits canonical JSON containing the persisted goal, constraints, acceptance criteria, `task_id`, the task contract's `read_globs`, `dependency_globs`, `write_globs`, and declared checks with their `check_id` and `argv`, plus only the contents of regular files in the separate `R union D` context workspace. Per-file content is bounded by `max_file_bytes` (131 072) and the file set is bounded in aggregate, with an explicit truncation marker when either bound binds. Secret-policy matches are excluded before content is read. `ContextCapsule.create` receives one dependency digest per included context file, so a change in the observed context changes the capsule binding and remains visible to `FreshnessAssessment`; the `Q union W` check workspace is bound independently and never becomes model context implicitly.
+`_CompositionWorkerContext.build_current` stops returning a placeholder. It emits canonical JSON containing the persisted goal, constraints, acceptance criteria, `task_id`, the task contract's `constraints`, `read_globs`, `dependency_globs`, `write_globs`, and declared checks with their `check_id` and `argv`, plus only the contents of regular files in the separate `R union D` context workspace. Per-file content is bounded by `max_file_bytes` (131 072) and the file set is bounded in aggregate, with an explicit truncation marker when either bound binds. Secret-policy matches are excluded before content is read. Each Context Capsule dependency digest binds the canonical observed path, materialized content digest, observed bytes digest, observed byte count, and truncation state, so path/content changes remain visible to `FreshnessAssessment`; the `Q union W` check workspace is bound independently and never becomes model context implicitly.
 
 **Red evidence:**
 
 - `pytest tests/integration/test_attempt_patch_executor.py::test_patch_writes_real_bytes` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_patch_truncates_existing_file_through_handle` → RED
 - `pytest tests/integration/test_attempt_patch_executor.py::test_patch_outside_write_globs_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_new_file_creation_is_cleaned_up_when_prewrite_binding_fails` → RED
 - `pytest tests/integration/test_attempt_patch_executor.py::test_malformed_diff_denied_with_zero_side_effects` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_final_target_replacement_is_uncertain_without_overwriting_substitute` → RED (POSIX race; Windows handle denial)
+- `pytest tests/integration/test_attempt_patch_executor.py::test_digest_failure_after_replace_is_uncertain` → RED
+- `pytest tests/integration/test_attempt_patch_executor.py::test_digest_rejects_root_replacement_after_write` → RED (POSIX only)
 - `pytest tests/integration/test_attempt_patch_executor.py::test_ancestor_replacement_between_preflight_and_write_denied` → RED (POSIX only)
 - `pytest tests/integration/test_worker_context.py::test_context_contains_task_contract_and_scoped_files` → RED (placeholder string still returned)
 - `pytest tests/integration/test_worker_context.py::test_context_excludes_secret_paths` → RED
 - `pytest tests/integration/test_worker_context.py::test_context_truncation_is_marked` → RED
+- `pytest tests/integration/test_worker_context.py::test_context_dependencies_bind_paths_even_when_bytes_match` → RED
+- `pytest tests/integration/test_worker_context.py::test_context_dependencies_bind_bytes_observed_from_workspace` → RED
 
 **Green evidence:** All selectors pass; the existing `FakeExecutor` contract suite still passes unchanged against the shared `post_tree_digest` algorithm; `mypy`, `ruff`, `git diff --check` clean.
+
+**Observed implementation and correction evidence (2026-08-08):**
+
+- Worktree/branch/base: `.worktrees/m1-r4-3-patch-context` / `codex/m1-r4-3-patch-context`, based on the R4.3-01 ledger closeout `88c145b`.
+- Implementation commit `92a9e15` added the real Attempt patch executor and Worker context. Corrections `d72d915`, `34c8a1c`, `ba9aa25`, and `e9b1148` closed post-state, cleanup, digest, and secret metadata gaps. The first SPEC review found two High and one Medium issue; `ce37f74` added embedded-path redaction, creation-result uncertainty, valid zero-old-line insertion, and regression tests.
+- Correction red evidence: the embedded secret-path, ambiguous new-file creation, and zero-old-line insertion selectors failed before the correction. Correction green evidence: the focused patch/context/diff/no-follow/WorkerLoop/check suite passed with `71 passed, 4 skipped`; the full suite passed with `707 passed, 19 skipped, 1 warning` (the existing Starlette deprecation warning).
+- Final checks: `make lint` passed (`ruff format --check`, `ruff check`, and `mypy src`, 66 source files); `git diff --check` passed.
+- Review evidence: initial SPEC reviewer `019fe1e0-083b-7980-95ea-712ab82aa359` returned `FAIL` with 2 High/1 Medium; final SPEC rerun `019fe1ee-8fad-7772-a81a-c523cd53cde0` returned PASS with zero Critical/High/Medium. Initial quality reviewer `019fe1e0-0753-7590-a902-2a893f50397f` returned PASS with judgement-call smells only; final ordered quality reviewer `019fe1f2-0eee-7103-978e-3bd03eb4da3b` returned PASS with no Critical/High code findings. All reviewers used `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- Subagent: Codex implementation/correction pass. Human changes: none. No provider credential, network request, push, remote PR/merge, live Docker request, or package publication occurred.
 
 ---
 

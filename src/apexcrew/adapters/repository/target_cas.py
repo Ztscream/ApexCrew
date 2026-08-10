@@ -13,6 +13,7 @@ from apexcrew.adapters.repository.git import (
 )
 from apexcrew.domain.admission import RepositoryEffectError, TargetReservationWorktreeGuard
 from apexcrew.domain.effects import TargetReservation
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.types import GitOid
 
 
@@ -20,6 +21,13 @@ from apexcrew.domain.types import GitOid
 class TargetCasResult:
     result_class: Literal["APPLIED", "CONFLICT", "UNOBSERVABLE"]
     observed_oid: GitOid | None
+
+
+@dataclass(frozen=True, slots=True)
+class TargetCasObservation:
+    state: Literal["EXACT_POST", "EXACT_PRE", "THIRD_STATE", "UNAVAILABLE"]
+    observed_oid: GitOid | None
+    registration_digest: Sha256DigestText | None
 
 
 class GitTargetCasAdapter:
@@ -58,6 +66,7 @@ class GitTargetCasAdapter:
             if (
                 observation.admin_entry_name != self._reservation.admin_entry_name
                 or observation.admin_binding_digest != self._reservation.admin_binding_digest
+                or not observation.locked
             ):
                 raise RepositoryEffectError("TARGET_UNSAFE")
             before = self._runner.run(self._repository, GitShowRefVerify(target_ref))
@@ -94,3 +103,36 @@ class GitTargetCasAdapter:
             return TargetCasResult("APPLIED", observed_after)
         except (OSError, RepositoryEffectError, ValueError):
             return TargetCasResult("UNOBSERVABLE", None)
+
+    def observe_resolution(
+        self,
+        *,
+        target_ref: str,
+        expected_old_oid: GitOid,
+        prepared_oid: GitOid,
+    ) -> TargetCasObservation:
+        if (
+            target_ref != self._reservation.target_ref
+            or expected_old_oid != self._reservation.pinned_target_oid
+            or self._reservation.phase != "REGISTERED_LOCKED"
+        ):
+            return TargetCasObservation("UNAVAILABLE", None, None)
+        try:
+            self._guard.require_safe_before_list(self._reservation)
+            admin = self._guard.require_compatible_observation(self._reservation)
+            if admin.admin_binding_digest is None:
+                return TargetCasObservation("UNAVAILABLE", None, None)
+            before = self._runner.run(self._repository, GitShowRefVerify(target_ref))
+            if before.returncode != 0:
+                return TargetCasObservation("UNAVAILABLE", None, admin.admin_binding_digest)
+            observed = GitOid(before.stdout.strip())
+            state: Literal["EXACT_POST", "EXACT_PRE", "THIRD_STATE"]
+            if observed == prepared_oid:
+                state = "EXACT_POST"
+            elif observed == expected_old_oid:
+                state = "EXACT_PRE"
+            else:
+                state = "THIRD_STATE"
+            return TargetCasObservation(state, observed, admin.admin_binding_digest)
+        except (OSError, RepositoryEffectError, ValueError):
+            return TargetCasObservation("UNAVAILABLE", None, None)

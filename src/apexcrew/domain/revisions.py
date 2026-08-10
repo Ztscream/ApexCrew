@@ -155,6 +155,8 @@ class BudgetRevisionDocument(FrozenDocument):
 class InferenceSettingsDocument(FrozenDocument):
     max_input_tokens: int = Field(ge=1, le=32_000)
     max_output_tokens: int = Field(ge=1, le=4_096)
+    temperature: float = Field(ge=0, le=2)
+    reasoning_effort: Literal["low", "medium", "high"]
     provider_storage_enabled: Literal[False]
 
 

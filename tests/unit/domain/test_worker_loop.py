@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
+from apexcrew.domain.actions import ToolActionEnvelope
 from apexcrew.domain.authority import (
+    ActionClass,
+    ActionDeadline,
     AuthorizationDecision,
     AuthorizationRequest,
     ModelReservation,
@@ -21,6 +24,7 @@ from apexcrew.domain.model import (
     ModelDispatchResult,
     ModelRequest,
 )
+from apexcrew.domain.revisions import Sha256DigestText
 from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import AttemptId, AuditSequence, IntentId, RunId, TaskId
 from apexcrew.domain.worker import (
@@ -112,6 +116,7 @@ class StaticAttempts:
 class RecordingAttempts(StaticAttempts):
     recorded_intents: int = 0
     settled_results: int = 0
+    settled_result_code: str | None = None
     feedback: str | None = None
 
     def record_authorized_worker_action(self, **values: object) -> ToolIntent:
@@ -126,6 +131,7 @@ class RecordingAttempts(StaticAttempts):
         result = cast(ToolResult, values["result"])
         assert result.intent_id == intent.intent_id
         self.settled_results += 1
+        self.settled_result_code = result.code
         if result.code == "CHECK_FAILED":
             self.feedback = "CHECK_FAILED: expected 3.00, received 2.99"
         return AuditSequence(2)
@@ -206,6 +212,7 @@ class SequencedCompletions:
 @dataclass
 class AllowAuthority:
     authorization_count: int = 0
+    deadline_count: int = 0
     request: AuthorizationRequest | None = None
 
     def authorize_action(self, request: AuthorizationRequest) -> AuthorizationDecision:
@@ -227,6 +234,24 @@ class AllowAuthority:
             effect_intent_id=None,
             pending_action_id=None,
             resulting_sequence=None,
+        )
+
+    def open_action_deadline(
+        self, run_id: RunId, intent_id: IntentId, expected_sequence: AuditSequence
+    ) -> ActionDeadline:
+        self.deadline_count += 1
+        started = datetime(2026, 8, 2, tzinfo=UTC)
+        return ActionDeadline(
+            run_id=run_id,
+            intent_id=intent_id,
+            budget_digest=SHA,
+            applicable_revision_digests=binding().applicable_revision_digests,
+            action_class=ActionClass.DECLARED_CHECK,
+            started_at=started,
+            expires_at=started + timedelta(seconds=600),
+            recorded_sequence=AuditSequence(expected_sequence + 1),
+            check_id="unit",
+            snapshot_digest=SHA,
         )
 
 
@@ -256,6 +281,29 @@ class RecordingTools:
             intent_id=intent.intent_id,
             bounded_payload={"snapshot_digest": SHA},
         )
+
+
+class UncertainTools:
+    execution_count: int = 0
+
+    def execute(self, intent: ToolIntent) -> ToolResult:
+        self.execution_count += 1
+        return ToolResult(
+            code="INFRASTRUCTURE_UNCERTAINTY",
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            timed_out=True,
+            bounded_payload={"snapshot_digest": SHA, "reason": "PATCH_RESULT_UNCERTAIN"},
+        )
+
+
+class ExplodingTools:
+    execution_count: int = 0
+
+    def execute(self, intent: ToolIntent) -> ToolResult:
+        del intent
+        self.execution_count += 1
+        raise RuntimeError("WORKER_TOOL_EXECUTION_FAILED")
 
 
 class FailingThenPassingTools:
@@ -329,6 +377,43 @@ def test_action_batch_is_rejected_without_tool_execution() -> None:
     assert tools.execution_count == 0
 
 
+def test_workspace_capture_failure_is_recorded_as_malformed_action() -> None:
+    attempts = StaticAttempts()
+    tools = NeverTools()
+    model = OneCompletion(
+        {
+            "kind": "check",
+            "check_id": "task-1:check-1",
+        }
+    )
+
+    def fail_snapshot(_binding: WorkerTurnBinding, _action: ToolActionEnvelope) -> Sha256DigestText:
+        raise RuntimeError("WORKER_CHECK_WORKSPACE_UNAVAILABLE")
+
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(
+            lambda _binding, _action: ActionPreState(),
+            fail_snapshot,
+        ),
+        authority=cast(object, NeverAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "MALFORMED_ACTION"
+    assert decision.resulting_sequence == 1
+    assert attempts.malformed_count == 1
+    assert tools.execution_count == 0
+
+
 def test_model_deadline_is_not_caller_selectable() -> None:
     request = worker_request()
 
@@ -370,6 +455,71 @@ def test_one_typed_completion_executes_and_records_exactly_one_action() -> None:
     assert attempts.recorded_intents == 1
     assert tools.execution_count == 1
     assert attempts.settled_results == 1
+
+
+def test_uncertain_patch_result_settles_before_worker_pauses() -> None:
+    attempts = RecordingAttempts()
+    tools = UncertainTools()
+    model = OneCompletion(
+        {
+            "kind": "patch",
+            "path": "src/a.py",
+            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+        }
+    )
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(lambda _binding, _action: ActionPreState(source_digest=SHA)),
+        authority=cast(object, AllowAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "STOP"
+    assert decision.stop_reason == "INFRASTRUCTURE_UNCERTAINTY"
+    assert decision.resulting_sequence == 2
+    assert tools.execution_count == 1
+    assert attempts.settled_results == 1
+
+
+def test_tool_execution_failure_settles_before_worker_pauses() -> None:
+    attempts = RecordingAttempts()
+    tools = ExplodingTools()
+    model = OneCompletion(
+        {
+            "kind": "patch",
+            "path": "src/a.py",
+            "unified_diff": "@@ -1 +1 @@\n-old\n+new\n",
+        }
+    )
+    worker = WorkerLoopService(
+        attempts=cast(object, attempts),
+        capsules=StaticContext(),
+        requests=StaticRequests(),
+        models=cast(object, model),
+        actions=WorkerActionCodec(lambda _binding, _action: ActionPreState(source_digest=SHA)),
+        authority=cast(object, AllowAuthority()),
+        tools=cast(object, tools),
+        journal=cast(object, StaticJournal()),
+        ids=StaticIds(),
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    decision = worker.run_turn(binding().attempt_id)
+
+    assert decision.code == "STOP"
+    assert decision.stop_reason == "INFRASTRUCTURE_UNCERTAINTY"
+    assert decision.resulting_sequence == 2
+    assert tools.execution_count == 1
+    assert attempts.settled_results == 1
+    assert attempts.settled_result_code == "INFRASTRUCTURE_UNCERTAINTY"
 
 
 def test_failed_check_feedback_reaches_next_model_request() -> None:

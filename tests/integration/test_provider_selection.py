@@ -95,6 +95,7 @@ def test_default_deepseek_selection_parses_one_fake_response() -> None:
     selected = module.build_model_port(
         model_configuration=revisions.model_configuration,
         budget=revisions.budget,
+        allow_live_provider=True,
         credential_source=MemoryCredentialStore({"deepseek": "test-key"}),
         client_factory=lambda **_: client,
     )
@@ -113,6 +114,8 @@ def test_default_deepseek_selection_parses_one_fake_response() -> None:
         max_input_tokens=100,
         max_output_tokens=100,
         reserved_cost_usd=Decimal("0.01"),
+        temperature=0.0,
+        reasoning_effort="medium",
     )
 
     result = selected.complete(request)
@@ -147,6 +150,7 @@ def test_default_deepseek_selection_accepts_a_planning_action() -> None:
     selected = module.build_model_port(
         model_configuration=revisions.model_configuration,
         budget=revisions.budget,
+        allow_live_provider=True,
         credential_source=MemoryCredentialStore({"deepseek": "test-key"}),
         client_factory=lambda **_: Client(),
     )
@@ -165,6 +169,8 @@ def test_default_deepseek_selection_accepts_a_planning_action() -> None:
         max_input_tokens=100,
         max_output_tokens=100,
         reserved_cost_usd=Decimal("0.01"),
+        temperature=0.0,
+        reasoning_effort="medium",
     )
 
     result = selected.complete(request)

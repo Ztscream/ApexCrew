@@ -26,6 +26,72 @@ def _git(root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def test_cli_run_rejects_unauthorized_deepseek_before_permit_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(LIVE_SMOKE_ENV, raising=False)
+    root = tmp_path / "repository"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.name", "ApexCrew gate test")
+    _git(root, "config", "user.email", "apexcrew-gate@example.test")
+    (root / "task.py").write_text("value = 1\n", encoding="utf-8")
+    _git(root, "add", "task.py")
+    _git(root, "commit", "-qm", "gate fixture")
+    target_oid = _git(root, "rev-parse", "refs/heads/main")
+    _git(root, "checkout", "--detach", target_oid)
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["init", "--root", str(root)]).exit_code == 0
+    created = runner.invoke(
+        app,
+        [
+            "run-create",
+            "--root",
+            str(root),
+            "--target-ref",
+            "refs/heads/main",
+            "--goal",
+            "gate test",
+        ],
+    )
+    assert created.exit_code == 0, created.stdout
+    run_id = json.loads(created.stdout)["run_id"]
+
+    for command in ("approve-policy", "approve-budget", "approve-model"):
+        preview = runner.invoke(app, [command, run_id, "--root", str(root), "--preview"])
+        assert preview.exit_code == 0, preview.stdout
+        values = json.loads(preview.stdout)
+        accepted = runner.invoke(
+            app,
+            [
+                command,
+                run_id,
+                "--root",
+                str(root),
+                "--digest",
+                values["revision_digest"],
+                "--confirmation-code",
+                values["confirmation_code"],
+            ],
+        )
+        assert accepted.exit_code == 0, accepted.stdout
+
+    begin = runner.invoke(app, ["begin-planning", run_id, "--root", str(root)])
+    assert begin.exit_code == 0, begin.stdout
+    before = json.loads(runner.invoke(app, ["show", run_id, "--root", str(root)]).stdout)
+
+    delivered = runner.invoke(app, ["run", run_id, "--root", str(root)])
+    after = json.loads(runner.invoke(app, ["show", run_id, "--root", str(root)]).stdout)
+
+    assert delivered.exit_code == 1
+    assert json.loads(delivered.stdout) == {
+        "failed_invariant": "LIVE_PROVIDER_NOT_AUTHORIZED",
+        "status": "RUN_REJECTED",
+    }
+    assert after["sequence"] == before["sequence"]
+
+
 @pytest.mark.skipif(
     os.environ.get(LIVE_SMOKE_ENV) != "1",
     reason=f"set {LIVE_SMOKE_ENV}=1 to authorize one live DeepSeek request",
@@ -112,5 +178,5 @@ def test_live_cli_approval_permit_runtime_lifecycle(tmp_path: Path) -> None:
 
     assert delivered.exit_code == 0, delivered.stdout
     outcome = json.loads(delivered.stdout)
-    assert outcome["status"] == "AWAITING_PLAN_APPROVAL"
+    assert outcome["status"] == "AWAITING_PLAN_APPROVAL", delivered.stdout
     assert calls == 1

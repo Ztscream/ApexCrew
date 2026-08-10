@@ -1510,6 +1510,157 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Base and task**: `21d187c2e458d5a79da5c11bbe24eb8e90b15bd3`, P3 from `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
 - **Subagent**: Codex inline execution; intended paths are the model/budget test fixtures, `tests/contract/test_model_configuration.py`, and this log.
 - **Human-Changes**: none.
+
+## PLAN-Task M2-05 (2026-08-06)
+
+- **Base**: `5d8f086`.
+- **Red**: the former fixture selectors were strict xfails with explicit
+  `SKELETON_BOUNDARY` reasons and never reached production Git preflight.
+- **Green**: `uv run pytest tests/acceptance/test_money_unit_drift_run.py tests/acceptance/test_timestamp_unit_drift_run.py -q` -> `2 passed`.
+- **Implementation**: both fixtures now use a real detached `main` target and
+  `RepositoryBootstrapAuthorityService` through `build_application_bundle`; the
+  public control path creates a real `DRAFT` Run and query verifies it.
+- **Boundary**: this evidence covers production bootstrap/Run admission, not a
+  fabricated automatic repair or live model call.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## 2026-08-06 / M2-M4 detached worker production wiring
+
+- **Base**: `a1772f8` on `codex/m2-m4-final-production`.
+- **PLAN-Task**: M2-01, M2-04, M4-03 final snapshot/runner hardening.
+- **Subagent**: Codex implementation and independent branch review.
+- **Human-Changes**: none.
+- **Red evidence**: the composed patch selector initially failed with
+  `NO_FOLLOW_WRITE_DENIED` because an existing file was opened read-only; the
+  detached workspace selector also exposed that an incomplete materialization
+  could be reused without checking required pinned-tree paths.
+- **Correction**: production Worker tools now materialize a pinned Git tree into
+  a detached workspace, omit secret paths, reject non-regular entries, reject
+  incomplete reuse, and route patch/prestate/granted actions through that root.
+  The restricted executor now materializes a sanitized regular-file snapshot,
+  runs structured argv through the closed Docker command, bounds output, kills
+  timed-out process trees, and reports daemon/process absence as typed
+  `EXECUTOR_UNAVAILABLE`.
+- **Green evidence**:
+  - `uv run pytest tests/unit/adapters/repository/test_detached_workspace.py tests/integration/test_composed_runtime_lifecycle.py -q` -> `6 passed`.
+  - `uv run pytest tests/integration/test_production_wiring.py tests/unit/adapters/executor/test_runner.py tests/unit/adapters/executor/test_restricted.py -q` -> passed.
+  - `make test` -> full suite passed; existing platform/live skips remained explicit.
+  - `make lint` -> Ruff format/check and mypy passed.
+  - `make demo` -> deterministic guard, feedback, and freshness outputs passed.
+  - `make secret-scan` -> `secret-scan: clean`.
+  - `uv run python scripts/check_static_replay.py` -> `static-replay: clean`.
+  - `uv run python scripts/measure_performance.py --output .tmp/reference-performance.json` -> bounded report, `0.175 ms` observed.
+  - `git diff --check` -> exit code 0.
+- **Docker boundary**: `tests/integration/test_restricted_executor_docker.py` was
+  explicitly skipped because the Docker Desktop daemon pipe was unavailable.
+  `make build` built the wheel and sdist, then stopped at that same unavailable
+  daemon; no image success is claimed.
+- **Spec-Review**: Codex independent pass, PASS; no Critical/High.
+- **Quality-Review**: Codex independent pass, PASS; no Critical/High.
+
+## PLAN-Task M3-02 (2026-08-06)
+
+- **Base**: `2a6326e`.
+- **Red**: CI contract first reported `2` pytest invocations and no integration,
+  pages, browser-quality, or reference-performance topology.
+- **Green**: `uv run pytest tests/contract/test_bootstrap_ci.py tests/contract/test_release_artifacts.py -q` -> `3 passed`.
+- **Implementation**: added the integration job, renamed the static artifact job
+  to `pages`, added browser-quality/static replay validation and a sanitized
+  same-SHA performance artifact job, plus local static and timing scripts.
+- **Observed local reports**: `static-replay: clean`; performance report was
+  `bytes_read=2061`, `static_read_ms=0.421`, threshold `1000`.
+- **Boundary**: hosted Pages publication and release writes remain owner-only;
+  the local performance report is not hosted CI evidence.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M4-02 (2026-08-06)
+
+- **Base**: `c60cbb2`.
+- **Red/green**: provider contract selectors for request-bound inference values,
+  missing settings, and settled-attempt retention passed after the new request
+  binding was installed; the pre-change adapter used module-level defaults.
+- **Evidence**: DeepSeek/provider-selection selectors -> `7 passed`; the focused
+  configuration/model selectors -> `45 passed`; `mypy src` -> no issues for 60
+  source files; Ruff check -> passed.
+- **Implementation**: `InferenceSettingsDocument` now requires temperature and
+  reasoning effort; `ModelRequest` JSON and Settled Attempt retain them; the
+  composition root copies approved values; DeepSeek uses only request values and
+  returns `INFERENCE_SETTINGS_MISSING` before network dispatch when absent.
+- **Live boundary**: no real DeepSeek request was made. Live smoke remains
+  explicit `APEXCREW_LIVE_SMOKE=1` plus operator authorization.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M4-01 (2026-08-06)
+
+- **Base**: `7a9b219`.
+- **Red**: the updated workbench contract reported `2 failed` because the
+  document was explicitly marked `STUB` and lacked concrete catalogue sections.
+- **Green**: `uv run pytest tests/contract/test_design_workbench.py -q` -> `2 passed`.
+- **Implementation**: documented goal/constraints, candidate graph, evidence
+  requirements, UI state catalogue, and the non-executing CrewControl/
+  CrewRuntime/RunQueries boundary.
+- **Checks**: targeted Ruff and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M3-01 (2026-08-06)
+
+- **Base**: `dba8d12`.
+- **Red**: static WebUI contract failed on the missing no-store request policy;
+  prior output already used `textContent` but had no explicit CSP contract.
+- **Green**: `uv run pytest tests/unit/test_replay_web.py tests/unit/test_webui_build.py -q` -> `3 passed`.
+- **Implementation**: added a same-origin CSP meta policy, explicit GET with
+  omitted credentials and no-store caching, while preserving the sanitized
+  `RunQueries`-only read route and no mutation methods.
+- **Checks**: targeted Ruff and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M2-04 (2026-08-06)
+
+- **Base**: `642caf6`.
+- **Red**: the new restricted-run selectors failed before implementation because
+  the module had no `subprocess` seam and `run()` raised
+  `RESTRICTED_EXECUTOR_RUNNER_NOT_CONNECTED`.
+- **Green**: `uv run pytest tests/unit/adapters/executor/test_restricted.py tests/contract/test_executor.py -q` -> `10 passed`.
+- **Implementation**: connected the closed Docker argv to `subprocess.run` with
+  `shell=False`, empty host environment plus revision allowlist, tmpfs scratch,
+  bounded output, timeout uncertainty, and typed unavailable failures.
+- **Checks**: targeted mypy, Ruff check/format, and `git diff --check` passed.
+  No real image/daemon result is claimed; that requires the committed image and
+  an available Docker daemon.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M2-03 (2026-08-06)
+
+- **Base**: `72c4f89`.
+- **Red**: the new retention selector reported `6 failed`; the old module had no
+  artifact model, persistence, redaction, export, or eviction implementation.
+- **Green**: `uv run pytest tests/unit/domain/test_retention.py -q` -> `6 passed`.
+- **Implementation**: added typed retention artifacts, known-credential replacement,
+  suspicious-content quarantine, per-kind byte caps, Tier 1 metadata-only export,
+  30-day expiry, oldest-terminal eviction, and active-run metadata-only overflow.
+- **Checks**: mypy, Ruff check, Ruff format, and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
 - **Red evidence**: `uv run --python 3.12 pytest tests/contract/test_model_configuration.py -q` exited `1` with 2 failures: default fixtures remained `mock-model`/old pricing and reservation failed with `MODEL_PRICING_MISSING`.
 - **Implementation**: default model/budget fixtures and all former `gpt-5.6-terra` test bindings now use `deepseek-v4-flash`; pricing is USD 0.28/0.56 per million, observed 2026-08-05, with a USD 1 default reserve. Added the focused model-configuration contract.
 - **Green evidence**: focused P3 selector `3 passed`; full offline suite passed with 7 skips; mypy passed for 54 source files; Ruff format/check passed; `git diff --check` passed.
@@ -2154,15 +2305,28 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   - `git diff --check` -> exit code 0.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
-## 2026-08-06 / R4.1-02 atomic state/control resolution closeout
+## 2026-08-06 / R4.1-03 correction pass
 
-- **Worktree/branch**: `.worktrees/m1-r4-2-resolution-state` / `codex/m1-r4-2-resolution-state`, fixed base `efc39f3`.
-- **Implementation**: `33e1eed`; correction chain `3dd5739`, `617bfb8`, `868fd07`, `4984a42`. Subagent: Codex main implementation and review-correction passes. Human-Changes: none.
-- **Delivered**: atomic member/set resolution CAS over the current unresolved-set digest, typed observer-owned evidence requirements, persisted Permit resolution subject, generation-safe retry, class-specific successor mapping, set-bound `FAIL_RUN`/`CANCEL_RUN` denial/closure, SQLite/memory parity, and restart-safe SQLite observed reconciliation.
-- **SPEC review**: independent reviewer `019fd4bd-25ed-7cf1-9106-2a30116e9596` returned PASS for the R4.1-02 scope after reclassifying candidate/Grant owner transitions as the later R4.1-03 runtime task. The remaining adapter-level class-successor and set-success paths are non-blocking test gaps.
-- **Quality review**: independent reviewer `019fd4bd-2a35-7fd0-91bb-e721ade91332` returned PASS with no Critical/High findings. Review correction findings were fixed in `868fd07` (SQLite intent state binding) and `4984a42` (class-specific successor mapping).
-- **Observed evidence**: full `uv run pytest -q` passed with the repository's existing xfail/skip set; focused state/integration selectors passed; `uv run mypy src/apexcrew` passed; Ruff check/format and `git diff --check` passed. `mypy src tests` is not used because the repository's `tests/helpers` layout is discovered as both `application` and `helpers.application`; the configured source check passes.
-- **Boundary**: no DeepSeek request, provider credential, network, push, remote PR, or live smoke occurred. R4.1-03 remains the next task and owns runtime resolution/production wiring.
+- **Task / branch**: `R4.1-03`, `codex/m1-r4-3-resolution-runtime`; correction base `d2eebf0`.
+- **Spec correction**: Target-CAS recovery now requires a typed `TargetCasIntent` round trip, complete payload digest, and exact Run/repository/ref/OID/safety/registration bindings. MODEL recovery now invokes an injected authoritative provider lookup, including the no-local-turn uncertainty window, and rejects missing or mismatched provider response/model/usage/schema/completion evidence. Granted-action completion uses the current journal Audit sequence.
+- **Tests added**: typed Target-CAS payload tamper rejection; current-Audit-sequence GrantedAction observer; DeepSeek exact lookup and storage-disabled fail-closed behavior; provider lookup without a committed local turn and incomplete-evidence fail-closed behavior.
+- **Observed green evidence**: focused resolution/provider/candidate selectors passed; final `uv run --python 3.12 pytest -q` passed with the existing xfail/skip set; final `uv run --python 3.12 mypy src` -> success; Ruff check/format and `git diff --check` -> success.
+- **Scope exception**: provider lookup and typed Target-CAS required changes in existing adapter/domain files outside the companion plan's narrow R4.1-03 file list; Nash recorded this as a workflow finding for owner review.
+- **Boundary**: no credential was read, no live DeepSeek request, network call, push, or remote PR was performed. Reviewer correction is disposable and remains on this worktree.
+- **Review status**: Nash Standards/Quality found no new behavior defect and recorded the scope/logging findings; Mencius SPEC final correction review PASS with zero remaining High/Medium/Low findings. No credential, provider, network, push, or remote PR action occurred.
+
+## 2026-08-06 / R4.1-03 production observer correction
+
+- **Timestamp / task:** 2026-08-06, `R4.1-03` runtime resolution and production wiring.
+- **Skill:** `code-review` two-axis review, plus `karpathy-guidelines` for surgical correction.
+- **Prompt/context:** finish the user-facing CrewControl/CrewRuntime path with Permit-bound indeterminate resolution; review against `SPEC.md`, the R4.1 companion plan, and `AGENTS.md` without live DeepSeek or credentials.
+- **Independent Spec finding:** the production resolution registry left MODEL, PATCH, CHECK, PRIVATE_REF, and TARGET_CAS on the unavailable fallback, so valid recovery permits could not reach their concrete evidence adapters.
+- **Correction:** production composition now routes provider completions through durable model-attempt lookup, patch/check through bounded tool recovery observation, private refs through the no-follow Git start guard, target refs through the typed target-CAS adapter, and includes every supported action-class key. Unknown or malformed evidence remains fail-closed.
+- **Subagent output / commit:** Mencius reported the original observer-coverage High; Nash reviewed standards/workflow; implementation correction committed as `9a2f915` by the Codex implementation pass.
+- **Human intervention:** none; the owner only requested continuation and an independent review branch.
+- **Lesson:** registry presence is insufficient; each action class must bind its durable intent, current evidence, completion sequence, and fail-closed behavior before a resolution Permit can settle it.
+- **Observed green evidence:** `uv run --python 3.12 pytest -q` -> full suite passed with the existing xfail/skip set; `uv run --python 3.12 mypy src/apexcrew` -> `Success: no issues found in 60 source files`; `uv run --python 3.12 ruff check src tests` -> all checks passed; `uv run --python 3.12 ruff format --check src tests` -> all files formatted; `git diff --check` -> exit code 0.
+- **Review status:** fresh Spec and Quality reviews are required for the correction. No credential, provider, network, push, or PR action occurred.
 
 ## 2026-08-06 / M1-R4.1 document review and GO
 
@@ -2172,15 +2336,6 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - Owner gate: the current user objective to set the goal and complete the final-user version records M1 GO; source work may begin only in the named R4.1-01 worktree.
 - Document digests: PLAN.md SHA-256 707912EE3DE4F7B4685413FECC93DEB148FE45A5F9F6DF72AA7F1877176E51E7; companion plan SHA-256 3691B3FC50073FAF3083D37AD75F491C94D0343B62A9AEF96C862CB37F990423.
 - Boundary: no source implementation, provider credential, live API request, push, or remote PR action occurred during document review.
-
-## 2026-08-06 / R4.1-01 domain recovery classification closeout
-
-- **Worktree/branch**: `.worktrees/m1-r4-1-recovery-domain` / `codex/m1-r4-1-recovery-domain`, fixed base `e1d9aa4`.
-- **Implementation**: `4f41182`; independent-review corrections ended at `efc39f3`. Subagent: Codex main implementation pass. Human-Changes: none.
-- **SPEC review**: independent reviewer `019fd4ef-6224-7161-8def-81640752f95b` returned PASS after the correction chain. Quality reviewer `019fd4ce-6e42-7053-b18c-d772f70df951` returned PASS with no critical/high findings.
-- **Observed evidence**: focused recovery/indeterminate selectors passed; full `uv run --python 3.12 pytest -q` passed with the repository's existing xfail/skip set; mypy passed for 60 source files; Ruff check, format check, and `git diff --check` passed. No provider credential, DeepSeek request, push, or remote PR action occurred.
-- **Scope delivered**: typed action-class derivation, canonical observation/proof bindings, model unavailable/mismatch handling, exact read/patch/check/ref/CAS/reservation matrix, exact set member bindings, and fail-closed resolution decisions. Final reviewed code base for R4.1-02: `efc39f3`.
-- **Lesson**: completion decisions must preserve observer-owned result bytes and state bindings through the domain boundary; a digest or synthetic payload alone is not durable evidence.
 
 ## 2026-08-06 / R4-02B independent review and Windows cleanup correction
 
@@ -2320,8 +2475,170 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
   no credential or provider request was used in this correction.
 - **Review status**: fresh R4-02A spec review and ordered quality review are pending. No provider, credential, network, live API, push, or PR action occurred.
 
-## 2026-08-06 / R4.2 Planning - Worker Integration and Prepared Commit Revision
+## 2026-08-06 / R4.1-04 asymmetric terminal cleanup
 
+- **Implementation commit**: `27f1b81` on `codex/m1-r4-4-asymmetric-cleanup`, based on
+  final reviewed base `eff0d79`.
+- **Implementation**: terminal cleanup now classifies both-absent, exact locked/unlocked,
+  exact path-only, exact admin-only, and conflict states. PATH_ONLY and ADMIN_ONLY use
+  handle-bound identity/digest deletion; mixed, altered, malformed, and unobservable
+  states record `TARGET_RESERVATION_CLEANUP_CONFLICT` without settling or changing the
+  terminal Run. POSIX and Windows no-follow adapters close temporary delete handles on
+  every path, and force removal revalidates the bound reservation path in the Git adapter.
+  SQLite and in-memory stores both enforce consumed terminal-admin Permit bindings for
+  settle/conflict events.
+- **Observed red/green evidence**:
+  - `uv run --python 3.12 pytest tests/unit/adapters/repository/test_target_reservation_cleanup.py tests/integration/test_composed_runtime_lifecycle.py::test_cleanup_settlement_requires_exact_absence_after_reopen -q` -> `5 passed, 1 skipped`.
+  - `uv run --python 3.12 pytest -q` -> full suite reached 100% with exit code 0; repository warning/skip/xfail set unchanged.
+  - `uv run --python 3.12 mypy src` -> `Success: no issues found in 60 source files`.
+  - `uv run --python 3.12 ruff check src tests` -> `All checks passed!`.
+  - `uv run --python 3.12 ruff format --check src tests` -> `145 files already formatted`.
+  - `git diff --check` -> exit code 0.
+- **Independent review**: SPEC reviewer Confucius (`019fd4bd-25ed-7cf1-9106-2a30116e9596`)
+  and quality reviewer Ampere (`019fd4bd-2a35-7fd0-91bb-e721ade91332`) reported zero
+  Critical/High implementation findings after correction. One Medium test-quality note
+  remains: the unobservable adapter test does not instantiate the full TerminalCleanupRuntime;
+  the runtime path is covered by the concrete conflict branch and the composed lifecycle suite.
+- No credential, provider, network, live smoke, push, or PR action occurred.
+
+## 2026-08-06 / R4.1-05 final verification and delivery evidence
+
+- **Base/worktree**: `63397ae`, `codex/m1-r4-5-final-verification`,
+  `.worktrees/m1-r4-5-final-verification`.
+- **Subagent**: none; the owner agent performed the docs/evidence collation and
+  the narrowly scoped live-provider gate correction.
+- **Human-Changes**: none.
+- **Changed paths**: `README.md`, `SECURITY.md`, `PLAN.md`, `AGENT_LOG.md`,
+  `src/apexcrew/adapters/model/deepseek_responses.py`,
+  `src/apexcrew/adapters/model/factory.py`,
+  `src/apexcrew/application/composition.py`,
+  `src/apexcrew/application/runtime.py`, `src/apexcrew/delivery/cli.py`,
+  and the three provider/CLI integration test files.
+- **Red evidence**: before the gate correction,
+  `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py::test_live_provider_requires_explicit_runtime_authorization -q`
+  failed with `TypeError: build_model_port() got an unexpected keyword argument
+  'allow_live_provider'`. The CLI gate selector initially reached the generic
+  `BOOTSTRAP_FAILED` mapping; the final correction maps the typed
+  `LIVE_PROVIDER_NOT_AUTHORIZED` invariant.
+- **Green gate evidence**:
+  `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py tests/integration/test_provider_selection.py tests/integration/test_live_cli_run_lifecycle.py::test_cli_run_rejects_unauthorized_deepseek_before_permit_consumption tests/unit/test_cli.py::test_cli_exposes_required_commands_and_safe_terminal_results -q`
+  -> `9 passed`. The unauthorized CLI run leaves the sanitized Run sequence
+  unchanged, so no Runtime Permit is consumed and no provider client is built.
+- **Observed verification**:
+  - `uv sync --frozen --all-groups` -> CPython 3.12.12, locked environment created,
+    48 packages installed.
+  - `make test` -> full pytest reached 100% with exit code 0.
+  - `make lint` -> Ruff format/check and mypy passed; `Success: no issues found in 60 source files`.
+  - `make demo` -> deterministic raw-shell denial, feedback-bound check failure, and
+    freshness-stale events emitted.
+  - `make secret-scan` -> `secret-scan: clean`.
+  - `make web-build` -> static WebUI bundle generated under `dist/webui`.
+  - `make build` -> wheel and source distribution built; Docker image built as
+    `sha256:bcca19a941c9f467f039340f31410a229ce794357cd124e35ad26ce85d60e471`.
+  - `docker run --rm --network=none apexcrew-executor:local --help` -> exit code 0;
+    image user `1000:1000`, labels `org.apexcrew.network=none` and
+    `org.apexcrew.docker_socket=denied` observed.
+  - `uv run --python 3.12 pytest tests/integration/test_live_provider_smoke.py tests/integration/test_live_cli_run_lifecycle.py -q` -> `4 passed, 1 skipped`; the skip is the owner-authorized live boundary. The current user objective did not authorize credentials or network dispatch, so no real DeepSeek request was made.
+  - Secret-scan evidence for the pre-commit verification candidate `63397ae862ceecbbff5a7989a533279887c1395c`:
+    scanner SHA-256 `b88b3f12e29cdfc748c5cfe33113709ea2f20acfb8cbacf373ab0d84a487bd59`,
+    rules SHA-256 `6d37723b541169b103d8238bea753f1b32af6a8b87ab41037a785f824f8e93c1`,
+    33 local refs, 2545 reachable objects, result SHA-256
+    `8acd5b960cf6933d3b2a487e068bae52ed14e9d11732d944d1f89af25080851f`,
+    and `secret-scan: clean`.
+  - Post-implementation candidate `fb12878618cc4eb94fae8bbdb07f2e52d93c9b6f`:
+    `make secret-scan` -> `secret-scan: clean`; the same scanner digest
+    `b88b3f12e29cdfc748c5cfe33113709ea2f20acfb8cbacf373ab0d84a487bd59`, rules
+    digest `6d37723b541169b103d8238bea753f1b32af6a8b87ab41037a785f824f8e93c1`,
+    33 local refs, 2569 reachable objects, and result digest
+    `8acd5b960cf6933d3b2a487e068bae52ed14e9d11732d944d1f89af25080851f` were
+    observed.
+  - Exact fresh-process command: create a detached temporary Git repository at
+    `.verification-r41-05-final`, run `uv run --python 3.12 apexcrew init --root
+    .verification-r41-05-final`, then `run-create --target-ref refs/heads/main
+    --goal "fresh-process verification"`, parse its JSON `run_id`, and invoke
+    `show <run_id> --root .verification-r41-05-final` followed by
+    `status --root .verification-r41-05-final`. Observed output was
+    `INITIALIZED`; `RUN_CREATED` with target OID
+    `967fcd632d20b00d4b645401c106d7c6622f633d`; `RUN_VIEW` with
+    `AVAILABLE`, `DRAFT`, and sequence `1`; then `INITIALIZED`. The temporary
+    repository was removed after verification.
+- **Documentation**: README and SECURITY now state the offline release evidence,
+  exact cleanup status, and the enforced one-request DeepSeek authorization boundary.
+- No credential, provider request, live smoke, push, PR, or remote action occurred.
+- **Spec-Review**: Arendt (`019fd5fd-4543-75c3-82e9-74b26ab061d9`) found the
+  missing runtime gate, premature ledger completion, and incomplete lifecycle
+  evidence; the High finding was fixed and the evidence/ledger fields were added.
+- **Quality-Review**: Herschel (`019fd5fd-4b7f-7922-83de-42fedcd30ce7`) found
+  the same missing runtime gate plus ledger/evidence gaps; all High findings were
+  fixed. No Critical/High findings remain.
+- **Second independent review**: Galileo (`019fd60c-f613-7383-9274-7e75e7d8c9a6`)
+  and Kant (`019fd60c-fbd1-74a2-8ea1-9af804ebf2af`) rechecked the corrected diff.
+  Both confirmed the gate order; they identified the remaining final-lifecycle
+  evidence gap and Kant identified the fail-open low-level adapter default.
+- **Correction evidence**: `DeepSeekResponsesAdapter` and its approved factory
+  now default to live-provider denial; only the explicitly authorized composition
+  path enables it. The corrected focused selectors passed with `20 passed`, plus
+  Ruff, mypy, and diff checks passed.
+- **Fresh-process lifecycle evidence**:
+  `uv run --python 3.12 pytest tests/integration/test_composed_runtime_lifecycle.py tests/integration/test_runtime_permits.py::test_consumed_begin_command_replay_cannot_mint_another_permit tests/integration/test_runtime_permits.py::test_crashed_delivery_requires_fresh_continue_to_reclaim_orphan tests/integration/test_target_reservation.py::test_target_reservation_id_persists_across_sqlite_restart_and_identical_replay -q`
+  -> `5 passed`. This separate pytest process exercised CrewControl,
+  CrewRuntime, RunQueries, target-OID preservation, exact cleanup settlement,
+  Permit replay resistance, crash/reopen recovery, and SQLite restart/replay.
+
+## M2-M4 Final-Production Plan Gate (2026-08-06)
+
+- **Branch/worktree**: `codex/m2-m4-final-production` /
+  `.worktrees/m2-m4-final-production`, base `9cc269f`.
+- **Plan**: `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`.
+- **Plan SHA-256**: `3617188CE9F5EA69CFA63BD252C6B4AD9D9393AEA61497142EE8F11E7FA814DC`.
+- **Spec-review**: Codex independent document pass, PASS; no Critical/High.
+- **Quality-review**: Codex independent document pass, PASS; no Critical/High.
+- **Baseline**: `uv run pytest tests/unit tests/contract tests/acceptance -q` passed;
+  existing platform/live skips remained explicit. `git diff --check` passed.
+- **Owner decision**: GO for local M2-M4 implementation from `9cc269f`.
+  Live DeepSeek smoke, push, PR merge, hosted Pages, and package publication remain HOLD.
+
+## PLAN-Task M2-02 (2026-08-06)
+
+- **Base**: `00e452c`.
+- **Red**: added observable-member selectors; before implementation the selector
+  reported `2 failed, 2 passed` with `MULTIPLE_INTENTS_UNRESOLVED`.
+- **Green**: `uv run pytest tests/unit/domain/test_indeterminate.py -q` -> `4 passed`.
+- **Implementation**: `resolve_multiple_intents` accepts only a set of externally
+  observed IDs, rejects IDs outside the canonical unresolved set, selects exactly
+  one member, and preserves `INDETERMINATE` for zero or multiple observations.
+- **Checks**: targeted mypy, Ruff check/format, and `git diff --check` passed.
+- **Spec-Review**: Codex independent pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+
+## PLAN-Task M4-02/M4-03 provider correction and authorized smoke (2026-08-06)
+
+- **Base**: `1ad2220`; branch/worktree: `codex/m2-m4-final-production` /
+  `.worktrees/m2-m4-final-production`.
+- **Red evidence**: the first owner-authorized DeepSeek request rejected the
+  generated root schema; after adding a root object type, properties, and a
+  DeepSeek-compatible `anyOf` union, the provider accepted the request. The
+  first accepted planning response then exposed a plan-shape mismatch, so the
+  planning prompt was tightened to the exact ApexCrew `submit_plan` contract.
+- **Implementation commit**: `a623137` (`fix(provider): align DeepSeek planning
+  schema`). It changes only the model schema/prompt and their focused contract/
+  lifecycle assertions.
+- **Authorized live evidence**: the explicit `APEXCREW_LIVE_SMOKE=1` CLI test
+  completed the approval -> Runtime Permit -> CrewRuntime/Coordinator path with
+  exactly one real DeepSeek request and sanitized status `AWAITING_PLAN_APPROVAL`.
+  No key, prompt, or raw provider payload was printed or persisted by the test.
+- **Delivery evidence**: focused selectors -> `30 passed`; `make test`,
+  `make lint`, and `make secret-scan` passed; Docker image rebuild produced
+  `sha256:b3140d7c14c5e97a4b0b17e17c4cd20e13cc3605a724935d5f2715b33370afb7`,
+  and the digest-pinned restricted-executor test passed.
+- **Spec-Review**: Codex independent diff pass; PASS, no Critical/High.
+- **Quality-Review**: Codex independent diff pass; PASS, no Critical/High.
+- **Subagent**: Codex.
+- **Human-Changes**: none.
+- **Owner-only actions not performed**: push, PR merge, hosted release, and
+  package publication.
 - **Skills**: `planning`, `tdd` (skeleton phase).
 - **Context**: R4 module ledger contains seven BLOCKED tasks due to unresolved recovery gaps in R4.1 and missing composed Worker infrastructure. R4.2 is a corrective module to complete composition wiring and prepared-commit generation while R4.1-03..05 resolve recovery/resolution gaps in parallel.
 - **Blockers reviewed**: R4-02B (Coordinator/Worker/phase-driver wiring), R4-03A/B (CLI/Worker lifecycle end-to-end), R4-04A/B (executor/tool wiring), R4-05A/B (provider/delivery). All blocked by: (1) composition `_CompositionWorkerTools._runtime()` passes six `None` parameters to `ScopedToolRuntime`; (2) no Attempt workspace materialization logic; (3) `RestrictedDockerExecutor.run()` not implemented; (4) Admission doesn't construct prepared commits; (5) two acceptance fixture tests trapped in `strict xfail` with skeleton-boundary reason.
@@ -2338,5 +2655,305 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Independent reviewer**: `019fe0e5-77f9-7050-bde1-d3b42d1da1a1`, configured as `gpt-5.6-luna` with max reasoning (the requested `gpt-5.6-luna-max` reviewer configuration).
 - **Review sequence**: first review `BLOCKED`; corrections covered independent Run Candidate `R` parented by pinned target `T0`, clean-base red evidence, reviewed-plan ancestry, union filtering, per-check `Q_i`, typed delete/rename/mode approvals, per-task PR mapping, exact browser gates, `DEBT-M2-005`, and GitLab `unit-test`; second independent review returned `PASS` with zero Critical/High findings and no SPEC/AGENTS conflict.
 - **Owner decision**: `M1 GO` for R4.3 source work, subject to the docs-only reviewed-plan commit, per-task worktree/PR/review gates, and no-push/no-credential rules. No source/test/fixture/CI files were staged by this gate.
-- **Reviewed-plan commit**: `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1` contains only the approved plan, companion plan, and this review record. A docs-only review closeout is required as the immediate ancestor of R4.3-00 so the recorded commit identity is included in the implementation ancestry.
+- **Reviewed-plan commit**: formal-base commit `e8461003ee3c8da888683fb1975bb1523803096c` contains only the approved plan, companion plan, and this review record. The current docs-only closeout is its descendant and is the immediate ancestor of R4.3-00 so the recorded commit identity is included in the implementation ancestry.
 - **Human changes**: none.
+
+## 2026-08-08 / R4.3-00 real demonstration feedback loop
+
+- **Worktree/branch/base**: `.worktrees/m1-r4-3-demo-loop` / `codex/m1-r4-3-demo-loop`, descended from docs-only closeout `d51cf806` and formal implementation base `9e7648f`.
+- **Subagent**: Codex implementation pass for R4.3-00. **Human-Changes**: none.
+- **Red evidence**: the four named demo selectors initially failed with missing trace fields (`loop_turns`, `tool_executions`, `feedback_role`, and `repaired_path`), and the memory-patch selector initially failed with `ModuleNotFoundError` for `memory_patch`.
+- **Implementation**: this task commit adds the shared strict unified-diff module and deterministic in-memory patch executor, delegates granted protected-patch application/reversal to the shared algorithm, and drives `build_demo_trace` through `WorkerLoopService`, `ScopedToolRuntime`, `FakeExecutor`, `ScriptedMockLLM`, and bounded structured feedback. The exact implementation SHA is recorded in the R4.3 ledger after ordered reviews.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_demo.py tests/unit/adapters/executor/test_memory_patch.py -q` -> `7 passed`; related granted workspace/patch/check/recovery selectors -> `19 passed, 2 skipped`; `python -m apexcrew.demo` repeated byte-identically; mypy, Ruff check/format, and `git diff --check` passed.
+- **Review configuration**: the independent SPEC and quality reviewers are configured as `gpt-5.6-luna-max` (the local reviewer record uses `gpt-5.6-luna` with max reasoning).
+- **Review status**: ordered independent SPEC-compliance review followed by independent code-quality review is pending against the task commit. No provider credential, network request, push, remote PR, or live Docker request occurred.
+- **Lesson**: the Worker feedback demonstration must exercise the same tool/runtime boundary as production; a prompt replacement can show a changed action without proving that the failed check or repair ever happened.
+
+## 2026-08-08 / R4.3-00 review corrections
+
+- **Initial SPEC review**: reviewer `019fe10e-3452-7010-b209-efee65ff9a2b`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero findings for `3fb60c1d9e9151abb435370a05b63a4d64934cb9`.
+- **Initial quality review**: reviewer `019fe112-7865-7e90-a440-7c5c802bf78a`, configured as `gpt-5.6-luna-max`, returned `BLOCKED` with one High and two Medium findings: oversized hunk numbers escaped typed denial; the demo attempt double hid unimplemented protocol branches behind casts; and the snapshot entry digest was not computed from raw bytes.
+- **Correction**: unified-diff integer parsing now maps conversion failures to `PROTECTED_PATCH_FORMAT_INVALID`; the demo attempt state implements the full WorkerAttemptState surface and removes its broad casts; snapshot content digests hash the exact file bytes; and an oversized-header zero-side-effect regression test was added.
+- **Correction evidence**: focused R4.3-00 selectors -> `8 passed`; related repository/patch/check/recovery selectors -> `27 passed, 2 skipped`; mypy, Ruff, format, diff, and byte-identical demo repeatability passed. The corrected implementation SHA is recorded after the rerun reviews.
+- **Rerun status**: the SPEC review is rerun because the patch-denial contract changed; the final quality review follows that ordered check. No provider credential, network request, push, remote PR, or live Docker request occurred.
+
+## 2026-08-08 / R4.3-00 final quality marker correction
+
+- **Final SPEC review**: reviewer `019fe120-bcac-7c31-8419-4f0d02302356`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High/Medium findings for `408f106f01efb1f43f322b81e64bf63dc3d80a8a`.
+- **Final quality review**: reviewer `019fe112-7865-7e90-a440-7c5c802bf78a`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High findings and one Low documentation marker finding.
+- **Correction**: added the required `# DEBT-M3-001` marker to the malformed-diff denial branch in `MemoryPatchExecutor`. No runtime behavior changed.
+- **Verification**: the final quality rerun is required against this marker-only correction; focused tests and static checks remain green. No provider credential, network request, push, remote PR, or live Docker request occurred.
+
+## 2026-08-08 / R4.3-00 final review closeout
+
+- **Final reviewed commit**: `654804a6c34474edf19745d2680191ea0cfc198c`; implementation chain is `3fb60c1d9e9151abb435370a05b63a4d64934cb9` with corrections `408f106f01efb1f43f322b81e64bf63dc3d80a8a` and `654804a6c34474edf19745d2680191ea0cfc198c`.
+- **Final quality rerun**: reviewer `019fe12c-1db4-70f0-bd7e-c53f244a238c`, configured as `gpt-5.6-luna-max`, returned `PASS` with zero Critical/High/Medium/Low findings.
+- **SPEC disposition**: the corrected behavioral commit `408f106f01efb1f43f322b81e64bf63dc3d80a8a` received rerun `PASS` with zero Critical/High/Medium findings; `654804a` is marker-only and does not alter runtime behavior.
+- **Ledger status**: R4.3-00 is `COMPLETED`; the next task must start from final reviewed commit `654804a6c34474edf19745d2680191ea0cfc198c` in a fresh worktree. No provider credential, network request, push, remote PR, or live Docker request occurred.
+
+## 2026-08-08 / R4.3-01 attempt workspace materialization
+
+- **Worktree/branch/base**: `.worktrees/m1-r4-3-attempt-workspace` / `codex/m1-r4-3-attempt-workspace`, based on final reviewed R4.3-00 commit `654804a`; the inherited R4.3-00 ledger was cherry-picked as docs-only commit `8d56930`.
+- **Subagent**: Codex implementation pass. **Human-Changes**: none. The separate inherited documentation correction is `4ca5e57`; it discloses `DEBT-M3-001` required by the documentation contract.
+- **Red evidence**: all eight named R4.3-01 selectors were run before implementation and failed during collection with `ModuleNotFoundError: No module named 'apexcrew.adapters.repository.attempt_workspace'`.
+- **Implementation**: `6f3d005` adds `AttemptWorkspaceAdapter` and `MaterializedWorkspace`, exact context/check glob unions, typed Git tree/blob reads, scope-first filtering, secret/mode rejection, digest-bound manifests, separate no-follow roots, idempotent partial-root rebuilds, and the composition adapter factory.
+- **Quality correction**: initial `gpt-5.6-luna-max` quality review found one High case-fold collision issue and two Medium hard-boundary issues (blob size read order and unbounded recursive cleanup). `f18d3c0` adds case-fold collision rejection, `GitCatFileSize` preflight with exact blob length verification, iterative cleanup with total/depth budgets, same-adapter serialization, and regression selectors for case collisions, submodules, and size-before-blob.
+- **Focused green evidence**: `uv run pytest tests/integration/test_attempt_workspace.py -q` -> `11 passed, 1 skipped`; related detached/composition selectors passed; `uv run pytest -q` passed at 100% with only the existing Starlette deprecation warning. `mypy src`, Ruff check/format, and `git diff --check` passed.
+- **Review evidence**: initial SPEC review `019fe13f-fac3-7eb2-9861-92c0c9e94586` returned PASS; rerun SPEC review `019fe14a-9844-7722-ad6f-4446f6c35a52` returned PASS with zero findings. Final quality review `019fe14a-98fe-7830-a37a-a2577895d258` returned PASS with zero Critical/High/Medium/Low findings. All reviewers used `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Residual gaps**: Windows symlink construction remains platform-skipped; malformed Git response, aggregate-limit, data-root ancestor-race, and cross-adapter concurrency selectors remain follow-up coverage. Runtime Worker context/patch/check composition is intentionally deferred to R4.3-02/R4.3-03.
+- **Owner-only actions not performed**: provider credentials/network requests, push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-08 / R4.3-02 atomic patch and Worker context
+
+- **Worktree/branch/base**: `.worktrees/m1-r4-3-patch-context` / `codex/m1-r4-3-patch-context`, based on R4.3-01 ledger closeout `88c145b`.
+- **Subagent**: Codex implementation/correction pass. **Human-Changes**: none.
+- **Red evidence**: the task selectors listed in `PLAN.md` initially covered the absent executor/context behavior. During review correction, the embedded secret-path, ambiguous new-file creation, and zero-old-line insertion selectors each failed before implementation.
+- **Implementation chain**: `92a9e15` implemented the Attempt PatchExecutor and Worker context; `d72d915`, `34c8a1c`, `ba9aa25`, and `e9b1148` corrected post-state, cleanup, digest, uncertainty, and metadata binding; final behavioral correction `ce37f74` closes embedded secret disclosure, ambiguous creation, and valid zero-old-line insertion.
+- **Green evidence**: focused patch/context/diff/no-follow/WorkerLoop/check selectors -> `71 passed, 4 skipped`; full `uv run pytest` -> `707 passed, 19 skipped, 1 warning` (existing Starlette deprecation); `make lint` -> Ruff format/check and `mypy src` passed with 66 source files; `git diff --check` passed.
+- **Spec-Review**: initial reviewer `019fe1e0-083b-7980-95ea-712ab82aa359` returned `FAIL` with two High and one Medium; all findings were corrected in `ce37f74`. Fresh SPEC reviewer `019fe1ee-8fad-7772-a81a-c523cd53cde0` returned PASS with zero Critical/High/Medium.
+- **Quality-Review**: initial quality reviewer `019fe1e0-0753-7590-a902-2a893f50397f` returned PASS with judgement-call smells only. Ordered final quality reviewer `019fe1f2-0eee-7103-978e-3bd03eb4da3b` returned PASS with zero Critical/High code findings; its ledger Medium was closed by this documentation commit. All reviewers used `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Lesson**: uncertain external effects must be typed before any ordinary denial path, including a create call that may have committed a file before returning; context redaction must inspect embedded path syntax rather than relying on whitespace token boundaries.
+- **Owner-only actions not performed**: provider credentials/network requests, push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 post-intent settlement and denial recovery correction
+
+- **Base and task**: R4.3-03 correction started from `f7ce7ab` on
+  `codex/m1-r4-3-executor-wiring`; the implementation worktree is
+  `.worktrees/m1-r4-3-executor-wiring`.
+- **Subagent and human changes**: Codex implementation pass using
+  `andrej-karpathy-skills:karpathy-guidelines`; **Human-Changes: none**.
+- **Red evidence**: the post-intent selectors exited `2 failed` before the
+  correction: WorkerLoop propagated `WORKER_TOOL_EXECUTION_FAILED`, and the
+  composed executor failure left no joined settled effect result. The
+  unknown-check recovery selector first returned `UNAVAILABLE`; the recovery
+  proof then rejected its denial code.
+- **Implementation**: WorkerLoop converts post-intent tool exceptions into a
+  current-intent-bound `INFRASTRUCTURE_UNCERTAINTY` result before settlement.
+  Check denial recovery now emits an exact receipt with a stable sentinel
+  `argv_digest`, check ID, snapshot digest, and receipt digest. Recovery keeps
+  denial effects as `FAILED`, while both state adapters accept that observed
+  settled outcome. The composed unknown-check regression now asserts the
+  durable denial result and `FAILED/SETTLED` state.
+- **Green evidence**: focused Worker/composition/patch/check selectors ->
+  `20 passed`; recovery/runtime selectors -> `36 passed`; full
+  `uv run --python 3.12 pytest -q` exited `0` with the repository's existing
+  platform/Docker skips and Starlette deprecation warning. `mypy src`, Ruff
+  check/format, and `git diff --check` passed.
+- **Review status**: the prior SPEC rerun `019fe4ba-875e-7c80-aac4-6e57c52f65a7`
+  inspected the pre-correction `HEAD` and reported the now-fixed execution
+  exception High. A fresh final SPEC review and ordered quality review are
+  required against the correction commit.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because the restricted
+  Docker invocation was not observed in this environment. Workspace mutation
+  history remains process-local; restart recovery for an in-flight patched
+  workspace is a follow-up boundary and is not claimed closed by R4.3-03.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 final quality review and ledger closeout
+
+- **Quality rerun**: independent reviewer `019fe558-8441-7fc3-923f-f909f3b85a3e`,
+  configured as `gpt-5.6-luna-max`, reviewed the correction range
+  `e46c10d..2b98c9e` and returned `PASS` with zero findings. The review
+  confirmed that the prior Medium test-module coupling is removed and that
+  the support boundary introduces no Critical/High/Medium/Low issue.
+- **Correction evidence**: `tests/helpers/composition_wiring.py` now owns
+  the minimal production graph setup and exposes `production_check_executor()`;
+  `test_restricted_executor_docker.py` imports only that public helper and no
+  longer depends on another test module's private helpers or collection order.
+  **Human-Changes: none**.
+- **Observed green evidence**: affected selectors -> `14 passed, 1 skipped`;
+  `make test` -> `100%` pass; `make lint` -> Ruff format/check clean and
+  mypy clean for 66 source files; `git diff --check` -> exit `0`.
+- **Task closeout**: R4.3-03 is final-reviewed at `2b98c9e` with base
+  `a77a7f8`; the PLAN ledger now records the implementation and correction
+  chain plus the final SPEC and quality reviewer IDs. R4.3-04 may use this
+  reviewed commit as its exact base.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no live
+  restricted Docker process was observed; process-local workspace mutation
+  history and restart recovery remain follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 quality correction: test support boundary
+
+- **Quality review**: independent reviewer `019fe53e-5288-7e92-937b-c80d68a42823`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with one Medium and no
+  Critical/High/Low findings. The restricted Docker selector imported
+  underscore-prefixed helpers from another test module and accessed private
+  production graph members, coupling collection to pytest import order.
+- **Red evidence**: the quality review identified the coupling at the
+  selector's import and graph-inspection lines; the selector itself passed in
+  isolation, so the red condition was review-level fragility rather than a
+  runtime assertion failure.
+- **Correction**: added dedicated `tests/helpers/composition_wiring.py`
+  support. It owns the minimal production graph setup and returns the actual
+  selected check executor; `test_restricted_executor_docker.py` now imports
+  only the public support function and asserts its type/host-fallback boundary.
+  The composition test module remains independent of the restricted test.
+  **Human-Changes: none**.
+- **Green evidence**: the five exact wiring selectors -> `5 passed`; the
+  restricted production selector -> `1 passed`; Ruff check/format (`166 files
+  already formatted`), `mypy src` (66 source files), and `git diff --check`
+  exited `0`.
+- **Review status**: the prior SPEC review passed at
+  `019fe538-49f7-7991-b7f6-7f0ee437a8b2`; a fresh independent quality rerun
+  is required against the correction commit. All reviewers use
+  `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no live
+  restricted Docker process was observed; workspace mutation history and
+  restart recovery remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 SPEC selector placement correction
+
+- **SPEC rerun**: fresh reviewer `019fe52e-1fda-7701-99cf-5ac045e94f1f`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with zero
+  Critical/High/Low findings and one Medium. The production-only executor
+  selector was in the composition test module, while the plan explicitly
+  assigns that selector to `tests/integration/test_restricted_executor_docker.py`.
+- **Red evidence**: the exact plan command still exercised the old direct
+  constructor at `test_restricted_executor_docker.py::test_docker_executor_is_the_only_composed_check_path`; the production graph assertion lived only in the other module.
+- **Correction**: moved the named selector into the restricted executor test
+  module. It now builds the production application graph, installs a real
+  SQLite Worker attempt/lease, constructs the current check runtime, and
+  asserts the selected executor is `RestrictedDockerExecutor` with no local
+  subprocess escape. The prior low-level Docker command assertions remain in
+  a separate test. **Human-Changes: none**.
+- **Green evidence**: the five exact plan selectors -> `5 passed`; affected
+  composition, patch/check, production-wiring, and Docker files ->
+  `24 passed, 1 skipped`; Ruff check/format, `mypy src` (66 source files),
+  and `git diff --check` exited `0`.
+- **Review status**: a fresh SPEC rerun is required against this placement
+  correction; ordered quality review remains blocked until it passes. The
+  previous scope observation was explicitly judged not a violation because
+  the dependency-layer edits close the same R4.3-03 recovery/authority
+  contract.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** without an observed
+  restricted Docker process; workspace mutation history and restart recovery
+  remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 SPEC selector evidence correction
+
+- **SPEC review**: independent reviewer `019fe517-f551-7943-97a1-028a4fbfd4d5`,
+  configured as `gpt-5.6-luna-max`, returned `FAIL` with zero Critical/High
+  findings and one Medium: the task plan's five independent selectors were
+  absent, and the Docker test inspected only a directly constructed executor
+  instead of the production composition graph.
+- **Red evidence**: the plan selector command exited `1`; pytest reported
+  `not found` for `test_check_id_derivation_is_shared`,
+  `test_composed_patch_is_not_lease_scope_denied`,
+  `test_composed_check_resolves_declared_definition`, and
+  `test_context_and_check_workspace_bindings_are_distinct`. The existing
+  restricted executor selector was present but did not inspect composition.
+- **Correction**: added the five independent composition selectors and a
+  real SQLite run/lease/contract test seam. The selectors exercise the Worker
+  context and declared registry, direct composition patch/check execution,
+  distinct context/check roots and digests, and the production graph's
+  `RestrictedDockerExecutor`. The fixture now gives context an additional
+  file while retaining the check input scope. Existing dependency-layer
+  changes remain because they are required review remediations for the same
+  R4.3-03 end-to-end recovery/authority contract; reverting them would reopen
+  already observed spec failures. **Human-Changes: none**.
+- **Green evidence**: the five named selectors -> `5 passed`; the affected
+  composition, patch/check, production-wiring, and Docker test files ->
+  `24 passed, 1 skipped`; Ruff format/check, `mypy src` (66 source files),
+  and `git diff --check` exited `0`.
+- **Review status**: fresh SPEC review is required against this correction
+  commit; ordered quality review remains blocked until SPEC passes. The
+  prior quality FAIL findings remain corrected in `a8e29a3`.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no real
+  restricted Docker process invocation was observed; workspace mutation
+  history and restart recovery remain process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.
+
+## 2026-08-09 / R4.3-03 memory recovery-set parity correction
+
+- **Review finding**: SPEC reviewer `019fe4d0-a59a-7710-b3b5-f250b724006b`,
+  configured as `gpt-5.6-luna-max`, found that the memory adapter's specialized
+  Worker settlement stored an `INDETERMINATE` result without adding the intent
+  to its unresolved recovery set or moving the Run to `INDETERMINATE`. SQLite
+  already performed both transitions.
+- **Red evidence**:
+  `uv run --python 3.12 pytest
+  tests/contract/test_state_store.py::test_worker_indeterminate_settlement_enters_recovery_set_identically -q`
+  exited `1` for `memory_store_factory` and passed for
+  `sqlite_store_factory`; the memory assertion was `unresolved is None`.
+- **Correction**: `InMemoryStateStore.settle_worker_action` now mirrors the
+  generic settlement transition for `INDETERMINATE`: it records the recovery
+  member/generation and changes the Run state atomically with the Worker result.
+  **Human-Changes: none**.
+- **Green evidence**: the exact contract selector -> `2 passed`; the three
+  post-intent/denial recovery selectors -> `3 passed`. The full offline
+  `uv run --python 3.12 pytest -q --color=no` run exited `0` at `100%` in
+  `192.1s`; `uv run --python 3.12 mypy src` exited `0` with no issues in 66
+  source files; Ruff check/format exited `0` (`All checks passed!`, 165 files
+  already formatted); and `git diff --check` exited `0`.
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** without a live Docker
+  process observation; workspace mutation history/restart recovery remains an
+  explicitly documented process-local follow-up.
+
+## 2026-08-09 / R4.3-03 composed recovery and debt-status correction
+
+- **Review finding**: final SPEC reviewer `019fe4e5-221f-7f41-95a2-5b6ddfc5ac95`,
+  configured as `gpt-5.6-luna-max`, found two High issues on `bcf9a99`: the
+  composition adapter inherited placeholder `observe_recovery()` behavior, and
+  `DEBT-M2-005` was not synchronized across README, SECURITY, SPRINT, and the
+  audit log.
+- **Red evidence**: the exact forwarding selector
+  `uv run --python 3.12 pytest
+  tests/integration/test_composed_worker_tools.py::test_composition_worker_tools_delegates_recovery_observation -q --color=no`
+  exited `1`; the inherited method attempted placeholder authorization and
+  raised `AttributeError` before reaching the per-intent runtime.
+- **Correction**: `_CompositionWorkerTools.observe_recovery()` now delegates to
+  `_runtime(intent).observe_recovery(intent)`. The selector then exited `0` at
+  `100%`. README, SECURITY, and SPRINT now state `DEBT-M2-005` is **OPEN** until
+  a real restricted Docker process is observed; the process-local workspace
+  mutation/restart boundary is stated alongside it. **Human-Changes: none**.
+- **Final green evidence**: the composed-worker, patch/check-recovery, and
+  documentation selectors passed; the final offline
+  `uv run --python 3.12 pytest -q --color=no` run exited `0` at `100%` in
+  `211.6s` with only the existing Starlette deprecation warning. `uv run
+  --python 3.12 mypy src` exited `0` with no issues in 66 source files; Ruff
+  check/format and `git diff --check` exited `0`.
+- **Review status**: a fresh SPEC review and ordered quality review are required
+  against the next correction commit; the previous FAIL remains open until both
+  High findings are re-reviewed.
+
+## 2026-08-09 / R4.3-03 quality correction: current workspace digest binding
+
+- **Review finding**: quality reviewer `019fe501-cfd8-7053-b258-591872963906`,
+  configured as `gpt-5.6-luna-max`, found that recovery could compare a patch
+  against a stale configured digest, workspace/materialization failures could
+  escape as unbounded exceptions, and a PatchAction captured from the current
+  workspace was rejected by the Worker intent binding.
+- **Red evidence**: after applying the recovery correction, the exact composed
+  Worker selector `uv run pytest
+  tests/integration/test_composed_worker_tools.py::test_public_composition_binds_check_to_patched_workspace -q`
+  exited `1` with `expected AWAITING_FINAL_APPROVAL` but observed `PAUSED`.
+  The failure came from `validate_authorized_worker_action()` still requiring
+  every non-CheckAction snapshot digest to equal the initial attempt binding.
+- **Correction**: recovery now receives the current primary/check workspace
+  digest; the composition PatchAction runtime binds execution to the captured
+  current digest while observing recovery from the live primary workspace;
+  workspace `RuntimeError` is converted to bounded `UNAVAILABLE`; and both
+  CheckAction and PatchAction are allowed to carry their current workspace
+  digest through Worker intent validation. **Human-Changes: none**.
+- **Green evidence**: composed-worker, patch/check, and production-wiring
+  selectors -> `18 passed`; `make test` exited `0` at `100%`; `make lint`
+  exited `0` (`165 files already formatted`, Ruff clean, mypy clean for 66
+  source files); and `git diff --check` exited `0`.
+- **Review status**: this correction invalidates the prior quality FAIL
+  conclusion; a fresh independent SPEC review followed by an independent
+  quality review is required against the correction commit. All future
+  reviewers use `gpt-5.6-luna-max` (`gpt-5.6-luna` with max reasoning).
+- **Open evidence/debt**: `DEBT-M2-005` remains **OPEN** because no real
+  restricted Docker process invocation was observed; workspace mutation
+  history and restart recovery for an in-flight patched workspace remain
+  process-local follow-up boundaries.
+- **Owner-only actions not performed**: credentials, provider/network calls,
+  push, remote PR/merge, live Docker invocation, and package publication.

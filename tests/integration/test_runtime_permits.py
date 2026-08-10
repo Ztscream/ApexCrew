@@ -21,10 +21,15 @@ from helpers.application import (
 from apexcrew.adapters.model.scripted import ScriptedMockLLM
 from apexcrew.application.runtime import RuntimeStateStore
 from apexcrew.domain.authority import GlobalBudgetMetric, MonotonicInstant
-from apexcrew.domain.commands import RuntimeDecision, RuntimePermit
+from apexcrew.domain.commands import (
+    CommandEnvelope,
+    ResumePayload,
+    RuntimeDecision,
+    RuntimePermit,
+)
 from apexcrew.domain.effects import StateCommitFault
 from apexcrew.domain.model import RecoveredModelAction
-from apexcrew.domain.types import AuditSequence, RunId, RunStopReason
+from apexcrew.domain.types import AuditSequence, RunId, RunState, RunStopReason
 
 
 def test_direct_runtime_call_without_permit_has_zero_mutation(tmp_path: Path) -> None:
@@ -52,6 +57,66 @@ def test_normal_delivery_releases_durable_owner_before_return(tmp_path: Path) ->
     assert stop.reason == RunStopReason.PAUSED
     assert app.store.runtime_owner(app.run_id) is None
     assert app.store.runtime_delivery_event(app.run_id) == "RUNTIME_OWNER_RELEASED"
+
+
+class AlwaysContinueCoordinator:
+    def __init__(self, store: RuntimeStateStore) -> None:
+        self._store = store
+        self.action_count = 0
+
+    def run_planning_turn(self, run_id: RunId) -> RuntimeDecision:
+        raise AssertionError("active fixture must not plan")
+
+    def resume_recovered_planning_action(
+        self, run_id: RunId, permit: RuntimePermit, action: RecoveredModelAction
+    ) -> RuntimeDecision:
+        raise AssertionError("active fixture has no planning recovery")
+
+    def schedule(self, run_id: RunId) -> RuntimeDecision:
+        self.action_count += 1
+        return RuntimeDecision.continued(self._store.audit_sequence(run_id))
+
+
+def test_runtime_phase_cap_is_durable_and_requires_exact_resume(tmp_path: Path) -> None:
+    coordinators: list[AlwaysContinueCoordinator] = []
+    app = make_permitted_active_runtime(
+        tmp_path,
+        model_calls=0,
+        model_call_ceiling=240,
+        coordinator_factory=lambda store: (
+            coordinators.append(AlwaysContinueCoordinator(store)) or coordinators[-1]
+        ),
+    )
+
+    stop = app.runtime.run_until_blocked(app.run_id)
+
+    assert stop.state == RunState.PAUSED
+    assert stop.reason == RunStopReason.PAUSED
+    assert coordinators[0].action_count == 256
+    assert app.store.recorded_stop_reason(app.run_id) == "RUNTIME_PHASE_STEP_CAP"
+    assert app.store.new_dispatch_open(app.run_id) is False
+    assert app.runtime.run_until_blocked(app.run_id).reason == RunStopReason.NO_RUNTIME_PERMIT
+
+    continue_outcome = app.control.handle(
+        make_continue_command(app, app.run_id, request_id="continue-capped")
+    )
+    assert continue_outcome.status == "INVALID"
+
+    pause_sequence, pause_reason = app.store.runtime_phase_pause(app.run_id)
+    resume = CommandEnvelope(
+        request_id="resume-capped",
+        expected_sequence=app.store.audit_sequence(app.run_id),
+        applicable_revision_digests=app.store.current_revision_digests(app.run_id),
+        payload=ResumePayload(
+            run_id=app.run_id,
+            pause_sequence=pause_sequence,
+            pause_reason=pause_reason,
+        ),
+    )
+    resumed = app.control.handle(resume)
+
+    assert resumed.status == "ACCEPTED"
+    assert app.store.unconsumed_permit(app.run_id).allowed_phase == "PAUSED"
 
 
 class ScriptedBoundaryCoordinator:

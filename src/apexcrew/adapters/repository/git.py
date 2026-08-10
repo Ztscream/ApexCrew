@@ -7,7 +7,8 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import IO, Literal, Protocol, cast
@@ -59,6 +60,7 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
         reservation: TargetReservation,
         target_safety_digest: Sha256DigestText,
         reflog_message: str,
+        private_data_root: Path | None = None,
     ) -> None:
         self._repository = repository
         self._repository_id = repository_id
@@ -68,6 +70,11 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
         self._reservation = reservation
         self._target_safety_digest = target_safety_digest
         self._reflog_message = reflog_message
+        self._private_data_root = (
+            reservation.path.parent if private_data_root is None else private_data_root
+        )
+        if not self._private_data_root.is_absolute():
+            raise ValueError("PRIVATE_DATA_ROOT_MUST_BE_ABSOLUTE")
 
     @staticmethod
     def _identity_binding(node: OpenedNode | None) -> RefPathBinding:
@@ -132,6 +139,9 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             reflog_exists=reflog.state == "REGULAR_FILE",
             reflog_message=self._reflog_message,
         )
+
+    def current_ref_effect_binding(self, run_id: RunId) -> RefEffectBinding:
+        return self._effect_binding(run_id)
 
     def inspect(
         self,
@@ -280,6 +290,167 @@ class GitPrivateRefStartGuard(PrivateRefAdmissionPort):
             observed_oid=oid,
         )
 
+    @contextmanager
+    def _private_ref_lock(self, run_id: RunId) -> Iterator[bool]:
+        backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
+        tree: StableHandleTree | None = None
+        node: OpenedNode | None = None
+        try:
+            tree = StableHandleTree(self._private_data_root, backend)
+            relative = f"run-ref-locks/{run_id!s}.lock"
+            tree.ensure_directory("run-ref-locks")
+            if tree.try_open(relative, "file") is None:
+                node = tree.create_file(relative)
+            else:
+                node = tree.open_for_lock(relative)
+            if not tree.read_prefix(node, 1):
+                tree.write_bytes(node, b"0")
+            tree.lock_exclusive(node)
+        except (ImportError, OSError, RepositoryUnsafeError, ValueError):
+            if tree is not None:
+                tree.close()
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                tree.unlock_exclusive(node)
+            except (ImportError, OSError):
+                pass
+            finally:
+                if tree is not None:
+                    tree.close()
+
+    def promote_private_ref(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
+        try:
+            with self._private_ref_lock(intent.run_id) as locked:
+                if not locked:
+                    return PrivateRefCasOutcome(
+                        intent_id=intent.intent_id,
+                        run_id=intent.run_id,
+                        result_class="PRIVATE_REF_UNOBSERVABLE",
+                        observed_oid=None,
+                    )
+                return self._promote_private_ref_locked(intent)
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class="PRIVATE_REF_UNOBSERVABLE",
+                observed_oid=None,
+            )
+
+    def _promote_private_ref_locked(self, intent: RefCasIntent) -> PrivateRefCasOutcome:
+        def outcome(
+            result_class: Literal[
+                "PRIVATE_REF_PROMOTED",
+                "PRIVATE_REF_ABSENT_FAILED",
+                "PRIVATE_REF_CONFLICT",
+                "PRIVATE_REF_UNOBSERVABLE",
+            ],
+            observed_oid: GitOid | None,
+        ) -> PrivateRefCasOutcome:
+            return PrivateRefCasOutcome(
+                intent_id=intent.intent_id,
+                run_id=intent.run_id,
+                result_class=result_class,
+                observed_oid=observed_oid,
+            )
+
+        try:
+            current_binding = self._effect_binding(intent.run_id)
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if (
+            intent.kind != "private_ref_cas"
+            or intent.run_id != self._reservation.run_id
+            or intent.repository_id != self._repository_id
+            or intent.expected_old_oid is None
+            or intent.target_safety_digest != self._target_safety_digest
+            or intent.target_reservation_id != self._reservation.reservation_id
+            or intent.ref_effect_binding != current_binding
+        ):
+            return outcome("PRIVATE_REF_CONFLICT", None)
+        try:
+            before = self._runner.run(self._repository, GitShowRefVerify(intent.ref_name))
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if before.returncode != 0:
+            return (
+                outcome("PRIVATE_REF_ABSENT_FAILED", None)
+                if before.returncode == 1
+                else outcome("PRIVATE_REF_UNOBSERVABLE", None)
+            )
+        try:
+            current_oid = GitOid(before.stdout.strip())
+        except ValueError:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if current_oid != intent.expected_old_oid:
+            return outcome("PRIVATE_REF_CONFLICT", current_oid)
+        try:
+            result = self._runner.run(
+                self._repository,
+                GitUpdatePrivateRefCas(
+                    direct_ref=intent.ref_name,
+                    prepared_oid=intent.prepared_oid,
+                    expected_old_oid=intent.expected_old_oid,
+                    reflog_message=intent.ref_effect_binding.reflog_message,
+                ),
+            )
+            self._repository = self._repository.refresh_after_verified_owned_transition()
+            after = self._runner.run(self._repository, GitShowRefVerify(intent.ref_name))
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if after.returncode != 0:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        try:
+            observed_oid = GitOid(after.stdout.strip())
+        except ValueError:
+            return outcome("PRIVATE_REF_UNOBSERVABLE", None)
+        if observed_oid == intent.prepared_oid:
+            return outcome("PRIVATE_REF_PROMOTED", observed_oid)
+        if observed_oid == intent.expected_old_oid and result.returncode != 0:
+            return outcome("PRIVATE_REF_ABSENT_FAILED", observed_oid)
+        return outcome("PRIVATE_REF_CONFLICT", observed_oid)
+
+    def observe_resolution(
+        self,
+        *,
+        ref_name: str,
+        expected_old_oid: GitOid | None,
+        prepared_oid: GitOid,
+        expected_binding: RefEffectBinding,
+    ) -> tuple[
+        Literal["EXACT_POST", "EXACT_PRE", "THIRD_STATE", "UNAVAILABLE"],
+        GitOid | None,
+        Sha256DigestText | None,
+    ]:
+        try:
+            current_binding = self._effect_binding(self._reservation.run_id)
+            result = self._runner.run(self._repository, GitShowRefVerify(ref_name))
+            registration_digest = current_binding.checkout_registration_digest
+            if current_binding != expected_binding:
+                current_oid = None
+                if result.returncode == 0:
+                    current_oid = GitOid(result.stdout.strip())
+                return "THIRD_STATE", current_oid, registration_digest
+            if result.returncode == 0:
+                current_oid = GitOid(result.stdout.strip())
+                if current_oid == prepared_oid:
+                    return "EXACT_POST", current_oid, registration_digest
+                if expected_old_oid is not None and current_oid == expected_old_oid:
+                    return "EXACT_PRE", current_oid, registration_digest
+                return "THIRD_STATE", current_oid, registration_digest
+            absent = result.returncode == 1 or (
+                result.returncode == 128 and result.stderr.strip().endswith("not a valid ref")
+            )
+            if absent and expected_old_oid is None:
+                return "EXACT_PRE", None, registration_digest
+            return "THIRD_STATE", None, registration_digest
+        except (OSError, RepositoryEffectError, RepositoryUnsafeError, ValueError):
+            return "UNAVAILABLE", None, None
+
 
 RepositoryUnsafeError = _RepositoryUnsafeError
 
@@ -297,6 +468,7 @@ MAX_TARGET_RESERVATION_LOG_HEAD_BYTES = 65_536
 MAX_WORKTREE_PORCELAIN_BYTES = 1_048_576
 MAX_GIT_STDOUT_BYTES = 2_000_000
 MAX_GIT_STDERR_BYTES = 65_536
+MAX_GIT_STDIN_BYTES = 67_108_864
 _TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES = frozenset({"gitdir", "commondir", "HEAD"})
 _TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES = frozenset({"logs", "refs"})
 _TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES = frozenset({"locked"})
@@ -902,6 +1074,21 @@ class RepositoryInstance:
         self.storage_snapshot.assert_current(self.handles)
 
     def assert_stable_for(self, operation: object) -> None:
+        if isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+            transition_entries = _private_ref_transition_entries(operation.direct_ref)
+            if transition_entries:
+                excluded_prefixes = tuple(
+                    relative for relative, kind in transition_entries if kind == "file"
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                self.storage_snapshot.assert_current(
+                    self.handles,
+                    excluded_prefixes=excluded_prefixes,
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                return
         if isinstance(operation, (GitWorktreeUnlock, GitWorktreeRemoveForce)):
             self.storage_snapshot.assert_current(
                 self.handles,
@@ -934,8 +1121,10 @@ class GitRepositoryPreflight:
             raise
 
 
-def closed_git_environment(trusted_empty_dir: Path) -> dict[str, str]:
-    return {
+def closed_git_environment(
+    trusted_empty_dir: Path, index_file: Path | None = None
+) -> dict[str, str]:
+    environment = {
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": str(trusted_empty_dir / "global.gitconfig"),
         "GIT_ATTR_NOSYSTEM": "1",
@@ -946,7 +1135,16 @@ def closed_git_environment(trusted_empty_dir: Path) -> dict[str, str]:
         "GIT_PAGER": "cat",
         "GIT_EDITOR": "false",
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_AUTHOR_NAME": "ApexCrew",
+        "GIT_AUTHOR_EMAIL": "apexcrew@localhost",
+        "GIT_COMMITTER_NAME": "ApexCrew",
+        "GIT_COMMITTER_EMAIL": "apexcrew@localhost",
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
     }
+    if index_file is not None:
+        environment["GIT_INDEX_FILE"] = str(index_file)
+    return environment
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,6 +1222,77 @@ class GitCatFileSize:
     blob_oid: GitOid
 
 
+@dataclass(frozen=True, slots=True)
+class GitReadTree:
+    base_oid: GitOid
+
+
+@dataclass(frozen=True, slots=True)
+class GitHashObjectWrite:
+    blob_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class GitHashObjectWriteContent:
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class GitUpdateIndexCacheInfo:
+    mode: str
+    blob_oid: GitOid
+    path: CanonicalPath
+
+
+@dataclass(frozen=True, slots=True)
+class GitRemoveIndexPath:
+    path: CanonicalPath
+
+
+@dataclass(frozen=True, slots=True)
+class GitWriteTree:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class GitCommitTree:
+    tree_oid: GitOid
+    parent_oid: GitOid
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class GitUpdatePrivateRefCas:
+    direct_ref: str
+    prepared_oid: GitOid
+    expected_old_oid: GitOid
+    reflog_message: str
+
+
+def _private_ref_transition_entries(
+    direct_ref: str,
+) -> tuple[tuple[str, Literal["file", "directory"]], ...]:
+    prefix = "refs/apexcrew/runs/"
+    component = direct_ref.removeprefix(prefix)
+    if (
+        not component
+        or len(component) > 128
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+            for character in component
+        )
+    ):
+        return ()
+    return (
+        (".git/refs/apexcrew/runs", "directory"),
+        (".git/logs/refs/apexcrew/runs", "directory"),
+        (f".git/refs/apexcrew/runs/{component}", "file"),
+        (f".git/refs/apexcrew/runs/{component}.lock", "file"),
+        (f".git/logs/refs/apexcrew/runs/{component}", "file"),
+        (f".git/logs/refs/apexcrew/runs/{component}.lock", "file"),
+    )
+
+
 type GitOperation = (
     GitStatusPorcelain
     | GitWorktreeListPorcelain
@@ -1038,6 +1307,14 @@ type GitOperation = (
     | GitLsTreePath
     | GitCatFileBlob
     | GitCatFileSize
+    | GitReadTree
+    | GitHashObjectWrite
+    | GitHashObjectWriteContent
+    | GitUpdateIndexCacheInfo
+    | GitRemoveIndexPath
+    | GitWriteTree
+    | GitCommitTree
+    | GitUpdatePrivateRefCas
 )
 
 
@@ -1049,6 +1326,7 @@ class GitSpawner(Protocol):
         environment: Mapping[str, str],
         *,
         text: bool,
+        input_bytes: bytes | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]: ...
 
 
@@ -1060,11 +1338,13 @@ class SubprocessGitSpawner:
         environment: Mapping[str, str],
         *,
         text: bool,
+        input_bytes: bytes | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
         process = subprocess.Popen(
             argv,
             cwd=cwd,
             env=dict(environment),
+            stdin=subprocess.PIPE if input_bytes is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -1105,6 +1385,16 @@ class SubprocessGitSpawner:
         )
         for thread in threads:
             thread.start()
+        if input_bytes is not None:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(input_bytes)
+                process.stdin.close()
+            except OSError:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
         try:
             returncode = process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -1158,21 +1448,34 @@ class GitCommandRunner:
             self._owned_trusted_empty_dir = None
 
     def run(
-        self, repository: RepositoryInstance, operation: GitOperation
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        result = self._run(repository, operation, text=True)
+        result = self._run(repository, operation, text=True, index_file=index_file)
         assert isinstance(result.stdout, str)
         return result
 
     def run_bytes(
-        self, repository: RepositoryInstance, operation: GitOperation
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        result = self._run(repository, operation, text=False)
+        result = self._run(repository, operation, text=False, index_file=index_file)
         assert isinstance(result.stdout, bytes)
         return result
 
     def _run(
-        self, repository: RepositoryInstance, operation: GitOperation, *, text: bool
+        self,
+        repository: RepositoryInstance,
+        operation: GitOperation,
+        *,
+        text: bool,
+        index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
         if not isinstance(
             operation,
@@ -1190,30 +1493,89 @@ class GitCommandRunner:
                 GitLsTreePath,
                 GitCatFileBlob,
                 GitCatFileSize,
+                GitReadTree,
+                GitHashObjectWrite,
+                GitHashObjectWriteContent,
+                GitUpdateIndexCacheInfo,
+                GitRemoveIndexPath,
+                GitWriteTree,
+                GitCommitTree,
+                GitUpdatePrivateRefCas,
             ),
         ):
             raise RepositoryUnsafeError("RAW_GIT_ARGUMENTS_DENIED")
+        argv = self._argv_for(operation)
         repository.assert_stable_for(operation)
-        command = (
-            str(self._git),
-            "-c",
-            "core.hooksPath=" + str(self._trusted_empty_dir / "hooks"),
-            "-c",
-            "commit.gpgSign=false",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "diff.external=",
-            "-c",
-            "credential.helper=",
-            *self._argv_for(operation),
+        transition_handles = self._open_private_ref_transition(repository, operation)
+        try:
+            command = (
+                str(self._git),
+                "-c",
+                "core.hooksPath=" + str(self._trusted_empty_dir / "hooks"),
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "diff.external=",
+                "-c",
+                "credential.helper=",
+                *argv,
+            )
+            environment = closed_git_environment(self._trusted_empty_dir, index_file)
+            if isinstance(operation, GitHashObjectWriteContent):
+                if len(operation.content) > MAX_GIT_STDIN_BYTES:
+                    raise RepositoryUnsafeError("GIT_INPUT_LIMIT_EXCEEDED")
+                return self._spawner.run(
+                    command,
+                    repository.root,
+                    environment,
+                    text=text,
+                    input_bytes=operation.content,
+                )
+            return self._spawner.run(
+                command,
+                repository.root,
+                environment,
+                text=text,
+            )
+        finally:
+            if transition_handles is not None:
+                transition_handles.close()
+
+    @staticmethod
+    def _open_private_ref_transition(
+        repository: RepositoryInstance,
+        operation: GitOperation,
+    ) -> StableHandleTree | None:
+        if not isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+            return None
+        if not isinstance(repository, RepositoryInstance):
+            return None
+        entries = _private_ref_transition_entries(operation.direct_ref)
+        if not entries:
+            return None
+        backend = (
+            WindowsNoFollowBackend(allow_delete_share=True)
+            if os.name == "nt"
+            else PosixNoFollowBackend()
         )
-        return self._spawner.run(
-            command,
-            repository.root,
-            closed_git_environment(self._trusted_empty_dir),
-            text=text,
-        )
+        handles = StableHandleTree(repository.root, backend)
+        expected = {node.relative: node.identity for node in repository.storage_snapshot.nodes}
+        try:
+            for relative, kind in entries:
+                if kind != "directory":
+                    continue
+                bound = expected.get(relative)
+                current = handles.try_open(relative, kind)
+                if (current is None) != (bound is None) or (
+                    current is not None and current.identity != bound
+                ):
+                    raise RepositoryUnsafeError("GIT_STORAGE_IDENTITY_CHANGED")
+            return handles
+        except BaseException:
+            handles.close()
+            raise
 
     def _argv_for(self, operation: GitOperation) -> tuple[str, ...]:
         match operation:
@@ -1275,6 +1637,63 @@ class GitCommandRunner:
                 return ("cat-file", "blob", self._require_oid(blob_oid))
             case GitCatFileSize(blob_oid=blob_oid):
                 return ("cat-file", "-s", self._require_oid(blob_oid))
+            case GitReadTree(base_oid=base_oid):
+                return ("read-tree", self._require_oid(base_oid))
+            case GitHashObjectWrite(blob_path=path):
+                self._require_operand_path(path)
+                return ("hash-object", "-w", "--", str(path))
+            case GitHashObjectWriteContent():
+                return ("hash-object", "-w", "--stdin")
+            case GitUpdateIndexCacheInfo(mode=mode, blob_oid=blob_oid, path=path):
+                if mode not in {"100644", "100755"}:
+                    raise RepositoryUnsafeError("GIT_INDEX_MODE_INVALID")
+                return (
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    ",".join(
+                        (
+                            mode,
+                            self._require_oid(blob_oid),
+                            self._require_canonical_path(path),
+                        )
+                    ),
+                )
+            case GitRemoveIndexPath(path=path):
+                return (
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    self._require_canonical_path(path),
+                )
+            case GitWriteTree():
+                return ("write-tree",)
+            case GitCommitTree(tree_oid=tree_oid, parent_oid=parent_oid, message=message):
+                self._require_commit_message(message)
+                return (
+                    "commit-tree",
+                    self._require_oid(tree_oid),
+                    "-p",
+                    self._require_oid(parent_oid),
+                    "-m",
+                    message,
+                )
+            case GitUpdatePrivateRefCas(
+                direct_ref=target,
+                prepared_oid=new_oid,
+                expected_old_oid=old_oid,
+                reflog_message=message,
+            ):
+                self._require_private_ref(target)
+                self._require_reason(message)
+                return (
+                    "update-ref",
+                    "-m",
+                    message,
+                    target,
+                    self._require_oid(new_oid),
+                    self._require_oid(old_oid),
+                )
         raise AssertionError("GIT_OPERATION_UNION_EXHAUSTIVENESS")
 
     @staticmethod
@@ -1320,6 +1739,18 @@ class GitCommandRunner:
         text = str(value)
         if not value.is_absolute() or text.startswith("-") or "\x00" in text:
             raise RepositoryUnsafeError("GIT_PATH_OPERAND_INVALID")
+
+    @staticmethod
+    def _require_canonical_path(value: CanonicalPath) -> str:
+        try:
+            return str(CanonicalPath.parse(str(value)))
+        except PathValidationError as error:
+            raise RepositoryUnsafeError("GIT_CANONICAL_PATH_INVALID") from error
+
+    @staticmethod
+    def _require_commit_message(value: str) -> None:
+        if not value or "\x00" in value or "\n" in value or "\r" in value:
+            raise RepositoryUnsafeError("GIT_COMMIT_MESSAGE_INVALID")
 
     @staticmethod
     def _require_reason(value: str) -> None:
@@ -1404,19 +1835,22 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         self.require_safe_before_list(reservation)
         names = self._worktree_admin_names()
         if not names:
-            if self._reservation_path_state(reservation)[0]:
-                raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
-            return ReservationAdminObservation(admin_entry_name=None, admin_binding_digest=None)
+            return ReservationAdminObservation(
+                admin_entry_name=None, admin_binding_digest=None, locked=False, lock_digest=None
+            )
         expected = _target_reservation_component(reservation.reservation_id)
         if names != (expected,):
             raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_INVENTORY_INVALID")
         record = self._read_exact_admin_record(reservation)
-        path_present, gitfile_exact = self._reservation_path_state(reservation)
-        if not path_present or not gitfile_exact:
-            raise RepositoryEffectError("TARGET_RESERVATION_DATA_INVENTORY_INVALID")
         return ReservationAdminObservation(
             admin_entry_name=record.entry_name,
             admin_binding_digest=record.binding_digest,
+            locked=record.locked is not None,
+            lock_digest=(
+                None
+                if record.locked is None
+                else Sha256DigestText("sha256:" + hashlib.sha256(record.locked).hexdigest())
+            ),
         )
 
     def require_absent_before_add(self, operation: TargetReservationOperation) -> None:
@@ -1472,6 +1906,174 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
         self._data_handles.release_cached(
             "reservations/" + _target_reservation_component(reservation.reservation_id)
         )
+
+    def remove_exact_admin_entry(
+        self,
+        reservation: TargetReservation,
+        expected_digest: Sha256DigestText | None,
+        expected_lock_digest: Sha256DigestText | None,
+    ) -> None:
+        self.require_safe_before_list(reservation)
+        if expected_digest is None or self._reservation_path_state(reservation)[0]:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_PRESTATE_INVALID")
+        current = self._read_exact_admin_record(reservation)
+        if current.binding_digest != expected_digest:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_DIGEST_MISMATCH")
+        current_lock_digest = (
+            None
+            if current.locked is None
+            else Sha256DigestText("sha256:" + hashlib.sha256(current.locked).hexdigest())
+        )
+        if current_lock_digest != expected_lock_digest:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_LOCK_DIGEST_MISMATCH")
+        self.release_cached_admin_entry(reservation)
+        backend = (
+            WindowsNoFollowBackend(allow_delete_share=True)
+            if os.name == "nt"
+            else PosixNoFollowBackend()
+        )
+        tree = StableHandleTree(self._repository.root, backend)
+        try:
+            git_dir = tree.open(".git", "directory")
+            if git_dir.identity != self._repository.git_dir_identity:
+                raise RepositoryEffectError("TARGET_RESERVATION_COMMONDIR_IDENTITY_CHANGED")
+            entry_relative = ".git/worktrees/" + _target_reservation_component(
+                reservation.reservation_id
+            )
+            entry = tree.open(entry_relative, "directory")
+            names = tree.list_names(entry, MAX_TARGET_RESERVATION_ADMIN_ENTRIES)
+            required = (
+                _TARGET_RESERVATION_REQUIRED_ADMIN_FILE_NAMES
+                | _TARGET_RESERVATION_REQUIRED_ADMIN_DIRECTORY_NAMES
+            )
+            if set(names) not in (
+                required,
+                required | _TARGET_RESERVATION_OPTIONAL_ADMIN_FILE_NAMES,
+            ):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            gitdir = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/gitdir", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="GITDIR",
+            )
+            commondir = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/commondir", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="COMMONDIR",
+            )
+            head = _exact_admin_line(
+                tree.read_bytes(
+                    tree.open(entry_relative + "/HEAD", "file"),
+                    MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES,
+                ),
+                label="HEAD",
+            )
+            logs = tree.open(entry_relative + "/logs", "directory")
+            if tree.list_names(logs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES) != ("HEAD",):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            logs_head = tree.read_bytes(
+                tree.open(entry_relative + "/logs/HEAD", "file"),
+                MAX_TARGET_RESERVATION_LOG_HEAD_BYTES,
+            )
+            refs = tree.open(entry_relative + "/refs", "directory")
+            if tree.list_names(refs, MAX_TARGET_RESERVATION_ADMIN_ENTRIES):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_FILES_INVALID")
+            locked_node = tree.try_open(entry_relative + "/locked", "file")
+            if locked_node is not None:
+                _exact_admin_line(
+                    tree.read_bytes(locked_node, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES),
+                    label="LOCK",
+                )
+            observed_lock_digest = (
+                None
+                if locked_node is None
+                else Sha256DigestText(
+                    "sha256:"
+                    + hashlib.sha256(
+                        tree.read_bytes(locked_node, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES)
+                    ).hexdigest()
+                )
+            )
+            if observed_lock_digest != expected_lock_digest:
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_LOCK_DIGEST_MISMATCH")
+            if (
+                gitdir != os.fsencode((reservation.path / ".git").as_posix()) + b"\n"
+                or commondir != b"../..\n"
+                or head != b"ref: " + os.fsencode(reservation.target_ref) + b"\n"
+            ):
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_BACK_REFERENCE_INVALID")
+            digest = sha256_digest(
+                canonical_json(
+                    {
+                        "entry_name": reservation.reservation_id,
+                        "gitdir_hex": gitdir.hex(),
+                        "commondir_hex": commondir.hex(),
+                        "head_hex": head.hex(),
+                        "logs_head_hex": logs_head.hex(),
+                    }
+                )
+            )
+            if digest != expected_digest:
+                raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_DIGEST_MISMATCH")
+            for relative in (
+                entry_relative + "/HEAD",
+                entry_relative + "/commondir",
+                entry_relative + "/gitdir",
+                entry_relative + "/locked",
+                entry_relative + "/logs/HEAD",
+            ):
+                node = tree.try_open(relative, "file")
+                if node is not None:
+                    tree.remove_file(relative, node.identity)
+            tree.remove_directory(entry_relative + "/logs", logs.identity)
+            tree.remove_directory(entry_relative + "/refs", refs.identity)
+            tree.remove_directory(entry_relative, entry.identity)
+        except (RepositoryUnsafeError, OSError) as error:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_CLEANUP_FAILED") from error
+        finally:
+            tree.close()
+        self.refresh_after_git_transition()
+
+    def require_exact_cleanup_path(
+        self,
+        reservation: TargetReservation,
+        expected_path_identity: str,
+        expected_gitfile_digest: Sha256DigestText,
+    ) -> None:
+        self.require_safe_before_list(reservation)
+        relative = "reservations/" + _target_reservation_component(reservation.reservation_id)
+        directory = self._data_handles.open(relative, "directory")
+        if self._data_handles.list_names(directory, 2) != (".git",):
+            raise RepositoryEffectError("TARGET_RESERVATION_PATH_PRESTATE_NOT_EXACT")
+        identity = directory.identity
+        actual_path_identity = (
+            "sha256:"
+            + hashlib.sha256(
+                f"{identity.platform}:{identity.volume}:{identity.file_id}:{identity.kind}".encode()
+            ).hexdigest()
+        )
+        gitfile = self._data_handles.open(relative + "/.git", "file")
+        raw = self._data_handles.read_bytes(gitfile, MAX_TARGET_RESERVATION_ADMIN_FILE_BYTES)
+        actual_gitfile_digest = Sha256DigestText("sha256:" + hashlib.sha256(raw).hexdigest())
+        expected_gitfile = (
+            b"gitdir: "
+            + os.fsencode(
+                (
+                    self._repository.root / ".git" / "worktrees" / reservation.reservation_id
+                ).as_posix()
+            )
+            + b"\n"
+        )
+        if (
+            actual_path_identity != expected_path_identity
+            or actual_gitfile_digest != expected_gitfile_digest
+            or raw != expected_gitfile
+        ):
+            raise RepositoryEffectError("TARGET_RESERVATION_PATH_PRESTATE_NOT_EXACT")
 
     def refresh_after_git_transition(self) -> None:
         self._repository = self._repository.refresh_after_verified_owned_transition()
@@ -1578,7 +2180,6 @@ class NoFollowTargetReservationWorktreeGuard(TargetReservationWorktreeGuard):
                     "commondir_hex": commondir.hex(),
                     "head_hex": head.hex(),
                     "logs_head_hex": logs_head.hex(),
-                    "locked_hex": None if locked is None else locked.hex(),
                 }
             )
         )
@@ -1755,6 +2356,7 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             observable=True,
             admin_entry_name=admin_after.admin_entry_name,
             admin_binding_digest=admin_after.admin_binding_digest,
+            lock_digest=admin_after.lock_digest,
         )
 
     def unlock(self, reservation: TargetReservation) -> None:
@@ -1787,7 +2389,13 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_UNLOCK_POSTSTATE_NOT_EXACT")
 
-    def remove_force(self, reservation: TargetReservation) -> None:
+    def remove_force(
+        self,
+        reservation: TargetReservation,
+        *,
+        expected_path_identity: str,
+        expected_gitfile_digest: Sha256DigestText,
+    ) -> None:
         expected = self._data_root / "reservations" / reservation.reservation_id
         if reservation.path != expected:
             raise RepositoryEffectError("TARGET_RESERVATION_CLEANUP_PATH_INVALID")
@@ -1799,6 +2407,9 @@ class GitTargetReservationRepository(TargetReservationGitPort):
             or before.locked
         ):
             raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_PRESTATE_NOT_EXACT")
+        self._worktree_guard.require_exact_cleanup_path(
+            reservation, expected_path_identity, expected_gitfile_digest
+        )
         self._worktree_guard.release_cached_reservation(reservation)
         result = self._runner.run(
             self._repository,
@@ -1813,6 +2424,22 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         after = self.observe_registration(reservation)
         if not after.observable or after.registration_present or after.unexpected_registration:
             raise RepositoryEffectError("TARGET_RESERVATION_REMOVE_POSTSTATE_NOT_EXACT")
+
+    def remove_exact_admin_entry(
+        self,
+        reservation: TargetReservation,
+        expected_digest: Sha256DigestText | None,
+        expected_lock_digest: Sha256DigestText | None = None,
+    ) -> None:
+        try:
+            self._worktree_guard.remove_exact_admin_entry(
+                reservation, expected_digest, expected_lock_digest
+            )
+        except (RepositoryEffectError, RepositoryUnsafeError) as error:
+            raise RepositoryEffectError("TARGET_RESERVATION_ADMIN_ONLY_CLEANUP_FAILED") from error
+
+    def release_cached_reservation(self, reservation: TargetReservation) -> None:
+        self._worktree_guard.release_cached_reservation(reservation)
 
     def _require_pinned_target(
         self, operation: TargetReservationOperation, *, post_operation: bool

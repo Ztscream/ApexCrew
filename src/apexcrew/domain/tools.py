@@ -45,6 +45,7 @@ ToolResultCode = Literal[
     "PATCH_APPLIED",
     "CHECK_PASSED",
     "CHECK_FAILED",
+    "EXECUTOR_UNAVAILABLE",
     "FINISHED",
     "FAILED",
     "DELETED",
@@ -66,6 +67,16 @@ ToolDenialCode = Literal[
     "NO_FOLLOW_PATH_DENIED",
     "APPROVAL_REQUIRED",
 ]
+CHECK_DENIAL_CODES = frozenset(
+    {
+        "SECRET_PATH_DENIED",
+        "SCOPE_DENIED",
+        "LEASE_SCOPE_DENIED",
+        "NO_FOLLOW_PATH_DENIED",
+        "APPROVAL_REQUIRED",
+    }
+)
+UNKNOWN_CHECK_ARGV_DIGEST = Sha256DigestText("sha256:" + "0" * 64)
 MAX_EXECUTOR_OUTPUT_BYTES = 65_536
 
 
@@ -92,6 +103,10 @@ class SnapshotUnavailable(RuntimeError):
 
 
 class SnapshotNoFollowDenied(RuntimeError):
+    pass
+
+
+class PatchExecutionUncertain(RuntimeError):
     pass
 
 
@@ -204,7 +219,12 @@ def _bounded_chunks(chunks: Iterable[bytes], remaining: int) -> tuple[bytes, int
 
 
 class ExecutionResult(FrozenDocument):
-    code: Literal["CHECK_PASSED", "CHECK_FAILED", "INFRASTRUCTURE_UNCERTAINTY"]
+    code: Literal[
+        "CHECK_PASSED",
+        "CHECK_FAILED",
+        "EXECUTOR_UNAVAILABLE",
+        "INFRASTRUCTURE_UNCERTAINTY",
+    ]
     passed: bool | None
     timed_out: bool
     output_digest: Sha256DigestText | None = None
@@ -218,6 +238,7 @@ class ExecutionResult(FrozenDocument):
         expected = {
             "CHECK_PASSED": (True, False),
             "CHECK_FAILED": (False, False),
+            "EXECUTOR_UNAVAILABLE": (None, False),
             "INFRASTRUCTURE_UNCERTAINTY": (None, True),
         }[self.code]
         if (self.passed, self.timed_out) != expected:
@@ -236,8 +257,11 @@ class ExecutionResult(FrozenDocument):
         stderr_chunks: Iterable[bytes] = (),
         timing_ms: int,
         secret_paths: SecretPathPolicy,
+        executor_unavailable: bool = False,
     ) -> ExecutionResult:
-        if exit_code is None and not timed_out:
+        if executor_unavailable and timed_out:
+            raise ValueError("EXECUTOR_OUTCOME_BINDING_INVALID")
+        if exit_code is None and not timed_out and not executor_unavailable:
             raise ValueError("EXECUTOR_OUTCOME_UNOBSERVABLE")
         stdout, remaining, stdout_truncated = _bounded_chunks(
             stdout_chunks, MAX_EXECUTOR_OUTPUT_BYTES
@@ -248,9 +272,17 @@ class ExecutionResult(FrozenDocument):
         encoded = output.encode("utf-8")
         if len(encoded) > MAX_EXECUTOR_OUTPUT_BYTES:
             output = encoded[:MAX_EXECUTOR_OUTPUT_BYTES].decode("utf-8", errors="ignore")
-        code: Literal["CHECK_PASSED", "CHECK_FAILED", "INFRASTRUCTURE_UNCERTAINTY"]
+        code: Literal[
+            "CHECK_PASSED",
+            "CHECK_FAILED",
+            "EXECUTOR_UNAVAILABLE",
+            "INFRASTRUCTURE_UNCERTAINTY",
+        ]
         if timed_out:
             code = "INFRASTRUCTURE_UNCERTAINTY"
+            passed = None
+        elif executor_unavailable or exit_code == 125:
+            code = "EXECUTOR_UNAVAILABLE"
             passed = None
         elif exit_code == 0:
             code = "CHECK_PASSED"
@@ -299,7 +331,12 @@ class ExecutorPort(Protocol):
 
 
 class PatchExecutionResult(FrozenDocument):
-    code: Literal["PATCH_APPLIED", "LEASE_SCOPE_DENIED", "SECRET_PATH_DENIED"]
+    code: Literal[
+        "PATCH_APPLIED",
+        "PATCH_RESULT_UNCERTAIN",
+        "LEASE_SCOPE_DENIED",
+        "SECRET_PATH_DENIED",
+    ]
     post_tree_digest: Sha256DigestText | None = None
 
 
@@ -335,6 +372,9 @@ class DeclaredCheckRegistry:
             return self._definitions[check_id]
         except KeyError as error:
             raise CheckDefinitionError("DECLARED_CHECK_NOT_FOUND") from error
+
+    def get(self, check_id: str) -> CheckDefinition | None:
+        return self._definitions.get(check_id)
 
 
 class CheckDeadlineJournal(Protocol):
@@ -441,6 +481,8 @@ class GrantedActionJournal(Protocol):
     def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None: ...
 
     def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent: ...
+
+    def require_granted_action_for_recovery(self, intent_id: IntentId) -> GrantedActionIntent: ...
 
     def mark_granted_action_dispatched(
         self,
@@ -579,6 +621,7 @@ class ToolResult(FrozenDocument):
         expected = {
             "CHECK_PASSED": (True, False),
             "CHECK_FAILED": (False, False),
+            "EXECUTOR_UNAVAILABLE": (None, False),
             "INFRASTRUCTURE_UNCERTAINTY": (None, True),
         }.get(self.code)
         if expected is not None and (self.passed, self.timed_out) != expected:
@@ -594,7 +637,11 @@ class ToolResult(FrozenDocument):
             raise ValueError("TOOL_RESULT_OWNERSHIP_MISSING")
         payload = canonical_json(self.model_dump(mode="json", exclude_none=True))
         outcome: Literal["COMPLETED", "FAILED", "STALE", "CONFLICT", "INDETERMINATE"]
-        if self.code in {"INDETERMINATE", "INFRASTRUCTURE_UNCERTAINTY"}:
+        if self.code in {
+            "INDETERMINATE",
+            "EXECUTOR_UNAVAILABLE",
+            "INFRASTRUCTURE_UNCERTAINTY",
+        }:
             outcome = "INDETERMINATE"
         elif self.code in {
             "SECRET_PATH_DENIED",
@@ -675,20 +722,31 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
     if tool_result.run_id != intent.run_id or tool_result.intent_id != intent.intent_id:
         raise ToolEffectResultError("TOOL_RESULT_BINDING_INVALID")
     if intent.kind == "check":
-        if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in {
+        check_codes = {
             "CHECK_PASSED",
             "CHECK_FAILED",
+            "EXECUTOR_UNAVAILABLE",
             "INFRASTRUCTURE_UNCERTAINTY",
-        }:
+        } | CHECK_DENIAL_CODES
+        if not isinstance(tool_intent.action, CheckAction) or tool_result.code not in check_codes:
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+        if result.snapshot_digest != tool_intent.snapshot_digest:
+            raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+        if tool_result.code in CHECK_DENIAL_CODES:
+            if tool_result.bounded_payload.get("snapshot_digest") != tool_intent.snapshot_digest:
+                raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+            if result.outcome != "FAILED":
+                raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
+            return
         expected_outcome = (
-            "INDETERMINATE" if tool_result.code == "INFRASTRUCTURE_UNCERTAINTY" else "COMPLETED"
+            "INDETERMINATE"
+            if tool_result.code in {"EXECUTOR_UNAVAILABLE", "INFRASTRUCTURE_UNCERTAINTY"}
+            else "COMPLETED"
         )
         output = tool_result.bounded_payload.get("output", "")
         output_bytes = tool_result.bounded_payload.get("output_bytes", 0)
         if (
             result.outcome != expected_outcome
-            or result.snapshot_digest != tool_intent.snapshot_digest
             or not isinstance(output, str)
             or not isinstance(output_bytes, int)
             or output_bytes != len(output.encode("utf-8"))
@@ -696,9 +754,17 @@ def validate_tool_effect_result(intent: EffectIntent, result: EffectResult) -> N
         ):
             raise ToolEffectResultError("CHECK_RESULT_BINDING_INVALID")
         return
+    if not isinstance(tool_intent.action, PatchAction):
+        raise ToolEffectResultError("PATCH_RESULT_BINDING_INVALID")
+    if tool_result.code == "INFRASTRUCTURE_UNCERTAINTY":
+        if (
+            result.outcome != "INDETERMINATE"
+            or result.snapshot_digest != tool_intent.snapshot_digest
+        ):
+            raise ToolEffectResultError("PATCH_RESULT_BINDING_INVALID")
+        return
     if (
-        not isinstance(tool_intent.action, PatchAction)
-        or tool_result.code != "PATCH_APPLIED"
+        tool_result.code != "PATCH_APPLIED"
         or result.outcome != "COMPLETED"
         or result.snapshot_digest != tool_intent.snapshot_digest
     ):
@@ -718,6 +784,7 @@ class ScopedToolRuntime:
         snapshot_digest: Sha256DigestText,
         scope_digest: Sha256DigestText,
         dependency_fingerprint_basis: Sha256DigestText,
+        recovery_snapshot_digest: Sha256DigestText | None = None,
         max_file_bytes: int = 131_072,
         max_search_matches: int = 200,
         max_search_bytes: int = 65_536,
@@ -727,6 +794,7 @@ class ScopedToolRuntime:
         patch_executor: PatchExecutorPort | None = None,
         declared_checks: DeclaredCheckRegistry | None = None,
         sanitized_snapshot: SanitizedSnapshot | None = None,
+        materialized_snapshot_digest: Sha256DigestText | None = None,
         deadline_journal: CheckDeadlineJournal | None = None,
         deadline_authority: CheckDeadlineAuthority | None = None,
         workspace_lease: WorkspaceLease | None = None,
@@ -739,6 +807,9 @@ class ScopedToolRuntime:
         self._applicable_revision_digests = applicable_revision_digests
         self._repository_id = repository_id
         self._snapshot_digest = snapshot_digest
+        self._recovery_snapshot_digest = (
+            snapshot_digest if recovery_snapshot_digest is None else recovery_snapshot_digest
+        )
         self._scope_digest = scope_digest
         self._dependency_fingerprint_basis = dependency_fingerprint_basis
         self._max_file_bytes = max_file_bytes
@@ -748,6 +819,13 @@ class ScopedToolRuntime:
         self._patch_executor = patch_executor
         self._declared_checks = declared_checks
         self._sanitized_snapshot = sanitized_snapshot
+        self._materialized_snapshot_digest = (
+            materialized_snapshot_digest
+            if materialized_snapshot_digest is not None
+            else sanitized_snapshot.tree_digest
+            if sanitized_snapshot is not None
+            else snapshot_digest
+        )
         self._deadline_journal = deadline_journal
         self._deadline_authority = deadline_authority
         self._workspace_lease = workspace_lease
@@ -771,6 +849,63 @@ class ScopedToolRuntime:
         if self._policy.classify(intent.action) == "REQUIRE_APPROVAL":
             return ToolResult.approval_required(intent)
         return self._denied(intent, "LEASE_SCOPE_DENIED")
+
+    def observe_recovery(
+        self, intent: ToolIntent
+    ) -> tuple[
+        Literal["EXACT_POST", "EXACT_PRE", "EXACT_RECEIPT", "THIRD_STATE", "UNAVAILABLE"],
+        ToolResult | None,
+    ]:
+        """Return bounded recovery evidence without replaying a patch."""
+        if not self._current_authorization(intent):
+            return "UNAVAILABLE", None
+        if isinstance(intent.action, PatchAction):
+            expected_post = intent.expected_poststate_digest
+            observed_snapshot_digest = self._recovery_snapshot_digest
+            if expected_post is not None and observed_snapshot_digest == expected_post:
+                result = ToolResult(
+                    code="PATCH_APPLIED",
+                    run_id=intent.run_id,
+                    intent_id=intent.intent_id,
+                    bounded_payload={
+                        "post_tree_digest": expected_post,
+                        "pre_tree_digest": intent.snapshot_digest,
+                        "snapshot_digest": intent.snapshot_digest,
+                    },
+                    content_digest=expected_post,
+                )
+                return "EXACT_POST", result
+            if observed_snapshot_digest == intent.snapshot_digest:
+                return "EXACT_PRE", None
+            return "THIRD_STATE", None
+        if isinstance(intent.action, CheckAction):
+            result = self.execute(intent)
+            if result.code not in {"CHECK_PASSED", "CHECK_FAILED"} | CHECK_DENIAL_CODES:
+                return "UNAVAILABLE", None
+            definition = (
+                self._declared_checks.get(intent.action.check_id) if self._declared_checks else None
+            )
+            argv_digest = (
+                UNKNOWN_CHECK_ARGV_DIGEST
+                if definition is None
+                else sha256_digest(canonical_json({"argv": list(definition.argv)}))
+            )
+            receipt_digest = result.content_digest or sha256_digest(
+                canonical_json(result.model_dump(mode="json"))
+            )
+            bounded_payload = dict(result.bounded_payload)
+            bounded_payload.update(
+                {
+                    "argv_digest": argv_digest,
+                    "check_id": intent.action.check_id,
+                    "receipt_digest": receipt_digest,
+                    "snapshot_digest": intent.snapshot_digest,
+                }
+            )
+            return "EXACT_RECEIPT", result.model_copy(
+                update={"bounded_payload": bounded_payload, "content_digest": receipt_digest}
+            )
+        return "UNAVAILABLE", None
 
     def execute_granted(self, intent: GrantedActionIntent) -> ToolResult:
         if canonical_action_json(intent.action) != intent.normalized_action_json:
@@ -885,9 +1020,14 @@ class ScopedToolRuntime:
             pattern.matches(path) for pattern in lease.write_globs
         ):
             return self._denied(intent, "LEASE_SCOPE_DENIED")
-        result = self._patch_executor.apply_patch(
-            lease, {str(path): action.unified_diff.encode("utf-8")}
-        )
+        try:
+            result = self._patch_executor.apply_patch(
+                lease, {str(path): action.unified_diff.encode("utf-8")}
+            )
+        except PatchExecutionUncertain:
+            return self._uncertain_patch_result(intent)
+        if result.code == "PATCH_RESULT_UNCERTAIN":
+            return self._uncertain_patch_result(intent)
         if result.code != "PATCH_APPLIED":
             denial: ToolDenialCode = (
                 "SECRET_PATH_DENIED"
@@ -906,6 +1046,19 @@ class ScopedToolRuntime:
             content_digest=result.post_tree_digest,
         )
 
+    @staticmethod
+    def _uncertain_patch_result(intent: ToolIntent) -> ToolResult:
+        return ToolResult(
+            code="INFRASTRUCTURE_UNCERTAINTY",
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            timed_out=True,
+            bounded_payload={
+                "reason": "PATCH_RESULT_UNCERTAIN",
+                "snapshot_digest": intent.snapshot_digest,
+            },
+        )
+
     def _check(self, intent: ToolIntent) -> ToolResult:
         action = intent.action
         assert isinstance(action, CheckAction)
@@ -917,16 +1070,21 @@ class ScopedToolRuntime:
             or self._deadline_authority is None
         ):
             return self._denied(intent, "LEASE_SCOPE_DENIED")
-        definition = self._declared_checks.require(action.check_id)
+        definition = self._declared_checks.get(action.check_id)
+        if definition is None:
+            return self._denied(intent, "SCOPE_DENIED")
         snapshot = self._sanitized_snapshot
+        allowed_snapshot_globs = definition.input_globs
+        if self._workspace_lease is not None:
+            allowed_snapshot_globs += self._workspace_lease.write_globs
         if (
             snapshot.repository_id != intent.repository_id
-            or snapshot.tree_digest != intent.snapshot_digest
+            or snapshot.tree_digest != self._materialized_snapshot_digest
             or any(
                 self._policy.classify(ReadAction(path=entry.path)) != "ALLOW"
                 or not any(
                     pattern.matches(CanonicalPath.parse(entry.path))
-                    for pattern in definition.input_globs
+                    for pattern in allowed_snapshot_globs
                 )
                 for entry in snapshot.entries
             )
@@ -939,7 +1097,8 @@ class ScopedToolRuntime:
             or deadline.applicable_revision_digests != intent.applicable_revision_digests
             or deadline.action_class != ActionClass.DECLARED_CHECK
             or deadline.check_id != action.check_id
-            or deadline.snapshot_digest != snapshot.tree_digest
+            or deadline.snapshot_digest != intent.snapshot_digest
+            or deadline.snapshot_digest != self._snapshot_digest
         ):
             raise ToolValidationError("CURRENT_CHECK_DEADLINE_REQUIRED")
         timeout_seconds = int((deadline.expires_at - deadline.started_at).total_seconds())
@@ -1042,4 +1201,14 @@ class ScopedToolRuntime:
                 ),
                 self._denial_expected_sequence,
             )
-        return ToolResult(code=code, run_id=intent.run_id, intent_id=intent.intent_id)
+        bounded_payload = (
+            {"snapshot_digest": intent.snapshot_digest}
+            if isinstance(intent.action, CheckAction)
+            else {}
+        )
+        return ToolResult(
+            code=code,
+            run_id=intent.run_id,
+            intent_id=intent.intent_id,
+            bounded_payload=bounded_payload,
+        )
