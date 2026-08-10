@@ -12,7 +12,7 @@ from hashlib import sha256
 from hmac import compare_digest
 from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
@@ -30,6 +30,7 @@ from apexcrew.domain.admission import (
     RuntimeStartBinding,
     StartGuard,
     StartGuardBinding,
+    TargetCasIntent,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
     TargetReservationIdAllocationError,
@@ -1101,6 +1102,31 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
             )""",
         ),
     ),
+    (
+        28,
+        (
+            """CREATE TABLE run_candidates_v28 (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                candidate_id TEXT NOT NULL UNIQUE,
+                evidence_bundle_digest TEXT NOT NULL,
+                candidate_json TEXT NOT NULL,
+                prepared_oid TEXT,
+                state TEXT NOT NULL CHECK(state IN (
+                    'PENDING_APPROVAL','APPLYING','INTEGRATED','CONFLICT','INDETERMINATE'
+                ))
+            )""",
+            """INSERT INTO run_candidates_v28(
+                run_id, candidate_id, evidence_bundle_digest, candidate_json, prepared_oid, state
+            ) SELECT run_id, candidate_id, evidence_bundle_digest, candidate_json, prepared_oid, state
+            FROM run_candidates""",
+            "DROP TABLE run_candidates",
+            "ALTER TABLE run_candidates_v28 RENAME TO run_candidates",
+        ),
+    ),
+    (
+        29,
+        ("ALTER TABLE run_candidates ADD COLUMN evidence_json TEXT NOT NULL DEFAULT ''",),
+    ),
 )
 
 
@@ -2025,22 +2051,63 @@ class SqliteStateStore:
     def final_candidate_prepared_oid(self, run_id: RunId) -> GitOid:
         with self._read_transaction() as connection:
             row = connection.execute(
-                "SELECT prepared_oid FROM run_candidates WHERE run_id = ? "
+                "SELECT prepared_oid, candidate_json FROM run_candidates WHERE run_id = ? "
                 "AND state = 'PENDING_APPROVAL'",
                 (run_id,),
             ).fetchone()
         if row is None or row["prepared_oid"] is None:
             raise StateConflict("FINAL_INTEGRATION_OID_NOT_FOUND")
-        return GitOid(str(row["prepared_oid"]))
+        try:
+            candidate = FrozenRunCandidate.model_validate_json(str(row["candidate_json"]))
+        except ValueError as error:
+            raise StateConflict("FINAL_CANDIDATE_STORAGE_INVALID") from error
+        prepared_oid = GitOid(str(row["prepared_oid"]))
+        if candidate.prepared_oid != prepared_oid or candidate.prepared_oid == candidate.head_oid:
+            raise StateConflict("FINAL_INTEGRATION_OID_BINDING_INVALID")
+        return prepared_oid
+
+    def integrated_candidate_prepared_oid(self, run_id: RunId) -> GitOid:
+        """Return the prepared OID needed to verify post-integration cleanup."""
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT prepared_oid, candidate_json FROM run_candidates WHERE run_id = ? "
+                "AND state = 'INTEGRATED'",
+                (run_id,),
+            ).fetchone()
+        if row is None or row["prepared_oid"] is None:
+            raise StateConflict("INTEGRATED_CANDIDATE_NOT_FOUND")
+        try:
+            candidate = FrozenRunCandidate.model_validate_json(str(row["candidate_json"]))
+        except ValueError as error:
+            raise StateConflict("FINAL_CANDIDATE_STORAGE_INVALID") from error
+        prepared_oid = GitOid(str(row["prepared_oid"]))
+        if candidate.prepared_oid != prepared_oid or candidate.prepared_oid == candidate.head_oid:
+            raise StateConflict("FINAL_INTEGRATION_OID_BINDING_INVALID")
+        return prepared_oid
 
     def prepare_final_candidate(
-        self, run_id: RunId, expected_sequence: AuditSequence
+        self,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        *,
+        prepared_oid: GitOid | None = None,
+        target_base_oid: GitOid | None = None,
+        target_safety_digest: Sha256DigestText | None = None,
     ) -> AuditSequence:
-        existing = self._connection.execute(
-            "SELECT state FROM run_candidates WHERE run_id = ?", (run_id,)
-        ).fetchone()
+        with self._read_transaction() as connection:
+            existing = connection.execute(
+                "SELECT state, prepared_oid FROM run_candidates WHERE run_id = ?", (run_id,)
+            ).fetchone()
         if existing is not None:
+            if (
+                prepared_oid is not None
+                and existing["prepared_oid"] is not None
+                and str(prepared_oid) != str(existing["prepared_oid"])
+            ):
+                raise StateConflict("FINAL_CANDIDATE_PREPARED_OID_CHANGED")
             return expected_sequence
+        if prepared_oid is None:
+            raise StateConflict("FINAL_CANDIDATE_PREPARED_OID_REQUIRED")
         created: list[FrozenRunCandidate] = []
         evidence_digest: list[EvidenceBundleDigest] = []
 
@@ -2050,34 +2117,83 @@ class SqliteStateStore:
                 raise StateConflict("RUN_NOT_FOUND")
             if run["state"] != RunState.ACTIVE or run["current_plan_digest"] is None:
                 raise StateConflict("FINAL_CANDIDATE_SOURCE_STATE_INVALID")
+            pinned_target_oid = GitOid(str(run["pinned_target_oid"]))
+            if target_base_oid is not None and target_base_oid != pinned_target_oid:
+                raise StateConflict("FINAL_CANDIDATE_TARGET_BASE_MISMATCH")
+            if str(prepared_oid) == str(run["run_head_oid"]):
+                raise StateConflict("FINAL_CANDIDATE_REUSES_RUN_HEAD")
+            if len(str(prepared_oid)) != 40 or any(
+                character not in "0123456789abcdef" for character in str(prepared_oid)
+            ):
+                raise StateConflict("FINAL_CANDIDATE_PREPARED_OID_INVALID")
+            private_ref_row = connection.execute(
+                "SELECT state, current_oid FROM run_refs WHERE run_id = ? AND ref_kind = 'PRIVATE'",
+                (run_id,),
+            ).fetchone()
+            if (
+                private_ref_row is None
+                or private_ref_row["state"] != "PRESENT"
+                or private_ref_row["current_oid"] is None
+                or run["run_head_oid"] is None
+                or private_ref_row["current_oid"] != run["run_head_oid"]
+            ):
+                raise StateConflict("FINAL_CANDIDATE_PRIVATE_HEAD_NOT_PROMOTED")
             contracts = self._task_contracts_in_transaction(
                 connection, RevisionDigest(str(run["current_plan_digest"]))
             )
             if not contracts:
                 raise StateConflict("FINAL_CANDIDATE_TASKS_MISSING")
             for contract in contracts:
-                succeeded = connection.execute(
-                    "SELECT 1 FROM worker_attempts WHERE run_id = ? AND task_id = ? "
-                    "AND state = 'SUCCEEDED' LIMIT 1",
+                promoted = connection.execute(
+                    "SELECT * FROM task_candidates WHERE run_id = ? AND task_id = ? "
+                    "AND state = 'PROMOTED' LIMIT 1",
                     (run_id, contract.task_id),
                 ).fetchone()
-                if succeeded is None:
+                if promoted is None:
                     raise StateConflict("FINAL_CANDIDATE_TASKS_INCOMPLETE")
+                self._task_candidate_from_row(promoted)
             plan = connection.execute(
                 "SELECT run_check_set_digest FROM plans WHERE run_id = ? AND plan_digest = ?",
                 (run_id, run["current_plan_digest"]),
             ).fetchone()
             if plan is None:
                 raise StateConflict("FINAL_CANDIDATE_PLAN_NOT_FOUND")
-            head_oid = GitOid(str(run["run_head_oid"] or run["pinned_target_oid"]))
-            dependency = sha256_digest(str(head_oid))
+            head_oid = GitOid(str(run["run_head_oid"]))
+            safety_digest = self._target_authority_digest_in_transaction(connection, run_id)
+            if target_safety_digest is not None and target_safety_digest != safety_digest:
+                raise StateConflict("FINAL_CANDIDATE_TARGET_SAFETY_CHANGED")
+            task_rows = tuple(
+                connection.execute(
+                    "SELECT * FROM task_candidates "
+                    "WHERE run_id = ? AND state = 'PROMOTED' ORDER BY task_id, candidate_id",
+                    (run_id,),
+                )
+            )
+            task_candidates = tuple(self._task_candidate_from_row(row) for row in task_rows)
+            dependencies = (
+                str(sha256_digest(str(head_oid))),
+                str(safety_digest),
+                *(
+                    str(candidate.gate_binding.check_workspace_digest)
+                    for candidate in task_candidates
+                    if candidate.gate_binding is not None
+                ),
+            )
             capsule = ContextCapsule.create(
                 run_id=str(run_id),
                 task_id="run-wide",
                 revision_digest=str(run["current_plan_digest"]),
-                dependencies=(str(dependency),),
+                dependencies=tuple(sorted(set(dependencies))),
                 content=canonical_json(
-                    {"completed_tasks": sorted(str(contract.task_id) for contract in contracts)}
+                    {
+                        "completed_tasks": sorted(str(contract.task_id) for contract in contracts),
+                        "head_oid": head_oid,
+                        "prepared_oid": prepared_oid,
+                        "target_base_oid": pinned_target_oid,
+                        "task_candidate_digests": [
+                            str(candidate.candidate_digest) for candidate in task_candidates
+                        ],
+                    }
                 ),
             )
             receipt = EvidenceReceipt.create(
@@ -2088,7 +2204,7 @@ class SqliteStateStore:
             freshness = FreshnessAssessment.assess(
                 receipt,
                 current_revision=str(run["current_plan_digest"]),
-                current_dependencies=(str(dependency),),
+                current_dependencies=tuple(sorted(set(dependencies))),
             )
             promoted = promote_candidate(receipt, freshness)
             candidate = freeze_run_candidate(
@@ -2099,18 +2215,22 @@ class SqliteStateStore:
                 head_oid=str(head_oid),
                 target_ref=str(run["target_ref"]),
                 checks_digest=str(plan["run_check_set_digest"]),
+                target_base_oid=str(pinned_target_oid),
+                prepared_oid=str(prepared_oid),
+                target_safety_digest=str(safety_digest),
             )
             bundle_digest = EvidenceBundleDigest(sha256_digest(receipt.to_json()))
             connection.execute(
                 "INSERT INTO run_candidates(run_id, candidate_id, evidence_bundle_digest, "
                 "candidate_json, evidence_json, prepared_oid, state) "
-                "VALUES (?, ?, ?, ?, ?, NULL, 'PENDING_APPROVAL')",
+                "VALUES (?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL')",
                 (
                     run_id,
                     candidate.candidate_id,
                     bundle_digest,
                     candidate.model_dump_json(),
                     receipt.to_json(),
+                    candidate.prepared_oid,
                 ),
             )
             connection.execute(
@@ -2130,6 +2250,146 @@ class SqliteStateStore:
             mutate=mutate,
         )
 
+    def prepare_run_candidate(
+        self,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        *,
+        prepared_oid: GitOid,
+        target_base_oid: GitOid,
+        target_safety_digest: Sha256DigestText,
+    ) -> FrozenRunCandidate:
+        self.prepare_final_candidate(
+            run_id,
+            expected_sequence,
+            prepared_oid=prepared_oid,
+            target_base_oid=target_base_oid,
+            target_safety_digest=target_safety_digest,
+        )
+        return self.final_candidate(run_id)
+
+    def begin_final_integration(
+        self,
+        *,
+        run_id: RunId,
+        owner_id: RuntimeOwnerId,
+        permit_generation: int,
+        expected_sequence: AuditSequence,
+    ) -> TargetCasIntent:
+        created: list[TargetCasIntent] = []
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            permit, run = self._require_consumed_runtime_owner(
+                connection, run_id, owner_id, permit_generation
+            )
+            if (
+                permit.allowed_phase != "READY_FOR_APPROVAL"
+                or run["state"] != RunState.READY_FOR_APPROVAL
+            ):
+                raise StateConflict("FINAL_INTEGRATION_PERMIT_BINDING_MISMATCH")
+            candidate_row = connection.execute(
+                "SELECT candidate_id, candidate_json, prepared_oid, state "
+                "FROM run_candidates WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if candidate_row is None:
+                raise StateConflict("FINAL_CANDIDATE_NOT_FOUND")
+            try:
+                candidate = FrozenRunCandidate.model_validate_json(
+                    str(candidate_row["candidate_json"])
+                )
+            except ValueError as error:
+                raise StateConflict("FINAL_CANDIDATE_STORAGE_INVALID") from error
+            if candidate_row["prepared_oid"] != str(candidate.prepared_oid):
+                raise StateConflict("FINAL_INTEGRATION_OID_BINDING_INVALID")
+            if candidate.prepared_oid == candidate.head_oid:
+                raise StateConflict("FINAL_INTEGRATION_OID_BINDING_INVALID")
+            if candidate.target_base_oid != GitOid(str(run["pinned_target_oid"])):
+                raise StateConflict("FINAL_CANDIDATE_TARGET_BASE_MISMATCH")
+            if candidate.target_safety_digest != self._target_authority_digest_in_transaction(
+                connection, run_id
+            ):
+                raise StateConflict("FINAL_CANDIDATE_TARGET_SAFETY_CHANGED")
+            if candidate_row["state"] == "APPLYING":
+                existing_rows = tuple(
+                    connection.execute(
+                        "SELECT * FROM effect_intents WHERE run_id = ? "
+                        "AND kind = 'target_ref_cas' AND state = 'UNSETTLED' "
+                        "ORDER BY created_sequence DESC",
+                        (run_id,),
+                    )
+                )
+                if len(existing_rows) != 1:
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_NOT_UNIQUE")
+                try:
+                    existing = TargetCasIntent.from_effect_intent(
+                        self._effect_intent_from_row(existing_rows[0])
+                    )
+                except ValueError as error:
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_STORAGE_INVALID") from error
+                if (
+                    existing.run_id != run_id
+                    or existing.prepared_oid != candidate.prepared_oid
+                    or existing.expected_old_oid != candidate.target_base_oid
+                ):
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_BINDING_MISMATCH")
+                created.append(existing)
+                return
+            if candidate_row["state"] != "PENDING_APPROVAL":
+                raise StateConflict("FINAL_CANDIDATE_BINDING_MISMATCH")
+            reservation = self._target_reservation_for_run_for_update(connection, run_id)
+            if reservation.phase != "REGISTERED_LOCKED" or reservation.admin_binding_digest is None:
+                raise StateConflict("FINAL_TARGET_RESERVATION_BINDING_INVALID")
+            identity = canonical_json(
+                {
+                    "candidate_digest": candidate.candidate_digest,
+                    "candidate_id": candidate.candidate_id,
+                    "expected_old_oid": candidate.target_base_oid,
+                    "permit_generation": permit_generation,
+                    "prepared_oid": candidate.prepared_oid,
+                    "registration_digest": reservation.admin_binding_digest,
+                    "run_id": run_id,
+                }
+            )
+            intent = TargetCasIntent(
+                intent_id=IntentId("target-cas-" + sha256(identity.encode("utf-8")).hexdigest()),
+                run_id=run_id,
+                kind="target_ref_cas",
+                repository_id=RepositoryId(str(run["repository_id"])),
+                repository_instance_digest=Sha256DigestText(str(run["repository_instance_digest"])),
+                ref_name=str(run["target_ref"]),
+                expected_old_oid=candidate.target_base_oid,
+                prepared_oid=candidate.prepared_oid,
+                target_safety_digest=candidate.target_safety_digest,
+                registration_digest=reservation.admin_binding_digest,
+                applicable_revision_digests=permit.applicable_revision_digests,
+                idempotency_key=(
+                    f"target-cas:{run_id}:{candidate.candidate_id}:"
+                    f"{candidate.target_base_oid}:{candidate.prepared_oid}:{permit_generation}"
+                ),
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            self._validate_effect_intent(effect, expected_sequence)
+            self._insert_effect_intent(connection, effect)
+            if (
+                connection.execute(
+                    "UPDATE run_candidates SET state = 'APPLYING' "
+                    "WHERE run_id = ? AND state = 'PENDING_APPROVAL'",
+                    (run_id,),
+                ).rowcount
+                != 1
+            ):
+                raise StateConflict("FINAL_CANDIDATE_BINDING_MISMATCH")
+            created.append(intent)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind("FINAL_TARGET_CAS_INTENT_RECORDED"),
+            mutate=mutate,
+        )
+        return created[0]
+
     def settle_final_integration(
         self,
         *,
@@ -2140,6 +2400,7 @@ class SqliteStateStore:
         result_class: Literal["APPLIED", "CONFLICT", "UNOBSERVABLE"],
         observed_oid: GitOid | None,
         expected_sequence: AuditSequence,
+        intent: TargetCasIntent | None = None,
     ) -> AuditSequence:
         def mutate(connection: sqlite3.Connection) -> None:
             permit, run = self._require_consumed_runtime_owner(
@@ -2157,16 +2418,73 @@ class SqliteStateStore:
             if (
                 row is None
                 or row["candidate_id"] != candidate_id
-                or row["state"] != "PENDING_APPROVAL"
+                or row["state"] not in {"PENDING_APPROVAL", "APPLYING"}
             ):
                 raise StateConflict("FINAL_CANDIDATE_BINDING_MISMATCH")
+            candidate = FrozenRunCandidate.model_validate_json(
+                str(
+                    connection.execute(
+                        "SELECT candidate_json FROM run_candidates WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()["candidate_json"]
+                )
+            )
+            if intent is not None:
+                if (
+                    row["state"] != "APPLYING"
+                    or intent.run_id != run_id
+                    or intent.prepared_oid != candidate.prepared_oid
+                    or intent.expected_old_oid != candidate.target_base_oid
+                ):
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_BINDING_MISMATCH")
+                effect_row = connection.execute(
+                    "SELECT * FROM effect_intents WHERE intent_id = ? AND state = 'UNSETTLED'",
+                    (intent.intent_id,),
+                ).fetchone()
+                if effect_row is None:
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_NOT_CURRENT")
+                stored_effect = self._effect_intent_from_row(effect_row)
+                if stored_effect != intent.to_effect_intent(stored_effect.recorded_sequence):
+                    raise StateConflict("FINAL_INTEGRATION_INTENT_BINDING_MISMATCH")
+                if result_class == "APPLIED" and observed_oid != intent.prepared_oid:
+                    raise StateConflict("FINAL_INTEGRATION_OUTCOME_OID_MISMATCH")
+                outcome = cast(
+                    Literal["COMPLETED", "FAILED", "STALE", "CONFLICT", "INDETERMINATE"],
+                    {
+                        "APPLIED": "COMPLETED",
+                        "CONFLICT": "CONFLICT",
+                        "UNOBSERVABLE": "INDETERMINATE",
+                    }[result_class],
+                )
+                payload = canonical_json(
+                    {
+                        "observed_oid": observed_oid,
+                        "result_class": result_class,
+                    }
+                )
+                self._insert_effect_result(
+                    connection,
+                    run_id,
+                    intent.intent_id,
+                    EffectResult(
+                        intent_id=intent.intent_id,
+                        run_id=run_id,
+                        outcome=outcome,
+                        result_class=result_class,
+                        result_digest=sha256_digest(payload),
+                        bounded_result_json=payload,
+                        settled_sequence=AuditSequence(expected_sequence + 1),
+                    ),
+                    intent.applicable_revision_digests,
+                )
             next_state = {
                 "APPLIED": "INTEGRATED",
                 "CONFLICT": "CONFLICT",
                 "UNOBSERVABLE": "INDETERMINATE",
             }[result_class]
             connection.execute(
-                "UPDATE run_candidates SET state = ? WHERE run_id = ? AND state = 'PENDING_APPROVAL'",
+                "UPDATE run_candidates SET state = ? WHERE run_id = ? "
+                "AND state IN ('PENDING_APPROVAL', 'APPLYING')",
                 (next_state, run_id),
             )
             run_state = (
@@ -2810,7 +3128,7 @@ class SqliteStateStore:
                     task_contract_digest(contract),
                     str(run["pinned_target_oid"]),
                     revisions,
-                    str(target_row[0]),
+                    str(self._target_authority_digest_in_transaction(connection, run_id)),
                     "deepseek" if model.provider == "deepseek_responses" else "scripted_mock",
                     None if resume is None else str(resume["allocation_id"]),
                     None if resume is None else AttemptId(resume["reserved_attempt_id"]),
@@ -6370,7 +6688,11 @@ class SqliteStateStore:
                 ).fetchone()
                 if current_revisions != expected_revisions:
                     reason = "REVISION_BINDING_MISMATCH"
-                elif target is None or target[0] != request.target_safety_digest:
+                elif target is None or (
+                    request.target_safety_digest != target[0]
+                    and request.target_safety_digest
+                    != self._target_authority_digest_in_transaction(connection, request.run_id)
+                ):
                     reason = "TARGET_BINDING_MISMATCH"
                 elif run["new_dispatch_open"] != 1 or run["state"] not in {
                     "PLANNING",
@@ -6971,7 +7293,10 @@ class SqliteStateStore:
             or row["current_model_configuration_digest"] != request.model_configuration_digest
         ):
             return "REVISION_BINDING_MISMATCH"
-        if target is None or target["admin_binding_digest"] != request.target_safety_digest:
+        if target is None or (
+            request.target_safety_digest != target["admin_binding_digest"]
+            and request.target_safety_digest != self.target_authority_digest(request.run_id)
+        ):
             return "TARGET_BINDING_MISMATCH"
         return None
 
@@ -9335,8 +9660,9 @@ class SqliteStateStore:
         return (
             payload.candidate_id == candidate_row["candidate_id"]
             and payload.evidence_bundle_digest == candidate_row["evidence_bundle_digest"]
-            and payload.expected_target_oid == candidate.head_oid
-            and payload.prepared_oid == candidate_row["prepared_oid"]
+            and payload.expected_target_oid == candidate.target_base_oid
+            and payload.prepared_oid == candidate.prepared_oid
+            and candidate_row["prepared_oid"] == str(candidate.prepared_oid)
             and command.applicable_revision_digests
             == self._current_revision_digests_in_transaction(connection, payload.run_id)
             and compare_digest(
@@ -10442,7 +10768,9 @@ class SqliteStateStore:
         if (
             payload.candidate_id != candidate.candidate_id
             or payload.evidence_bundle_digest != evidence_digest
-            or payload.expected_target_oid != candidate.head_oid
+            or payload.expected_target_oid != candidate.target_base_oid
+            or payload.prepared_oid != candidate.prepared_oid
+            or candidate.prepared_oid == candidate.head_oid
             or command.applicable_revision_digests != current
             or target_authority.current_for(run_id) != target_digest
             or not compare_digest(payload.confirmation_code, expected_code)
@@ -10458,13 +10786,13 @@ class SqliteStateStore:
         def mutate(connection: sqlite3.Connection) -> None:
             if self._target_authority_digest_in_transaction(connection, run_id) != target_digest:
                 raise StateConflict("TARGET_AUTHORITY_BINDING_MISMATCH")
-            if (
-                connection.execute(
-                    "UPDATE run_candidates SET prepared_oid = ? "
-                    "WHERE run_id = ? AND candidate_id = ? AND state = 'PENDING_APPROVAL'",
-                    (payload.prepared_oid, run_id, payload.candidate_id),
-                ).rowcount
-                != 1
+            candidate_row = connection.execute(
+                "SELECT prepared_oid FROM run_candidates "
+                "WHERE run_id = ? AND candidate_id = ? AND state = 'PENDING_APPROVAL'",
+                (run_id, payload.candidate_id),
+            ).fetchone()
+            if candidate_row is None or candidate_row["prepared_oid"] != str(
+                candidate.prepared_oid
             ):
                 raise StateConflict("FINAL_CANDIDATE_BINDING_MISMATCH")
             self._issue_runtime_permit_in_transaction(
@@ -10522,8 +10850,9 @@ class SqliteStateStore:
             if (
                 payload.candidate_id != candidate_row["candidate_id"]
                 or payload.evidence_bundle_digest != candidate_row["evidence_bundle_digest"]
-                or payload.expected_target_oid != candidate.head_oid
-                or payload.prepared_oid != candidate_row["prepared_oid"]
+                or payload.expected_target_oid != candidate.target_base_oid
+                or payload.prepared_oid != candidate.prepared_oid
+                or candidate_row["prepared_oid"] != str(candidate.prepared_oid)
                 or command.applicable_revision_digests != current
                 or target_authority.current_for(run_id) != target_digest
                 or not compare_digest(payload.confirmation_code, expected_code)

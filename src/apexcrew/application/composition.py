@@ -9,6 +9,7 @@ import shutil
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal, cast
@@ -34,6 +35,7 @@ from apexcrew.adapters.repository.bootstrap import (
 from apexcrew.adapters.repository.bootstrap import (
     repository_binding,
 )
+from apexcrew.adapters.repository.candidate_preparation import CandidatePreparationAdapter
 from apexcrew.adapters.repository.detached_workspace import DetachedWorkspace
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
@@ -95,6 +97,9 @@ from apexcrew.domain.admission import (
     TargetReservationBootstrapAdmissionService,
     TargetReservationCreationIntent,
     TargetReservationObservationService,
+    TaskCandidate,
+    TaskCandidateGateBinding,
+    task_candidate_lease_provenance_digest,
 )
 from apexcrew.domain.authority import (
     NO_PROGRESS,
@@ -160,6 +165,7 @@ from apexcrew.domain.tools import (
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
+    EvidenceBundleDigest,
     GitOid,
     IntentId,
     RepositoryId,
@@ -675,6 +681,7 @@ class _CompositionRepositoryResources:
         repository_id: RepositoryId,
         repository_instance_digest: Sha256DigestText,
         target_authority_digest: Sha256DigestText,
+        expected_post_target_oid: GitOid | None = None,
     ) -> tuple[
         TargetReservationObservationService,
         GitTargetReservationRepository,
@@ -697,6 +704,7 @@ class _CompositionRepositoryResources:
             worktree_guard=guard,
             data_root=self._data_root,
             target_authority_digest=target_authority_digest,
+            expected_post_target_oid=expected_post_target_oid,
         )
         backend = WindowsNoFollowBackend() if os.name == "nt" else PosixNoFollowBackend()
         path_reader = ReservationPathInspector(
@@ -757,6 +765,60 @@ class _CompositionRepositoryResources:
         )
         return GitTargetCasAdapter(repository, runner, guard, reservation)
 
+    def prepare_run_candidate(
+        self,
+        *,
+        run_id: RunId,
+        head_oid: GitOid,
+        target_base_oid: GitOid,
+        message: str,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+    ) -> GitOid:
+        self.validate_repository_binding(repository_id, repository_instance_digest)
+        repository, runner, _ = self._ensure()
+        adapter = CandidatePreparationAdapter(repository, runner, self._data_root)
+        try:
+            prepared_oid = adapter.prepare_run_candidate(
+                run_id=run_id,
+                head_oid=head_oid,
+                target_base_oid=target_base_oid,
+                message=message,
+            )
+        finally:
+            self._repository = adapter.repository
+        return prepared_oid
+
+    def prepare_task_candidate(
+        self,
+        *,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        run_head_oid: GitOid,
+        workspace: Path,
+        changed_paths: tuple[str, ...],
+        message: str,
+        repository_id: RepositoryId,
+        repository_instance_digest: Sha256DigestText,
+    ) -> TaskCandidate:
+        self.validate_repository_binding(repository_id, repository_instance_digest)
+        repository, runner, _ = self._ensure()
+        adapter = CandidatePreparationAdapter(repository, runner, self._data_root)
+        try:
+            candidate = adapter.prepare_task_candidate(
+                run_id=run_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                run_head_oid=run_head_oid,
+                workspace=workspace,
+                changed_paths=changed_paths,
+                message=message,
+            )
+        finally:
+            self._repository = adapter.repository
+        return candidate
+
     def close(self) -> None:
         first_error: BaseException | None = None
         self._attempt_adapter = None
@@ -808,9 +870,11 @@ class _GrantedMutation:
 @dataclass
 class _AttemptWorkspaceState:
     adapter: AttemptWorkspaceAdapter
+    binding: WorkerTurnBinding | None = None
     context: MaterializedWorkspace | None = None
     check_workspaces: dict[tuple[str, ...], _CheckWorkspaceState] = field(default_factory=dict)
     mutation_history: list[_PatchMutation | _GrantedMutation] = field(default_factory=list)
+    check_results: dict[str, ToolResult] = field(default_factory=dict)
     patch_sync_uncertain: bool = False
 
 
@@ -1095,6 +1159,8 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         key = (str(binding.attempt_id), str(binding.admissible_head))
         state = self._attempt_workspaces.get(key)
         if state is not None:
+            if state.binding is None:
+                state.binding = binding
             return state
         run = self._store.run_record(binding.run_id)
         adapter = self._resources.attempt_workspace_adapter(
@@ -1102,7 +1168,7 @@ class _CompositionWorkerTools(ScopedToolRuntime):
             run.repository_instance_digest,
             self._secret_policy,
         )
-        state = _AttemptWorkspaceState(adapter=adapter)
+        state = _AttemptWorkspaceState(adapter=adapter, binding=binding)
         self._attempt_workspaces[key] = state
         return state
 
@@ -1389,7 +1455,151 @@ class _CompositionWorkerTools(ScopedToolRuntime):
         )
 
     def execute(self, intent: ToolIntent) -> ToolResult:
-        return self._runtime(intent).execute(intent)
+        result = self._runtime(intent).execute(intent)
+        if isinstance(intent.action, CheckAction) and intent.attempt_id is not None:
+            binding = self._store.current_worker_turn_binding(intent.attempt_id)
+            state = self._attempt_state(binding)
+            state.check_results[intent.action.check_id] = result
+        return result
+
+    def prepare_completed_task_candidate(self, attempt_id: AttemptId) -> TaskCandidate | None:
+        """Admit one completed Attempt from the still-owned in-process workspace."""
+        matching = tuple(
+            state
+            for state in self._attempt_workspaces.values()
+            if state.binding is not None and state.binding.attempt_id == attempt_id
+        )
+        if len(matching) != 1:
+            return None
+        state = matching[0]
+        binding = state.binding
+        assert binding is not None
+        existing = tuple(
+            candidate
+            for candidate in self._store.task_candidates(binding.run_id)
+            if candidate.attempt_id == attempt_id
+        )
+        if existing:
+            return existing[0]
+        if state.patch_sync_uncertain:
+            raise StateConflict("TASK_CANDIDATE_WORKSPACE_SYNC_UNCERTAIN")
+        contract = self._contract(binding)
+        expected_checks = tuple(
+            check_id_for(binding.task_id, ordinal)
+            for ordinal, _definition in enumerate(contract.checks)
+        )
+        check_results = tuple(
+            (check_id, state.check_results.get(check_id)) for check_id in expected_checks
+        )
+        if any(result is None or result.code != "CHECK_PASSED" for _, result in check_results):
+            raise StateConflict("TASK_CANDIDATE_CHECKS_INCOMPLETE")
+        changed_paths = self._changed_paths(state)
+        if not changed_paths:
+            raise StateConflict("TASK_CANDIDATE_CHANGES_REQUIRED")
+        lease = self._store.workspace_lease(binding.run_id, binding.lease_id)
+        if lease is None:
+            raise StateConflict("TASK_CANDIDATE_LEASE_NOT_FOUND")
+        primary = self._primary_workspace(state, binding, lease, contract)
+        evidence_payload = canonical_json(
+            {
+                "attempt_id": attempt_id,
+                "checks": [
+                    {
+                        "check_id": check_id,
+                        "result": result.model_dump(mode="json"),
+                    }
+                    for check_id, result in check_results
+                    if result is not None
+                ],
+                "post_tree_digest": primary.tree_digest,
+                "scope_digest": binding.scope_digest,
+            }
+        )
+        evidence_digest = EvidenceBundleDigest(str(sha256_digest(evidence_payload)))
+        prepared_at = datetime.now(UTC)
+        if prepared_at < lease.issued_at or prepared_at >= lease.expires_at:
+            raise StateConflict("TASK_CANDIDATE_LEASE_EXPIRED_AT_PREPARATION")
+        candidate_without_gate = self._resources.prepare_task_candidate(
+            run_id=binding.run_id,
+            task_id=binding.task_id,
+            attempt_id=attempt_id,
+            run_head_oid=GitOid(binding.admissible_head),
+            workspace=primary.workspace.root,
+            changed_paths=changed_paths,
+            message=f"apexcrew prepare task candidate {binding.task_id}",
+            repository_id=RepositoryId(binding.repository_id),
+            repository_instance_digest=self._store.run_record(
+                binding.run_id
+            ).repository_instance_digest,
+        )
+        freshness_digest = sha256_digest(
+            canonical_json(
+                {
+                    "candidate_digest": candidate_without_gate.candidate_digest,
+                    "current_revisions": binding.applicable_revision_digests,
+                    "evidence_bundle_digest": evidence_digest,
+                    "prepared_at_utc": prepared_at,
+                }
+            )
+        )
+        gate = TaskCandidateGateBinding(
+            attempt_id=attempt_id,
+            task_contract_digest=binding.task_contract_digest,
+            base_run_head_oid=GitOid(binding.admissible_head),
+            post_tree_oid=candidate_without_gate.prepared_tree_oid,
+            evidence_bundle_digest=evidence_digest,
+            freshness_assessment_digest=freshness_digest,
+            freshness_status="FRESH",
+            applicable_revision_digests=binding.applicable_revision_digests,
+            target_safety_digest=binding.target_safety_digest,
+            scope_digest=binding.scope_digest,
+            check_workspace_digest=binding.snapshot_digest,
+            policy_decision="ALLOW",
+            lease_id=lease.lease_id,
+            lease_generation=lease.generation,
+            lease_base_head_oid=GitOid(lease.base_head),
+            lease_admissible_head_oid=GitOid(lease.admissible_head),
+            lease_issued_at_utc=lease.issued_at,
+            lease_expires_at_utc=lease.expires_at,
+            prepared_at_utc=prepared_at,
+            lease_provenance_digest=task_candidate_lease_provenance_digest(
+                attempt_id=attempt_id,
+                lease_id=lease.lease_id,
+                lease_generation=lease.generation,
+                lease_base_head_oid=GitOid(lease.base_head),
+                lease_admissible_head_oid=GitOid(lease.admissible_head),
+                lease_issued_at_utc=lease.issued_at,
+                lease_expires_at_utc=lease.expires_at,
+                prepared_at_utc=prepared_at,
+            ),
+        )
+        candidate = TaskCandidate.create(
+            run_id=binding.run_id,
+            task_id=binding.task_id,
+            attempt_id=attempt_id,
+            expected_run_head_oid=GitOid(binding.admissible_head),
+            prepared_oid=candidate_without_gate.prepared_oid,
+            prepared_tree_oid=candidate_without_gate.prepared_tree_oid,
+            changed_paths=candidate_without_gate.changed_paths,
+            gate_binding=gate,
+        )
+        self._store.persist_task_candidate(candidate, self._store.audit_sequence(binding.run_id))
+        return candidate
+
+    @staticmethod
+    def _changed_paths(state: _AttemptWorkspaceState) -> tuple[str, ...]:
+        paths: set[str] = set()
+        for mutation in state.mutation_history:
+            if isinstance(mutation, _PatchMutation):
+                paths.update(path for path, _diff in mutation.patches)
+                continue
+            paths.add(mutation.action.path)
+            if mutation.action.destination is not None:
+                paths.add(mutation.action.destination)
+        try:
+            return tuple(sorted(str(CanonicalPath.parse(path)) for path in paths))
+        except ValueError as error:
+            raise StateConflict("TASK_CANDIDATE_CHANGED_PATH_INVALID") from error
 
     def observe_recovery(
         self, intent: ToolIntent
@@ -1940,21 +2150,33 @@ class _CompositionIntegrationDriver:
         self._resources = resources
 
     def integrate(self, run_id: RunId, permit: RuntimePermit) -> RuntimeDecision:
-        if permit.state != "CONSUMED" or permit.consumed_owner_id is None:
+        if (
+            permit.state != "CONSUMED"
+            or permit.allowed_phase != "READY_FOR_APPROVAL"
+            or permit.consumed_owner_id is None
+        ):
             return RuntimeDecision.pause("FINAL_INTEGRATION_PERMIT_INVALID")
         candidate = self._store.final_candidate(run_id)
-        prepared_oid = self._store.final_candidate_prepared_oid(run_id)
         run = self._store.run_record(run_id)
-        result = self._resources.target_cas(
+        intent = self._store.begin_final_integration(
+            run_id=run_id,
+            owner_id=permit.consumed_owner_id,
+            permit_generation=permit.generation,
+            expected_sequence=self._store.audit_sequence(run_id),
+        )
+        target_cas = self._resources.target_cas(
             self._store.target_reservation_for_run(run_id),
             run.repository_id,
             run.repository_instance_digest,
-        ).apply(
-            target_ref=candidate.target_ref,
-            expected_old_oid=candidate.head_oid,
-            prepared_oid=prepared_oid,
+        )
+        result = target_cas.apply(
+            target_ref=intent.ref_name,
+            expected_old_oid=intent.expected_old_oid,
+            prepared_oid=intent.prepared_oid,
             reflog_message=f"apexcrew integrate {run_id}",
         )
+        if result.result_class == "APPLIED":
+            self._resources.refresh()
         sequence = self._store.settle_final_integration(
             run_id=run_id,
             owner_id=permit.consumed_owner_id,
@@ -1963,6 +2185,7 @@ class _CompositionIntegrationDriver:
             result_class=result.result_class,
             observed_oid=result.observed_oid,
             expected_sequence=self._store.audit_sequence(run_id),
+            intent=intent,
         )
         if result.result_class == "APPLIED":
             return RuntimeDecision.continued(sequence)
@@ -1979,6 +2202,11 @@ class _CompositionReservationCleanup:
         self._store = store
         self._resources = resources
 
+    def _post_target_oid(self, run: RunRecord) -> GitOid | None:
+        if run.state.value != "COMPLETED":
+            return None
+        return self._store.integrated_candidate_prepared_oid(run.run_id)
+
     def observe(self, reservation: TargetReservation) -> CleanupObservation:
         run = self._store.run_record(reservation.run_id)
         observer, _git, _path_reader = self._resources.reservation_adapters(
@@ -1986,6 +2214,7 @@ class _CompositionReservationCleanup:
             run.repository_id,
             run.repository_instance_digest,
             self._store.target_authority_digest(reservation.run_id),
+            self._post_target_oid(run),
         )
         observed = observer.observe(reservation)
         conflict = CleanupObservation(CleanupObservationKind.CONFLICT, reservation.reservation_id)
@@ -2050,6 +2279,7 @@ class _CompositionReservationCleanup:
             run.repository_id,
             run.repository_instance_digest,
             self._store.target_authority_digest(reservation.run_id),
+            self._post_target_oid(run),
         )
         if observation.kind is CleanupObservationKind.BOTH_ABSENT:
             return
@@ -2298,9 +2528,17 @@ class _RuntimeIds:
 class _CompositionWorkerScheduling:
     """Allocate the first bounded worker tranche through the authority service."""
 
-    def __init__(self, store: SqliteStateStore, authority: AuthorityService) -> None:
+    def __init__(
+        self,
+        store: SqliteStateStore,
+        authority: AuthorityService,
+        resources: _CompositionRepositoryResources,
+        worker_tools: _CompositionWorkerTools,
+    ) -> None:
         self._store = store
         self._authority = authority
+        self._resources = resources
+        self._worker_tools = worker_tools
 
     def next_dispatchable(self, run_id: RunId) -> TaskDispatchSelection | RuntimeDecision:
         state = self._store.load_runtime_state(run_id)
@@ -2329,9 +2567,52 @@ class _CompositionWorkerScheduling:
             isinstance(selection, RuntimeDecision)
             and selection.stop_reason == "NO_DISPATCHABLE_TASK"
         ):
+            plan_digest = self._store.run_record(run_id).current_plan_digest
+            if plan_digest is None:
+                return selection
+            for contract in sorted(
+                self._store.task_contracts(plan_digest),
+                key=lambda item: item.task_id,
+            ):
+                candidate_attempt_ids = {
+                    candidate.attempt_id
+                    for candidate in self._store.task_candidates(run_id)
+                    if candidate.task_id == contract.task_id
+                }
+                completed_attempts = tuple(
+                    attempt
+                    for attempt in self._store.attempts_for_task(contract.task_id)
+                    if attempt.run_id == run_id
+                    and attempt.state == "SUCCEEDED"
+                    and attempt.attempt_id not in candidate_attempt_ids
+                )
+                for attempt in completed_attempts:
+                    candidate = self._worker_tools.prepare_completed_task_candidate(
+                        attempt.attempt_id
+                    )
+                    if candidate is not None:
+                        return RuntimeDecision.continued(self._store.audit_sequence(run_id))
             try:
+                run = self._store.run_record(run_id)
+                head_oid = run.run_head_oid
+                if head_oid is None:
+                    raise StateConflict("FINAL_CANDIDATE_RUN_HEAD_MISSING")
+                reservation = self._store.target_reservation_for_run(run_id)
+                target_safety_digest = self._store.target_authority_digest(run_id)
+                prepared_oid = self._resources.prepare_run_candidate(
+                    run_id=run_id,
+                    head_oid=head_oid,
+                    target_base_oid=reservation.pinned_target_oid,
+                    message=f"apexcrew prepare run candidate {run_id}",
+                    repository_id=run.repository_id,
+                    repository_instance_digest=run.repository_instance_digest,
+                )
                 sequence = self._store.prepare_final_candidate(
-                    run_id, self._store.audit_sequence(run_id)
+                    run_id,
+                    self._store.audit_sequence(run_id),
+                    prepared_oid=prepared_oid,
+                    target_base_oid=reservation.pinned_target_oid,
+                    target_safety_digest=target_safety_digest,
                 )
             except StateConflict as error:
                 if str(error) not in {
@@ -2539,7 +2820,7 @@ def _build_application_bundle(
             journal=store,
             state=store,
             clock=SystemUtcClock(),
-            scheduling=_CompositionWorkerScheduling(store, authority),
+            scheduling=_CompositionWorkerScheduling(store, authority, resources, worker_tools),
             attempts=store,
             workers=worker,
         )

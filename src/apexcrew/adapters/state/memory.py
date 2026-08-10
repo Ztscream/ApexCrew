@@ -4024,9 +4024,12 @@ class InMemoryStateStore:
                         ),
                         None,
                     )
-                    if (
-                        reservation is None
-                        or reservation.admin_binding_digest != request.target_safety_digest
+                    if reservation is None or (
+                        request.target_safety_digest
+                        not in {
+                            reservation.admin_binding_digest,
+                            self.target_authority_digest(request.run_id),
+                        }
                     ):
                         reason = "TARGET_BINDING_MISMATCH"
                     elif run.state not in {RunState.PLANNING, RunState.ACTIVE} or (
@@ -4460,9 +4463,12 @@ class InMemoryStateStore:
                 ),
                 None,
             )
-            if (
-                reservation is None
-                or reservation.admin_binding_digest != request.target_safety_digest
+            if reservation is None or (
+                request.target_safety_digest
+                not in {
+                    reservation.admin_binding_digest,
+                    self.target_authority_digest(request.run_id),
+                }
             ):
                 return "TARGET_BINDING_MISMATCH"
             if run.state is not RunState.ACTIVE:

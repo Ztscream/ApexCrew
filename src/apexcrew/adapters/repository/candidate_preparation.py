@@ -12,6 +12,7 @@ from apexcrew.adapters.repository.git import (
     GitCommitTree,
     GitHashObjectWrite,
     GitHashObjectWriteContent,
+    GitOperation,
     GitReadTree,
     GitRemoveIndexPath,
     GitUpdateIndexCacheInfo,
@@ -41,7 +42,7 @@ class CandidatePreparationGitRunner(Protocol):
     def run(
         self,
         repository: RepositoryInstance,
-        operation: object,
+        operation: GitOperation,
         *,
         index_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
@@ -61,6 +62,10 @@ class CandidatePreparationAdapter:
         self._repository = repository
         self._runner = runner
         self._data_root = data_root
+
+    @property
+    def repository(self) -> RepositoryInstance:
+        return self._repository
 
     def prepare_task_candidate(
         self,
@@ -132,6 +137,55 @@ class CandidatePreparationAdapter:
                 finally:
                     index_tree.close()
 
+    def prepare_run_candidate(
+        self,
+        *,
+        run_id: RunId,
+        head_oid: GitOid,
+        target_base_oid: GitOid,
+        message: str,
+    ) -> GitOid:
+        """Create a fresh target-parent commit from the complete private Run Head tree."""
+        run_component = self._component(run_id, "RUN_ID_INVALID")
+        if not message or "\x00" in message or "\r" in message or "\n" in message:
+            raise CandidatePreparationError("COMMIT_MESSAGE_INVALID")
+        index_file = self._index_file(run_component, "run-candidate")
+        index_tree: StableHandleTree | None = None
+        index_identity: HandleIdentity | None = None
+        index_tree, index_identity = self._reserve_index_path(index_file)
+        try:
+            self._run(GitReadTree(head_oid), index_file=index_file, index_tree=index_tree)
+            index_identity = self._capture_index_identity(index_tree, index_file)
+            tree_oid = self._output_oid(
+                self._run(GitWriteTree(), index_file=index_file, index_tree=index_tree),
+                "WRITE_TREE_FAILED",
+            )
+            index_identity = self._capture_index_identity(index_tree, index_file)
+            prepared_oid = self._output_oid(
+                self._run(
+                    GitCommitTree(tree_oid, target_base_oid, message),
+                    index_file=index_file,
+                    index_tree=index_tree,
+                ),
+                "COMMIT_TREE_FAILED",
+            )
+            if prepared_oid == head_oid:
+                raise CandidatePreparationError("RUN_CANDIDATE_REUSES_HEAD")
+            return prepared_oid
+        except CandidatePreparationError:
+            raise
+        except (OSError, RepositoryUnsafeError, ValueError) as error:
+            raise CandidatePreparationError("RUN_CANDIDATE_PREPARATION_FAILED") from error
+        finally:
+            if index_tree is not None:
+                try:
+                    if index_identity is None:
+                        index_identity = self._maybe_index_identity(index_tree, index_file)
+                    if index_identity is not None:
+                        self._remove_index(index_tree, index_file, index_identity)
+                finally:
+                    index_tree.close()
+
     def _prepare_path(
         self,
         tree: StableHandleTree,
@@ -165,7 +219,7 @@ class CandidatePreparationAdapter:
 
     def _run(
         self,
-        operation: object,
+        operation: GitOperation,
         *,
         index_file: Path,
         index_tree: StableHandleTree | None = None,

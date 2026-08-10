@@ -528,7 +528,9 @@ def test_unknown_check_is_settled_as_a_durable_tool_denial(tmp_path: Path) -> No
     )
     try:
         stop = bundle.runtime.run_until_blocked(run_id)
-        assert stop.reason.value == "AWAITING_FINAL_APPROVAL"
+        # An undeclared check is durably denied, so the task cannot produce a
+        # candidate until a declared check has passed.
+        assert stop.reason.value == "PAUSED"
         assert executor.calls == []
         assert bundle.queries.get(run_id).sequence > 0
         with sqlite3.connect(root / ".apexcrew" / "state.db") as connection:

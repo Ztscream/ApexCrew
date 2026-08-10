@@ -411,6 +411,13 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         assert final_stop.reason == "AWAITING_FINAL_APPROVAL", final_stop.model_dump(mode="json")
         assert final_stop.pending is not None
         assert bundle.queries.get(run_id).state == "READY_FOR_APPROVAL"
+        candidate = bundle.runtime._store.final_candidate(run_id)
+        assert candidate.target_base_oid == target_oid
+        assert candidate.prepared_oid != candidate.head_oid
+        assert _git(root, "show", "-s", "--format=%P", str(candidate.prepared_oid)) == str(
+            target_oid
+        )
+        assert _git(root, "rev-parse", f"refs/apexcrew/runs/{run_id}") == str(candidate.head_oid)
         assert len(executor.calls) == 1
         argv, check_snapshot, timeout_seconds = executor.calls[0]
         assert argv == ("python", "-m", "pytest")
@@ -425,20 +432,6 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         ).fetchone()
         assert deadline_row is not None
 
-        preview = runner.invoke(
-            cli_app,
-            ["integrate", str(run_id), "--root", str(root), "--preview"],
-        )
-        assert preview.exit_code == 1, preview.stdout
-        assert json.loads(preview.stdout) == {
-            "failed_invariant": "STATE_CONFLICT",
-            "status": "INTEGRATE_REJECTED",
-        }
-        bundle.runtime._store._connection.execute(  # type: ignore[attr-defined]
-            "UPDATE run_candidates SET prepared_oid = ? WHERE run_id = ?",
-            (target_oid, run_id),
-        )
-        bundle.runtime._store._connection.commit()  # type: ignore[attr-defined]
         preview = runner.invoke(
             cli_app,
             ["integrate", str(run_id), "--root", str(root), "--preview"],
@@ -488,6 +481,7 @@ def test_cleanup_settlement_requires_exact_absence_after_reopen(tmp_path: Path) 
         replay = runner.invoke(cli_app, command_args)
         assert replay.exit_code == 0, replay.stdout
         assert json.loads(replay.stdout)["status"] == "COMMAND_ACCEPTED"
-        assert _git(root, "rev-parse", "refs/heads/main") == str(target_oid)
+        assert _git(root, "rev-parse", "refs/heads/main") == integration["prepared_oid"]
+        assert _git(root, "rev-parse", f"refs/apexcrew/runs/{run_id}") == str(candidate.head_oid)
     finally:
         bundle.close()

@@ -106,6 +106,7 @@ class _RunCommandContext:
     candidate_id: CandidateId | None = None
     evidence_bundle_digest: EvidenceBundleDigest | None = None
     candidate_head_oid: GitOid | None = None
+    target_base_oid: GitOid | None = None
     prepared_oid: GitOid | None = None
 
 
@@ -169,13 +170,18 @@ def _read_run_context(root: Path, run_id: RunId) -> _RunCommandContext:
             candidate_id: CandidateId | None = None
             evidence: EvidenceBundleDigest | None = None
             head_oid: GitOid | None = None
+            target_base_oid: GitOid | None = None
             prepared: GitOid | None = None
             if candidate is not None:
                 candidate_id = CandidateId(str(candidate[0]))
                 evidence = EvidenceBundleDigest(str(candidate[1]))
                 candidate_json = json.loads(str(candidate[2]))
                 head_oid = GitOid(str(candidate_json["head_oid"]))
-                if candidate[3] is not None:
+                if candidate_json.get("target_base_oid") is not None:
+                    target_base_oid = GitOid(str(candidate_json["target_base_oid"]))
+                if candidate_json.get("prepared_oid") is not None:
+                    prepared = GitOid(str(candidate_json["prepared_oid"]))
+                elif candidate[3] is not None:
                     prepared = GitOid(str(candidate[3]))
             return _RunCommandContext(
                 run_id=run_id,
@@ -188,6 +194,7 @@ def _read_run_context(root: Path, run_id: RunId) -> _RunCommandContext:
                 candidate_id=candidate_id,
                 evidence_bundle_digest=evidence,
                 candidate_head_oid=head_oid,
+                target_base_oid=target_base_oid,
                 prepared_oid=prepared,
             )
         finally:
@@ -632,7 +639,7 @@ def integrate(
         if (
             context.candidate_id is None
             or context.evidence_bundle_digest is None
-            or context.candidate_head_oid is None
+            or context.target_base_oid is None
         ):
             raise StateConflict("FINAL_CANDIDATE_NOT_FOUND")
         if context.prepared_oid is None:
@@ -648,7 +655,7 @@ def integrate(
                 "INTEGRATION_PREVIEW",
                 candidate_id=context.candidate_id,
                 evidence_bundle_digest=context.evidence_bundle_digest,
-                expected_target_oid=context.candidate_head_oid,
+                expected_target_oid=context.target_base_oid,
                 prepared_oid=context.prepared_oid,
                 confirmation_code=expected_code,
                 run_id=run_id,

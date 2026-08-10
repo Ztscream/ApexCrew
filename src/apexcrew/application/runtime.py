@@ -329,7 +329,10 @@ class PrivateRefPromotionDriver:
         if (
             permit.state != "CONSUMED"
             or permit.run_id != run_id
-            or permit.allowed_phase not in {"ACTIVE", "PAUSED"}
+            # The READY_TO_START permit remains the owner of the first ACTIVE
+            # runtime interval, so it may also settle the first task candidate
+            # promotion after private-ref initialization.
+            or permit.allowed_phase not in {"READY_TO_START", "ACTIVE", "PAUSED"}
         ):
             return RuntimeDecision.pause("PRIVATE_PROMOTION_PERMIT_INVALID")
         candidate = self._store.pending_task_candidate(run_id)

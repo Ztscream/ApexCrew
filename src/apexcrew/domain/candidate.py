@@ -26,6 +26,9 @@ class FrozenRunCandidate(FrozenDocument):
     target_ref: str = Field(pattern=r"^refs/heads/[A-Za-z0-9._/-]+$")
     checks_digest: Sha256DigestText
     candidate_digest: Sha256DigestText
+    target_base_oid: GitOid = Field(default=GitOid("0" * 40), pattern=r"^[0-9a-f]{40}$")
+    prepared_oid: GitOid = Field(default=GitOid("0" * 40), pattern=r"^[0-9a-f]{40}$")
+    target_safety_digest: Sha256DigestText = "sha256:" + "0" * 64
 
     @model_validator(mode="after")
     def validate_digest(self) -> FrozenRunCandidate:
@@ -37,6 +40,9 @@ class FrozenRunCandidate(FrozenDocument):
                 "run_id": self.run_id,
                 "source_candidate_digest": self.source_candidate_digest,
                 "target_ref": self.target_ref,
+                "target_base_oid": self.target_base_oid,
+                "prepared_oid": self.prepared_oid,
+                "target_safety_digest": self.target_safety_digest,
             }
         )
         if self.candidate_digest != expected:
@@ -52,7 +58,15 @@ def freeze_run_candidate(
     head_oid: str,
     target_ref: str,
     checks_digest: str,
+    target_base_oid: str | None = None,
+    prepared_oid: str | None = None,
+    target_safety_digest: str | None = None,
 ) -> FrozenRunCandidate:
+    target_base = GitOid(head_oid if target_base_oid is None else target_base_oid)
+    prepared = GitOid(head_oid if prepared_oid is None else prepared_oid)
+    safety = Sha256DigestText(
+        "sha256:" + "0" * 64 if target_safety_digest is None else target_safety_digest
+    )
     digest = _digest(
         {
             "candidate_id": candidate_id,
@@ -61,6 +75,9 @@ def freeze_run_candidate(
             "run_id": run_id,
             "source_candidate_digest": candidate.candidate_digest,
             "target_ref": target_ref,
+            "target_base_oid": target_base,
+            "prepared_oid": prepared,
+            "target_safety_digest": safety,
         }
     )
     return FrozenRunCandidate(
@@ -71,6 +88,9 @@ def freeze_run_candidate(
         target_ref=target_ref,
         checks_digest=checks_digest,
         candidate_digest=digest,
+        target_base_oid=target_base,
+        prepared_oid=prepared,
+        target_safety_digest=safety,
     )
 
 

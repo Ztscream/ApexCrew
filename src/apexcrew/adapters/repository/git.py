@@ -1089,6 +1089,21 @@ class RepositoryInstance:
                 for relative, _kind in transition_entries:
                     self.handles.release_cached(relative)
                 return
+        if isinstance(operation, GitUpdateRefCas):
+            transition_entries = _target_ref_transition_entries(operation.direct_ref)
+            if transition_entries:
+                excluded_prefixes = tuple(
+                    relative for relative, kind in transition_entries if kind == "file"
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                self.storage_snapshot.assert_current(
+                    self.handles,
+                    excluded_prefixes=excluded_prefixes,
+                )
+                for relative, _kind in transition_entries:
+                    self.handles.release_cached(relative)
+                return
         if isinstance(operation, (GitWorktreeUnlock, GitWorktreeRemoveForce)):
             self.storage_snapshot.assert_current(
                 self.handles,
@@ -1291,6 +1306,33 @@ def _private_ref_transition_entries(
         (f".git/logs/refs/apexcrew/runs/{component}", "file"),
         (f".git/logs/refs/apexcrew/runs/{component}.lock", "file"),
     )
+
+
+def _target_ref_transition_entries(
+    direct_ref: str,
+) -> tuple[tuple[str, Literal["file", "directory"]], ...]:
+    """Return the bounded storage paths touched by a direct target-ref CAS."""
+    prefix = "refs/heads/"
+    component = direct_ref.removeprefix(prefix)
+    parts = tuple(component.split("/"))
+    if (
+        not direct_ref.startswith(prefix)
+        or not component
+        or any(part in {"", ".", ".."} or "\\" in part or "\x00" in part for part in parts)
+    ):
+        return ()
+
+    entries: list[tuple[str, Literal["file", "directory"]]] = []
+    for root in (".git/refs", ".git/logs/refs"):
+        relative = root
+        entries.append((relative, "directory"))
+        for part in ("heads", *parts[:-1]):
+            relative += "/" + part
+            entries.append((relative, "directory"))
+        ref_relative = relative + "/" + parts[-1]
+        entries.append((ref_relative, "file"))
+        entries.append((ref_relative + ".lock", "file"))
+    return tuple(entries)
 
 
 type GitOperation = (
@@ -1506,7 +1548,7 @@ class GitCommandRunner:
             raise RepositoryUnsafeError("RAW_GIT_ARGUMENTS_DENIED")
         argv = self._argv_for(operation)
         repository.assert_stable_for(operation)
-        transition_handles = self._open_private_ref_transition(repository, operation)
+        transition_handles = self._open_ref_transition(repository, operation)
         try:
             command = (
                 str(self._git),
@@ -1544,15 +1586,18 @@ class GitCommandRunner:
                 transition_handles.close()
 
     @staticmethod
-    def _open_private_ref_transition(
+    def _open_ref_transition(
         repository: RepositoryInstance,
         operation: GitOperation,
     ) -> StableHandleTree | None:
-        if not isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+        if isinstance(operation, (GitCreatePrivateRef, GitUpdatePrivateRefCas)):
+            entries = _private_ref_transition_entries(operation.direct_ref)
+        elif isinstance(operation, GitUpdateRefCas):
+            entries = _target_ref_transition_entries(operation.direct_ref)
+        else:
             return None
         if not isinstance(repository, RepositoryInstance):
             return None
-        entries = _private_ref_transition_entries(operation.direct_ref)
         if not entries:
             return None
         backend = (
@@ -2220,6 +2265,7 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         worktree_guard: TargetReservationWorktreeGuard,
         data_root: Path,
         target_authority_digest: Sha256DigestText,
+        expected_post_target_oid: GitOid | None = None,
     ) -> None:
         self._repository = repository
         self._repository_id = repository_id
@@ -2228,6 +2274,7 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         self._worktree_guard = worktree_guard
         self._data_root = data_root
         self._target_authority_digest = target_authority_digest
+        self._expected_post_target_oid = expected_post_target_oid
 
     def _require_safe_reservation_state(
         self, operation: TargetReservationOperation, *, post_operation: bool
@@ -2346,7 +2393,7 @@ class GitTargetReservationRepository(TargetReservationGitPort):
         exact = (
             not unexpected
             and record is not None
-            and record.head_oid == reservation.pinned_target_oid
+            and record.head_oid in {reservation.pinned_target_oid, self._expected_post_target_oid}
         )
         return ReservationRegistrationObservation(
             registration_present=record is not None,

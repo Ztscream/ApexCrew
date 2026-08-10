@@ -93,6 +93,14 @@ class GitTargetCasAdapter:
                     "CONFLICT" if observed_after != expected_old_oid else "UNOBSERVABLE",
                     observed_after,
                 )
+            refresh_repository = getattr(
+                self._repository, "refresh_after_verified_owned_transition", None
+            )
+            if callable(refresh_repository):
+                self._repository = refresh_repository()
+            refresh_guard = getattr(self._guard, "refresh_after_git_transition", None)
+            if callable(refresh_guard):
+                refresh_guard()
             self._guard.require_safe_before_list(self._reservation)
             after = self._runner.run(self._repository, GitShowRefVerify(target_ref))
             if after.returncode != 0:
