@@ -18,7 +18,15 @@ from apexcrew.delivery.cli import app
 def test_cli_exposes_required_commands_and_safe_terminal_results(tmp_path: Path) -> None:
     root = make_git_repository(tmp_path)
     runner = CliRunner()
-    for command in ("init", "run", "status", "approve", "doctor"):
+    for command in (
+        "init",
+        "run",
+        "status",
+        "approve",
+        "doctor",
+        "prepare-purge",
+        "confirm-purge",
+    ):
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0, result.stdout
 

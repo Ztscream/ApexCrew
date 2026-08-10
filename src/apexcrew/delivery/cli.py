@@ -30,6 +30,7 @@ from apexcrew.application.configuration import (
     build_create_run_payload,
 )
 from apexcrew.application.control import (
+    BootstrapRepositoryAuthority,
     ControlCommandService,
     CrewControlService,
     TargetAuthorityDigestService,
@@ -44,9 +45,12 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
     CommandPayload,
+    ConfirmPurgePayload,
     CreateRunPayload,
     GrantPayload,
     IntegratePayload,
+    PreparePurgePayload,
+    PurgePreparedResult,
     ReconcileCleanupPayload,
     StartPayload,
 )
@@ -272,6 +276,82 @@ class _SqliteTargetAuthorityDigestService(TargetAuthorityDigestService):
         return self._store.target_authority_digest(run_id)
 
 
+class _PurgeRepositoryAuthority:
+    """Sentinel authority: purge is administrative and must never inspect Git."""
+
+    def inspect(self, repository_root: str, target_ref: str) -> BootstrapRepositoryAuthority:
+        raise AssertionError(f"purge attempted Git inspection: {repository_root}:{target_ref}")
+
+
+def _purge_request_id(payload: PreparePurgePayload | ConfirmPurgePayload) -> str:
+    digest = hashlib.sha256(canonical_json(payload.model_dump(mode="json")).encode("utf-8"))
+    return "cli-purge-" + digest.hexdigest()
+
+
+def _handle_purge_command(
+    root: Path, payload: PreparePurgePayload | ConfirmPurgePayload
+) -> CommandOutcome:
+    guard = ControlPathGuard(root.resolve())
+    store: SqliteStateStore | None = None
+    try:
+        probe = guard.open_existing_database_read_only()
+        probe.close()
+        connection = guard.open_database()
+        store = SqliteStateStore(guard.state.database, connection=connection)
+        run_id = RunId(payload.run_id)
+        command = CommandEnvelope(
+            request_id=_purge_request_id(payload),
+            expected_sequence=store.audit_sequence(run_id),
+            applicable_revision_digests=ApplicableRevisionDigests(),
+            payload=payload,
+        )
+        control = CrewControlService(
+            ControlCommandService(
+                state=store,
+                target_authority=_SqliteTargetAuthorityDigestService(store),
+                repository_authority=_PurgeRepositoryAuthority(),
+            )
+        )
+        outcome = control.handle(command)
+        guard.assert_current()
+        return outcome
+    finally:
+        if store is not None:
+            store.close()
+        guard.close()
+
+
+def _emit_purge_outcome(outcome: CommandOutcome, *, accepted_status: str) -> None:
+    fields: dict[str, object] = {
+        "run_id": outcome.run_id,
+        "resulting_sequence": outcome.resulting_sequence,
+    }
+    if outcome.failed_invariant is not None:
+        fields["failed_invariant"] = outcome.failed_invariant
+    if outcome.safe_next_action is not None:
+        fields["safe_next_action"] = outcome.safe_next_action
+    if outcome.status != "ACCEPTED":
+        rejected_status = {
+            "PURGE_PREPARED": "PURGE_PREPARE_REJECTED",
+            "PURGE_CONFIRMED": "PURGE_CONFIRM_REJECTED",
+        }.get(accepted_status, "PURGE_REJECTED")
+        _emit(rejected_status, **fields)
+        raise typer.Exit(code=1)
+    if accepted_status == "PURGE_PREPARED":
+        if not isinstance(outcome.result, PurgePreparedResult):
+            _emit("PURGE_PREPARE_REJECTED", failed_invariant="PURGE_RESULT_MISSING", **fields)
+            raise typer.Exit(code=1)
+        fields.update(
+            {
+                "purge_digest": outcome.result.purge_digest,
+                "confirmation_code": outcome.result.confirmation_code,
+                "expires_at_utc": outcome.result.expires_at_utc.isoformat(),
+                "manifest": outcome.result.manifest.model_dump(mode="json"),
+            }
+        )
+    _emit(accepted_status, **fields)
+
+
 @app.command()
 def init(root: Path = typer.Option(Path("."), exists=True, file_okay=False)) -> None:  # noqa: B008
     """Create non-sensitive local ApexCrew configuration."""
@@ -448,6 +528,60 @@ def reconcile_cleanup(
     ) as error:
         _reject("RECONCILE_CLEANUP_REJECTED", error)
     _emit_outcome(outcome)
+
+
+@app.command("prepare-purge")
+def prepare_purge(
+    run_id: str,
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Freeze and display the metadata-first purge manifest for one terminal Run."""
+    try:
+        outcome = _handle_purge_command(
+            root,
+            PreparePurgePayload(run_id=RunId(run_id)),
+        )
+    except (
+        ConfigurationError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("PURGE_PREPARE_REJECTED", error)
+    _emit_purge_outcome(outcome, accepted_status="PURGE_PREPARED")
+
+
+@app.command("confirm-purge")
+def confirm_purge(
+    run_id: str,
+    purge_digest: str = typer.Option(..., "--purge-digest"),
+    confirmation_code: str = typer.Option(..., "--confirmation-code"),
+    root: Path = typer.Option(Path("."), exists=True, file_okay=False),  # noqa: B008
+) -> None:
+    """Confirm one displayed purge manifest and remove only its frozen local state."""
+    try:
+        outcome = _handle_purge_command(
+            root,
+            ConfirmPurgePayload(
+                run_id=RunId(run_id),
+                purge_digest=Sha256DigestText(purge_digest),
+                confirmation_code=confirmation_code,
+            ),
+        )
+    except (
+        ConfigurationError,
+        RepositoryUnsafeError,
+        sqlite3.Error,
+        OSError,
+        ValueError,
+        StateConflict,
+        RuntimeError,
+    ) as error:
+        _reject("PURGE_CONFIRM_REJECTED", error)
+    _emit_purge_outcome(outcome, accepted_status="PURGE_CONFIRMED")
 
 
 @app.command()

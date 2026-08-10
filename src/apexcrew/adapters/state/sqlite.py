@@ -120,16 +120,23 @@ from apexcrew.domain.commands import (
     BeginPlanningPayload,
     CommandEnvelope,
     CommandOutcome,
+    ConfirmPurgePayload,
     CreateRunPayload,
     GrantPayload,
     IntegratePayload,
+    PreparePurgePayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
     PublicRunSnapshot,
+    PurgeDatabaseRowEntry,
+    PurgeLocalArtifactEntry,
+    PurgeManifestDocument,
+    PurgePreparedResult,
     ReconcileCleanupPayload,
     ResolveIndeterminatePayload,
     ResumePayload,
+    RevisionApprovalResult,
     RunStop,
     RuntimeAllowedPhase,
     RuntimeDecision,
@@ -1126,6 +1133,38 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
     (
         29,
         ("ALTER TABLE run_candidates ADD COLUMN evidence_json TEXT NOT NULL DEFAULT ''",),
+    ),
+    (
+        30,
+        (
+            """CREATE TABLE retention_artifacts (
+                artifact_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                relative_path TEXT NOT NULL,
+                artifact_digest TEXT NOT NULL,
+                byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+                state TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0 CHECK(deleted IN (0, 1))
+            )""",
+            "CREATE INDEX retention_artifacts_by_run ON retention_artifacts(run_id, relative_path)",
+            """CREATE TABLE purge_manifests (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                purge_digest TEXT NOT NULL UNIQUE,
+                manifest_json TEXT NOT NULL,
+                confirmation_code TEXT NOT NULL,
+                expires_at_utc TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('PREPARED','PURGING','PURGED'))
+            )""",
+            """CREATE TABLE purge_tombstones (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                terminal_state TEXT NOT NULL,
+                terminal_sequence INTEGER NOT NULL,
+                phase TEXT NOT NULL CHECK(phase IN ('PURGING','PURGED')),
+                removed_count INTEGER NOT NULL CHECK(removed_count >= 0),
+                created_at_utc TEXT NOT NULL
+            )""",
+        ),
     ),
 )
 
@@ -9756,6 +9795,8 @@ class SqliteStateStore:
         failed_invariant: str | None,
         event_kind: str,
         mutate_domain: Callable[[sqlite3.Connection], None] | None = None,
+        result: RevisionApprovalResult | PurgePreparedResult | None = None,
+        safe_next_action: str | None = None,
     ) -> CommandOutcome:
         if command.expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
@@ -9797,6 +9838,8 @@ class SqliteStateStore:
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected + 1),
                 failed_invariant=failed_invariant,
+                safe_next_action=safe_next_action,
+                result=result,
             )
             self._claim_control_request_in_transaction(connection, command, outcome)
             if mutate_domain is not None:
@@ -11019,6 +11062,369 @@ class SqliteStateStore:
             mutate,
         )
 
+    def register_retention_artifact(
+        self,
+        run_id: RunId,
+        entry: PurgeLocalArtifactEntry,
+        *,
+        state: str = "STORED",
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        """Persist artifact metadata independently from its optional payload."""
+        metadata_json = canonical_json({} if metadata is None else metadata)
+        with self._transaction("IMMEDIATE") as connection:
+            if (
+                connection.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+                is None
+            ):
+                raise StateConflict("RUN_NOT_FOUND")
+            connection.execute(
+                """INSERT INTO retention_artifacts(
+                    artifact_id, run_id, relative_path, artifact_digest, byte_count,
+                    state, metadata_json, deleted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    relative_path = excluded.relative_path,
+                    artifact_digest = excluded.artifact_digest,
+                    byte_count = excluded.byte_count,
+                    state = excluded.state,
+                    metadata_json = excluded.metadata_json,
+                    deleted = 0""",
+                (
+                    entry.artifact_id,
+                    run_id,
+                    entry.relative_path,
+                    entry.artifact_digest,
+                    entry.byte_count,
+                    state,
+                    metadata_json,
+                ),
+            )
+
+    def retention_artifacts(self, run_id: RunId) -> tuple[PurgeLocalArtifactEntry, ...]:
+        with self._read_transaction() as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT artifact_id, relative_path, artifact_digest, byte_count "
+                    "FROM retention_artifacts WHERE run_id = ? AND deleted = 0 "
+                    "ORDER BY relative_path, artifact_digest",
+                    (run_id,),
+                )
+            )
+        return tuple(
+            PurgeLocalArtifactEntry(
+                artifact_id=str(row["artifact_id"]),
+                relative_path=str(row["relative_path"]),
+                artifact_digest=str(row["artifact_digest"]),
+                byte_count=int(row["byte_count"]),
+            )
+            for row in rows
+        )
+
+    def purge_inventory(
+        self, run_id: RunId
+    ) -> tuple[PurgeDatabaseRowEntry | PurgeLocalArtifactEntry, ...]:
+        run = self.run_record(run_id)
+        terminal = run.state in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
+        if not terminal:
+            raise StateConflict("PURGE_REQUIRES_TERMINAL_RUN")
+        run_entry = PurgeDatabaseRowEntry(
+            table_name="runs",
+            row_id=str(run_id),
+            row_digest=sha256_digest(canonical_json({"run_id": run_id, "state": run.state})),
+            byte_count=0,
+        )
+        entries: tuple[PurgeDatabaseRowEntry | PurgeLocalArtifactEntry, ...] = (
+            run_entry,
+            *self.retention_artifacts(run_id),
+        )
+        return tuple(
+            sorted(
+                entries,
+                key=lambda entry: (
+                    entry.kind,
+                    getattr(entry, "relative_path", getattr(entry, "table_name", "")),
+                    getattr(entry, "artifact_id", getattr(entry, "row_id", "")),
+                ),
+            )
+        )
+
+    def _purge_manifest_from_row(self, row: sqlite3.Row) -> PurgeManifestDocument:
+        try:
+            return PurgeManifestDocument.model_validate_json(str(row["manifest_json"]))
+        except ValueError as error:
+            raise StateConflict("PURGE_MANIFEST_STORAGE_INVALID") from error
+
+    def _purge_eligibility_in_transaction(
+        self, connection: sqlite3.Connection, run_id: RunId
+    ) -> tuple[bool, str | None]:
+        row = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return False, "RUN_NOT_FOUND"
+        if row["state"] not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+            return False, "PURGE_REQUIRES_TERMINAL_RUN"
+        if row["runtime_owner_id"] is not None:
+            return False, "RUNTIME_OWNER_ACTIVE"
+        reservation = connection.execute(
+            "SELECT phase FROM target_reservations WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if reservation is None or reservation["phase"] != "CLEANUP_SETTLED":
+            return False, "TARGET_RESERVATION_CLEANUP_REQUIRED"
+        checks = (
+            (
+                "SELECT 1 FROM pending_actions WHERE run_id = ? AND state = 'WAITING_APPROVAL'",
+                "PENDING_ACTION_LIVE",
+            ),
+            (
+                "SELECT 1 FROM workspace_leases WHERE run_id = ? AND state = 'ACTIVE'",
+                "WORKSPACE_LEASE_ACTIVE",
+            ),
+            (
+                "SELECT 1 FROM effect_intents WHERE run_id = ? AND state IN ('UNSETTLED', 'INDETERMINATE')",
+                "EFFECT_INTENT_UNSETTLED",
+            ),
+            (
+                "SELECT 1 FROM runtime_permits WHERE run_id = ? AND state = 'UNCONSUMED'",
+                "RUNTIME_PERMIT_LIVE",
+            ),
+        )
+        for query, reason in checks:
+            if connection.execute(query, (run_id,)).fetchone() is not None:
+                return False, reason
+        if (
+            connection.execute(
+                "SELECT 1 FROM indeterminate_members WHERE run_id = ? AND state = 'PENDING'",
+                (run_id,),
+            ).fetchone()
+            is not None
+        ):
+            return False, "INDETERMINATE_OUTCOME_PRESENT"
+        return True, None
+
+    def _purge_result(self, manifest: PurgeManifestDocument, now: datetime) -> PurgePreparedResult:
+        digest = Sha256DigestText(str(revision_digest(manifest)))
+        return PurgePreparedResult(
+            manifest=manifest,
+            purge_digest=digest,
+            confirmation_code=_approval_confirmation_code(
+                "prepare_purge", manifest.run_id, "PURGE", RevisionDigest(str(digest))
+            ),
+            expires_at_utc=now + timedelta(minutes=10),
+        )
+
+    def _apply_prepare_purge(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, PreparePurgePayload):
+            raise TypeError("prepare purge command required")
+        expected = command.expected_sequence
+        if expected is None:
+            raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
+        now = datetime.now(UTC)
+        with self._read_transaction() as connection:
+            existing = connection.execute(
+                "SELECT manifest_json, confirmation_code, expires_at_utc, state "
+                "FROM purge_manifests WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if existing is not None and existing["state"] == "PURGED":
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "RUN_ALREADY_PURGED",
+                "PURGE_REJECTED",
+            )
+        if existing is not None:
+            manifest = self._purge_manifest_from_row(existing)
+            result = self._purge_result(
+                manifest, datetime.fromisoformat(str(existing["expires_at_utc"]))
+            )
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.ACCEPTED,
+                None,
+                "PURGE_ALREADY_PREPARED",
+                result=result,
+            )
+        with self._read_transaction() as connection:
+            eligible, reason = self._purge_eligibility_in_transaction(connection, run_id)
+        if not eligible:
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                reason or "PURGE_NOT_ELIGIBLE",
+                "PURGE_REJECTED",
+                safe_next_action=(
+                    "reconcile terminal administrative cleanup"
+                    if reason == "TARGET_RESERVATION_CLEANUP_REQUIRED"
+                    else None
+                ),
+            )
+        entries = self.purge_inventory(run_id)
+        with self._read_transaction() as connection:
+            run = connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            sequence_row = connection.execute(
+                "SELECT current_sequence FROM run_sequences WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if run is None:
+            raise StateConflict("RUN_NOT_FOUND")
+        sequence = AuditSequence(int(sequence_row["current_sequence"]))
+        manifest = PurgeManifestDocument(
+            repository_id=Sha256DigestText(str(run["repository_id"])),
+            run_id=run_id,
+            terminal_state=run["state"],
+            terminal_sequence=sequence,
+            ledger_head_digest=sha256_digest(
+                canonical_json({"run_id": run_id, "sequence": sequence})
+            ),
+            entries=entries,
+            database_row_count=sum(isinstance(entry, PurgeDatabaseRowEntry) for entry in entries),
+            local_artifact_count=sum(
+                isinstance(entry, PurgeLocalArtifactEntry) for entry in entries
+            ),
+            total_byte_count=sum(entry.byte_count for entry in entries),
+        )
+        result = self._purge_result(manifest, now)
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            eligible, reason = self._purge_eligibility_in_transaction(connection, run_id)
+            if not eligible:
+                raise StateConflict(reason or "PURGE_NOT_ELIGIBLE")
+            connection.execute(
+                """INSERT INTO purge_manifests(
+                    run_id, purge_digest, manifest_json, confirmation_code, expires_at_utc, state
+                ) VALUES (?, ?, ?, ?, ?, 'PREPARED')""",
+                (
+                    run_id,
+                    result.purge_digest,
+                    manifest.model_dump_json(),
+                    result.confirmation_code,
+                    result.expires_at_utc.isoformat(),
+                ),
+            )
+
+        return self._record_control_outcome(
+            command,
+            run_id,
+            CommandStatus.ACCEPTED,
+            None,
+            "PURGE_PREPARED",
+            mutate,
+            result=result,
+        )
+
+    def _finish_purge_manifest_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        run_id: RunId,
+        manifest: PurgeManifestDocument,
+    ) -> int:
+        removed = 0
+        connection.execute(
+            "UPDATE purge_manifests SET state = 'PURGING' WHERE run_id = ? "
+            "AND state IN ('PREPARED', 'PURGING')",
+            (run_id,),
+        )
+        connection.execute(
+            """INSERT INTO purge_tombstones(
+                run_id, terminal_state, terminal_sequence, phase, removed_count, created_at_utc
+            ) VALUES (?, ?, ?, 'PURGING', ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET phase = 'PURGING'""",
+            (
+                run_id,
+                manifest.terminal_state,
+                manifest.terminal_sequence,
+                len(manifest.entries),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        for entry in manifest.entries:
+            if isinstance(entry, PurgeLocalArtifactEntry):
+                path = (self._data_root / Path(*entry.relative_path.split("/"))).resolve()
+                if self._data_root not in path.parents:
+                    raise StateConflict("PURGE_PATH_OUTSIDE_DATA_ROOT")
+                if path.is_file():
+                    path.unlink()
+                    removed += 1
+                connection.execute(
+                    "UPDATE retention_artifacts SET deleted = 1 WHERE artifact_id = ? AND run_id = ?",
+                    (entry.artifact_id, run_id),
+                )
+        connection.execute(
+            "UPDATE purge_manifests SET state = 'PURGED' WHERE run_id = ?",
+            (run_id,),
+        )
+        connection.execute(
+            "UPDATE purge_tombstones SET phase = 'PURGED', removed_count = ? WHERE run_id = ?",
+            (removed, run_id),
+        )
+        return removed
+
+    def _finish_purge_manifest(self, run_id: RunId, manifest: PurgeManifestDocument) -> int:
+        with self._transaction("IMMEDIATE") as connection:
+            return self._finish_purge_manifest_in_transaction(connection, run_id, manifest)
+
+    def recover_purge(self, run_id: RunId) -> int:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT manifest_json, state FROM purge_manifests WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise StateConflict("PURGE_MANIFEST_NOT_FOUND")
+        if row["state"] == "PURGED":
+            return 0
+        if row["state"] != "PURGING":
+            raise StateConflict("PURGE_RECOVERY_REQUIRES_PURGING")
+        return self._finish_purge_manifest(run_id, self._purge_manifest_from_row(row))
+
+    def _apply_confirm_purge(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
+        payload = command.payload
+        if not isinstance(payload, ConfirmPurgePayload):
+            raise TypeError("confirm purge command required")
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT manifest_json, purge_digest, confirmation_code, expires_at_utc, state "
+                "FROM purge_manifests WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return self._record_control_outcome(
+                command, run_id, CommandStatus.DENIED, "PURGE_MANIFEST_NOT_FOUND", "PURGE_REJECTED"
+            )
+        if row["state"] == "PURGED":
+            return self._record_control_outcome(
+                command, run_id, CommandStatus.DENIED, "RUN_ALREADY_PURGED", "PURGE_REJECTED"
+            )
+        manifest = self._purge_manifest_from_row(row)
+        if datetime.now(UTC) >= datetime.fromisoformat(str(row["expires_at_utc"])):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "PURGE_CONFIRMATION_EXPIRED",
+                "PURGE_REJECTED",
+            )
+        if payload.purge_digest != row["purge_digest"] or not compare_digest(
+            payload.confirmation_code, str(row["confirmation_code"])
+        ):
+            return self._record_control_outcome(
+                command,
+                run_id,
+                CommandStatus.DENIED,
+                "PURGE_CONFIRMATION_MISMATCH",
+                "PURGE_REJECTED",
+            )
+
+        def mutate(connection: sqlite3.Connection) -> None:
+            self._finish_purge_manifest_in_transaction(connection, run_id, manifest)
+
+        return self._record_control_outcome(
+            command, run_id, CommandStatus.ACCEPTED, None, "PURGE_CONFIRMED", mutate
+        )
+
     def apply_control_command(
         self,
         command: CommandEnvelope,
@@ -11125,6 +11531,10 @@ class SqliteStateStore:
                 "RUNTIME_PERMIT_ISSUED",
                 issue,
             )
+        if isinstance(command.payload, PreparePurgePayload):
+            return self._apply_prepare_purge(command, run_id)
+        if isinstance(command.payload, ConfirmPurgePayload):
+            return self._apply_confirm_purge(command, run_id)
         if isinstance(command.payload, ReconcileCleanupPayload):
             if state not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
                 return self._record_control_outcome(

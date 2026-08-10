@@ -107,14 +107,21 @@ from apexcrew.domain.commands import (
     BeginPlanningPayload,
     CommandEnvelope,
     CommandOutcome,
+    ConfirmPurgePayload,
     CreateRunPayload,
     GrantPayload,
+    PreparePurgePayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
     PublicRunSnapshot,
+    PurgeDatabaseRowEntry,
+    PurgeLocalArtifactEntry,
+    PurgeManifestDocument,
+    PurgePreparedResult,
     ResolveIndeterminatePayload,
     ResumePayload,
+    RevisionApprovalResult,
     RunStop,
     RuntimeAllowedPhase,
     RuntimeDecision,
@@ -545,6 +552,8 @@ class InMemoryStateStore:
         self._pending_actions: dict[PendingActionId, PendingAction] = {}
         self._approval_grants: dict[GrantId, tuple[ApprovalGrant, RequestId]] = {}
         self._granted_action_intents: dict[IntentId, GrantedActionIntent] = {}
+        self._retention_artifacts: dict[RunId, tuple[PurgeLocalArtifactEntry, ...]] = {}
+        self._purge_manifests: dict[RunId, tuple[PurgeManifestDocument, str, str, str]] = {}
         self._monotonic_clock = monotonic_clock
         self._target_reservation_id_source = (
             random_target_reservation_id
@@ -623,6 +632,8 @@ class InMemoryStateStore:
         copied._pending_actions = self._pending_actions.copy()
         copied._approval_grants = self._approval_grants.copy()
         copied._granted_action_intents = self._granted_action_intents.copy()
+        copied._retention_artifacts = self._retention_artifacts.copy()
+        copied._purge_manifests = self._purge_manifests.copy()
         copied._monotonic_clock = self._monotonic_clock
         copied._target_reservation_id_source = self._target_reservation_id_source
         copied._lock = self._lock
@@ -696,6 +707,8 @@ class InMemoryStateStore:
         self._pending_actions = copied._pending_actions
         self._approval_grants = copied._approval_grants
         self._granted_action_intents = copied._granted_action_intents
+        self._retention_artifacts = copied._retention_artifacts
+        self._purge_manifests = copied._purge_manifests
 
     def _commit_state_and_event(
         self,
@@ -5824,6 +5837,8 @@ class InMemoryStateStore:
         failed_invariant: str | None,
         event_kind: str,
         mutate_domain: Callable[[InMemoryStateStore], None] | None = None,
+        result: RevisionApprovalResult | PurgePreparedResult | None = None,
+        safe_next_action: str | None = None,
     ) -> CommandOutcome:
         if command.expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
@@ -5863,6 +5878,8 @@ class InMemoryStateStore:
                 run_id=run_id,
                 resulting_sequence=AuditSequence(expected + 1),
                 failed_invariant=failed_invariant,
+                safe_next_action=safe_next_action,
+                result=result,
             )
             self._claim_control_request(copied, command, outcome)
             if mutate_domain is not None:
@@ -6848,6 +6865,10 @@ class InMemoryStateStore:
                 "RUNTIME_PERMIT_ISSUED",
                 issue,
             )
+        if isinstance(command.payload, PreparePurgePayload):
+            return self._apply_prepare_purge(command, run_id)
+        if isinstance(command.payload, ConfirmPurgePayload):
+            return self._apply_confirm_purge(command, run_id)
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, run.state)
         if isinstance(
@@ -6903,6 +6924,220 @@ class InMemoryStateStore:
             "COMMAND_NOT_AVAILABLE_IN_TASK_10",
             "CONTROL_COMMAND_REJECTED",
         )
+
+    def register_retention_artifact(self, run_id: RunId, entry: PurgeLocalArtifactEntry) -> None:
+        with self._lock:
+            if run_id not in self._runs:
+                raise StateConflict("RUN_NOT_FOUND")
+            current = tuple(
+                item
+                for item in self._retention_artifacts.get(run_id, ())
+                if item.artifact_id != entry.artifact_id
+            )
+            self._retention_artifacts[run_id] = tuple(
+                sorted(
+                    (*current, entry), key=lambda item: (item.relative_path, item.artifact_digest)
+                )
+            )
+
+    def retention_artifacts(self, run_id: RunId) -> tuple[PurgeLocalArtifactEntry, ...]:
+        with self._lock:
+            return self._retention_artifacts.get(run_id, ())
+
+    def purge_inventory(
+        self, run_id: RunId
+    ) -> tuple[PurgeDatabaseRowEntry | PurgeLocalArtifactEntry, ...]:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run.state not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+                raise StateConflict("PURGE_REQUIRES_TERMINAL_RUN")
+            run_entry = PurgeDatabaseRowEntry(
+                table_name="runs",
+                row_id=str(run_id),
+                row_digest=sha256_digest(canonical_json({"run_id": run_id, "state": run.state})),
+                byte_count=0,
+            )
+            return (run_entry, *self._retention_artifacts.get(run_id, ()))
+
+    def _purge_result(self, manifest: PurgeManifestDocument, now: datetime) -> PurgePreparedResult:
+        digest = Sha256DigestText(str(revision_digest(manifest)))
+        return PurgePreparedResult(
+            manifest=manifest,
+            purge_digest=digest,
+            confirmation_code=_approval_confirmation_code(
+                "prepare_purge", manifest.run_id, "PURGE", RevisionDigest(str(digest))
+            ),
+            expires_at_utc=now + timedelta(minutes=10),
+        )
+
+    def _purge_is_eligible(self, run_id: RunId) -> str | None:
+        run = self._runs[run_id]
+        if run.state not in {RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}:
+            return "PURGE_REQUIRES_TERMINAL_RUN"
+        if run_id in self._runtime_owners:
+            return "RUNTIME_OWNER_ACTIVE"
+        reservation = next(
+            (item for item in self._target_reservations.values() if item.run_id == run_id), None
+        )
+        if reservation is None or reservation.phase != "CLEANUP_SETTLED":
+            return "TARGET_RESERVATION_CLEANUP_REQUIRED"
+        if any(
+            item.bindings.run_id == run_id and item.state == "WAITING_APPROVAL"
+            for item in self._pending_actions.values()
+        ):
+            return "PENDING_ACTION_LIVE"
+        if any(
+            item.run_id == run_id and item.state == "ACTIVE"
+            for item in self._workspace_leases.values()
+        ):
+            return "WORKSPACE_LEASE_ACTIVE"
+        if any(
+            item.run_id == run_id
+            for item in self._effect_intents.values()
+            if item.intent_id not in self._effect_results
+        ):
+            return "EFFECT_INTENT_UNSETTLED"
+        return None
+
+    def _apply_prepare_purge(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
+        if not isinstance(command.payload, PreparePurgePayload):
+            raise TypeError("prepare purge command required")
+        with self._lock:
+            existing = self._purge_manifests.get(run_id)
+            if existing is not None and existing[3] == "PURGED":
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.DENIED,
+                    "RUN_ALREADY_PURGED",
+                    "PURGE_REJECTED",
+                )
+            if existing is not None:
+                result = self._purge_result(existing[0], datetime.fromisoformat(existing[2]))
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.ACCEPTED,
+                    None,
+                    "PURGE_ALREADY_PREPARED",
+                    result=result,
+                )
+            run = self._runs.get(run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            reason = self._purge_is_eligible(run_id)
+            if reason is not None:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.DENIED,
+                    reason,
+                    "PURGE_REJECTED",
+                    safe_next_action=(
+                        "reconcile terminal administrative cleanup"
+                        if reason == "TARGET_RESERVATION_CLEANUP_REQUIRED"
+                        else None
+                    ),
+                )
+            sequence = self._sequences.get(run_id, AuditSequence(0))
+            entries = self.purge_inventory(run_id)
+            manifest = PurgeManifestDocument(
+                repository_id=Sha256DigestText(str(run.repository_id)),
+                run_id=run_id,
+                terminal_state=cast(Literal["COMPLETED", "FAILED", "CANCELLED"], run.state.value),
+                terminal_sequence=sequence,
+                ledger_head_digest=sha256_digest(
+                    canonical_json({"run_id": run_id, "sequence": sequence})
+                ),
+                entries=entries,
+                database_row_count=sum(
+                    isinstance(entry, PurgeDatabaseRowEntry) for entry in entries
+                ),
+                local_artifact_count=sum(
+                    isinstance(entry, PurgeLocalArtifactEntry) for entry in entries
+                ),
+                total_byte_count=sum(entry.byte_count for entry in entries),
+            )
+            result = self._purge_result(manifest, datetime.now(UTC))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            reason = copied._purge_is_eligible(run_id)
+            if reason is not None:
+                raise StateConflict(reason)
+            copied._purge_manifests[run_id] = (
+                manifest,
+                result.confirmation_code,
+                result.expires_at_utc.isoformat(),
+                "PREPARED",
+            )
+
+        return self._record_control_outcome(
+            command, run_id, CommandStatus.ACCEPTED, None, "PURGE_PREPARED", mutate, result=result
+        )
+
+    def _apply_confirm_purge(self, command: CommandEnvelope, run_id: RunId) -> CommandOutcome:
+        if not isinstance(command.payload, ConfirmPurgePayload):
+            raise TypeError("confirm purge command required")
+        with self._lock:
+            existing = self._purge_manifests.get(run_id)
+            if existing is None:
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.DENIED,
+                    "PURGE_MANIFEST_NOT_FOUND",
+                    "PURGE_REJECTED",
+                )
+            manifest, confirmation, expires_at, state = existing
+            if state == "PURGED":
+                return self._record_control_outcome(
+                    command, run_id, CommandStatus.DENIED, "RUN_ALREADY_PURGED", "PURGE_REJECTED"
+                )
+            if command.payload.purge_digest != revision_digest(manifest) or not compare_digest(
+                command.payload.confirmation_code, confirmation
+            ):
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.DENIED,
+                    "PURGE_CONFIRMATION_MISMATCH",
+                    "PURGE_REJECTED",
+                )
+            if datetime.now(UTC) >= datetime.fromisoformat(expires_at):
+                return self._record_control_outcome(
+                    command,
+                    run_id,
+                    CommandStatus.DENIED,
+                    "PURGE_CONFIRMATION_EXPIRED",
+                    "PURGE_REJECTED",
+                )
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            stored = copied._purge_manifests.get(run_id)
+            if stored is None or stored[0] != manifest:
+                raise StateConflict("PURGE_MANIFEST_CHANGED")
+            copied._purge_manifests[run_id] = (manifest, confirmation, expires_at, "PURGED")
+            copied._retention_artifacts.pop(run_id, None)
+
+        return self._record_control_outcome(
+            command, run_id, CommandStatus.ACCEPTED, None, "PURGE_CONFIRMED", mutate
+        )
+
+    def recover_purge(self, run_id: RunId) -> int:
+        with self._lock:
+            existing = self._purge_manifests.get(run_id)
+            if existing is None:
+                raise StateConflict("PURGE_MANIFEST_NOT_FOUND")
+            if existing[3] == "PURGED":
+                return 0
+            if existing[3] != "PURGING":
+                raise StateConflict("PURGE_RECOVERY_REQUIRES_PURGING")
+            manifest, confirmation, expires_at, _state = existing
+            self._purge_manifests[run_id] = (manifest, confirmation, expires_at, "PURGED")
+            self._retention_artifacts.pop(run_id, None)
+            return len(manifest.entries)
 
     def plan_approval(self, run_id: RunId) -> PlanApproval:
         with self._lock:

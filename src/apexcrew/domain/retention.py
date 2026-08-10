@@ -5,7 +5,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from typing import Literal
+
+from apexcrew.domain.commands import PurgeLocalArtifactEntry
 
 RetentionState = Literal["STORED", "QUARANTINED", "DROPPED_BY_RETENTION"]
 
@@ -35,6 +38,7 @@ class RetentionArtifact:
     original_length: int
     content_digest: str
     preview: bytes | None
+    relative_path: str
 
 
 class RetentionManager:
@@ -46,6 +50,7 @@ class RetentionManager:
         known_credentials: tuple[str, ...] = (),
         max_bytes: int = 1 << 30,
         now: Callable[[], datetime] | None = None,
+        data_root: Path | None = None,
     ) -> None:
         if max_bytes < 0:
             raise ValueError("RETENTION_CAP_INVALID")
@@ -54,7 +59,10 @@ class RetentionManager:
         )
         self._max_bytes = max_bytes
         self._now = now or (lambda: datetime.now(UTC))
+        self._data_root = None if data_root is None else data_root.resolve()
         self._artifacts: dict[str, RetentionArtifact] = {}
+        # Metadata survives payload eviction so purge can be frozen without reading bytes.
+        self._inventory: dict[str, RetentionArtifact] = {}
 
     def persist(
         self,
@@ -91,13 +99,24 @@ class RetentionManager:
             original_length=original_length,
             content_digest=original_digest,
             preview=preview,
+            relative_path=("retention/" + sha256(record_id.encode("utf-8")).hexdigest() + ".bin"),
         )
 
         self._artifacts.pop(record_id, None)
+        self._inventory.pop(record_id, None)
         self._evict_for(len(preview or b""))
         if self._stored_bytes() + len(preview or b"") > self._max_bytes:
             artifact = replace(artifact, state="DROPPED_BY_RETENTION", preview=None)
         self._artifacts[record_id] = artifact
+        self._inventory[record_id] = artifact
+        if (
+            self._data_root is not None
+            and artifact.state == "STORED"
+            and artifact.preview is not None
+        ):
+            path = self._data_root / artifact.relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(artifact.preview)
         return artifact
 
     def export_diagnostic(
@@ -120,6 +139,33 @@ class RetentionManager:
 
     def get(self, record_id: str) -> RetentionArtifact | None:
         return self._artifacts.get(record_id)
+
+    def purge_inventory(self, run_id: str) -> tuple[PurgeLocalArtifactEntry, ...]:
+        """Return terminal artifact metadata without requiring a payload to exist."""
+        entries = [
+            PurgeLocalArtifactEntry(
+                artifact_id=artifact.record_id,
+                relative_path=artifact.relative_path,
+                artifact_digest=artifact.content_digest,
+                byte_count=len(artifact.preview or b""),
+            )
+            for artifact in self._inventory.values()
+            if artifact.run_id == run_id
+            and artifact.run_state in {"COMPLETED", "FAILED", "CANCELLED"}
+        ]
+        return tuple(
+            sorted(entries, key=lambda entry: (entry.relative_path, entry.artifact_digest))
+        )
+
+    def purge(self, run_id: str) -> tuple[str, ...]:
+        """Forget metadata after an external frozen manifest has been deleted."""
+        record_ids = tuple(
+            artifact.record_id for artifact in self._inventory.values() if artifact.run_id == run_id
+        )
+        for record_id in record_ids:
+            self._artifacts.pop(record_id, None)
+            self._inventory.pop(record_id, None)
+        return record_ids
 
     def _redact(self, content: bytes) -> bytes:
         redacted = content
