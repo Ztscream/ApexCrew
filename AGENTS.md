@@ -1,16 +1,16 @@
 # Repository Guidelines
 
-ApexCrew is specification-only. `SPEC.md` is signed off, `PLAN.md` R3 exists, and the Stage 4 cold-start review passed with zero blockers on 2026-07-31. Do not add source, fixtures, tests, or CI until a new M1 `PLAN.md` revision passes its own independent document review. Reviewer code is disposable. ApexCrew must own Coordinator and WorkerLoop; external agent CLIs and high-level frameworks cannot replace them.
+ApexCrew is an implementation-in-progress Coding Agent Harness. `SPEC.md` revision 3 is signed off, the M1-M4 mixed-depth sprint baseline is delivered, and the independently reviewed R4.3 plan is the current authority for final runtime closure. Source, fixtures, tests, CI, and delivery artifacts now exist; describe the repository as a pre-release implementation, never as documents-only or production-ready. New implementation work must stay within the latest approved `PLAN.md` revision, and final v0.1 completion requires the R4.3 task reviews plus same-revision release evidence. Reviewer code remains disposable. ApexCrew must own Coordinator and WorkerLoop; external agent CLIs and high-level frameworks cannot replace them.
 
 From M1 onward the course brief's workflow rules bind: each independent feature or large module gets its own Git worktree and one corresponding pull request, a single commit containing everything is rejected, commit or PR text states which subagent did the work and which parts a human changed, each task is followed by a spec-compliance check then a code-quality check with critical issues fixed before the next task, and `PLAN.md` is updated with each task's commit hash as it lands.
 
 ## Project Structure & Module Organization
 
-Keep course artifacts at the root: `SPEC.md`, `PLAN.md`, `SPEC_PROCESS.md`, `AGENT_LOG.md`, `README.md`, and `REFLECTION.md`. Store research in `docs/research/`, learning notes in `docs/learning/`, experiments in `docs/experiments/`, architecture maps in `docs/architecture/`, and decisions in `docs/adr/`. The eventual package will use the approved A-Hybrid shape under `src/apexcrew/`. Add target repositories under `fixtures/` only after cold-start review.
+Keep course artifacts at the root: `SPEC.md`, `PLAN.md`, `SPEC_PROCESS.md`, `AGENT_LOG.md`, `README.md`, and `REFLECTION.md` when created. Store research in `docs/research/`, learning notes in `docs/learning/`, experiments in `docs/experiments/`, architecture maps in `docs/architecture/`, and decisions in `docs/adr/`. The package uses the approved A-Hybrid shape under `src/apexcrew/`; tests are split across `tests/unit/`, `tests/contract/`, `tests/integration/`, and `tests/acceptance/`. Approved target repositories live under `fixtures/`.
 
 ## Build, Test, and Development Commands
 
-Planned entry points:
+Available entry points:
 
 - `uv sync --frozen --all-groups`: install locked Python 3.12 dependencies.
 - `make test`: run the deterministic offline suite and fixture scenarios.
