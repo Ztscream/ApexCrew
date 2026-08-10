@@ -2750,6 +2750,41 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-10 / R4.3-05 Run Candidate and final target CAS implementation
+
+- **Implementation worktree/commit**: `codex/m1-r4-3-run-candidate`,
+  `be9f48d83877850b904664b66c5d566c0720bdef`, descended from the R4.3-04
+  implementation `0019165`. Human changes: none; all source, test, and plan
+  edits in this task were made by the coding agent.
+- **Red evidence observed in the inherited draft**: the Windows lifecycle
+  selector reached the final CAS but cleanup paused with
+  `FINAL_CANDIDATE_NOT_FOUND` because the cleanup observer queried only
+  `PENDING_APPROVAL`; the full regression run also exposed the legacy target-CAS
+  test double lacking the new refresh seam and the stale unknown-check assertion.
+  No clean-base red checkout was fabricated.
+- **Correction**: added a state-isolated
+  `integrated_candidate_prepared_oid()` read for terminal cleanup, guarded
+  target-ref transition handles with Windows delete sharing, refreshed the
+  repository/guard after a verified CAS, removed the CLI head-OID fallback, and
+  froze a distinct `R` commit whose parent is pinned `T0` while retaining private
+  Run Head `H`. Unknown checks remain durable denials and cannot produce a task
+  candidate without a declared passing check.
+- **Green evidence**: the Run Candidate and lifecycle selectors passed; the
+  focused candidate-preparation, private-promotion, composed-worker, target-CAS,
+  cleanup, mypy, Ruff, format, and `git diff --check` gates exited `0`. The full
+  offline `uv run --python 3.12 pytest -q --color=no` run exited `0` with no
+  failures and only the existing Starlette deprecation warning. The lifecycle
+  asserts `head_oid=H`, `target_base_oid=T0`, non-equal `prepared_oid=R`,
+  `parent(R)=T0`, exactly one target transition, replay idempotency, and
+  `CLEANUP_SETTLED` after reopening SQLite.
+- **Local review status**: a local SPEC-compliance pass and a separate local
+  quality pass found no Critical/High issue after the above corrections. The
+  required owner-independent SPEC and quality reviews, one PR/remote CI run,
+  and ledger closeout remain pending and are not represented as completed here.
+- **Owner-only actions not performed**: no credentials, provider/network call,
+  push, PR creation/merge, hosted CI, live Docker observation, or package
+  publication occurred.
+
 ## 2026-08-09 / R4.3-03 final quality review and ledger closeout
 
 - **Quality rerun**: independent reviewer `019fe558-8441-7fc3-923f-f909f3b85a3e`,
