@@ -13,6 +13,26 @@
 
 **执行模式:** 连续执行,按顺序做完整个清单。遇到阻塞记录到 `AGENT_LOG.md` 后跳过继续,不要停下来等人回答。**唯一例外是 push 和 PR 创建,那是仓库所有者的动作。**
 
+## R4.3 最短闭环状态（2026-08-10）
+
+R4.3-06 的本地实现提交为
+`a846b3f6b799cc596e449aec9076ce434d188a47`。两个 acceptance fixture 已验证
+真实 `read -> patch -> check -> finish -> final target CAS`；retention 已有
+metadata-first inventory、缺失 payload 清单、确认过期拒绝、`PURGING` 恢复和
+无 Git purge CLI。焦点测试、全量离线 pytest、mypy、Ruff、format 和 diff check
+均已观察到通过。
+
+最短剩余路径只有三段：
+
+1. 为 R4.3-04、R4.3-05、R4.3-06 补齐独立 SPEC/quality review 和 PLAN ledger；
+2. 在 R4.3-07 完成本地同 SHA 的 CI/platform/performance/static replay/WebUI
+   gates，并保留 hosted CI/PR/merge/publish 的 owner-only 状态；
+3. 在支持的 Windows/Ubuntu 环境做真实受限 Docker process observation，关闭
+   `DEBT-M2-005` 前同步 README、SECURITY、SPRINT、AGENT_LOG。
+
+Tier 2 export、linked worktree/sparse/split/shallow/partial Git 拓扑、多意图
+冲突消解和 malformed unified diff 独立结果码仍不属于本次最短闭环。
+
 ---
 
 ## 一、不可破的规则(动手前读完)

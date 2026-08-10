@@ -43,6 +43,24 @@ is unavailable.
 
 ## Known Operational Boundaries
 
+### R4.3-06 local purge boundary
+
+The local implementation freezes a metadata-first manifest only after a terminal
+Run and settled Target Reservation cleanup. Retained, expired, quarantined,
+`DROPPED_BY_RETENTION`, and missing-payload metadata are all represented; a
+missing payload is not a reason to skip the manifest entry. Confirmation and
+`PURGING` recovery remove only frozen retention metadata and validated paths under
+the configured data root. The repository authority supplied to the purge CLI is a
+sentinel that fails if Git inspection is attempted, so purge does not invoke Git,
+change refs, or touch the reservation worktree. Expired or mismatched confirmation
+and recovery before the `PURGING` phase fail closed.
+
+Tier 2 and quarantined bytes remain excluded from projections and exports; the
+Tier 2 export surface is intentionally disabled in v0.1. The R4.3-06 implementation
+is locally green, but its owner-independent SPEC/quality reviews and ledger closeout
+are still pending. That evidence gap is separate from the controls exercised by the
+offline tests.
+
 Observed multi-intent members are selectable only when exactly one member is
 identified by authoritative external observation; no observation or multiple
 observations remain `INDETERMINATE`. Tier 2 export, retention, and eviction are

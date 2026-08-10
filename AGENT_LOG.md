@@ -2750,6 +2750,33 @@ FAILED tests/contract/test_cli_approvals.py::test_malformed_generic_approve_is_b
 - **Owner-only actions not performed**: credentials, provider/network calls,
   push, remote PR/merge, live Docker invocation, and package publication.
 
+## 2026-08-10 / R4.3-06 - acceptance repair and metadata-first purge
+
+- **Skill**: `writing-plans`; the existing v0.1 closure plan was rechecked and
+  narrowed to the independent R4.3-06 implementation boundary.
+- **PLAN-Task / base**: R4.3-06 on `d910f83`; implementation worktree
+  `.worktrees/m1-r4-3-acceptance-retention`; `SPEC.md` unchanged.
+- **Red evidence**: the task's pre-existing acceptance selectors were red after
+  strict `xfail` removal and the purge selectors were red before the local
+  metadata/state implementation. A review pass also exposed that normal SQLite
+  confirmation did not select `expires_at_utc`; the correction was covered by
+  normal and expired confirmation tests.
+- **Implementation**: both fixtures now execute deterministic `read -> patch ->
+  check -> finish` and assert changed target OID, `T0` parent, private-ref
+  stability, and repaired bytes. Retention preserves metadata after eviction;
+  SQLite/Memory implement frozen manifests, data-root validation, confirmation,
+  `PURGING` recovery, and fail-closed pre-confirmation/expiry paths. The CLI adds
+  `prepare-purge` and `confirm-purge` without Git inspection.
+- **Green evidence**: commit `a846b3f6b799cc596e449aec9076ce434d188a47`; focused
+  acceptance/purge selectors pass; `uv run --python 3.12 pytest -q --color=no`
+  reaches `100%` with only the existing Starlette deprecation warning and
+  platform skips; `mypy src`, Ruff check/format, and `git diff --check` pass.
+- **Spec/quality review**: local self-check is green; the required independent
+  owner SPEC review and independent quality review remain pending, as do PR/remote
+  CI/merge and R4.3-07 release evidence.
+- **Human-Changes**: none. **Owner-only actions**: no push, PR, merge, hosted CI,
+  real restricted-Docker observation, provider request, or package/Pages publish.
+
 ## 2026-08-10 / R4.3-05 Run Candidate and final target CAS implementation
 
 - **Implementation worktree/commit**: `codex/m1-r4-3-run-candidate`,

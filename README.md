@@ -115,6 +115,39 @@ request is deliberately not part of ordinary verification: configure a keyring
 credential and set `APEXCREW_LIVE_SMOKE=1` only when the operator explicitly authorizes
 the one-request live smoke.
 
+## v0.1 最短闭环状态（R4.3-06）
+
+本地 R4.3-06 实现提交为 `a846b3f6b799cc596e449aec9076ce434d188a47`。两个
+acceptance fixture 都已从只创建 `DRAFT` 改为确定性的：Worker 读取代码，
+在独立 check workspace 写入补丁，运行声明检查，完成 Run Candidate，并通过
+最终 target CAS。测试同时验证 target OID 只在最终 CAS 改变、提交父节点是
+`T0`、私有 Run ref 不被 purge 修改、以及修复后的文件字节真实存在。
+
+终端 Run 完成并且 Target Reservation cleanup settled 后，保留清单采用
+metadata-first 方式冻结；保留、过期、quarantined、`DROPPED_BY_RETENTION`
+以及已经不在磁盘上的 payload 都进入 manifest。确认只删除 manifest 绑定的
+data-root 路径和 retention metadata，不调用 Git、不改 target/private ref，
+`PURGING` 恢复可重复执行。CLI 入口为：
+
+```text
+uv run --python 3.12 apexcrew prepare-purge RUN_ID --root REPOSITORY
+uv run --python 3.12 apexcrew confirm-purge RUN_ID --root REPOSITORY \
+  --purge-digest sha256:... --confirmation-code ABC123
+```
+
+`prepare-purge` 输出完整的冻结 manifest、digest、短确认码和过期时间；
+`confirm-purge` 只接受这些绑定字段。非终端 Run、未完成终端清理、活动 lease、
+未结算 effect、活动 Runtime Permit、pending action、过期或错误确认都会
+fail closed。Tier 2/quarantined 内容仍不进入 projection/export；Tier 2 导出
+不是 v0.1 的可用产品面。
+
+本地证据已观察到：`pytest -q --color=no` 在 100% 结束，仅有既有 Starlette
+deprecation warning 与平台 skip；`mypy src`、Ruff check/format、
+`git diff --check` 均通过。R4.3-04/05 的 owner-independent SPEC/quality review
+和 ledger closeout、R4.3-07 的 same-SHA release verification、Windows/Ubuntu
+hosted CI、GitLab 结果、远端 PR/merge/publish，以及 `DEBT-M2-005` 的真实受限
+Docker process observation 仍未完成，不能由本地绿色替代。
+
 ## Accepted v0.1 Boundary
 
 - One local repository and one user.
