@@ -1,15 +1,8 @@
 const availability = document.querySelector("#availability");
 const state = document.querySelector("#state");
 const sequence = document.querySelector("#sequence");
+const replay = JSON.parse(document.querySelector("#replay-data").textContent);
 
-fetch("/api/run")
-  .then((response) => response.json())
-  .then((run) => {
-    availability.textContent = run.availability;
-    state.textContent = run.state || "Unavailable";
-    sequence.textContent = run.sequence === undefined ? "" : `Audit sequence ${run.sequence}`;
-  })
-  .catch(() => {
-    availability.textContent = "UNAVAILABLE";
-    state.textContent = "Read failed";
-  });
+availability.textContent = replay.availability;
+state.textContent = replay.state || "Unavailable";
+sequence.textContent = replay.sequence === undefined ? "" : `Audit sequence ${replay.sequence}`;

@@ -2,7 +2,7 @@
 
 Build the static read-only bundle with `uv run --python 3.12 python scripts/build_webui.py dist/webui`.
 
-The output contains only static assets and reads `/api/run`; it cannot submit commands, approvals, model requests, credentials, or repository mutations. The GitHub Pages deployment is a sanitized, deterministic fixture replay for inspection, not an execution service.
+The output contains only static assets. Its fixed, sanitized fixture record is embedded in the page, so it works at the GitHub Pages project URL without an API server or any network request. It cannot submit commands, approvals, model requests, credentials, or repository mutations. The GitHub Pages deployment is an inspection surface, not an execution service.
 
 `pages.yml` deploys only after the `ci` workflow succeeds for `main`. It checks
 out that completed CI run's exact SHA, rebuilds `dist/webui`, uploads it as a

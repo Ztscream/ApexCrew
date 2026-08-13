@@ -2,6 +2,17 @@
 
 This chronological log records material agent work and human decisions. Future implementation entries must include the `PLAN.md` task, Superpowers skill, red/green evidence, commit or PR, and any manual correction. Never record credentials, private prompt text, or secret-bearing command output.
 
+## 2026-08-13 / Static GitHub Pages replay repair
+
+- **Base and task**: `4f26bbb4471574e81fbdb67073f5be7f04fd2594`; repair the deployed GitHub Pages replay that displayed `UNAVAILABLE / Read failed`.
+- **Subagent/Human-Changes**: Codex; none.
+- **Observed red**: `uv run --python 3.12 pytest tests/unit/test_webui_build.py -q` failed with `FileNotFoundError` for the proposed replay data because the deployed static bundle copied only HTML, JavaScript, and CSS while `webui/app.js` requested the unavailable `/api/run` route.
+- **Implementation**: embedded the fixed, allowlisted sanitized fixture record in `webui/index.html`; changed the client to render only that data; added a CSP with `connect-src 'none'`; added `scripts/check_static_replay.py`; made `make web-build` run that checker; and updated the bundle test and deployment documentation. The client has no network API path.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_webui_build.py -q`, `uv run --python 3.12 python scripts/check_static_replay.py`, `make web-build`, Python Ruff format/check, and `git diff --check` passed. A fresh temporary build contained exactly `app.js`, `index.html`, and `styles.css`. Playwright loaded that build and rendered `SANITIZED REPLAY`, `COMPLETED`, and `Audit sequence 3`; its dynamic-request list was empty. The only browser console entry was a local `python -m http.server` favicon 404, unrelated to the application resources.
+- **Spec-Review**: PASS. The public surface is a fixed sanitized fixture replay with no backend, mutation, credential, approval, model, or repository path, consistent with `SPEC.md` static-replay requirements and ADR-0005.
+- **Quality-Review**: PASS. The repair removes the broken absolute API dependency, prevents reintroduction of network APIs through the static checker, keeps the existing simple bundle shape, and adds only directly relevant documentation and tests.
+- **Intended commit**: `fix(pages): embed static replay data`.
+
 ## 2026-08-04 / M1-FIX-004 - random Target Reservation identity
 
 - **Skill**: `tdd`; the exact public store/control seams were recorded before adding the two required test nodes, and the failing selector preceded production changes.
