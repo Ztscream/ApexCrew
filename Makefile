@@ -17,6 +17,7 @@ secret-scan:
 	$(UV_RUN) python scripts/secret_scan.py .
 
 web-build:
+	$(UV_RUN) python scripts/check_static_replay.py
 	$(UV_RUN) python scripts/build_webui.py dist/webui
 
 build:

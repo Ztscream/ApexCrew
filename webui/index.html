@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
     <title>ApexCrew Run View</title>
     <link rel="stylesheet" href="styles.css">
   </head>
@@ -18,6 +19,9 @@
         <span id="sequence"></span>
       </section>
     </main>
+    <script id="replay-data" type="application/json">
+      {"availability": "SANITIZED REPLAY", "run_id": "fixture-run-001", "sequence": 3, "state": "COMPLETED"}
+    </script>
     <script src="app.js"></script>
   </body>
 </html>
