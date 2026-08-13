@@ -1578,3 +1578,17 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Subagent/Human-Changes**: Claude (assisting agent); the owner authorized the push and approved these three corrections.
 - **Changed paths**: `AGENT_LOG.md`, `README.md`, `docs/superpowers/plans/2026-08-05-apexcrew-m1-m4-completion.md`.
 - **Lesson**: a self-reported green count is not evidence until someone re-runs it; and a credential boundary that exists in code but not in the README is invisible to the person it protects.
+
+## 2026-08-13 / Pages Run Evidence Console
+
+- **Timestamp/base SHA**: 2026-08-13 Asia/Singapore; `ba780cf057966ed58f7a480f5acc21de960c98fb`.
+- **Task/context**: replace the one-word `COMPLETED` Pages view with a public, deterministic console that demonstrates ApexCrew's Coordinator, bounded Workers, evidence freshness, authority, budget, and Audit ledger without becoming an execution surface.
+- **Observed red**: `uv run --python 3.12 pytest tests/unit/test_webui_build.py -q` exited `1` with 2 failures: the former page had no lifecycle view, and its embedded replay only exposed availability, run ID, sequence, and final state.
+- **Implementation**: added the responsive Run Evidence Console, a sanitized nine-frame replay, lifecycle and Task topology, sequence-aware evidence and authority panels, budget summary, Worker/Task ledger filters, and play/pause/step/scrub controls. Extended the build contract and static checker with exact public-field allowlists, ordered sequence checks, required view/control markers, CSP enforcement, and browser API denials; updated deployment documentation.
+- **Green evidence**: focused WebUI/Pages contracts passed with `4 passed`; `scripts/check_static_replay.py` reported `static-replay: clean`; `make test` exited `0` with 8 skips; repository Ruff format/check and mypy passed; `make secret-scan` reported clean; `git diff --check` passed. A clean build produced exactly `index.html`, one content-hashed script, and one content-hashed stylesheet.
+- **Browser evidence**: Playwright verified 1440x900 and 390x844 layouts with no document-level horizontal overflow. Sequence 3 projected `ACTIVE`, one passed check, and pending final Grant/CAS state; Worker 02 filtering exposed only Audit sequence 5. The only browser request beyond the three static assets was the browser's missing `favicon.ico`; no application runtime request or script error occurred.
+- **Spec-Review**: PASS. The page is a sanitized fixture replay, keeps commands and approvals CLI-only, owns no runtime behavior, exposes no credentials or repository paths, and clearly labels ApexCrew v0.1 as pre-release.
+- **Quality-Review**: PASS. Semantic controls are keyboard accessible, mobile content does not overlap, selected replay state is internally consistent, JavaScript only uses embedded data and text/visibility updates, and no critical issue remains.
+- **Subagent/Human-Changes**: Codex inline execution; human changes none.
+- **Changed paths**: `webui/index.html`, `webui/styles.css`, `webui/app.js`, `scripts/check_static_replay.py`, `tests/unit/test_webui_build.py`, `docs/deployment.md`, `docs/superpowers/plans/2026-08-13-pages-evidence-console.md`, `AGENT_LOG.md`.
+- **Intended commit**: `feat(pages): add run evidence console`. Publication remains a separate owner-authorized action.
