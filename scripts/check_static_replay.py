@@ -28,9 +28,24 @@ def main() -> None:
     root = Path(__file__).parents[1] / "webui"
     index = (root / "index.html").read_text(encoding="utf-8")
     script = (root / "app.js").read_text(encoding="utf-8")
-    required = ("Content-Security-Policy", "default-src 'self'", "connect-src 'none'")
-    if any(value not in index for value in required):
+    required_csp = ("Content-Security-Policy", "default-src 'self'", "connect-src 'none'")
+    if any(value not in index for value in required_csp):
         raise SystemExit("STATIC_REPLAY_CSP_MISSING")
+    required_markers = (
+        'data-view="lifecycle"',
+        'data-view="tasks"',
+        'data-view="evidence"',
+        'data-view="authority"',
+        'data-view="audit"',
+        'data-control="play"',
+        'data-control="pause"',
+        'data-control="step"',
+        'data-control="scrub"',
+        'data-control="worker-filter"',
+        'data-control="task-filter"',
+    )
+    if any(value not in index for value in required_markers):
+        raise SystemExit("STATIC_REPLAY_VIEW_OR_CONTROL_MISSING")
     if any(
         value in script
         for value in (
@@ -39,6 +54,7 @@ def main() -> None:
             "WebSocket",
             "sendBeacon",
             "innerHTML",
+            "insertAdjacentHTML",
             "eval(",
             'method: "POST"',
         )
@@ -48,13 +64,53 @@ def main() -> None:
     parser.feed(index)
     if not parser.replay_data:
         raise SystemExit("STATIC_REPLAY_RECORD_MISSING")
-    if json.loads(parser.replay_data) != {
-        "availability": "SANITIZED REPLAY",
-        "run_id": "fixture-run-001",
-        "sequence": 3,
-        "state": "COMPLETED",
+    replay = json.loads(parser.replay_data)
+    if set(replay) != {
+        "availability",
+        "budget",
+        "frames",
+        "goal",
+        "plan_revision",
+        "repository",
+        "run_id",
+        "state",
+        "tasks",
+        "workers",
     }:
         raise SystemExit("STATIC_REPLAY_FIELDS_INVALID")
+    frames = replay["frames"]
+    frame_fields = {
+        "authority",
+        "category",
+        "checks",
+        "detail",
+        "evidence",
+        "sequence",
+        "snapshot",
+        "state",
+        "time",
+        "title",
+    }
+    records_are_allowlisted = (
+        set(replay["budget"]) == {"elapsed", "model_calls", "tool_actions"}
+        and all(set(frame) == frame_fields for frame in frames)
+        and all(set(task) == {"id", "state", "worker"} for task in replay["tasks"])
+        and all(set(worker) == {"id", "state"} for worker in replay["workers"])
+    )
+    sequences = [frame.get("sequence") for frame in frames]
+    if (
+        not records_are_allowlisted
+        or replay["availability"] != "SANITIZED REPLAY"
+        or replay["state"] != "COMPLETED"
+        or len(replay["workers"]) != 2
+        or len(replay["tasks"]) != 3
+        or sequences != list(range(1, 10))
+        or len(set(sequences)) != len(sequences)
+        or frames[-1].get("state") != "COMPLETED"
+        or frames[-1].get("evidence") != "FRESH"
+        or frames[-1].get("authority") != "GRANT CONSUMED"
+    ):
+        raise SystemExit("STATIC_REPLAY_RECORD_INVALID")
     if 'href="styles.css"' not in index or 'src="app.js"' not in index:
         raise SystemExit("STATIC_REPLAY_SOURCE_ASSET_NAMES_INVALID")
     if re.search(r"app\.[0-9a-f]{12}\.js", index):

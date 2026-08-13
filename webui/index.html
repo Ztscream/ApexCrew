@@ -4,23 +4,212 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
-    <title>ApexCrew Run View</title>
+    <title>ApexCrew Run Evidence Console</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
+    <header class="app-bar">
+      <a class="brand" href="#run-overview" aria-label="ApexCrew run overview">
+        <span class="brand-mark" aria-hidden="true">AC</span>
+        <span>
+          <strong>APEXCREW</strong>
+          <small>Run Evidence Console</small>
+        </span>
+      </a>
+      <div class="header-meta">
+        <span class="recording-label">SANITIZED FIXTURE REPLAY</span>
+        <span class="status-chip" id="run-state">COMPLETED</span>
+      </div>
+    </header>
+
     <main>
-      <header>
-        <p class="eyebrow">APEXCREW</p>
-        <h1>Run status</h1>
-      </header>
-      <section aria-live="polite" class="status-panel">
-        <span id="availability">Loading</span>
-        <strong id="state">...</strong>
-        <span id="sequence"></span>
+      <section class="run-overview" id="run-overview" aria-labelledby="run-title">
+        <div class="run-heading">
+          <p class="section-label">CREW RUN / <span id="run-id">fixture-run-001</span></p>
+          <h1 id="run-title">Harden patch admission and evidence freshness</h1>
+          <p class="run-summary">A recorded coding run showing how ApexCrew coordinates bounded Workers, validates prospective revisions, and admits only fresh evidence.</p>
+        </div>
+        <dl class="run-facts" aria-label="Run facts">
+          <div><dt>Repository</dt><dd id="repository">fixture/python-money</dd></div>
+          <div><dt>Plan revision</dt><dd id="plan-revision">R4.3</dd></div>
+          <div><dt>Workers</dt><dd>2 bounded</dd></div>
+          <div><dt>Run checks</dt><dd>7 / 7 passed</dd></div>
+        </dl>
+      </section>
+
+      <section class="replay-band" aria-labelledby="replay-title">
+        <div class="replay-header">
+          <div>
+            <p class="section-label">AUDIT REPLAY</p>
+            <h2 id="replay-title">Sequence <span id="current-sequence">9</span> of 9</h2>
+          </div>
+          <div class="replay-controls" aria-label="Replay controls">
+            <button type="button" data-control="play" title="Play audit replay" aria-label="Play audit replay">&#9654;</button>
+            <button type="button" data-control="pause" title="Pause audit replay" aria-label="Pause audit replay">&#9208;</button>
+            <button type="button" data-control="step" title="Advance one audit event" aria-label="Advance one audit event">&#8594;</button>
+          </div>
+        </div>
+        <label class="scrubber">
+          <span class="sr-only">Selected audit sequence</span>
+          <input data-control="scrub" type="range" min="1" max="9" value="9">
+        </label>
+        <ol class="lifecycle" data-view="lifecycle" aria-label="Run lifecycle">
+          <li data-phase="DRAFT"><span>1</span>DRAFT</li>
+          <li data-phase="PLANNING"><span>2</span>PLANNING</li>
+          <li data-phase="ACTIVE"><span>3</span>ACTIVE</li>
+          <li data-phase="VERIFYING"><span>4</span>VERIFYING</li>
+          <li data-phase="READY_FOR_APPROVAL"><span>5</span>READY</li>
+          <li data-phase="COMPLETED"><span>6</span>COMPLETED</li>
+        </ol>
+        <div class="current-event">
+          <span class="event-index" id="event-index">09</span>
+          <div>
+            <p id="event-category">INTEGRATION</p>
+            <strong id="event-title">Target branch advanced by exact CAS</strong>
+            <span id="event-detail">The approved Run Candidate was integrated and its one-use Grant was consumed.</span>
+          </div>
+          <time id="event-time">02:14.882</time>
+        </div>
+      </section>
+
+      <div class="workspace-grid">
+        <section class="workspace-section task-section" data-view="tasks" aria-labelledby="tasks-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">COORDINATION</p>
+              <h2 id="tasks-title">Workers &amp; task topology</h2>
+            </div>
+            <span class="quiet-badge">3 / 3 promoted</span>
+          </div>
+          <div class="task-flow" aria-label="Task dependency graph">
+            <article class="task" data-task-card="task-01">
+              <div class="task-rail"><span>01</span><i></i></div>
+              <div class="task-body">
+                <div class="task-topline"><span class="worker worker-one">W1</span><span class="task-status">PROMOTED</span></div>
+                <h3>Normalize patch input</h3>
+                <p>Reject path escape, symlink, and malformed diff input before materialization.</p>
+                <dl><div><dt>Candidate</dt><dd>cnd-8a31</dd></div><div><dt>Commit</dt><dd>a51f2d8</dd></div></dl>
+              </div>
+            </article>
+            <article class="task" data-task-card="task-02">
+              <div class="task-rail"><span>02</span><i></i></div>
+              <div class="task-body">
+                <div class="task-topline"><span class="worker worker-two">W2</span><span class="task-status">PROMOTED</span></div>
+                <h3>Bind evidence freshness</h3>
+                <p>Attach check receipts to the exact verification snapshot and policy revision.</p>
+                <dl><div><dt>Candidate</dt><dd>cnd-24bf</dd></div><div><dt>Commit</dt><dd>cf094be</dd></div></dl>
+              </div>
+            </article>
+            <article class="task" data-task-card="task-03">
+              <div class="task-rail"><span>03</span></div>
+              <div class="task-body">
+                <div class="task-topline"><span class="worker worker-one">W1</span><span class="task-status">PROMOTED</span></div>
+                <h3>Integrate frozen Run Candidate</h3>
+                <p>Advance the target only after the exact Run Check Set and final Grant are current.</p>
+                <dl><div><dt>Candidate</dt><dd>run-cnd-07</dd></div><div><dt>Commit</dt><dd>f3b87aa</dd></div></dl>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <aside class="signal-stack" aria-label="Run evidence and authority">
+          <section class="signal-section" data-view="evidence" aria-labelledby="evidence-title">
+            <div class="section-heading">
+              <div><p class="section-label">ADMISSION</p><h2 id="evidence-title">Evidence bundle</h2></div>
+              <span class="signal-status fresh" id="evidence-state">FRESH</span>
+            </div>
+            <div class="evidence-score"><strong id="checks-passed">7</strong><span>/ 7 required checks</span></div>
+            <ul class="check-list">
+              <li data-check-threshold="2"><span>pytest · unit</span><strong>PASS</strong></li>
+              <li data-check-threshold="3"><span>pytest · contract</span><strong>PASS</strong></li>
+              <li data-check-threshold="5"><span>ruff + mypy</span><strong>PASS</strong></li>
+              <li data-check-threshold="7"><span>secret scan</span><strong>PASS</strong></li>
+            </ul>
+            <p class="binding"><span>Snapshot</span><code id="snapshot-id">sha256:92af...71d0</code></p>
+          </section>
+
+          <section class="signal-section" data-view="authority" aria-labelledby="authority-title">
+            <div class="section-heading">
+              <div><p class="section-label">CONTROL PLANE</p><h2 id="authority-title">Authority chain</h2></div>
+              <span class="signal-status consumed" id="authority-state">GRANT CONSUMED</span>
+            </div>
+            <ol class="authority-chain">
+              <li data-authority-sequence="1" data-authority-result="policy-r7"><span>Policy revision</span><strong>policy-r7</strong></li>
+              <li data-authority-sequence="2" data-authority-result="consumed once"><span>Runtime Permit</span><strong>consumed once</strong></li>
+              <li data-authority-sequence="8" data-authority-result="bound to run-cnd-07"><span>Final Grant</span><strong>bound to run-cnd-07</strong></li>
+              <li data-authority-sequence="9" data-authority-result="applied exactly"><span>Target CAS</span><strong>applied exactly</strong></li>
+            </ol>
+            <div class="security-note"><span aria-hidden="true">&#9632;</span><p><strong>Read-only surface</strong>No commands, credentials, approvals, or repository effects.</p></div>
+          </section>
+
+          <section class="budget-strip" aria-label="Run budget">
+            <div><span>Model calls</span><strong>6 / 24</strong></div>
+            <div><span>Tool actions</span><strong>14 / 80</strong></div>
+            <div><span>Elapsed</span><strong>02:14</strong></div>
+          </section>
+        </aside>
+      </div>
+
+      <section class="audit-section" data-view="audit" aria-labelledby="audit-title">
+        <div class="section-heading audit-heading">
+          <div><p class="section-label">TIER 1 LEDGER</p><h2 id="audit-title">Audit events</h2></div>
+          <div class="filters">
+            <label><span>Worker</span><select data-control="worker-filter"><option value="all">All workers</option><option value="coordinator">Coordinator</option><option value="worker-01">Worker 01</option><option value="worker-02">Worker 02</option><option value="admission">Admission</option></select></label>
+            <label><span>Task</span><select data-control="task-filter"><option value="all">All tasks</option><option value="task-01">Task 01</option><option value="task-02">Task 02</option><option value="task-03">Task 03</option><option value="run">Run gate</option></select></label>
+          </div>
+        </div>
+        <div class="audit-table-wrap">
+          <table>
+            <thead><tr><th>Seq</th><th>Actor</th><th>Scope</th><th>Event</th><th>Result</th><th>Time</th></tr></thead>
+            <tbody>
+              <tr data-audit-row data-sequence="1" data-worker="coordinator" data-task="run"><td>01</td><td>Coordinator</td><td>Run gate</td><td>Run revisions approved</td><td><span class="result neutral">RECORDED</span></td><td>00:00.000</td></tr>
+              <tr data-audit-row data-sequence="2" data-worker="coordinator" data-task="run"><td>02</td><td>Coordinator</td><td>Run gate</td><td>Plan frozen with three tasks</td><td><span class="result neutral">RECORDED</span></td><td>00:07.212</td></tr>
+              <tr data-audit-row data-sequence="3" data-worker="worker-01" data-task="task-01"><td>03</td><td>Worker 01</td><td>Task 01</td><td>Patch input normalized</td><td><span class="result pass">PASS</span></td><td>00:31.480</td></tr>
+              <tr data-audit-row data-sequence="4" data-worker="admission" data-task="task-01"><td>04</td><td>Admission</td><td>Task 01</td><td>Candidate promoted by CAS</td><td><span class="result pass">PROMOTED</span></td><td>00:47.903</td></tr>
+              <tr data-audit-row data-sequence="5" data-worker="worker-02" data-task="task-02"><td>05</td><td>Worker 02</td><td>Task 02</td><td>Evidence receipts bound</td><td><span class="result pass">PASS</span></td><td>01:08.116</td></tr>
+              <tr data-audit-row data-sequence="6" data-worker="admission" data-task="task-02"><td>06</td><td>Admission</td><td>Task 02</td><td>Freshness assessed</td><td><span class="result fresh">FRESH</span></td><td>01:22.704</td></tr>
+              <tr data-audit-row data-sequence="7" data-worker="worker-01" data-task="task-03"><td>07</td><td>Worker 01</td><td>Task 03</td><td>Run Candidate prepared</td><td><span class="result neutral">FROZEN</span></td><td>01:44.209</td></tr>
+              <tr data-audit-row data-sequence="8" data-worker="admission" data-task="run"><td>08</td><td>Admission</td><td>Run gate</td><td>Exact Run Check Set complete</td><td><span class="result pass">7 / 7</span></td><td>02:03.518</td></tr>
+              <tr data-audit-row data-sequence="9" data-worker="admission" data-task="run"><td>09</td><td>Admission</td><td>Run gate</td><td>Target branch advanced by exact CAS</td><td><span class="result pass">COMPLETED</span></td><td>02:14.882</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="empty-state" id="audit-empty" hidden>No audit events match these filters.</p>
       </section>
     </main>
+
+    <footer><span>ApexCrew v0.1 pre-release</span><span>Deterministic ScriptedMockLLM fixture</span><span>Public fields only</span></footer>
+
     <script id="replay-data" type="application/json">
-      {"availability": "SANITIZED REPLAY", "run_id": "fixture-run-001", "sequence": 3, "state": "COMPLETED"}
+      {
+        "availability": "SANITIZED REPLAY",
+        "budget": {"model_calls": "6 / 24", "tool_actions": "14 / 80", "elapsed": "02:14"},
+        "frames": [
+          {"sequence": 1, "state": "DRAFT", "category": "AUTHORITY", "title": "Run revisions approved", "detail": "Policy, Budget, and Model Configuration revisions were approved before dispatch.", "time": "00:00.000", "evidence": "PENDING", "authority": "REVISIONS APPROVED", "checks": 0, "snapshot": "not prepared"},
+          {"sequence": 2, "state": "PLANNING", "category": "COORDINATION", "title": "Plan frozen with three tasks", "detail": "The Coordinator recorded dependencies, write scopes, and the exact Run Check Set.", "time": "00:07.212", "evidence": "PENDING", "authority": "PERMIT CONSUMED", "checks": 0, "snapshot": "plan:r4.3"},
+          {"sequence": 3, "state": "ACTIVE", "category": "WORKER 01", "title": "Patch input normalized", "detail": "Task 01 rejected unsafe paths and produced a bounded candidate revision.", "time": "00:31.480", "evidence": "COLLECTING", "authority": "LEASE ACTIVE", "checks": 2, "snapshot": "sha256:18bc...02ae"},
+          {"sequence": 4, "state": "ACTIVE", "category": "ADMISSION", "title": "Task 01 promoted by CAS", "detail": "Fresh checks authorized one private Run Head compare-and-swap.", "time": "00:47.903", "evidence": "FRESH", "authority": "CAS APPLIED", "checks": 3, "snapshot": "sha256:2d10...7ab4"},
+          {"sequence": 5, "state": "ACTIVE", "category": "WORKER 02", "title": "Evidence receipts bound", "detail": "Task 02 attached check results to the exact prospective revision.", "time": "01:08.116", "evidence": "COLLECTING", "authority": "LEASE ACTIVE", "checks": 4, "snapshot": "sha256:44df...8e19"},
+          {"sequence": 6, "state": "ACTIVE", "category": "ADMISSION", "title": "Freshness assessed", "detail": "The current Run Head, policy, task graph, and execution fingerprint still matched.", "time": "01:22.704", "evidence": "FRESH", "authority": "CAS APPLIED", "checks": 5, "snapshot": "sha256:63f2...ad80"},
+          {"sequence": 7, "state": "VERIFYING", "category": "COORDINATION", "title": "Run Candidate frozen", "detail": "All promoted Task Candidates were prepared against the pinned target revision.", "time": "01:44.209", "evidence": "VERIFYING", "authority": "TARGET PINNED", "checks": 5, "snapshot": "sha256:7ca3...419e"},
+          {"sequence": 8, "state": "READY_FOR_APPROVAL", "category": "RUN GATE", "title": "Exact Run Check Set complete", "detail": "Seven required checks passed against the same frozen Run Candidate.", "time": "02:03.518", "evidence": "FRESH", "authority": "GRANT ISSUED", "checks": 7, "snapshot": "sha256:92af...71d0"},
+          {"sequence": 9, "state": "COMPLETED", "category": "INTEGRATION", "title": "Target branch advanced by exact CAS", "detail": "The approved Run Candidate was integrated and its one-use Grant was consumed.", "time": "02:14.882", "evidence": "FRESH", "authority": "GRANT CONSUMED", "checks": 7, "snapshot": "sha256:92af...71d0"}
+        ],
+        "goal": "Harden patch admission and evidence freshness",
+        "plan_revision": "R4.3",
+        "repository": "fixture/python-money",
+        "run_id": "fixture-run-001",
+        "state": "COMPLETED",
+        "tasks": [
+          {"id": "task-01", "worker": "worker-01", "state": "PROMOTED"},
+          {"id": "task-02", "worker": "worker-02", "state": "PROMOTED"},
+          {"id": "task-03", "worker": "worker-01", "state": "PROMOTED"}
+        ],
+        "workers": [
+          {"id": "worker-01", "state": "RELEASED"},
+          {"id": "worker-02", "state": "RELEASED"}
+        ]
+      }
     </script>
     <script src="app.js"></script>
   </body>

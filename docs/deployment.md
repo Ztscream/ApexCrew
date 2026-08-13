@@ -1,8 +1,18 @@
 # Deployment
 
-Build the static read-only bundle with `uv run --python 3.12 python scripts/build_webui.py dist/webui`.
+Build the static read-only Run Evidence Console with `uv run --python 3.12
+python scripts/build_webui.py dist/webui`.
 
-The output contains only static assets. Its fixed, sanitized fixture record is embedded in the page, so it works at the GitHub Pages project URL without an API server or any network request. It cannot submit commands, approvals, model requests, credentials, or repository mutations. The GitHub Pages deployment is an inspection surface, not an execution service.
+The console replays one fixed, sanitized Crew Run. It presents the Coordinator
+lifecycle, bounded Worker tasks, evidence freshness, Runtime Permit and Grant
+state, budget use, and the Tier 1 Audit ledger. Reviewers can play, pause, step,
+scrub, and filter that embedded record without contacting an API.
+
+The output contains only static assets. It cannot submit commands, approvals,
+model requests, credentials, or repository mutations. The Content Security
+Policy disables runtime connections, and the browser script only projects the
+embedded JSON through text and visibility state. GitHub Pages is therefore a
+deterministic inspection surface, not an ApexCrew execution service.
 
 `pages.yml` deploys only after the `ci` workflow succeeds for `main`. It checks
 out that completed CI run's exact SHA, rebuilds `dist/webui`, uploads it as a
