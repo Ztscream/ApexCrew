@@ -12,7 +12,7 @@
 
 ## Scope and Review Gates
 
-`SPEC.md` remains byte-frozen. The formal implementation base is `9e7648f` on `codex/m2-m4-final-production`, containing the reviewed R4.1 recovery/cleanup chain and verified M2-M4 provider, Docker, retention, CI, WebUI, and build work. The primary checkout at `3676526` has an uncommitted diagnostic/demo draft; it is not an implementation base and no unreviewed source/test/fixture/CI change may be copied from it. The zero-blocker document review is recorded in formal-base docs-only commit `e8461003ee3c8da888683fb1975bb1523803096c`; the current docs-only review closeout is its descendant, and the first implementation worktree must be created from that closeout while proving ancestry before any source/test/fixture/CI change.
+`SPEC.md` remains byte-frozen. The formal implementation base is `9e7648f` on `codex/m2-m4-final-production`, containing the reviewed R4.1 recovery/cleanup chain and verified M2-M4 provider, Docker, retention, CI, WebUI, and build work. The primary checkout at `3676526` has an uncommitted diagnostic/demo draft; it is not an implementation base and no unreviewed source/test/fixture/CI change may be copied from it. The zero-blocker document review is recorded in docs-only commit `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; a second docs-only review closeout records that commit, and the first implementation worktree must be created from that closeout commit while proving ancestry before any source/test/fixture/CI change.
 
 The abandoned `b4d802e` R4.2 Git object skeleton is diagnostic only. Its stdin `GitMkTree` design is superseded by a temporary-index implementation. The existing private Run Head ref is the only ref R4.3-04 may update, and only through the typed Admission port. The user target ref remains unchanged until the final CAS in R4.3-05.
 
@@ -50,7 +50,7 @@ Each task maps to exactly one PR (`PR-R4.3-00` through `PR-R4.3-07`) and no PR m
 - [ ] Reconcile the dependency chain: formal base `9e7648f`; `3676526` and `b4d802e` diagnostic only; R4.3-04 private promotion and R4.3-05 final target CAS separate; Run Candidate `R` is an independent commit with parent `T0`, not `H`.
 - [ ] Run the independent SPEC document review and obtain `PASS` with zero Critical/High findings.
 - [ ] Record both plan SHA-256 digests, reviewed base, reviewer ID, verdict, owner M1 GO, and the preserved primary draft. Use `Get-FileHash` and `git diff --check`; do not stage source/test/fixture/CI changes.
-- [ ] Create a docs-only review closeout descended from formal-base reviewed-plan commit `e8461003ee3c8da888683fb1975bb1523803096c`, prove its changed paths are only `PLAN.md`, this companion plan, and the review/GO record in `AGENT_LOG.md`, then create `.worktrees/m1-r4-3-demo-loop` from that exact closeout commit and verify `git status --short --branch` is empty.
+- [ ] Create a docs-only review closeout descended from reviewed-plan commit `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`, prove its changed paths are only `PLAN.md`, this companion plan, and the review/GO record in `AGENT_LOG.md`, then create `.worktrees/m1-r4-3-demo-loop` from that exact closeout commit and verify `git status --short --branch` is empty.
 
 ### Task 2: R4.3-00 Real Demonstration Feedback Loop
 
@@ -153,4 +153,4 @@ materialize_check(*, attempt_id, base_oid, input_globs, write_globs) -> Material
 | Findings | All first-review findings corrected and rechecked: independent Run Candidate `R` parent `T0`; clean-base red evidence; reviewed-plan ancestor; union filter order; per-check `Q_i`; typed delete/rename/mode approval; per-task PR mapping; exact browser viewports; `DEBT-M2-005`; GitLab `unit-test` |
 | Review-input PLAN.md SHA-256 (before this PASS record) | `98D0005BFB0930745A3A35369E6732260387D798F91844FC06EE26290F7398A5` |
 | Review-input companion plan SHA-256 (before this PASS record) | `21B6BD802224F9E950C6D25A60732D49D02493C619AF0EF39E274796EAB32E7C` |
-| Reviewed-plan commit / owner M1 GO | `e8461003ee3c8da888683fb1975bb1523803096c`; `GO` granted for R4.3 source work under this plan |
+| Reviewed-plan commit / owner M1 GO | `0a5935a5d140c0aa3c6c9d8b2fe078afb26950c1`; `GO` granted for R4.3 source work under this plan |

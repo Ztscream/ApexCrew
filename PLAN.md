@@ -10,7 +10,7 @@
 
 **Revision:** M2-M4 final-production amendment, prepared 2026-08-06 from base `9cc269f`; detailed execution authority is `docs/superpowers/plans/2026-08-06-apexcrew-m2-m4-final-production.md`. `SPEC.md` remains frozen.
 
-**Current status:** **COMPLETE - M2-M4 LOCAL PRODUCTION VERIFIED.** The current branch is an isolated worktree. Local implementation, offline verification, Docker containment, and the explicitly authorized one-request DeepSeek lifecycle smoke are complete; push, merge, hosted release, and package publication remain owner-only actions and are not claimed here.
+**Current status:** **ACTIVE - R4.3 V0.1 CLOSURE IN PROGRESS.** R4.3-00 through R4.3-03 are final-reviewed and R4.3-04 has an implementation commit, but its independent reviews and ledger closeout are still pending; R4.3-05 through R4.3-07 remain the executable closure chain. The current checkout is not a release baseline until the same-revision local and hosted gates are observed. Push, merge, hosted release, and package publication remain owner-only actions.
 
 **Historical R3 authority record:** Approved `SPEC.md` revision 2 SHA-256 `97E9652D874B606C1673867923C97C29834F63B43ADB3F3E89779B13183E26D6`, 131,011 bytes and 636 lines; merged M1-01 through M1-07 base `de4c0a56e0a2c4080ff010aab9c39f17f9e367e8`; unmerged M1-08 evidence head `b232bf3c87e168b3fa2f4f8b3a35d3c38f4272a4`; rejected M1-R1 SHA-256 `C19C351A877351214C9D915A6EE23A79AA9FC9EE6C52ADAA879B91F03B6EE5AD`; and superseded M0 R3 SHA-256 `93ADDFE784DC510E5D621E3CFABFD65814C5352B72D6DA3A79C876700C7490CE`.
 

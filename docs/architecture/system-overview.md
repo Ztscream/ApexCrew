@@ -1,10 +1,10 @@
 # System Overview
 
-> Architecture companion, updated 2026-07-27 after final written-spec sign-off. This map explains accepted interfaces and seams; the signed `SPEC.md` owns normative behavior, while planning and implementation cold-start review still gate implementation.
+> Historical high-level architecture map, originally updated 2026-07-27 after final written-spec sign-off. The signed `SPEC.md` owns normative behavior. Source, tests, `PLAN.md`, and `AGENT_LOG.md` now provide implementation evidence; use the [Architecture Guide index](README.md) for the current source-mapped explanation and task-status boundary.
 
 ## Scope
 
-ApexCrew coordinates one developer goal in one local Git repository with at most three logical Workers. The approved A-Hybrid shape exposes a small command/runtime/query surface while keeping Coordinator, WorkerLoop, Admission, Authority, recovery, and projection as internal deep modules. OpenAI Responses or `ScriptedMockLLM` returns one low-level completion at a time and never controls tools, approval, scheduling, budgets, or stop conditions. The host control plane is trusted; repository commands are not.
+ApexCrew coordinates one developer goal in one local Git repository with at most three logical Workers. The approved A-Hybrid shape exposes a small command/runtime/query surface while keeping Coordinator, WorkerLoop, Admission, Authority, recovery, and projection as internal deep modules. DeepSeek Responses or `ScriptedMockLLM` returns one low-level completion at a time and never controls tools, approval, scheduling, budgets, or stop conditions. The host control plane is trusted; repository commands are not.
 
 ```mermaid
 flowchart LR
@@ -89,4 +89,4 @@ flowchart LR
 - Durable state is exercised through one domain-facing transaction/event interface with SQLite and in-memory test adapters.
 - Clocks/IDs, keyring, and other local-substitutable dependencies remain internal seams; pure rules and state machines receive no speculative adapter.
 
-The A-Hybrid comparison deliberately combines the minimal kernel's small external surface with the dual-reactor design's internal locality. It rejects a giant `execute/read` implementation, a public interface for every rule helper, and a continuation-token façade that could leak command authority into read projections. Acceptance fixtures remain separate Python and TypeScript repositories. No source directories are created until specification, planning, and cold-start gates pass.
+The A-Hybrid comparison deliberately combines the minimal kernel's small external surface with the dual-reactor design's internal locality. It rejects a giant `execute/read` implementation, a public interface for every rule helper, and a continuation-token façade that could leak command authority into read projections. Acceptance fixtures remain separate Python and TypeScript repositories. The final sentence in the earlier map, which said that source directories would not yet be created, applied to the pre-implementation Stage 4 gate and is now historical; source and tests exist under `src/` and `tests/`.
