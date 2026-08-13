@@ -76,4 +76,4 @@ WebUI 和 static replay 只依赖 sanitized `RunQueries` projection。它们没�
 
 ## 当前状态边界
 
-canonical path、secret policy、no-follow handles、Git preflight、credential isolation 和 query-only delivery 都有当前源码及测试入口。`RestrictedDockerExecutor.run` 的真实进程执行仍由 `DEBT-M2-005` 限定；R4.3-03 的更完整 composition 工作必须以其任务分支审查记录为准，不能覆盖当前 root checkout 的显式拒绝行为。
+canonical path、secret policy、no-follow handles、Git preflight、credential isolation 和 query-only delivery 都有当前源码及测试入口。R4.3-06 独立工作树还验证了 purge 不读取 Git、不改 ref、且只删除冻结 manifest 绑定的 data-root 路径；该任务仍待独立 review 和 root 集成，不能据此扩大当前 root 的权限或 delivery claim。`RestrictedDockerExecutor.run` 的真实进程执行仍由 `DEBT-M2-005` 限定；R4.3-03 的更完整 composition 工作必须以其任务分支审查记录为准，不能覆盖当前 root checkout 的显式拒绝行为。

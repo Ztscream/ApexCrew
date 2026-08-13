@@ -39,7 +39,7 @@ R4.3 计划将准入扩展到真实 patch/check/Git candidate 链路。最终逻
 6. 所有 Task Candidate 已私有推进后，重新对完整 Run Head 构造 Run Candidate 并运行 run-wide checks。
 7. 仅当 final Grant、pinned target `T0`、target safety 和 Evidence Bundle 仍匹配时，才发出 final target CAS。
 
-R4.3-04 至 R4.3-07 未全部完成审查和发布验证，因此这些项目是计划目标，不应被混同为当前 checkout 的已交付行为。
+R4.3-04、R4.3-05 和 R4.3-06 各有本地实现提交（分别为 `0019165`、`be9f48d`、`a846b3f`），但三者均未完成独立 review 和 ledger closeout；R4.3-07 尚未开始。因此这些项目仍不能被混同为当前 checkout、root/`main` 或 release 的已交付行为。任务级证据与门禁见 [v0.1 闭环状态](10-v0.1-closure-status.md)。
 
 ## 为什么每个检查有自己的工作区绑定
 

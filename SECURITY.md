@@ -69,6 +69,14 @@ quarantined content remain excluded from exports. The restricted executor
 launches only the closed digest-pinned Docker argv and reports daemon/process
 unavailability as a typed failure.
 
+R4.3-06 has a locally green, unreviewed task-worktree implementation of a
+metadata-first purge manifest, confirmation, and `PURGING` recovery. It deletes
+only manifest-bound paths below the configured data root and does not inspect
+Git or mutate refs. This is task-worktree evidence, not a root/`main` delivery
+claim: its independent SPEC review, quality review, ledger closeout, PR, remote
+CI, and merge remain pending. The root baseline therefore continues to retain
+the `DEBT-M2-004` durable-retention boundary documented in `README.md`.
+
 `DEBT-M2-005` remains **OPEN**. This worktree has not observed a real restricted
 Docker process invocation; closure requires that observation and synchronized
 updates to `README.md`, `SECURITY.md`, `SPRINT.md`, and `AGENT_LOG.md`. Workspace

@@ -46,7 +46,7 @@
 - `fixtures/python-money/`：金额单位漂移。
 - `fixtures/typescript-time/`：时间戳单位漂移。
 
-它们的价值不是测试 Python/TypeScript 语法，而是验证 Harness 是否能在不同生态中保持相同安全链路：有界 context、patch、声明 check、evidence、candidate 和最终 Git 效果。R4.3-06 计划将完整 repair/integration assertion 和 retention purge 纳入验收；在该任务完成前，不能把 acceptance fixture 的存在描述为完整 end-to-end 自动修复证据。
+它们的价值不是测试 Python/TypeScript 语法，而是验证 Harness 是否能在不同生态中保持相同安全链路：有界 context、patch、声明 check、evidence、candidate 和最终 Git 效果。R4.3-06 的独立工作树提交 `a846b3f` 已在两者上观察到 deterministic repair/integration assertion 与 retention purge selectors 通过；该提交仍待独立 SPEC/quality review、ledger closeout 和 root 集成，因此不能把 fixture 的存在或该工作树的绿色结果描述为当前 checkout 的完整 end-to-end 交付证据。
 
 ## 如何阅读测试结果
 
@@ -91,6 +91,6 @@ make build
 
 ## 当前状态边界
 
-测试分层和基本命令已存在，但 release readiness 不能从一次 local test exit code 推导。R4.3-06/07 仍拥有完整 acceptance、retention purge、same-revision build/scan/hosted evidence 等收尾责任；真实 live provider 和远端发布仍是显式 owner action。
+测试分层和基本命令已存在，但 release readiness 不能从一次 local test exit code 推导。R4.3-06 已有待审查的本地 acceptance/purge 证据；R4.3-07 仍承担 same-revision build/scan/performance/static replay/WebUI/hosted evidence 的收尾责任。真实 live provider、远端 CI 观测和发布仍是显式 owner action。完整状态见 [v0.1 闭环状态](10-v0.1-closure-status.md)。
 
 下一步可结合 [项目伪代码](pseudocode/README.md) 阅读对应测试的行为断言。

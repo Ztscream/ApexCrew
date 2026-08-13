@@ -25,11 +25,12 @@
 7. [Durability 与 Recovery](07-recovery-and-durability.md)：理解 Intent、外部副作用和 `INDETERMINATE`。
 8. [安全与受限执行](08-security-and-executor.md)：理解路径、Git、Docker、凭据和只读 WebUI 的边界。
 9. [测试与验收](09-testing-and-acceptance.md)：理解分层测试、fixture 和证据口径。
-10. [项目伪代码](pseudocode/README.md)：按真实源文件阅读关键控制流。
+10. [v0.1 闭环状态](10-v0.1-closure-status.md)：区分已审查基线、独立工作树的本地证据、release gate 与 owner-only 外部交付。
+11. [项目伪代码](pseudocode/README.md)：按真实源文件阅读关键控制流。
 
 ## 当前实现状态
 
-本文档反映 2026-08-10 的工作树事实：M1-M4 Sprint baseline 已按 REAL、SKELETON、STUB 的混合深度记录；R4.3-00 至 R4.3-03 在顺序任务分支上完成规格和质量审查；R4.3-04 仍待审查，R4.3-05 正在实现，R4.3-06/07 尚未完成。公开文档可以描述已观测的代码和已审查基线，但不能把未合并分支、未完成任务、真实 provider smoke、Pages、push、merge 或 package publication 描述为完成。
+本文档反映 2026-08-10 的工作树事实：M1-M4 Sprint baseline 已按 REAL、SKELETON、STUB 的混合深度记录；R4.3-00 至 R4.3-03 在顺序任务分支上完成规格和质量审查；R4.3-04、R4.3-05 和 R4.3-06 各有本地绿色实现提交，但独立审查和 ledger closeout 仍待完成；R4.3-07 尚未开始。公开文档可以描述已观测的代码和已审查基线，但不能把未合并分支、未完成任务、真实 provider smoke、Pages、push、merge 或 package publication 描述为完成。详细矩阵见 [v0.1 闭环状态](10-v0.1-closure-status.md)。
 
 ## 阅读约定
 

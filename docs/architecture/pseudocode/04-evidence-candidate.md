@@ -74,7 +74,7 @@ def prepare_task_candidate(binding, patched_workspace, task_checks):
     return TaskCandidate.bind(binding, prepared_oid, evidence, freshness)
 ```
 
-The R4.3 block is target pseudocode, not a declaration that all of these methods are complete in the current checkout.
+The R4.3 block is target pseudocode, not a declaration that all of these methods are complete in the current checkout. R4.3-04 and R4.3-05 have corresponding local implementation commits (`0019165` and `be9f48d`), but their required independent reviews and ledger closeouts are pending; read the block as task-worktree behavior rather than root or release behavior.
 
 ## Candidate rejection matrix
 

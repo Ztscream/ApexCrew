@@ -77,7 +77,7 @@ Git adapter 使用封闭 operation types 和结构化 argv，而不是让模型�
 
 ## 当前状态边界：Observed 与 Planned
 
-baseline 已有 target reservation、typed target CAS、candidate/freshness 概念和对应测试。R4.3-04/05 定义真实 Task Candidate preparation、private promotion、Run Candidate freeze 和最终 CAS 的完整闭环。R4.3-04 已有实现分支但评审未完成，R4.3-05 正在实现；因此本篇对象流程必须按 Planned R4.3 阅读，不能写成当前 `main` 的已完成流程。
+baseline 已有 target reservation、typed target CAS、candidate/freshness 概念和对应测试。R4.3-04/05 定义真实 Task Candidate preparation、private promotion、Run Candidate freeze 和最终 CAS 的完整闭环。R4.3-04 的本地实现提交为 `0019165`，R4.3-05 的本地实现提交为 `be9f48d`；两者都仍待独立 review 和 ledger closeout。因此本篇对象流程可以作为已观测的任务工作树行为阅读，但不能写成当前 root、`main` 或 release 的已完成流程。详见 [v0.1 闭环状态](10-v0.1-closure-status.md)。
 
 ## 源码与测试映射
 

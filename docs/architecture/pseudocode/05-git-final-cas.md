@@ -96,4 +96,4 @@ def integrate_frozen_run_candidate(run_id, grant):
 
 ## 当前状态边界
 
-这篇主体是 R4.3-04/05 的目标伪代码。它用于解释设计和审查条件，不是对当前 `main`、当前脏 checkout 或远端 release 的完成声明。阅读时必须查看 `PLAN.md` 任务 ledger 和相关 task branch review evidence。
+这篇主体是 R4.3-04/05 的目标伪代码。对应本地实现提交分别为 `0019165` 与 `be9f48d`，但均仍待独立 SPEC review、quality review 和 ledger closeout。它们因此不是对当前 root、`main`、当前脏 checkout 或远端 release 的完成声明。阅读时必须查看 `PLAN.md` 任务 ledger、相关 task branch review evidence 与 [v0.1 闭环状态](../10-v0.1-closure-status.md)。

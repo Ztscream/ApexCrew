@@ -66,6 +66,6 @@ Agent 工作流跨越 SQLite、模型 provider、文件系统、Docker 和 Git�
 
 ## 当前状态边界与 Open Boundaries
 
-当前 checkout 对多意图 precedence、retention 和 Docker process runner 仍保留明确债务；`README.md` 与 `SECURITY.md` 逐项记录 `DEBT-M2-*`。R4.3/R4.1 的恢复设计不意味着所有真实外部观察都已经完成。任何无法观察的结果都仍应停在 `INDETERMINATE`。
+当前 root checkout 对多意图 precedence、retention 和 Docker process runner 仍保留明确债务；`README.md` 与 `SECURITY.md` 逐项记录 `DEBT-M2-*`。R4.3-06 独立工作树的本地实现 `a846b3f` 已覆盖 metadata-first purge manifest、确认以及 `PURGING` recovery，但未完成独立 review、ledger closeout 或 root 集成，因而不消除 root 的 `DEBT-M2-004` 边界。R4.3/R4.1 的恢复设计不意味着所有真实外部观察都已经完成。任何无法观察的结果都仍应停在 `INDETERMINATE`。
 
 详细顺序见 [Runtime 与 Recovery 伪代码](pseudocode/02-runtime-recovery.md)。

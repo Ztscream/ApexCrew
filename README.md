@@ -231,21 +231,26 @@ The read-only WebUI is not an execution service.
 | SPEC revision 3 / Stage 4 | 完成 | 规范已签署，冷启动审查已通过 |
 | M1-M4 Sprint baseline | 完成但深度混合 | REAL、SKELETON、STUB 按 `SPRINT.md` 边界交付 |
 | R4.3-00 ~ R4.3-03 | 完成双评审 | 真实 demo loop、scoped workspace、patch/context、restricted executor composition 已在顺序任务分支验证 |
-| R4.3-04 | 实现已绿，评审待完成 | Task Candidate 准备和私有 Run Head 推进尚不能计入门禁完成 |
-| R4.3-05 | 实现中 | Run Candidate freeze 和最终 target CAS 仍有静态检查问题 |
-| R4.3-06 / R4.3-07 | 未开始 | acceptance/purge 与 same-revision release 尚未闭环 |
+| R4.3-04 | 本地实现已绿，评审待完成 | 独立工作树提交 `0019165` 实现 Task Candidate 准备和私有 Run Head 推进；尚未形成权威增量 |
+| R4.3-05 | 本地实现已绿，评审待完成 | 独立工作树提交 `be9f48d` 实现 Run Candidate freeze 与最终 target CAS；尚未形成权威增量 |
+| R4.3-06 | 本地实现已绿，评审待完成 | 独立工作树提交 `a846b3f` 在两个 fixture 上验证 repair/CAS，并实现 metadata-first purge；尚未形成权威增量 |
+| R4.3-07 | 未开始 | 同一 SHA 的本地 release gates、hosted CI 证据与发布验证尚未开始 |
 | 远端交付 | 未同步到最终状态 | R4.3 本地分支尚未形成对应远端 PR；旧 PR 的绿色 CI 不覆盖当前增量 |
 
 因此，当前可以描述为“具有持久化治理和确定性测试的 Coding Agent Harness 预发布实现”，不能描述为“完整 v0.1”“生产可用”或“已经完成真实线上发布”。
 
+M2-M4 local production capabilities are implemented at the documented mixed-depth boundary; hosted publication remains owner-only while the R4.3 repair-loop closure is still in progress.
+
+R4.3 的本地提交、剩余门禁与可宣称边界集中见 [v0.1 闭环状态](docs/architecture/10-v0.1-closure-status.md)。该页不替代 `PLAN.md` ledger：只有独立 SPEC review、独立 quality review 和账本关闭后，任务才可成为后续任务的权威基线。
+
 ## 已知限制
 
-- R4.3-04 必须先完成独立 SPEC review、quality review 和账本关闭，后续任务才能成为权威增量。
-- R4.3-05 到 R4.3-07 尚未完成最终候选集成、retention purge 和同一 SHA 发布证明。
+- R4.3-04、R4.3-05、R4.3-06 虽有本地绿色实现提交，仍必须完成独立 SPEC review、quality review 和账本关闭；在此之前不能作为 root、`main` 或 release 证据。
+- R4.3-07 尚未完成同一 SHA 的本地 release gates、Windows/Ubuntu hosted CI、GitLab `unit-test`、性能、静态 replay 和 WebUI 证据。
 - `DEBT-M2-001`：当前 checkout 的多意图 precedence 仍有 fail-closed 边界，无法唯一权威判定时保持 `INDETERMINATE`。
 - `DEBT-M2-002`：Tier 2 diagnostic export 在当前 checkout 中保持禁用。
 - `DEBT-M2-003`：retention-tier export 在当前 checkout 中保持不可用。
-- `DEBT-M2-004`：durable retention eviction 仍需要最终 tombstone/purge 闭环。
+- `DEBT-M2-004`：root 基线尚未包含已在 R4.3-06 独立工作树验证的 durable retention purge；该实现仍待独立评审、账本关闭与集成。
 - `DEBT-M2-005` 只有在真实受限 Docker 进程被观测且文档同步后才能关闭；daemon/image 不可用仍按类型化不确定结果停止。
 - demo 中 malformed unified diff 暂时复用 fail-closed 的 scope denial 结果；扩展结果枚举需要独立 SPEC 修订。
 - live DeepSeek smoke、GitHub Pages 启用、push、merge 和 package publication 都是 owner-only 外部动作。
@@ -278,6 +283,7 @@ Quality-Review: <review-id-and-verdict>
 - [SECURITY.md](SECURITY.md)：信任边界、凭据、执行器和运行债务。
 - [CONTEXT.md](CONTEXT.md)：项目统一领域语言。
 - [`docs/architecture/`](docs/architecture/README.md)：源码映射的架构、运行机制、安全边界与项目伪代码；语义从属于 SPEC。
+- [v0.1 闭环状态](docs/architecture/10-v0.1-closure-status.md)：R4.3 任务的本地证据、未满足门禁与最短交付路径。
 - `docs/adr/`：不可轻易逆转的设计决策。
 - `docs/research/`：Agent Harness 和竞品研究。
 - `docs/experiments/`：可证伪实验与 fixture 设计。
