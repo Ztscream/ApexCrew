@@ -1739,6 +1739,33 @@ These findings are inputs to the M1 `PLAN.md` revision, not authorization to cha
 - **Human changes**: None.
 - **Intended commit**: `ci(pages): deploy static fixture replay`.
 
+## 2026-08-13 / Pages workflow release integration
+
+- **Task**: Deploy the static WebUI replay after a successful `main` CI run.
+- **Implementation subagent**: Codex.
+- **Base**: R4.3-06 local-evidence head `2119a47`, with the reviewed R4.3-00
+  through R4.3-03 baseline merged into the release integration branch.
+- **Red evidence**: `uv run --python 3.12 pytest
+  tests/contract/test_bootstrap_ci.py::test_pages_workflow_deploys_only_a_successful_main_ci_revision -q`
+  failed with `FileNotFoundError` because `.github/workflows/pages.yml` did not
+  exist.
+- **Implementation**: added `pages.yml`. A `workflow_run` trigger accepts only
+  successful `ci` executions from `main`, checks out the triggering run's
+  `head_sha`, builds the static replay, uploads the Pages artifact, and deploys
+  using only job-scoped Pages/OIDC write permissions. Manual dispatch from
+  `main` provides an owner retry path. Deployment documentation states the
+  required GitHub Pages setting and public URL. **Human-Changes: owner
+  authorized merging and deployment.**
+- **Green evidence**: the focused CI contract file passed with `2 passed`;
+  `make web-build` completed and `uv run --python 3.12 python
+  scripts/check_static_replay.py` reported `static-replay: clean`; `git diff
+  --check` passed.
+- **Boundary**: this workflow supplies GitHub Pages deployment only. It does
+  not complete R4.3-07's same-revision release verifier, protected tag,
+  GitLab observation, trusted package publication, or restricted Docker
+  process evidence.
+- **Intended commit**: `ci(pages): deploy verified main replay`.
+
 ## 2026-08-05 / E1 money unit drift acceptance
 
 - **Task**: E1 — drive Python money cents/unit drift through the end-to-end acceptance surface.
