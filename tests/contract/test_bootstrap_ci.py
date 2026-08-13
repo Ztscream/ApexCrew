@@ -15,3 +15,17 @@ def test_minimal_ci_runs_quality_and_offline_tests_on_every_push() -> None:
     assert "uv run mypy src" in workflow
     assert workflow.count("uv run pytest") == 2
     assert "OPENAI_API_KEY" not in workflow
+
+
+def test_pages_deployment_requires_a_successful_main_ci_run() -> None:
+    workflow = Path(".github/workflows/pages.yml").read_text(encoding="utf-8")
+    assert "workflow_run:" in workflow
+    assert 'workflows: ["ci"]' in workflow
+    assert "branches: [main]" in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert "github.event.workflow_run.head_sha" in workflow
+    assert "make web-build" in workflow
+    assert "actions/upload-pages-artifact@v3" in workflow
+    assert "actions/deploy-pages@v4" in workflow
+    assert "pages: write" in workflow
+    assert "id-token: write" in workflow
