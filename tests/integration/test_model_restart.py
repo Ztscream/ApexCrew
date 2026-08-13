@@ -29,7 +29,7 @@ def completion(
     model_id: str,
     action: dict[str, str],
     *,
-    requested_model_id: str = "gpt-5.6-terra",
+    requested_model_id: str = "deepseek-v4-flash",
 ) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
@@ -47,8 +47,8 @@ def make_model_request() -> ModelRequest:
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "6" * 64,
@@ -86,7 +86,7 @@ def committed_model_turn(
                 ScriptedModelStep.for_request(
                     request,
                     ProviderAttemptResult.completed(
-                        completion("gpt-5.6-terra", {"kind": "finish"})
+                        completion("deepseek-v4-flash", {"kind": "finish"})
                     ),
                 )
             ]
@@ -130,7 +130,7 @@ def test_restart_releases_committed_completion_without_provider_redispatch(
             ScriptedModelStep.for_request(
                 request,
                 ProviderAttemptResult.completed(
-                    completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+                    completion(model_id="deepseek-v4-flash", action={"kind": "finish"})
                 ),
             )
         ]
@@ -479,7 +479,7 @@ def test_restart_preserves_requested_model_mismatch_without_releasing_action(
                     request,
                     ProviderAttemptResult.completed(
                         completion(
-                            model_id="gpt-5.6-terra",
+                            model_id="deepseek-v4-flash",
                             action={"kind": "finish"},
                             requested_model_id="gpt-5.6-mini",
                         )
@@ -503,9 +503,9 @@ def test_restart_preserves_requested_model_mismatch_without_releasing_action(
     assert result.outcome == "REQUESTED_MODEL_MISMATCH"
     assert result.normalized_action is None
     assert len(attempts) == 1
-    assert attempts[0].request.requested_model_id == "gpt-5.6-terra"
+    assert attempts[0].request.requested_model_id == "deepseek-v4-flash"
     assert attempts[0].dispatch_result.response_requested_model_id == "gpt-5.6-mini"
-    assert attempts[0].dispatch_result.returned_model_id == "gpt-5.6-terra"
+    assert attempts[0].dispatch_result.returned_model_id == "deepseek-v4-flash"
     assert attempts[0].dispatch_result.outcome == "REQUESTED_MODEL_MISMATCH"
     assert attempts[0].reported_usage == ModelUsage(120, 12, Decimal("0.00048"))
     assert recovered.outcome == "MODEL_COMPLETION_NOT_COMMITTED"

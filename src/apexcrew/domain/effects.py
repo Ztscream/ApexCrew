@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         TaskResumeDecision,
         TimeoutDecision,
     )
+    from apexcrew.domain.tools import ToolDenialAudit
 
 from apexcrew.domain.commands import (
     ApplicableRevisionDigests,
@@ -248,6 +249,11 @@ class EffectJournal(Protocol):
         run_id: RunId,
         event: AuditEvent,
         expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        raise NotImplementedError
+
+    def record_tool_denial(
+        self, denial: ToolDenialAudit, expected_sequence: AuditSequence
     ) -> AuditSequence:
         raise NotImplementedError
 

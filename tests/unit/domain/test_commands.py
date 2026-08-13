@@ -58,12 +58,12 @@ def test_revision_approval_payload_is_closed_and_digest_bound() -> None:
         output_token_ceiling=200_000,
         cost_reserve_usd="10.00",
         concurrent_worker_ceiling=3,
-        pricing_observed_on="2026-07-26",
+        pricing_observed_on="2026-08-05",
         pricing_entries=(
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million="2.50",
-                output_usd_per_million="15.00",
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million="0.28",
+                output_usd_per_million="0.56",
             ),
         ),
     )
@@ -100,11 +100,11 @@ def test_model_configuration_rejects_a_mismatched_provider_origin() -> None:
             schema_version="model-configuration-revision-v1",
             provider="scripted_mock",
             provider_base_origin="https://api.openai.com",
-            requested_model_id="gpt-5.6-terra",
+            requested_model_id="deepseek-v4-flash",
             returned_model_aliases=(
                 ReturnedModelAliasDocument(
-                    returned_model_id="gpt-5.6-terra",
-                    canonical_model_id="gpt-5.6-terra",
+                    returned_model_id="deepseek-v4-flash",
+                    canonical_model_id="deepseek-v4-flash",
                 ),
             ),
             inference_settings=InferenceSettingsDocument(

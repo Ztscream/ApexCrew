@@ -2,11 +2,16 @@ import os
 import shutil
 import subprocess
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from helpers.application import make_permitted_draft_runtime
+from helpers.application import (
+    FixtureRepositoryBootstrapAuthorityService,
+    make_create_run_command,
+    make_permitted_draft_runtime,
+)
 
 from apexcrew.adapters.repository.git import (
     GitCommandRunner,
@@ -34,7 +39,15 @@ from apexcrew.domain.admission import (
 from apexcrew.domain.commands import ApplicableRevisionDigests, RuntimeDecision, RuntimePermit
 from apexcrew.domain.effects import ReservationObservation, TargetReservation
 from apexcrew.domain.model import RecoveredModelAction
-from apexcrew.domain.types import GitOid, IntentId, RepositoryId, RunId, RunState, RunStopReason
+from apexcrew.domain.types import (
+    CommandStatus,
+    GitOid,
+    IntentId,
+    RepositoryId,
+    RunId,
+    RunState,
+    RunStopReason,
+)
 
 
 @dataclass
@@ -50,6 +63,25 @@ class RecordingReservationGit:
 
 
 @dataclass
+class RecordingGitSpawner:
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        cwd: Path,
+        environment: Mapping[str, str],
+        *,
+        text: bool,
+    ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
+        del cwd, environment
+        self.calls.append(argv)
+        if text:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+@dataclass
 class ScriptedReservationObserver:
     observations: deque[ReservationObservation]
 
@@ -60,6 +92,12 @@ class ScriptedReservationObserver:
 
 class InjectedCrash(RuntimeError):
     pass
+
+
+class TargetAuthorityMustNotBeUsed:
+    def current_for(self, run_id: RunId) -> str:
+        del run_id
+        raise AssertionError("bootstrap creation does not consult target authority")
 
 
 def reservation(tmp_path: Path) -> TargetReservation:
@@ -112,6 +150,39 @@ def seeded_reservation_store(database: Path, allocated: TargetReservation) -> Sq
         allocated,
     )
     return store
+
+
+def test_target_reservation_id_persists_across_sqlite_restart_and_identical_replay(
+    tmp_path: Path,
+) -> None:
+    reservation_id = "reservation-" + "a" * 32
+    candidates = iter((reservation_id,))
+    database = tmp_path / "state.db"
+    store = SqliteStateStore(database, target_reservation_id_source=lambda: next(candidates))
+    command = make_create_run_command(request_id="reservation-restart")
+    accepted = store.apply_control_command(
+        command,
+        TargetAuthorityMustNotBeUsed(),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert accepted.status == CommandStatus.ACCEPTED
+    assert accepted.run_id is not None
+    assert store.target_reservation_for_run(accepted.run_id).reservation_id == reservation_id
+    store.close()
+
+    def replay_source() -> str:
+        raise AssertionError("identical replay must not consult the reservation ID source")
+
+    reopened = SqliteStateStore(database, target_reservation_id_source=replay_source)
+    replay = reopened.apply_control_command(
+        command,
+        TargetAuthorityMustNotBeUsed(),
+        FixtureRepositoryBootstrapAuthorityService(),
+    )
+    assert replay == accepted
+    assert accepted.run_id is not None
+    assert reopened.target_reservation_for_run(accepted.run_id).reservation_id == reservation_id
+    reopened.close()
 
 
 def real_git_reservation_adapter(
@@ -241,7 +312,7 @@ def test_real_git_adapter_reserves_symbolic_pinned_target_and_refreshes_guard(
         assert adapter.apply(lock) == lock.applied()
         admin_directory = tmp_path / "repository" / ".git" / "worktrees" / "reservation-1"
         admin_names = {entry.name for entry in admin_directory.iterdir()}
-        # Expected names come from real Git 2.47.1.windows.1 output, not the plan's model.
+        # Real Git creates the approved empty refs directory for a no-checkout worktree.
         assert admin_names == {
             "HEAD",
             "commondir",
@@ -273,6 +344,79 @@ def test_real_git_adapter_reserves_symbolic_pinned_target_and_refreshes_guard(
             text=True,
         )
         assert occupied.returncode != 0
+    finally:
+        repository.close()
+        data_handles.close()
+
+
+def test_reservation_inventory_rejects_extra_data_root_member_before_git(
+    tmp_path: Path,
+) -> None:
+    adapter, add, data_handles, _, repository = real_git_reservation_adapter(tmp_path)
+    try:
+        assert adapter.apply(add) == add.applied()
+        reservation_path = Path(add.reservation_path)
+        (reservation_path / "unexpected").write_bytes(b"must not be read\n")
+        spawner = RecordingGitSpawner()
+        git_executable_text = shutil.which("git")
+        assert git_executable_text is not None
+        adapter._runner = GitCommandRunner(  # type: ignore[attr-defined]
+            Path(git_executable_text), tmp_path / "trusted-empty", spawner
+        )
+        with pytest.raises(RepositoryEffectError, match="^TARGET_UNSAFE$"):
+            adapter.apply(add.model_copy(update={"kind": "LOCK"}))
+        assert spawner.calls == []
+    finally:
+        repository.close()
+        data_handles.close()
+
+
+def test_reservation_inventory_accepts_empty_git_refs_and_rejects_ref_child_before_git(
+    tmp_path: Path,
+) -> None:
+    adapter, add, data_handles, _, repository = real_git_reservation_adapter(tmp_path)
+    try:
+        assert adapter.apply(add) == add.applied()
+        refs = tmp_path / "repository" / ".git" / "worktrees" / "reservation-1" / "refs"
+        assert refs.is_dir()
+        assert tuple(refs.iterdir()) == ()
+        (refs / "unexpected").write_bytes(b"must not be read\n")
+        spawner = RecordingGitSpawner()
+        git_executable_text = shutil.which("git")
+        assert git_executable_text is not None
+        adapter._runner = GitCommandRunner(  # type: ignore[attr-defined]
+            Path(git_executable_text), tmp_path / "trusted-empty", spawner
+        )
+        with pytest.raises(RepositoryEffectError, match="^TARGET_UNSAFE$"):
+            adapter.apply(add.model_copy(update={"kind": "LOCK"}))
+        assert spawner.calls == []
+    finally:
+        repository.close()
+        data_handles.close()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows held directory handles deny ancestor replacement"
+)
+def test_reservation_inventory_rejects_held_data_ancestor_replacement_before_git(
+    tmp_path: Path,
+) -> None:
+    adapter, add, data_handles, _, repository = real_git_reservation_adapter(tmp_path)
+    try:
+        data_handles.open("reservations", "directory")
+        reservations = tmp_path / "data" / "reservations"
+        replacement = tmp_path / "data" / "reservations-replaced"
+        reservations.rename(replacement)
+        reservations.mkdir()
+        spawner = RecordingGitSpawner()
+        git_executable_text = shutil.which("git")
+        assert git_executable_text is not None
+        adapter._runner = GitCommandRunner(  # type: ignore[attr-defined]
+            Path(git_executable_text), tmp_path / "trusted-empty", spawner
+        )
+        with pytest.raises(RepositoryEffectError, match="^TARGET_UNSAFE$"):
+            adapter.apply(add)
+        assert spawner.calls == []
     finally:
         repository.close()
         data_handles.close()

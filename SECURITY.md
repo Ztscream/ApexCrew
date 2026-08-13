@@ -35,7 +35,21 @@ any exposed credential outside this repository before sharing diagnostic metadat
 
 ## Delivery Status
 
-M1 establishes secret-path and action-policy primitives. Executor containment,
-history secret scanning, retention/purge, public replay, CI, and distribution are
-later reviewed milestones and are not claimed until their ledger rows and evidence
-are complete.
+M1-M4 delivery artifacts are present at the depth recorded in `SPRINT.md` and
+`AGENT_LOG.md`. SKELETON and STUB tasks are intentionally not described as
+production-complete. The secret scanner checks the tracked tree and reachable
+history; replay/WebUI delivery is projection-only; Docker argv construction is
+closed but its process runner remains a debt.
+
+## Known Runtime Debt
+
+`DEBT-M1-006`: runtime ownership currently provides only the in-process ownership
+path. The production process mutex plus POSIX/Windows OS file-lock backend is not
+implemented in this sprint. `FileRunOwnership.acquire` fails closed for an explicit
+invalid Permit and never creates a lock path; a missing pre-provisioned lock path
+does not grant ownership. Multi-process exclusivity is therefore not claimed.
+
+`DEBT-M2-001`: multiple unresolved effects are represented as `INDETERMINATE`
+because no precedence table exists. `DEBT-M2-002` through `DEBT-M2-004` keep
+Tier 2 export, retention export, and durable eviction disabled. `DEBT-M2-005`
+builds a restricted digest-pinned argv but does not launch a Docker process.

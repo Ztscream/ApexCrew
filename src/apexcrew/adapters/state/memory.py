@@ -5,7 +5,7 @@ from base64 import b32encode
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from hmac import compare_digest
@@ -15,11 +15,13 @@ from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from apexcrew.application.runtime import RuntimeFault, RuntimeFaultDisposition
+    from apexcrew.domain.tools import ToolDenialAudit
 
 from apexcrew.application.control import (
     RepositoryBootstrapAuthorityService,
     TargetAuthorityDigestService,
 )
+from apexcrew.domain.actions import ACTION_ADAPTER, FailAction, FinishAction, RiskyAction
 from apexcrew.domain.admission import (
     PrivateRefCasOutcome,
     RefCasIntent,
@@ -28,15 +30,20 @@ from apexcrew.domain.admission import (
     StartGuardBinding,
     TargetReservationCreationIntent,
     TargetReservationCreationOutcome,
+    TargetReservationIdAllocationError,
+    allocate_target_reservation_id,
+    random_target_reservation_id,
 )
 from apexcrew.domain.authority import (
     ActionClass,
     ActionDeadline,
     ActiveRunTimeBoundaryDecision,
     ActiveRunTimeState,
+    ApprovalGrant,
     AtomicAction,
     AttemptLifecycleState,
     AuthorityDenied,
+    AuthorizationDecision,
     AuthorizationReason,
     AuthorizationRequest,
     BudgetSettlement,
@@ -44,14 +51,19 @@ from apexcrew.domain.authority import (
     CheckpointKey,
     DispatchAuthorization,
     DispatchCloseCause,
+    FrozenActionBindings,
     GlobalBudgetMetric,
     GlobalUsageSnapshot,
+    GrantCommandValidator,
+    GrantedActionIntent,
+    GrantValidationError,
     LeaseDenial,
     ModelReservation,
     ModelReservationReason,
     ModelReservationRequest,
     MonotonicClock,
     MonotonicInstant,
+    PendingAction,
     ProgressEvidence,
     ResumeTaskRequest,
     RuntimeAuditStamp,
@@ -68,10 +80,18 @@ from apexcrew.domain.authority import (
     TrancheReason,
     WorkspaceLease,
     action_deadline_binding,
+    approval_grant_from_json,
+    approval_grant_id,
+    approval_grant_to_json,
+    canonical_action_json,
+    confirmation_code_for_pending_digest,
     crossed_threshold,
+    freeze_pending_action,
     global_ceiling_for,
+    granted_action_intent_id,
     model_reservation_amounts,
     normalize_global_budget_metric,
+    pending_action_subject_json,
     progress_from_checks,
     task_resume_ids,
 )
@@ -85,6 +105,7 @@ from apexcrew.domain.commands import (
     CommandEnvelope,
     CommandOutcome,
     CreateRunPayload,
+    GrantPayload,
     ProposeBudgetPayload,
     ProposeModelConfigurationPayload,
     ProposePolicyPayload,
@@ -103,7 +124,9 @@ from apexcrew.domain.coordination import (
     PlanningReadResult,
     PlanningReadSettlement,
     PlanProposal,
+    TaskDispatchSelection,
     plan_proposal_from_document,
+    task_contract_digest,
     validate_plan_proposal,
 )
 from apexcrew.domain.effects import (
@@ -138,18 +161,23 @@ from apexcrew.domain.model import (
     RecoveredModelAction,
     SettledModelAttempt,
 )
-from apexcrew.domain.plan import CheckDefinition, TaskContract, may_overlap
+from apexcrew.domain.plan import CheckDefinition, GlobPattern, TaskContract, may_overlap
 from apexcrew.domain.revisions import (
     BudgetRevisionDocument,
     FrozenDocument,
+    ModelConfigurationRevisionDocument,
+    PolicyRevisionDocument,
     Sha256DigestText,
     revision_digest,
 )
+from apexcrew.domain.tools import ActionPreState, ToolIntent, ToolResult
 from apexcrew.domain.types import (
     AttemptId,
     AuditSequence,
     CommandStatus,
+    GrantId,
     IntentId,
+    PendingActionId,
     RepositoryId,
     RequestId,
     RevisionDigest,
@@ -157,6 +185,18 @@ from apexcrew.domain.types import (
     RunState,
     RuntimeOwnerId,
     TaskId,
+)
+from apexcrew.domain.worker import (
+    PendingActionFreeze,
+    WorkerActionRecord,
+    WorkerAttemptRecord,
+    WorkerAttemptSnapshot,
+    WorkerTaskRecord,
+    WorkerTurnBinding,
+    bounded_worker_feedback,
+    pending_worker_action_id,
+    terminal_worker_effects,
+    validate_authorized_worker_action,
 )
 
 _EXECUTION_REVISION_STATES = frozenset(
@@ -341,6 +381,19 @@ def _json_object(value: str, error_code: str = "STORED_JSON_OBJECT_REQUIRED") ->
     return parsed
 
 
+def _stored_command_outcome_identity(value: str) -> tuple[RunId | None, AuditSequence | None]:
+    try:
+        outcome = CommandOutcome.model_validate(
+            {
+                **_json_object(value, "CONTROL_REQUEST_CLAIM_STORAGE_INVALID"),
+                "result": None,
+            }
+        )
+    except ValueError as error:
+        raise StateConflict("CONTROL_REQUEST_CLAIM_STORAGE_INVALID") from error
+    return outcome.run_id, outcome.resulting_sequence
+
+
 def _require_canonical_json_object(value: str, error_code: str) -> None:
     if canonical_json(_json_object(value, error_code)) != value:
         raise StateConflict(error_code)
@@ -368,9 +421,21 @@ class _ResumeStale(RuntimeError):
         self.decision = decision
 
 
+class _ControlRequestClaimed(RuntimeError):
+    def __init__(self, outcome: CommandOutcome) -> None:
+        super().__init__("CONTROL_REQUEST_ALREADY_CLAIMED")
+        self.outcome = outcome
+
+
 class InMemoryStateStore:
-    def __init__(self, monotonic_clock: MonotonicClock | None = None) -> None:
+    def __init__(
+        self,
+        monotonic_clock: MonotonicClock | None = None,
+        *,
+        target_reservation_id_source: Callable[[], object] | None = None,
+    ) -> None:
         self._command_receipts: dict[str, tuple[str, RunId, str, str, AuditSequence]] = {}
+        self._control_request_claims: dict[str, tuple[str, str]] = {}
         self._audit_events: dict[RunId, list[tuple[AuditSequence, AuditEvent]]] = {}
         self._sequences: dict[RunId, AuditSequence] = {}
         self._effect_intents: dict[IntentId, EffectIntent] = {}
@@ -443,13 +508,26 @@ class InMemoryStateStore:
         ] = {}
         self._trusted_task_repairs: dict[tuple[RunId, TaskId, int, str], str] = {}
         self._task_resume_allocations: dict[str, TaskResumeAllocation] = {}
+        self._worker_attempts: dict[AttemptId, WorkerAttemptRecord] = {}
+        self._worker_bindings: dict[AttemptId, WorkerTurnBinding] = {}
+        self._worker_actions: dict[str, WorkerActionRecord] = {}
+        self._worker_turn_actions: dict[tuple[AttemptId, LogicalTurnId], str] = {}
+        self._pending_actions: dict[PendingActionId, PendingAction] = {}
+        self._approval_grants: dict[GrantId, tuple[ApprovalGrant, RequestId]] = {}
+        self._granted_action_intents: dict[IntentId, GrantedActionIntent] = {}
         self._monotonic_clock = monotonic_clock
+        self._target_reservation_id_source = (
+            random_target_reservation_id
+            if target_reservation_id_source is None
+            else target_reservation_id_source
+        )
         self._lock = RLock()
         self._fail_next_commit_after_state_write = False
 
     def _copied(self) -> InMemoryStateStore:
         copied = object.__new__(InMemoryStateStore)
         copied._command_receipts = deepcopy(self._command_receipts)
+        copied._control_request_claims = self._control_request_claims.copy()
         copied._audit_events = deepcopy(self._audit_events)
         copied._sequences = self._sequences.copy()
         copied._effect_intents = self._effect_intents.copy()
@@ -504,13 +582,22 @@ class InMemoryStateStore:
         copied._task_resume_metadata = self._task_resume_metadata.copy()
         copied._trusted_task_repairs = self._trusted_task_repairs.copy()
         copied._task_resume_allocations = self._task_resume_allocations.copy()
+        copied._worker_attempts = self._worker_attempts.copy()
+        copied._worker_bindings = self._worker_bindings.copy()
+        copied._worker_actions = self._worker_actions.copy()
+        copied._worker_turn_actions = self._worker_turn_actions.copy()
+        copied._pending_actions = self._pending_actions.copy()
+        copied._approval_grants = self._approval_grants.copy()
+        copied._granted_action_intents = self._granted_action_intents.copy()
         copied._monotonic_clock = self._monotonic_clock
+        copied._target_reservation_id_source = self._target_reservation_id_source
         copied._lock = self._lock
         copied._fail_next_commit_after_state_write = False
         return copied
 
     def _publish(self, copied: InMemoryStateStore) -> None:
         self._command_receipts = copied._command_receipts
+        self._control_request_claims = copied._control_request_claims
         self._audit_events = copied._audit_events
         self._sequences = copied._sequences
         self._effect_intents = copied._effect_intents
@@ -565,6 +652,13 @@ class InMemoryStateStore:
         self._task_resume_metadata = copied._task_resume_metadata
         self._trusted_task_repairs = copied._trusted_task_repairs
         self._task_resume_allocations = copied._task_resume_allocations
+        self._worker_attempts = copied._worker_attempts
+        self._worker_bindings = copied._worker_bindings
+        self._worker_actions = copied._worker_actions
+        self._worker_turn_actions = copied._worker_turn_actions
+        self._pending_actions = copied._pending_actions
+        self._approval_grants = copied._approval_grants
+        self._granted_action_intents = copied._granted_action_intents
 
     def _commit_state_and_event(
         self,
@@ -604,46 +698,70 @@ class InMemoryStateStore:
                 self._fail_next_commit_after_state_write = False
                 raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
             events = event_factory()
-            if not events:
-                raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
-            runtime_state = copied._active_run_times.get(
-                run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+            return self._publish_copied_events(
+                copied=copied,
+                run_id=run_id,
+                expected_sequence=expected_sequence,
+                events=events,
+                runtime_now=runtime_now,
+                runtime_now_factory=runtime_now_factory,
+                finalize=finalize,
             )
-            committed_events = events
-            if runtime_state.open_owner_generation is None:
-                if any(
-                    event.runtime_owner_generation is not None
-                    or event.runtime_monotonic_nanoseconds is not None
-                    for event in events
-                ):
-                    raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
-                copied._active_run_times[run_id] = runtime_state
-            else:
-                if copied._monotonic_clock is None:
-                    raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
-                if runtime_now_factory is not None:
-                    now = runtime_now_factory()
-                else:
-                    now = copied._monotonic_clock.now() if runtime_now is None else runtime_now
-                runtime_state.observed_nanoseconds(now)
-                committed_events = tuple(
-                    replace(
-                        event,
-                        runtime_owner_generation=runtime_state.open_owner_generation,
-                        runtime_monotonic_nanoseconds=now.nanoseconds,
-                    )
-                    for event in events
+
+    def _publish_copied_events(
+        self,
+        *,
+        copied: InMemoryStateStore,
+        run_id: RunId,
+        expected_sequence: AuditSequence,
+        events: tuple[AuditEvent, ...],
+        runtime_now: MonotonicInstant | None,
+        runtime_now_factory: Callable[[], MonotonicInstant] | None = None,
+        finalize: Callable[[InMemoryStateStore], None] | None = None,
+    ) -> AuditSequence:
+        if not events:
+            raise StateConflict("AUDIT_EVENT_BATCH_EMPTY")
+        runtime_state = copied._active_run_times.get(
+            run_id, ActiveRunTimeState(run_id, 0, None, None, None)
+        )
+        committed_events = events
+        if runtime_state.open_owner_generation is None:
+            if any(
+                event.runtime_owner_generation is not None
+                or event.runtime_monotonic_nanoseconds is not None
+                for event in events
+            ):
+                raise StateConflict("RUNTIME_AUDIT_WITHOUT_OWNER")
+            copied._active_run_times[run_id] = runtime_state
+        else:
+            if copied._monotonic_clock is None:
+                raise StateConflict("MONOTONIC_CLOCK_NOT_CONFIGURED")
+            now = (
+                runtime_now_factory()
+                if runtime_now_factory is not None
+                else copied._monotonic_clock.now()
+                if runtime_now is None
+                else runtime_now
+            )
+            runtime_state.observed_nanoseconds(now)
+            committed_events = tuple(
+                replace(
+                    event,
+                    runtime_owner_generation=runtime_state.open_owner_generation,
+                    runtime_monotonic_nanoseconds=now.nanoseconds,
                 )
-                copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
-            for offset, committed_event in enumerate(committed_events, start=1):
-                next_sequence = AuditSequence(expected_sequence + offset)
-                copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
-            if finalize is not None:
-                finalize(copied)
-            next_sequence = AuditSequence(expected_sequence + len(committed_events))
-            copied._sequences[run_id] = next_sequence
-            self._publish(copied)
-            return next_sequence
+                for event in events
+            )
+            copied._active_run_times[run_id] = replace(runtime_state, latest_committed_at=now)
+        for offset, committed_event in enumerate(committed_events, start=1):
+            next_sequence = AuditSequence(expected_sequence + offset)
+            copied._audit_events.setdefault(run_id, []).append((next_sequence, committed_event))
+        if finalize is not None:
+            finalize(copied)
+        next_sequence = AuditSequence(expected_sequence + len(committed_events))
+        copied._sequences[run_id] = next_sequence
+        self._publish(copied)
+        return next_sequence
 
     def record_command(self, command: CommandEnvelope, outcome: CommandOutcome) -> CommandOutcome:
         with self._lock:
@@ -651,15 +769,10 @@ class InMemoryStateStore:
             run = self._runs.get(run_id)
             if run is None:
                 raise StateConflict("RUN_NOT_FOUND")
-            envelope_digest = _command_digest(command)
-            existing = self._command_receipts.get(command.request_id)
-            if existing is not None:
-                repository_id, stored_run_id, stored_digest, stored_outcome, _ = existing
-                if (
-                    repository_id == run.repository_id
-                    and stored_run_id == run_id
-                    and stored_digest == envelope_digest
-                ):
+            claim = self._control_request_claims.get(command.request_id)
+            if claim is not None:
+                stored_digest, stored_outcome = claim
+                if stored_digest == _command_digest(command):
                     return CommandOutcome.validate_for_payload(
                         command.payload, _json_object(stored_outcome)
                     )
@@ -678,24 +791,28 @@ class InMemoryStateStore:
                 raise StateConflict("COMMAND_OUTCOME_SEQUENCE_MISMATCH")
 
             def mutate(copied: InMemoryStateStore) -> None:
+                self._claim_control_request(copied, command, outcome)
                 copied._command_receipts[command.request_id] = (
                     run.repository_id,
                     run_id,
-                    envelope_digest,
+                    _command_digest(command),
                     _outcome_json(outcome),
                     committed_sequence,
                 )
 
-            self._commit_state_and_event(
-                run_id=run_id,
-                expected_sequence=expected,
-                event=AuditEvent.kind(
-                    "COMMAND_RECORDED",
-                    applicable_revision_digests=command.applicable_revision_digests,
-                    result_class=outcome.status,
-                ),
-                mutate=mutate,
-            )
+            try:
+                self._commit_state_and_event(
+                    run_id=run_id,
+                    expected_sequence=expected,
+                    event=AuditEvent.kind(
+                        "COMMAND_RECORDED",
+                        applicable_revision_digests=command.applicable_revision_digests,
+                        result_class=outcome.status,
+                    ),
+                    mutate=mutate,
+                )
+            except _ControlRequestClaimed as error:
+                return error.outcome
             return outcome
 
     def create_draft_with_reservation(
@@ -887,6 +1004,494 @@ class InMemoryStateStore:
             self._tasks[task_key] = ("ACTIVE", None, None)
             if current_attempt is None:
                 self._attempts[attempt_key] = (task.task_id, "RUNNING")
+
+    def install_worker_attempt_for_test(self, binding: WorkerTurnBinding) -> None:
+        with self._lock:
+            current_budget = self._approved_budgets.get(binding.run_id)
+            if current_budget is None or current_budget[0] != binding.budget_digest:
+                raise StateConflict("CURRENT_BUDGET_BINDING_MISMATCH")
+            if binding.attempt_id in self._worker_attempts:
+                raise StateConflict("WORKER_ATTEMPT_DUPLICATE")
+            now = datetime.now(UTC)
+            self._tasks[(binding.run_id, binding.task_id)] = ("ACTIVE", None, None)
+            self._attempts[(binding.run_id, binding.attempt_id)] = (
+                binding.task_id,
+                "RUNNING",
+            )
+            self._worker_attempts[binding.attempt_id] = WorkerAttemptRecord(
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                plan_digest=binding.plan_digest,
+                policy_digest=binding.policy_digest,
+                budget_digest=binding.budget_digest,
+                model_configuration_digest=binding.model_configuration_digest,
+                tool_schema_digest=binding.tool_schema_digest,
+                target_safety_digest=binding.target_safety_digest,
+                credential_profile=binding.credential_profile,
+                task_contract_digest=binding.task_contract_digest,
+                base_run_head_oid=binding.admissible_head,
+                worker_slot=f"worker-{binding.lease_generation}",
+                state="RUNNING",
+                created_sequence=self._sequences.get(binding.run_id, AuditSequence(0)),
+            )
+            self._worker_bindings[binding.attempt_id] = binding
+            self._workspace_leases[(binding.run_id, binding.lease_id)] = WorkspaceLease(
+                lease_id=binding.lease_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                generation=binding.lease_generation,
+                base_head=binding.admissible_head,
+                admissible_head=binding.admissible_head,
+                task_contract_digest=binding.task_contract_digest,
+                write_globs=(GlobPattern.parse("**"),),
+                sensitivity_globs=(GlobPattern.parse("**"),),
+                issued_at=now,
+                expires_at=now + timedelta(minutes=30),
+                state="ACTIVE",
+            )
+
+    def current_worker_turn_binding(self, attempt_id: AttemptId) -> WorkerTurnBinding:
+        with self._lock:
+            binding = self._worker_bindings.get(attempt_id)
+            attempt = self._worker_attempts.get(attempt_id)
+            lease = (
+                None
+                if binding is None
+                else self._workspace_leases.get((binding.run_id, binding.lease_id))
+            )
+        if binding is None or attempt is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        if attempt.state != "RUNNING" or lease is None or lease.state != "ACTIVE":
+            raise StateConflict("WORKER_ATTEMPT_NOT_RUNNABLE")
+        return binding
+
+    def attempt(self, attempt_id: AttemptId) -> WorkerAttemptRecord:
+        with self._lock:
+            attempt = self._worker_attempts.get(attempt_id)
+        if attempt is None:
+            raise StateConflict("WORKER_ATTEMPT_NOT_FOUND")
+        return attempt
+
+    def attempts_for_task(self, task_id: TaskId) -> tuple[WorkerAttemptRecord, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    (
+                        attempt
+                        for attempt in self._worker_attempts.values()
+                        if attempt.task_id == task_id
+                    ),
+                    key=lambda attempt: (attempt.created_sequence, attempt.attempt_id),
+                )
+            )
+
+    def active_lease_for_task(self, task_id: TaskId) -> WorkspaceLease | None:
+        with self._lock:
+            active = tuple(
+                lease
+                for lease in self._workspace_leases.values()
+                if lease.task_id == task_id and lease.state == "ACTIVE"
+            )
+        if len(active) > 1:
+            raise StateConflict("MULTIPLE_ACTIVE_TASK_LEASES")
+        return None if not active else active[0]
+
+    def invalid_action_count(self, task_id: TaskId) -> int:
+        with self._lock:
+            return sum(
+                len(history)
+                for (
+                    candidate_run_id,
+                    candidate_task_id,
+                ), history in self._task_invalid_actions.items()
+                if candidate_task_id == task_id and candidate_run_id in self._runs
+            )
+
+    def task_record(self, task_id: TaskId) -> WorkerTaskRecord:
+        with self._lock:
+            matches = tuple(
+                (run_id, value)
+                for (run_id, candidate_task_id), value in self._tasks.items()
+                if candidate_task_id == task_id
+            )
+        if len(matches) != 1:
+            raise StateConflict("WORKER_TASK_NOT_FOUND_OR_AMBIGUOUS")
+        run_id, value = matches[0]
+        terminal_results = tuple(
+            result
+            for action in self._worker_actions.values()
+            if action.run_id == run_id
+            and action.task_id == task_id
+            and action.result_intent_id is not None
+            and (result := self._effect_results.get(action.result_intent_id)) is not None
+            and result.result_class in {"WORKER_FINISHED", "WORKER_FAILED"}
+        )
+        if terminal_results:
+            latest = max(terminal_results, key=lambda result: result.settled_sequence)
+            state = "SUCCEEDED" if latest.result_class == "WORKER_FINISHED" else "FAILED"
+            return WorkerTaskRecord(run_id, task_id, state, None)
+        return WorkerTaskRecord(run_id, task_id, value[0], value[1])
+
+    def next_dispatchable(self, run_id: RunId) -> TaskDispatchSelection | RuntimeDecision:
+        with self._lock:
+            run = self._runs.get(run_id)
+            sequence = self._sequences.get(run_id, AuditSequence(0))
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            if run.state != RunState.ACTIVE or not self._new_dispatch_open.get(run_id, True):
+                return RuntimeDecision.pause("RUN_DISPATCH_CLOSED", sequence)
+            revisions = ApplicableRevisionDigests(
+                plan_digest=run.current_plan_digest,
+                policy_digest=run.current_policy_digest,
+                budget_digest=run.current_budget_digest,
+                model_configuration_digest=run.current_model_configuration_digest,
+            )
+            if (
+                revisions.plan_digest is None
+                or revisions.policy_digest is None
+                or revisions.budget_digest is None
+                or revisions.model_configuration_digest is None
+            ):
+                return RuntimeDecision.pause("REVISION_BINDING_MISMATCH", sequence)
+            runnable = tuple(
+                sorted(
+                    (
+                        attempt
+                        for attempt in self._worker_attempts.values()
+                        if attempt.run_id == run_id and attempt.state == "RUNNING"
+                    ),
+                    key=lambda item: (item.created_sequence, item.attempt_id),
+                )
+            )
+            for attempt in runnable:
+                binding = self._worker_bindings[attempt.attempt_id]
+                lease = self._workspace_leases.get((run_id, binding.lease_id))
+                if lease is not None and lease.state == "ACTIVE":
+                    return TaskDispatchSelection(
+                        dispatch_id=f"existing:{attempt.attempt_id}",
+                        run_id=run_id,
+                        task_id=attempt.task_id,
+                        task_contract_digest=attempt.task_contract_digest,
+                        base_run_head_oid=attempt.base_run_head_oid,
+                        applicable_revision_digests=binding.applicable_revision_digests,
+                        target_safety_digest=binding.target_safety_digest,
+                        credential_profile=binding.credential_profile,
+                        resume_allocation_id=None,
+                        reserved_attempt_id=None,
+                        expected_sequence=sequence,
+                        existing_attempt_id=attempt.attempt_id,
+                    )
+            budget = self._require_current_budget(run_id, revisions.budget_digest)
+            active_count = sum(
+                lease.run_id == run_id and lease.state == "ACTIVE"
+                for lease in self._workspace_leases.values()
+            )
+            if active_count >= budget.concurrent_worker_ceiling:
+                return RuntimeDecision.pause("CONCURRENT_WORKER_CEILING", sequence)
+            contracts = self._plan_task_contracts.get(revisions.plan_digest, ())
+            active_task_ids = {
+                attempt.task_id
+                for attempt in self._worker_attempts.values()
+                if attempt.run_id == run_id
+                and attempt.state in {"RUNNING", "WAITING_APPROVAL", "VERIFYING"}
+            }
+            succeeded = {
+                attempt.task_id
+                for attempt in self._worker_attempts.values()
+                if attempt.run_id == run_id and attempt.state == "SUCCEEDED"
+            }
+            hazards = self._plan_hazard_edges.get(revisions.plan_digest, ())
+            for contract in sorted(contracts, key=lambda item: item.task_id):
+                task_state = self._tasks.get((run_id, contract.task_id), ("READY", None, None))[0]
+                if (
+                    task_state != "READY"
+                    or not set(contract.dependency_task_ids).issubset(succeeded)
+                    or any(
+                        contract.task_id in edge and any(item in active_task_ids for item in edge)
+                        for edge in hazards
+                    )
+                ):
+                    continue
+                counters = self._task_budget_counters.get(
+                    (run_id, contract.task_id),
+                    TaskBudgetState(run_id=run_id, task_id=contract.task_id),
+                )
+                attempts = max(
+                    counters.attempts,
+                    sum(
+                        item.run_id == run_id and item.task_id == contract.task_id
+                        for item in self._worker_attempts.values()
+                    ),
+                )
+                if attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling:
+                    return RuntimeDecision.pause("TASK_ATTEMPT_CEILING", sequence)
+                resume = next(
+                    (
+                        allocation
+                        for allocation in self._task_resume_allocations.values()
+                        if allocation.run_id == run_id
+                        and allocation.task_id == contract.task_id
+                        and allocation.state == "RESERVED"
+                    ),
+                    None,
+                )
+                tranche_id = counters.active_tranche_id
+                tranche = (
+                    None
+                    if tranche_id is None
+                    else self._task_tranches.get((run_id, contract.task_id, tranche_id))
+                )
+                if resume is None and (
+                    tranche is None or counters.active_tranche_remaining_calls <= 0
+                ):
+                    continue
+                identity = canonical_json(
+                    {
+                        "run_id": run_id,
+                        "sequence": int(sequence),
+                        "task_id": contract.task_id,
+                    }
+                )
+                return TaskDispatchSelection(
+                    dispatch_id="worker-dispatch-" + sha256(identity.encode()).hexdigest(),
+                    run_id=run_id,
+                    task_id=contract.task_id,
+                    task_contract_digest=task_contract_digest(contract),
+                    base_run_head_oid=str(run.pinned_target_oid),
+                    applicable_revision_digests=revisions,
+                    target_safety_digest=self.target_authority_digest(run_id),
+                    credential_profile=None,
+                    resume_allocation_id=None if resume is None else resume.allocation_id,
+                    reserved_attempt_id=(None if resume is None else resume.reserved_attempt_id),
+                    expected_sequence=sequence,
+                )
+            return RuntimeDecision.pause("NO_DISPATCHABLE_TASK", sequence)
+
+    def create_attempt_with_lease(
+        self,
+        selection: TaskDispatchSelection,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> WorkerAttemptSnapshot:
+        if selection.expected_sequence != expected_sequence:
+            raise StateConflict("WORKER_DISPATCH_SEQUENCE_MISMATCH")
+        if selection.existing_attempt_id is not None:
+            binding = self.current_worker_turn_binding(selection.existing_attempt_id)
+            if binding.run_id != selection.run_id or binding.task_id != selection.task_id:
+                raise StateConflict("WORKER_EXISTING_ATTEMPT_BINDING_MISMATCH")
+            return WorkerAttemptSnapshot(
+                binding.run_id,
+                binding.task_id,
+                binding.attempt_id,
+                binding.applicable_revision_digests,
+            )
+        created: list[WorkerAttemptSnapshot] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(selection.run_id)
+            if run is None or run.state != RunState.ACTIVE:
+                raise StateConflict("RUN_NOT_DISPATCHABLE")
+            if copied.current_revision_digests(selection.run_id) != (
+                selection.applicable_revision_digests
+            ):
+                raise StateConflict("REVISION_BINDING_MISMATCH")
+            plan_digest = selection.applicable_revision_digests.plan_digest
+            policy_digest = selection.applicable_revision_digests.policy_digest
+            budget_digest = selection.applicable_revision_digests.budget_digest
+            model_digest = selection.applicable_revision_digests.model_configuration_digest
+            if (
+                plan_digest is None
+                or policy_digest is None
+                or budget_digest is None
+                or model_digest is None
+            ):
+                raise StateConflict("REVISION_BINDING_MISMATCH")
+            budget = copied._require_current_budget(selection.run_id, budget_digest)
+            active = sum(
+                lease.run_id == selection.run_id and lease.state == "ACTIVE"
+                for lease in copied._workspace_leases.values()
+            )
+            if active >= budget.concurrent_worker_ceiling:
+                raise StateConflict("CONCURRENT_WORKER_CEILING")
+            contracts = copied._plan_task_contracts[plan_digest]
+            contract = next((item for item in contracts if item.task_id == selection.task_id), None)
+            if contract is None or task_contract_digest(contract) != selection.task_contract_digest:
+                raise StateConflict("TASK_CONTRACT_BINDING_MISMATCH")
+            counters = copied._task_budget_counters.get(
+                (selection.run_id, selection.task_id),
+                TaskBudgetState(selection.run_id, selection.task_id),
+            )
+            if counters.attempts >= V01_MECHANISM_LIMITS.task_attempt_ceiling:
+                raise StateConflict("TASK_ATTEMPT_CEILING")
+            tranche_id = counters.active_tranche_id
+            tranche = (
+                None
+                if tranche_id is None
+                else copied._task_tranches.get((selection.run_id, selection.task_id, tranche_id))
+            )
+            resume = (
+                None
+                if selection.resume_allocation_id is None
+                else copied._task_resume_allocations.get(selection.resume_allocation_id)
+            )
+            if resume is None and (tranche is None or counters.active_tranche_remaining_calls <= 0):
+                raise StateConflict("TASK_ALLOCATION_REQUIRED")
+            allocated_attempt_id = (
+                resume.reserved_attempt_id if resume is not None else tranche[0]  # type: ignore[index]
+            )
+            if (
+                selection.reserved_attempt_id is not None
+                and selection.reserved_attempt_id != allocated_attempt_id
+            ):
+                raise StateConflict("RESERVED_ATTEMPT_BINDING_MISMATCH")
+            attempt_id = AttemptId(allocated_attempt_id)
+            if attempt_id in copied._worker_attempts:
+                raise StateConflict("WORKER_ATTEMPT_DUPLICATE")
+            generation = 1 + max(
+                (
+                    lease.generation
+                    for lease in copied._workspace_leases.values()
+                    if lease.run_id == selection.run_id and lease.task_id == selection.task_id
+                ),
+                default=0,
+            )
+            lease_id = (
+                "worker-lease-"
+                + sha256(f"{selection.run_id}:{attempt_id}:{generation}".encode()).hexdigest()
+            )
+            scope_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "read": [item.value for item in contract.read_globs],
+                        "write": [item.value for item in contract.write_globs],
+                    }
+                )
+            )
+            snapshot_digest = sha256_digest(
+                canonical_json(
+                    {
+                        "head": selection.base_run_head_oid,
+                        "repository_id": run.repository_id,
+                        "scope_digest": scope_digest,
+                    }
+                )
+            )
+            dependency_basis = sha256_digest(
+                canonical_json({"dependencies": list(contract.dependency_task_ids)})
+            )
+            model_record = copied._revision_documents.get(
+                (
+                    selection.run_id,
+                    "MODEL_CONFIGURATION",
+                    model_digest,
+                )
+            )
+            if model_record is None or not isinstance(
+                model_record[0], ModelConfigurationRevisionDocument
+            ):
+                raise StateConflict("MODEL_CONFIGURATION_NOT_FOUND")
+            binding = WorkerTurnBinding(
+                run_id=selection.run_id,
+                task_id=selection.task_id,
+                attempt_id=attempt_id,
+                tranche_id=str(tranche_id or resume.allocation_id),  # type: ignore[union-attr]
+                lease_id=lease_id,
+                lease_generation=generation,
+                admissible_head=selection.base_run_head_oid,
+                task_contract_digest=selection.task_contract_digest,
+                plan_digest=plan_digest,
+                policy_digest=policy_digest,
+                budget_digest=budget_digest,
+                model_configuration_digest=model_digest,
+                tool_schema_digest=model_record[0].tool_schema_digest,
+                target_safety_digest=selection.target_safety_digest,
+                credential_profile=selection.credential_profile,
+                repository_id=str(run.repository_id),
+                snapshot_digest=snapshot_digest,
+                scope_digest=scope_digest,
+                dependency_fingerprint_basis=dependency_basis,
+            )
+            copied._tasks[(selection.run_id, selection.task_id)] = ("ACTIVE", None, None)
+            copied._attempts[(selection.run_id, attempt_id)] = (
+                selection.task_id,
+                "RUNNING",
+            )
+            copied._worker_attempts[attempt_id] = WorkerAttemptRecord(
+                selection.run_id,
+                selection.task_id,
+                attempt_id,
+                binding.plan_digest,
+                binding.policy_digest,
+                binding.budget_digest,
+                binding.model_configuration_digest,
+                binding.tool_schema_digest,
+                binding.target_safety_digest,
+                binding.credential_profile,
+                binding.task_contract_digest,
+                binding.admissible_head,
+                f"worker-{active + 1}",
+                "RUNNING",
+                AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_bindings[attempt_id] = binding
+            now = datetime.now(UTC)
+            sensitivity = (
+                contract.read_globs
+                + contract.dependency_globs
+                + tuple(item for check in contract.checks for item in check.input_globs)
+            )
+            copied._workspace_leases[(selection.run_id, lease_id)] = WorkspaceLease(
+                lease_id,
+                selection.run_id,
+                selection.task_id,
+                attempt_id,
+                generation,
+                selection.base_run_head_oid,
+                selection.base_run_head_oid,
+                selection.task_contract_digest,
+                contract.write_globs,
+                sensitivity,
+                now,
+                now + timedelta(minutes=15),
+                "ACTIVE",
+            )
+            copied._task_budget_counters[(selection.run_id, selection.task_id)] = replace(
+                counters, attempts=counters.attempts + 1
+            )
+            if resume is not None:
+                copied._task_resume_allocations[resume.allocation_id] = replace(
+                    resume, state="CONSUMED"
+                )
+            copied._settle_global_usage_for_producer(
+                selection.run_id,
+                binding.budget_digest,
+                GlobalBudgetMetric.CONCURRENT_WORKERS,
+                active + 1,
+            )
+            created.append(
+                WorkerAttemptSnapshot(
+                    selection.run_id,
+                    selection.task_id,
+                    attempt_id,
+                    binding.applicable_revision_digests,
+                )
+            )
+
+        self._commit_state_and_event(
+            run_id=selection.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_CREATED",
+                task_id=selection.task_id,
+                attempt_id=selection.reserved_attempt_id,
+                applicable_revision_digests=selection.applicable_revision_digests,
+                subject_digests=(selection.task_contract_digest,),
+            ),
+            mutate=mutate,
+        )
+        return created[0]
 
     def task_lifecycle_state(self, run_id: RunId, task_id: TaskId) -> TaskLifecycleState:
         with self._lock:
@@ -1316,6 +1921,14 @@ class InMemoryStateStore:
         action_digest: str,
         budget_digest: RevisionDigest,
         expected_sequence: AuditSequence,
+        *,
+        worker_recovery: tuple[
+            WorkerTurnBinding,
+            LogicalTurnId,
+            EffectIntent | None,
+            RuntimePermit | None,
+        ]
+        | None = None,
     ) -> TaskStopDecision:
         if attempt_id != task.attempt_id:
             raise StateConflict("TASK_ATTEMPT_BINDING_MISMATCH")
@@ -1325,6 +1938,11 @@ class InMemoryStateStore:
             nonlocal count
             copied._require_current_task_budget(task, budget_digest)
             copied._finish_attempt(task.run_id, task.task_id, attempt_id, "FAILED")
+            worker_attempt = copied._worker_attempts.get(attempt_id)
+            if worker_attempt is not None:
+                if worker_attempt.run_id != task.run_id or worker_attempt.task_id != task.task_id:
+                    raise StateConflict("WORKER_ATTEMPT_BINDING_MISMATCH")
+                copied._worker_attempts[attempt_id] = replace(worker_attempt, state="FAILED")
             current = copied._tasks.get((task.run_id, task.task_id))
             if current is None or current[0] != "ACTIVE":
                 raise StateConflict("TASK_INVALID_ACTION_SOURCE_STATE_ILLEGAL")
@@ -1349,6 +1967,16 @@ class InMemoryStateStore:
                 )
             else:
                 copied._set_task_state(task.run_id, task.task_id, "READY")
+            if worker_recovery is not None:
+                binding, logical_turn_id, marker, permit = worker_recovery
+                copied._settle_recovered_worker_marker(
+                    binding,
+                    logical_turn_id,
+                    marker,
+                    permit,
+                    "WORKER_MALFORMED_ACTION_RECORDED",
+                    expected_sequence,
+                )
 
         sequence = self._commit_state_and_event(
             run_id=task.run_id,
@@ -1371,6 +1999,955 @@ class InMemoryStateStore:
             attempt_state="FAILED",
             resulting_sequence=sequence,
         )
+
+    def record_malformed_worker_action(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action_digest: str,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> TaskStopDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        if self.current_worker_turn_binding(binding.attempt_id) != binding:
+            raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+        return self.record_invalid_action(
+            TaskAuthority(binding.run_id, binding.task_id, binding.attempt_id),
+            binding.attempt_id,
+            action_digest,
+            binding.budget_digest,
+            expected_sequence,
+            worker_recovery=(binding, logical_turn_id, recovered_marker, permit),
+        )
+
+    def record_authorized_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> ToolIntent:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        binding = self.current_worker_turn_binding(request.attempt_id)
+        try:
+            validate_authorized_worker_action(binding, intent, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, request.logical_turn_id)
+            if (
+                request.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            if effect.intent_id in copied._effect_intents or any(
+                existing.idempotency_key == effect.idempotency_key
+                for existing in copied._effect_intents.values()
+            ):
+                raise StateConflict("EFFECT_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._worker_actions[request.action_id] = WorkerActionRecord(
+                action_id=request.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=request.logical_turn_id,
+                normalized_action_digest=request.action_digest,
+                expected_prestate_digest=request.expected_prestate_digest,
+                authorization_binding_digest=decision.binding_digest,
+                deadline_at_utc=decision.deadline_at_utc,
+                intent_id=intent.intent_id,
+                result_intent_id=None,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = request.action_id
+            copied._settle_recovered_worker_marker(
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_INTENT_RECORDED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return intent
+
+    def settle_worker_action(
+        self,
+        *,
+        intent: ToolIntent,
+        authorization: AuthorizationDecision,
+        result: ToolResult,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != intent.run_id or result.intent_id != intent.intent_id:
+            raise StateConflict("WORKER_TOOL_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            action = copied._worker_actions.get(intent.action_id)
+            stored_intent = copied._effect_intents.get(intent.intent_id)
+            if (
+                action is None
+                or action.intent_id != intent.intent_id
+                or action.result_intent_id is not None
+                or action.authorization_binding_digest != authorization.binding_digest
+                or stored_intent is None
+                or ToolIntent.from_effect_intent(stored_intent) != intent
+                or intent.intent_id in copied._effect_results
+            ):
+                raise StateConflict("WORKER_ACTION_SETTLEMENT_BINDING_MISMATCH")
+            copied._effect_results[intent.intent_id] = effect_result
+            copied._worker_actions[intent.action_id] = replace(
+                action, result_intent_id=intent.intent_id
+            )
+
+        return self._commit_state_and_event(
+            run_id=intent.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ACTION_SETTLED",
+                task_id=intent.task_id,
+                attempt_id=intent.attempt_id,
+                action_id=intent.action_id,
+                applicable_revision_digests=intent.applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def settle_recovered_action_denial(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        marker: EffectIntent,
+        permit: RuntimePermit,
+        decision: AuthorizationDecision,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if (
+            decision.decision != "DENY"
+            or decision.persistence != "DENIAL_AUDIT"
+            or decision.run_id != binding.run_id
+            or decision.task_id != binding.task_id
+            or decision.attempt_id != binding.attempt_id
+            or decision.resulting_sequence != expected_sequence
+        ):
+            raise StateConflict("RECOVERED_WORKER_DENIAL_BINDING_MISMATCH")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            copied._settle_recovered_worker_marker(
+                binding,
+                LogicalTurnId(marker.action_id or ""),
+                marker,
+                permit,
+                "WORKER_ACTION_DENIED",
+                expected_sequence,
+            )
+
+        return self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "RECOVERED_WORKER_ACTION_DENIAL_SETTLED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=decision.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=decision.reason,
+            ),
+            mutate=mutate,
+        )
+
+    def freeze_authorized_pending_action(
+        self,
+        *,
+        request: AuthorizationRequest,
+        decision: AuthorizationDecision,
+        expected_prestate: ActionPreState,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> PendingActionFreeze:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        binding = self.current_worker_turn_binding(request.attempt_id)
+        try:
+            pending_id = pending_worker_action_id(binding, request, decision, expected_prestate)
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        policy_entry = self._revision_documents.get(
+            (binding.run_id, "POLICY", binding.policy_digest)
+        )
+        if policy_entry is None or not isinstance(policy_entry[0], PolicyRevisionDocument):
+            raise StateConflict("CURRENT_POLICY_NOT_FOUND")
+        try:
+            pending = freeze_pending_action(
+                PendingActionId(pending_id),
+                request,
+                decision,
+                expected_prestate,
+                request.started_at_utc,
+                policy_entry[0].grant_ttl_seconds,
+            )
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, request.logical_turn_id)
+            if (
+                request.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+                or pending.pending_id in copied._pending_actions
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            copied._worker_actions[request.action_id] = WorkerActionRecord(
+                action_id=request.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=request.logical_turn_id,
+                normalized_action_digest=request.action_digest,
+                expected_prestate_digest=request.expected_prestate_digest,
+                authorization_binding_digest=decision.binding_digest,
+                deadline_at_utc=decision.deadline_at_utc,
+                intent_id=None,
+                result_intent_id=None,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = request.action_id
+            copied._pending_actions[pending.pending_id] = pending
+            copied._worker_attempts[binding.attempt_id] = replace(
+                copied._worker_attempts[binding.attempt_id], state="WAITING_APPROVAL"
+            )
+            copied._settle_recovered_worker_marker(
+                binding,
+                request.logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_PENDING_ACTION_FROZEN",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_PENDING_ACTION_FROZEN",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=request.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                subject_digests=(request.action_digest, decision.binding_digest),
+            ),
+            mutate=mutate,
+        )
+        return PendingActionFreeze(pending_id, sequence)
+
+    @staticmethod
+    def _validated_pending_action(pending: PendingAction) -> PendingAction:
+        try:
+            action = ACTION_ADAPTER.validate_json(pending.normalized_action_json)
+        except ValueError as error:
+            raise StateConflict("PENDING_ACTION_STORAGE_INVALID") from error
+        subject = pending_action_subject_json(
+            pending_id=pending.pending_id,
+            normalized_action_json=pending.normalized_action_json,
+            action_digest=pending.action_digest,
+            authorization_binding_digest=Sha256DigestText(pending.authorization_binding_digest),
+            expected_pre_state=pending.expected_pre_state,
+            bindings=pending.bindings,
+            expires_at=pending.expires_at,
+        )
+        if (
+            not isinstance(action, RiskyAction)
+            or action != pending.action
+            or canonical_action_json(action) != pending.normalized_action_json
+            or sha256_digest(pending.normalized_action_json) != pending.action_digest
+            or sha256_digest(subject) != pending.pending_action_digest
+            or sha256_digest(confirmation_code_for_pending_digest(pending.pending_action_digest))
+            != pending.confirmation_code_digest
+            or pending.authorization_binding_digest != pending.bindings.authorization_binding_digest
+        ):
+            raise StateConflict("PENDING_ACTION_STORAGE_INVALID")
+        return pending
+
+    def pending_action(self, key: RunId | PendingActionId) -> PendingAction:
+        direct = self._pending_actions.get(PendingActionId(str(key)))
+        if direct is not None:
+            return self._validated_pending_action(direct)
+        matches = tuple(
+            pending
+            for pending in self._pending_actions.values()
+            if pending.bindings.run_id == RunId(str(key))
+        )
+        if len(matches) != 1:
+            raise StateConflict("PENDING_ACTION_NOT_FOUND_OR_AMBIGUOUS")
+        return self._validated_pending_action(matches[0])
+
+    def pending_actions(self, run_id: RunId) -> tuple[PendingAction, ...]:
+        return tuple(
+            self._validated_pending_action(pending)
+            for pending in sorted(
+                (item for item in self._pending_actions.values() if item.bindings.run_id == run_id),
+                key=lambda item: item.pending_id,
+            )
+        )
+
+    @staticmethod
+    def _current_frozen_action_bindings(
+        store: InMemoryStateStore, pending: PendingAction
+    ) -> FrozenActionBindings:
+        run = store._runs.get(pending.bindings.run_id)
+        attempt = store._worker_attempts.get(pending.bindings.attempt_id)
+        binding = store._worker_bindings.get(pending.bindings.attempt_id)
+        action = store._worker_actions.get(pending.bindings.action_id)
+        lease = store._workspace_leases.get((pending.bindings.run_id, pending.bindings.lease_id))
+        ref = store._run_refs.get((pending.bindings.run_id, "PRIVATE"))
+        if run is None or attempt is None or binding is None or action is None or lease is None:
+            raise StateConflict("FROZEN_ACTION_BINDING_NOT_FOUND")
+        lease_generation = lease.generation
+        if lease.state != "ACTIVE" or attempt.state != "WAITING_APPROVAL":
+            lease_generation = -1
+        run_head = (
+            str(ref.current_oid)
+            if ref is not None and ref.current_oid is not None
+            else str(run.pinned_target_oid)
+        )
+        return FrozenActionBindings(
+            run_id=run.run_id,
+            task_id=attempt.task_id,
+            attempt_id=attempt.attempt_id,
+            logical_turn_id=action.logical_turn_id,
+            action_id=action.action_id,
+            lease_id=lease.lease_id,
+            lease_generation=lease_generation,
+            run_head_oid=run_head,
+            target_safety_digest=RevisionDigest(attempt.target_safety_digest),
+            plan_digest=RevisionDigest(str(run.current_plan_digest)),
+            policy_digest=RevisionDigest(str(run.current_policy_digest)),
+            budget_digest=RevisionDigest(str(run.current_budget_digest)),
+            model_configuration_digest=RevisionDigest(str(run.current_model_configuration_digest)),
+            tool_schema_digest=attempt.tool_schema_digest,
+            authorization_binding_digest=action.authorization_binding_digest,
+            deadline_at_utc=action.deadline_at_utc,
+        )
+
+    @staticmethod
+    def _invalidate_pending_action_on_copy(
+        copied: InMemoryStateStore, pending: PendingAction
+    ) -> None:
+        current = copied._pending_actions.get(pending.pending_id)
+        attempt = copied._worker_attempts.get(pending.bindings.attempt_id)
+        if (
+            current is None
+            or current.state != "WAITING_APPROVAL"
+            or attempt is None
+            or attempt.state != "WAITING_APPROVAL"
+        ):
+            raise StateConflict("PENDING_ACTION_INVALIDATION_COMPARE_AND_SET_FAILED")
+        copied._pending_actions[pending.pending_id] = replace(current, state="INVALIDATED")
+        copied._worker_attempts[attempt.attempt_id] = replace(attempt, state="STALE")
+
+    def accept_pending_action_grant(
+        self,
+        *,
+        command: CommandEnvelope,
+        now: datetime,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent | None:
+        if not isinstance(command.payload, GrantPayload):
+            raise TypeError("PENDING_ACTION_GRANT_PAYLOAD_REQUIRED")
+        payload = command.payload
+        accepted: list[GrantedActionIntent] = []
+        event_kinds: list[str] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            run = copied._runs.get(payload.run_id)
+            if run is None:
+                raise StateConflict("RUN_NOT_FOUND")
+            interrupt = copied._runtime_interrupts.get(payload.run_id)
+            if interrupt is not None and interrupt[3] == "PENDING":
+                raise StateConflict("RUNTIME_INTERRUPT_PENDING")
+            try:
+                pending = copied._validated_pending_action(
+                    copied._pending_actions[payload.pending_action_id]
+                )
+            except (KeyError, StateConflict):
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant="PENDING_ACTION_BINDING_INVALID",
+                    safe_next_action="USE_DISPLAYED_CONFIRMATION_CODE",
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                copied._control_request_claims[command.request_id] = (
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            try:
+                if (
+                    command.applicable_revision_digests
+                    != pending.bindings.applicable_revision_digests
+                ):
+                    raise GrantValidationError("PENDING_ACTION_BINDING_INVALID")
+                GrantCommandValidator().validate_payload_before_grant_write(payload, pending, now)
+            except GrantValidationError as error:
+                expired = str(error) == "PENDING_ACTION_EXPIRED"
+                if expired:
+                    self._invalidate_pending_action_on_copy(copied, pending)
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE if expired else CommandStatus.DENIED,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=str(error),
+                    safe_next_action=(
+                        "CREATE_FRESH_ATTEMPT" if expired else "USE_DISPLAYED_CONFIRMATION_CODE"
+                    ),
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                copied._control_request_claims[command.request_id] = (
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            grant = ApprovalGrant(
+                grant_id=approval_grant_id(
+                    RequestId(command.request_id), pending.pending_action_digest
+                ),
+                pending_id=pending.pending_id,
+                pending_action_digest=pending.pending_action_digest,
+                confirmation_code_digest=pending.confirmation_code_digest,
+                bindings=pending.bindings,
+                expires_at=pending.expires_at,
+            )
+            if any(
+                stored_request == RequestId(command.request_id)
+                or stored_grant.pending_id == pending.pending_id
+                for stored_grant, stored_request in copied._approval_grants.values()
+            ):
+                raise StateConflict("APPROVAL_GRANT_DUPLICATE")
+            copied._approval_grants[grant.grant_id] = (
+                grant,
+                RequestId(command.request_id),
+            )
+            try:
+                current = self._current_frozen_action_bindings(copied, pending)
+                GrantCommandValidator().validate_current_binding(grant, pending, current, now)
+            except (GrantValidationError, StateConflict) as error:
+                self._invalidate_pending_action_on_copy(copied, pending)
+                copied._approval_grants[grant.grant_id] = (
+                    replace(grant, state="INVALIDATED"),
+                    RequestId(command.request_id),
+                )
+                outcome = CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=payload.run_id,
+                    resulting_sequence=AuditSequence(expected_sequence + 1),
+                    failed_invariant=(
+                        str(error)
+                        if isinstance(error, GrantValidationError)
+                        else "GRANT_BINDING_MISMATCH"
+                    ),
+                )
+                copied._command_receipts[command.request_id] = (
+                    run.repository_id,
+                    payload.run_id,
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                    AuditSequence(expected_sequence + 1),
+                )
+                copied._control_request_claims[command.request_id] = (
+                    _command_digest(command),
+                    _outcome_json(outcome),
+                )
+                event_kinds.append("PENDING_ACTION_GRANT_REJECTED")
+                return
+            self._issue_runtime_permit_on_copy(
+                copied,
+                command,
+                "ACTIVE",
+                pending.bindings.applicable_revision_digests,
+                copied.target_authority_digest(payload.run_id),
+                AuditSequence(expected_sequence + 1),
+            )
+            intent = GrantedActionIntent(
+                intent_id=granted_action_intent_id(grant),
+                pending_id=pending.pending_id,
+                grant_id=grant.grant_id,
+                action=pending.action,
+                normalized_action_json=pending.normalized_action_json,
+                action_digest=pending.action_digest,
+                expected_pre_state=pending.expected_pre_state,
+                bindings=pending.bindings,
+            )
+            effect = intent.to_effect_intent(AuditSequence(expected_sequence + 1))
+            if (
+                effect.intent_id in copied._effect_intents
+                or intent.intent_id in copied._granted_action_intents
+            ):
+                raise StateConflict("GRANTED_ACTION_INTENT_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._granted_action_intents[intent.intent_id] = intent
+            consumed = replace(
+                grant,
+                state="CONSUMED",
+                consumed_intent_id=intent.intent_id,
+                consumed_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._approval_grants[grant.grant_id] = (
+                consumed,
+                RequestId(command.request_id),
+            )
+            copied._pending_actions[pending.pending_id] = replace(pending, state="GRANT_CONSUMED")
+            attempt = copied._worker_attempts[pending.bindings.attempt_id]
+            if attempt.state != "WAITING_APPROVAL":
+                raise StateConflict("ATTEMPT_WAITING_APPROVAL_TRANSITION_INVALID")
+            copied._worker_attempts[attempt.attempt_id] = replace(attempt, state="RUNNING")
+            outcome = CommandOutcome.for_payload(
+                payload,
+                status=CommandStatus.ACCEPTED,
+                run_id=payload.run_id,
+                resulting_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._command_receipts[command.request_id] = (
+                run.repository_id,
+                payload.run_id,
+                _command_digest(command),
+                _outcome_json(outcome),
+                AuditSequence(expected_sequence + 1),
+            )
+            copied._control_request_claims[command.request_id] = (
+                _command_digest(command),
+                _outcome_json(outcome),
+            )
+            accepted.append(intent)
+            event_kinds.append("GRANT_CONSUMED_AND_INTENT_RECORDED")
+
+        self._commit_state_and_events(
+            run_id=payload.run_id,
+            expected_sequence=expected_sequence,
+            event_factory=lambda: (AuditEvent.kind(event_kinds[0]),),
+            mutate=mutate,
+        )
+        return accepted[0] if accepted else None
+
+    def approval_grant(self, grant_id: GrantId) -> ApprovalGrant:
+        try:
+            grant, _ = self._approval_grants[grant_id]
+        except KeyError as error:
+            raise StateConflict("APPROVAL_GRANT_NOT_FOUND") from error
+        try:
+            restored = approval_grant_from_json(approval_grant_to_json(grant))
+        except ValueError as error:
+            raise StateConflict("APPROVAL_GRANT_STORAGE_INVALID") from error
+        if restored != grant:
+            raise StateConflict("APPROVAL_GRANT_STORAGE_INVALID")
+        return grant
+
+    @staticmethod
+    def _validated_granted_action(
+        store: InMemoryStateStore, intent_id: IntentId
+    ) -> GrantedActionIntent:
+        intent = store._granted_action_intents.get(intent_id)
+        if intent is None or intent.state not in {"INTENT_RECORDED", "DISPATCHED"}:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        pending = store._validated_pending_action(store._pending_actions[intent.pending_id])
+        grant_entry = store._approval_grants.get(intent.grant_id)
+        effect = store._require_unsettled_effect_intent(intent.bindings.run_id, intent.intent_id)
+        if (
+            grant_entry is None
+            or pending.state != "GRANT_CONSUMED"
+            or pending.action != intent.action
+            or pending.normalized_action_json != intent.normalized_action_json
+            or pending.action_digest != intent.action_digest
+            or pending.expected_pre_state != intent.expected_pre_state
+            or pending.bindings != intent.bindings
+            or grant_entry[0].state != "CONSUMED"
+            or grant_entry[0].pending_id != intent.pending_id
+            or grant_entry[0].bindings != intent.bindings
+            or grant_entry[0].consumed_intent_id != intent.intent_id
+            or intent.to_effect_intent(effect.recorded_sequence) != effect
+        ):
+            raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+        return intent
+
+    def require_unsettled_granted_intent(self, intent_id: IntentId) -> GrantedActionIntent:
+        with self._lock:
+            return self._validated_granted_action(self, intent_id)
+
+    def next_unsettled_granted_action(self, run_id: RunId) -> GrantedActionIntent | None:
+        candidates = sorted(
+            (
+                intent
+                for intent in self._granted_action_intents.values()
+                if intent.bindings.run_id == run_id
+                and intent.state in {"INTENT_RECORDED", "DISPATCHED"}
+                and intent.intent_id not in self._effect_results
+                and intent.intent_id not in self._indeterminate_effect_intents
+            ),
+            key=lambda item: (
+                self._effect_intents[item.intent_id].recorded_sequence,
+                item.intent_id,
+            ),
+        )
+        return (
+            None
+            if not candidates
+            else self._validated_granted_action(self, candidates[0].intent_id)
+        )
+
+    def mark_granted_action_dispatched(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> GrantedActionIntent:
+        result: list[GrantedActionIntent] = []
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+                or intent.state != "INTENT_RECORDED"
+            ):
+                raise StateConflict("GRANTED_ACTION_DISPATCH_STATE_INVALID")
+            dispatched = replace(intent, state="DISPATCHED")
+            copied._granted_action_intents[intent_id] = dispatched
+            result.append(dispatched)
+
+        self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_DISPATCHED",
+                applicable_revision_digests=applicable_revision_digests,
+            ),
+            mutate=mutate,
+        )
+        return result[0]
+
+    def settle_granted_action(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        result: ToolResult,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        if result.run_id != run_id or result.intent_id != intent_id:
+            raise StateConflict("GRANTED_ACTION_RESULT_BINDING_MISMATCH")
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+        if effect_result.outcome == "INDETERMINATE":
+            raise StateConflict("GRANTED_ACTION_DETERMINATE_RESULT_REQUIRED")
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            action = copied._worker_actions.get(intent.bindings.action_id)
+            attempt = copied._worker_attempts.get(intent.bindings.attempt_id)
+            if (
+                intent.bindings.run_id != run_id
+                or intent.bindings.applicable_revision_digests != applicable_revision_digests
+                or action is None
+                or action.intent_id is not None
+                or action.result_intent_id is not None
+                or action.authorization_binding_digest
+                != intent.bindings.authorization_binding_digest
+                or action.normalized_action_digest != intent.action_digest
+                or action.expected_prestate_digest
+                != sha256_digest(intent.expected_pre_state.canonical_json())
+                or attempt is None
+                or attempt.state != "RUNNING"
+            ):
+                raise StateConflict("GRANTED_WORKER_ACTION_SETTLEMENT_MISMATCH")
+            copied._effect_results[intent_id] = effect_result
+            copied._worker_actions[action.action_id] = replace(action, result_intent_id=intent_id)
+            copied._granted_action_intents[intent_id] = replace(intent, state="SETTLED")
+            copied._pending_actions[intent.pending_id] = replace(
+                copied._pending_actions[intent.pending_id], state="SETTLED"
+            )
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_SETTLED",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class=result.code,
+                subject_digests=(effect_result.result_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def mark_granted_action_indeterminate(
+        self,
+        *,
+        run_id: RunId,
+        intent_id: IntentId,
+        observation_digest: Sha256DigestText,
+        applicable_revision_digests: ApplicableRevisionDigests,
+        expected_sequence: AuditSequence,
+    ) -> AuditSequence:
+        result = ToolResult.indeterminate(
+            "GRANTED_ACTION_POSTSTATE_UNCERTAIN", run_id=run_id, intent_id=intent_id
+        ).model_copy(update={"content_digest": observation_digest})
+        effect_result = result.to_effect_result(AuditSequence(expected_sequence + 1))
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            intent = self._validated_granted_action(copied, intent_id)
+            if intent.bindings.applicable_revision_digests != applicable_revision_digests:
+                raise StateConflict("GRANTED_ACTION_BINDING_MISMATCH")
+            copied._effect_results[intent_id] = effect_result
+            copied._indeterminate_effect_intents.add(intent_id)
+            copied._granted_action_intents[intent_id] = replace(intent, state="INDETERMINATE")
+            copied._runs[run_id] = replace(copied._runs[run_id], state=RunState.INDETERMINATE)
+
+        return self._commit_state_and_event(
+            run_id=run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "GRANTED_ACTION_INDETERMINATE",
+                applicable_revision_digests=applicable_revision_digests,
+                result_class="INDETERMINATE",
+                subject_digests=(observation_digest,),
+            ),
+            mutate=mutate,
+        )
+
+    def granted_intent_count(self, pending_id: PendingActionId) -> int:
+        return sum(
+            intent.pending_id == pending_id for intent in self._granted_action_intents.values()
+        )
+
+    def approval_grant_count(self, pending_id: PendingActionId) -> int:
+        return sum(grant.pending_id == pending_id for grant, _ in self._approval_grants.values())
+
+    def effect_for_pending(self, pending_id: PendingActionId) -> GrantedActionIntent:
+        matches = tuple(
+            intent
+            for intent in self._granted_action_intents.values()
+            if intent.pending_id == pending_id
+        )
+        if len(matches) != 1:
+            raise StateConflict("GRANTED_ACTION_INTENT_NOT_FOUND")
+        return matches[0]
+
+    def finish_attempt(
+        self,
+        *,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        action: FinishAction | FailAction,
+        action_digest: str,
+        authorization: AuthorizationDecision,
+        recovered_marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        expected_sequence: AuditSequence,
+    ) -> RuntimeDecision:
+        if (recovered_marker is None) != (permit is None):
+            raise StateConflict("RECOVERED_MARKER_PERMIT_BINDING_MISMATCH")
+        try:
+            effect, result = terminal_worker_effects(
+                binding,
+                logical_turn_id,
+                action,
+                action_digest,
+                authorization,
+                AuditSequence(expected_sequence + 1),
+            )
+        except ValueError as error:
+            raise StateConflict(str(error)) from error
+        self._validate_effect_intent(effect, expected_sequence)
+
+        def mutate(copied: InMemoryStateStore) -> None:
+            if copied.current_worker_turn_binding(binding.attempt_id) != binding:
+                raise StateConflict("WORKER_TURN_BINDING_MISMATCH")
+            turn_key = (binding.attempt_id, logical_turn_id)
+            if (
+                authorization.action_id in copied._worker_actions
+                or turn_key in copied._worker_turn_actions
+                or effect.intent_id in copied._effect_intents
+            ):
+                raise StateConflict("WORKER_ACTION_DUPLICATE")
+            copied._effect_intents[effect.intent_id] = effect
+            copied._effect_results[effect.intent_id] = result
+            copied._worker_actions[authorization.action_id] = WorkerActionRecord(
+                action_id=authorization.action_id,
+                run_id=binding.run_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                logical_turn_id=logical_turn_id,
+                normalized_action_digest=action_digest,
+                expected_prestate_digest=sha256_digest("{}"),
+                authorization_binding_digest=authorization.binding_digest,
+                deadline_at_utc=authorization.deadline_at_utc,
+                intent_id=effect.intent_id,
+                result_intent_id=effect.intent_id,
+                created_sequence=AuditSequence(expected_sequence + 1),
+            )
+            copied._worker_turn_actions[turn_key] = authorization.action_id
+            attempt = copied._worker_attempts[binding.attempt_id]
+            terminal_state = "SUCCEEDED" if isinstance(action, FinishAction) else "FAILED"
+            copied._worker_attempts[binding.attempt_id] = replace(attempt, state=terminal_state)
+            if isinstance(action, FailAction):
+                copied._finish_attempt(
+                    binding.run_id, binding.task_id, binding.attempt_id, "FAILED"
+                )
+            copied._release_attempt_lease(binding.run_id, binding.attempt_id)
+            copied._settle_recovered_worker_marker(
+                binding,
+                logical_turn_id,
+                recovered_marker,
+                permit,
+                "WORKER_TERMINAL_ACTION_RELEASED",
+                expected_sequence,
+            )
+
+        sequence = self._commit_state_and_event(
+            run_id=binding.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "WORKER_ATTEMPT_FINISHED",
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                action_id=authorization.action_id,
+                applicable_revision_digests=binding.applicable_revision_digests,
+                result_class=result.result_class,
+                subject_digests=(action_digest, result.result_digest),
+            ),
+            mutate=mutate,
+        )
+        return RuntimeDecision(
+            code="ACTION_RECORDED",
+            stop_reason=None,
+            resulting_sequence=sequence,
+        )
+
+    def _settle_recovered_worker_marker(
+        self,
+        binding: WorkerTurnBinding,
+        logical_turn_id: LogicalTurnId,
+        marker: EffectIntent | None,
+        permit: RuntimePermit | None,
+        result_class: str,
+        expected_sequence: AuditSequence,
+    ) -> None:
+        if marker is None and permit is None:
+            return
+        owner_id = None if permit is None else permit.consumed_owner_id
+        try:
+            payload = {} if marker is None else json.loads(marker.normalized_payload_json)
+        except json.JSONDecodeError as error:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH") from error
+        if (
+            marker is None
+            or permit is None
+            or owner_id is None
+            or permit.run_id != binding.run_id
+            or permit.state != "CONSUMED"
+            or permit.allowed_phase != "ACTIVE"
+            or permit.applicable_revision_digests != binding.applicable_revision_digests
+            or permit.target_authority_digest != binding.target_safety_digest
+            or marker.run_id != binding.run_id
+            or marker.kind != "RECOVERED_MODEL_ACTION"
+            or marker.task_id != binding.task_id
+            or marker.attempt_id != binding.attempt_id
+            or marker.action_id != logical_turn_id
+            or marker.applicable_revision_digests != binding.applicable_revision_digests
+            or not isinstance(payload, dict)
+            or payload.get("owner_kind") != "WORKER"
+            or payload.get("task_id") != binding.task_id
+            or payload.get("attempt_id") != binding.attempt_id
+            or payload.get("logical_turn_id") != logical_turn_id
+            or payload.get("tranche_id") != binding.tranche_id
+            or self._require_unsettled_effect_intent(binding.run_id, marker.intent_id) != marker
+        ):
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        stored_permit, _ = self._require_consumed_runtime_owner_on_copy(
+            self, binding.run_id, owner_id, permit.generation
+        )
+        if stored_permit != permit:
+            raise StateConflict("RECOVERED_WORKER_MARKER_BINDING_MISMATCH")
+        result_payload = canonical_json({"result_class": result_class})
+        self._effect_results[marker.intent_id] = EffectResult(
+            intent_id=marker.intent_id,
+            run_id=binding.run_id,
+            outcome="COMPLETED",
+            result_class=result_class,
+            result_digest=sha256_digest(result_payload),
+            bounded_result_json=result_payload,
+            settled_sequence=AuditSequence(expected_sequence + 1),
+        )
+
+    def latest_worker_feedback(self, attempt_id: AttemptId) -> str | None:
+        with self._lock:
+            actions = tuple(
+                action
+                for action in self._worker_actions.values()
+                if action.attempt_id == attempt_id and action.result_intent_id is not None
+            )
+            if not actions:
+                return None
+            latest = max(actions, key=lambda action: action.created_sequence)
+            result_intent_id = latest.result_intent_id
+            if result_intent_id is None:
+                raise StateConflict("WORKER_FEEDBACK_RESULT_MISSING")
+            result = self._effect_results.get(result_intent_id)
+        if result is None:
+            raise StateConflict("WORKER_FEEDBACK_RESULT_MISSING")
+        return bounded_worker_feedback(ToolResult.model_validate_json(result.bounded_result_json))
 
     def authorize_new_attempt(self, run_id: RunId, task_id: TaskId) -> DispatchAuthorization:
         with self._lock:
@@ -2973,6 +4550,23 @@ class InMemoryStateStore:
             mutate=lambda copied: None,
         )
 
+    def record_tool_denial(
+        self, denial: ToolDenialAudit, expected_sequence: AuditSequence
+    ) -> AuditSequence:
+        return self._commit_state_and_event(
+            run_id=denial.run_id,
+            expected_sequence=expected_sequence,
+            event=AuditEvent.kind(
+                "TOOL_ACTION_DENIED",
+                task_id=denial.task_id,
+                attempt_id=denial.attempt_id,
+                action_id=denial.action_id,
+                applicable_revision_digests=denial.applicable_revision_digests,
+                result_class=denial.result_code,
+            ),
+            mutate=lambda copied: None,
+        )
+
     def record_intent(self, intent: EffectIntent, expected_sequence: AuditSequence) -> EffectIntent:
         self._validate_effect_intent(intent, expected_sequence)
 
@@ -3155,6 +4749,12 @@ class InMemoryStateStore:
                 raise StateConflict("UNSETTLED_EFFECT_INTENT_REQUIRED")
             if intent.applicable_revision_digests != applicable_revision_digests:
                 raise StateConflict("EFFECT_RESULT_REVISION_BINDING_MISMATCH")
+            from apexcrew.domain.tools import ToolEffectResultError, validate_tool_effect_result
+
+            try:
+                validate_tool_effect_result(intent, result)
+            except ToolEffectResultError as error:
+                raise StateConflict(error.code) from error
             copied._effect_results[intent_id] = result
 
         return self._commit_state_and_event(
@@ -3750,22 +5350,65 @@ class InMemoryStateStore:
 
     def _existing_control_outcome(self, command: CommandEnvelope) -> CommandOutcome | None:
         with self._lock:
-            receipt = self._command_receipts.get(command.request_id)
-            if receipt is None:
-                return None
-            _, _, stored_digest, outcome_json, _ = receipt
-            stored = CommandOutcome.validate_for_payload(
-                command.payload, _json_object(outcome_json)
+            return self._control_request_claim_outcome(command, self._control_request_claims)
+
+    @staticmethod
+    def _control_request_claim_outcome(
+        command: CommandEnvelope, claims: dict[str, tuple[str, str]]
+    ) -> CommandOutcome | None:
+        claim = claims.get(command.request_id)
+        if claim is None:
+            return None
+        stored_digest, outcome_json = claim
+        if stored_digest == _command_digest(command):
+            return CommandOutcome.validate_for_payload(command.payload, _json_object(outcome_json))
+        stored_run_id, stored_sequence = _stored_command_outcome_identity(outcome_json)
+        return CommandOutcome.for_payload(
+            command.payload,
+            status=CommandStatus.CONFLICT,
+            run_id=stored_run_id,
+            resulting_sequence=stored_sequence,
+            failed_invariant="IDEMPOTENCY_KEY_REUSE",
+        )
+
+    def _claim_control_request(
+        self,
+        copied: InMemoryStateStore,
+        command: CommandEnvelope,
+        outcome: CommandOutcome,
+    ) -> None:
+        existing = self._control_request_claim_outcome(command, copied._control_request_claims)
+        if existing is not None:
+            raise _ControlRequestClaimed(existing)
+        copied._control_request_claims[command.request_id] = (
+            _command_digest(command),
+            _outcome_json(outcome),
+        )
+
+    def _record_unsequenced_control_outcome(
+        self, command: CommandEnvelope, outcome: CommandOutcome
+    ) -> CommandOutcome:
+        with self._lock:
+            existing = self._control_request_claim_outcome(command, self._control_request_claims)
+            if existing is not None:
+                return existing
+            self._control_request_claims[command.request_id] = (
+                _command_digest(command),
+                _outcome_json(outcome),
             )
-            if stored_digest == _command_digest(command):
-                return stored
-            return CommandOutcome.for_payload(
-                command.payload,
-                status=CommandStatus.CONFLICT,
-                run_id=stored.run_id,
-                resulting_sequence=stored.resulting_sequence,
-                failed_invariant="IDEMPOTENCY_KEY_REUSE",
-            )
+        return outcome
+
+    def _record_bootstrap_conflict_receipt(
+        self, command: CommandEnvelope, failed_invariant: str
+    ) -> CommandOutcome:
+        outcome = CommandOutcome.for_payload(
+            command.payload,
+            status=CommandStatus.CONFLICT,
+            run_id=None,
+            resulting_sequence=None,
+            failed_invariant=failed_invariant,
+        )
+        return self._record_unsequenced_control_outcome(command, outcome)
 
     def _record_control_outcome(
         self,
@@ -3779,18 +5422,43 @@ class InMemoryStateStore:
         if command.expected_sequence is None:
             raise StateConflict("EXPECTED_SEQUENCE_REQUIRED")
         expected = AuditSequence(command.expected_sequence)
-        outcome = CommandOutcome.for_payload(
-            command.payload,
-            status=status,
-            run_id=run_id,
-            resulting_sequence=AuditSequence(expected + 1),
-            failed_invariant=failed_invariant,
-        )
-
-        def mutate(copied: InMemoryStateStore) -> None:
+        with self._lock:
+            existing = self._control_request_claim_outcome(command, self._control_request_claims)
+            if existing is not None:
+                return existing
+            copied = self._copied()
             run = copied._runs.get(run_id)
             if run is None:
-                raise StateConflict("RUN_NOT_FOUND")
+                missing = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.INVALID,
+                    run_id=run_id,
+                    resulting_sequence=None,
+                    failed_invariant="RUN_NOT_FOUND",
+                )
+                self._claim_control_request(copied, command, missing)
+                self._publish(copied)
+                return missing
+            current = copied._sequences.get(run_id, AuditSequence(0))
+            if current != expected:
+                stale = CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=current,
+                    failed_invariant="STALE_SEQUENCE",
+                )
+                self._claim_control_request(copied, command, stale)
+                self._publish(copied)
+                return stale
+            outcome = CommandOutcome.for_payload(
+                command.payload,
+                status=status,
+                run_id=run_id,
+                resulting_sequence=AuditSequence(expected + 1),
+                failed_invariant=failed_invariant,
+            )
+            self._claim_control_request(copied, command, outcome)
             if mutate_domain is not None:
                 mutate_domain(copied)
             copied._command_receipts[command.request_id] = (
@@ -3800,20 +5468,39 @@ class InMemoryStateStore:
                 _outcome_json(outcome),
                 AuditSequence(expected + 1),
             )
-
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=expected,
-            event=AuditEvent.kind(
-                event_kind,
-                applicable_revision_digests=command.applicable_revision_digests,
-                result_class=status,
-            ),
-            mutate=mutate,
-        )
-        return outcome
+            if self._fail_next_commit_after_state_write:
+                self._fail_next_commit_after_state_write = False
+                raise StateCommitFault("TEST_FAULT_AFTER_STATE_WRITE")
+            self._publish_copied_events(
+                copied=copied,
+                run_id=run_id,
+                expected_sequence=expected,
+                events=(
+                    AuditEvent.kind(
+                        event_kind,
+                        applicable_revision_digests=command.applicable_revision_digests,
+                        result_class=status,
+                    ),
+                ),
+                runtime_now=None,
+            )
+            return outcome
 
     def create_bootstrap_run(
+        self,
+        command: CommandEnvelope,
+        repository_authority: RepositoryBootstrapAuthorityService,
+    ) -> CommandOutcome:
+        with self._lock:
+            existing = self._existing_control_outcome(command)
+            if existing is not None:
+                return existing
+            outcome = self._create_bootstrap_run_unchecked(command, repository_authority)
+            if outcome.status == CommandStatus.ACCEPTED:
+                return outcome
+            return self._record_unsequenced_control_outcome(command, outcome)
+
+    def _create_bootstrap_run_unchecked(
         self,
         command: CommandEnvelope,
         repository_authority: RepositoryBootstrapAuthorityService,
@@ -3873,7 +5560,6 @@ class InMemoryStateStore:
         run_id = RunId(f"run-{binding[:32]}")
         repository_id = authority.repository_id
         repository_instance_digest = authority.repository_instance_digest
-        reservation_id = f"reservation-{binding[32:64]}"
         revisions: dict[str, FrozenDocument] = {
             "POLICY": payload.policy_revision,
             "BUDGET": payload.budget_revision,
@@ -3891,6 +5577,11 @@ class InMemoryStateStore:
         )
 
         def mutate(copied: InMemoryStateStore) -> None:
+            reservation_id = allocate_target_reservation_id(
+                copied._target_reservation_id_source,
+                lambda candidate: candidate in copied._target_reservations,
+            )
+            self._claim_control_request(copied, command, outcome)
             copied._runs[run_id] = RunRecord(
                 run_id=run_id,
                 repository_id=repository_id,
@@ -3933,12 +5624,15 @@ class InMemoryStateStore:
                 AuditSequence(1),
             )
 
-        self._commit_state_and_event(
-            run_id=run_id,
-            expected_sequence=AuditSequence(0),
-            event=AuditEvent.kind("RUN_CREATED"),
-            mutate=mutate,
-        )
+        try:
+            self._commit_state_and_event(
+                run_id=run_id,
+                expected_sequence=AuditSequence(0),
+                event=AuditEvent.kind("RUN_CREATED"),
+                mutate=mutate,
+            )
+        except TargetReservationIdAllocationError as error:
+            return self._record_bootstrap_conflict_receipt(command, error.failed_invariant)
         return outcome
 
     def propose_revision(
@@ -4485,21 +6179,27 @@ class InMemoryStateStore:
             or approval.plan_digest != payload.plan_digest
             or command.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="PLAN_APPROVAL_BINDING_MISMATCH",
+                ),
             )
         target_digest = self.target_authority_digest(run_id)
         if target_authority.current_for(run_id) != target_digest or start_guard is None:
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.CONFLICT,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="START_GUARD_UNAVAILABLE",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.CONFLICT,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="START_GUARD_UNAVAILABLE",
+                ),
             )
         decision = start_guard.inspect(
             run_id=run_id,
@@ -4507,12 +6207,15 @@ class InMemoryStateStore:
             expected_sequence=AuditSequence(expected),
         )
         if not decision.ok or decision.binding is None:
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.CONFLICT,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant=decision.reason or "START_GUARD_DENIED",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.CONFLICT,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant=decision.reason or "START_GUARD_DENIED",
+                ),
             )
         guard = decision.binding
         run = self.run_record(run_id)
@@ -4525,12 +6228,15 @@ class InMemoryStateStore:
             or guard.target_safety_digest != target_digest
             or guard.applicable_revision_digests != current
         ):
-            return CommandOutcome.for_payload(
-                payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=AuditSequence(expected),
-                failed_invariant="START_GUARD_BINDING_MISMATCH",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=AuditSequence(expected),
+                    failed_invariant="START_GUARD_BINDING_MISMATCH",
+                ),
             )
 
         def mutate(copied: InMemoryStateStore) -> None:
@@ -4565,31 +6271,47 @@ class InMemoryStateStore:
         repository_authority: RepositoryBootstrapAuthorityService,
         start_guard: StartGuard | None = None,
     ) -> CommandOutcome:
+        if isinstance(command.payload, CreateRunPayload):
+            return self.create_bootstrap_run(command, repository_authority)
         existing = self._existing_control_outcome(command)
         if existing is not None:
             return existing
-        if isinstance(command.payload, CreateRunPayload):
-            return self.create_bootstrap_run(command, repository_authority)
         run_id = RunId(command.payload.run_id)
         with self._lock:
             run = self._runs.get(run_id)
             if run is None:
-                return CommandOutcome.for_payload(
-                    command.payload,
-                    status=CommandStatus.INVALID,
-                    run_id=run_id,
-                    resulting_sequence=None,
-                    failed_invariant="RUN_NOT_FOUND",
+                return self._record_unsequenced_control_outcome(
+                    command,
+                    CommandOutcome.for_payload(
+                        command.payload,
+                        status=CommandStatus.INVALID,
+                        run_id=run_id,
+                        resulting_sequence=None,
+                        failed_invariant="RUN_NOT_FOUND",
+                    ),
                 )
             sequence = self._sequences.get(run_id, AuditSequence(0))
         if command.expected_sequence != sequence:
-            return CommandOutcome.for_payload(
-                command.payload,
-                status=CommandStatus.STALE,
-                run_id=run_id,
-                resulting_sequence=sequence,
-                failed_invariant="STALE_SEQUENCE",
+            return self._record_unsequenced_control_outcome(
+                command,
+                CommandOutcome.for_payload(
+                    command.payload,
+                    status=CommandStatus.STALE,
+                    run_id=run_id,
+                    resulting_sequence=sequence,
+                    failed_invariant="STALE_SEQUENCE",
+                ),
             )
+        if isinstance(command.payload, GrantPayload):
+            self.accept_pending_action_grant(
+                command=command,
+                now=datetime.now(UTC),
+                expected_sequence=AuditSequence(sequence),
+            )
+            outcome = self._existing_control_outcome(command)
+            if outcome is None:
+                raise StateConflict("PENDING_ACTION_GRANT_OUTCOME_NOT_RECORDED")
+            return outcome
         if isinstance(command.payload, ApprovePlanPayload):
             return self._approve_plan(command, run_id, run.state)
         if isinstance(

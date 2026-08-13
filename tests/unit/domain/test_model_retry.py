@@ -17,7 +17,7 @@ from apexcrew.domain.model import (
 def completion(model_id: str, action: dict[str, str]) -> ModelCompletion:
     return ModelCompletion(
         response_id="response-1",
-        requested_model_id="gpt-5.6-terra",
+        requested_model_id="deepseek-v4-flash",
         returned_model_id=model_id,
         usage=ModelUsage(120, 12, Decimal("0.00048")),
         normalized_action=action,
@@ -31,8 +31,8 @@ def make_model_request() -> ModelRequest:
         policy_digest="sha256:" + "3" * 64,
         budget_digest="sha256:" + "4" * 64,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "2" * 64,
@@ -97,7 +97,7 @@ def test_known_closed_rejection_retries_with_new_reserved_attempts() -> None:
             ScriptedModelStep.for_request(
                 request,
                 ProviderAttemptResult.completed(
-                    completion(model_id="gpt-5.6-terra", action={"kind": "finish"})
+                    completion(model_id="deepseek-v4-flash", action={"kind": "finish"})
                 ),
             ),
         ]

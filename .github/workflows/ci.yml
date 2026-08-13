@@ -43,3 +43,15 @@ jobs:
           python-version: "3.12"
       - run: uv sync --frozen --all-groups
       - run: uv run pytest
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.29"
+          python-version: "3.12"
+      - run: uv sync --frozen --all-groups
+      - run: uv build
+      - run: docker build --tag apexcrew-executor:ci .

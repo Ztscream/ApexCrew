@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Annotated, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, Self
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
@@ -39,6 +39,7 @@ from apexcrew.domain.revisions import (
     Sha256DigestText,
 )
 from apexcrew.domain.types import (
+    AttemptId,
     AuditSequence,
     GitOid,
     IntentId,
@@ -47,6 +48,9 @@ from apexcrew.domain.types import (
     RunId,
     TaskId,
 )
+
+if TYPE_CHECKING:
+    from apexcrew.domain.worker import WorkerAttemptSnapshot
 
 
 def _check_document(check: CheckDefinition) -> dict[str, object]:
@@ -928,7 +932,44 @@ class AuthorityModelClient:
         raise AssertionError("closed model retry loop exhausted without a result")
 
 
+@dataclass(frozen=True, slots=True)
+class TaskDispatchSelection:
+    dispatch_id: str
+    run_id: RunId
+    task_id: TaskId
+    task_contract_digest: str
+    base_run_head_oid: str
+    applicable_revision_digests: ApplicableRevisionDigests
+    target_safety_digest: str
+    credential_profile: str | None
+    resume_allocation_id: str | None
+    reserved_attempt_id: AttemptId | None
+    expected_sequence: AuditSequence
+    existing_attempt_id: AttemptId | None = None
+
+
+class SchedulingState(Protocol):
+    def next_dispatchable(self, run_id: RunId) -> TaskDispatchSelection | RuntimeDecision: ...
+
+
+class WorkerAttemptCreator(Protocol):
+    def create_attempt_with_lease(
+        self,
+        selection: TaskDispatchSelection,
+        *,
+        expected_sequence: AuditSequence,
+    ) -> WorkerAttemptSnapshot: ...
+
+
+class WorkerTurnRunner(Protocol):
+    def run_turn(self, attempt_id: AttemptId) -> RuntimeDecision: ...
+
+
 class CoordinatorService:
+    _scheduling: SchedulingState
+    _worker_attempts: WorkerAttemptCreator
+    _workers: WorkerTurnRunner
+
     def __init__(
         self,
         *,
@@ -947,6 +988,30 @@ class CoordinatorService:
         self._journal = journal
         self._state = state
         self._clock = clock
+
+    @classmethod
+    def for_worker_scheduling(
+        cls,
+        *,
+        scheduling: SchedulingState,
+        attempts: WorkerAttemptCreator,
+        workers: WorkerTurnRunner,
+    ) -> Self:
+        service = cls.__new__(cls)
+        service._scheduling = scheduling
+        service._worker_attempts = attempts
+        service._workers = workers
+        return service
+
+    def schedule(self, run_id: RunId) -> RuntimeDecision:
+        selection = self._scheduling.next_dispatchable(run_id)
+        if isinstance(selection, RuntimeDecision):
+            return selection
+        attempt = self._worker_attempts.create_attempt_with_lease(
+            selection,
+            expected_sequence=selection.expected_sequence,
+        )
+        return self._workers.run_turn(attempt.attempt_id)
 
     def run_planning_turn(self, run_id: RunId) -> RuntimeDecision:
         authorization = self._planning_authorization.current(run_id)

@@ -37,12 +37,12 @@ def make_budget(**overrides: object) -> BudgetRevisionDocument:
         "output_token_ceiling": 200_000,
         "cost_reserve_usd": Decimal(10),
         "concurrent_worker_ceiling": 3,
-        "pricing_observed_on": date(2026, 7, 26),
+        "pricing_observed_on": date(2026, 8, 5),
         "pricing_entries": (
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal("15.00"),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     }
@@ -105,8 +105,8 @@ def planning_reservation_request(
         policy_digest="sha256:" + "3" * 64,
         budget_digest=budget_digest,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + "2" * 64,
@@ -164,7 +164,7 @@ def test_authorized_model_reservation_produces_five_global_metrics_atomically(
         model_call_ceiling=1,
         input_token_ceiling=1_000,
         output_token_ceiling=200,
-        cost_reserve_usd=Decimal("0.0055"),
+        cost_reserve_usd=Decimal("0.000392"),
     )
     reserved = authority.reserve_model_attempt(
         planning_reservation_request(
@@ -231,8 +231,8 @@ def test_model_settlement_replaces_reserved_token_and_cost_usage(tmp_path: Path)
         ProviderAttemptResult.completed(
             ModelCompletion(
                 response_id="response-1",
-                requested_model_id="gpt-5.6-terra",
-                returned_model_id="gpt-5.6-terra",
+                requested_model_id="deepseek-v4-flash",
+                returned_model_id="deepseek-v4-flash",
                 usage=ModelUsage(500, 100, Decimal("0.00275")),
                 normalized_action={"kind": "finish"},
             )

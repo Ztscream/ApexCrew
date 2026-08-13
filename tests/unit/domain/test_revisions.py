@@ -31,11 +31,11 @@ def test_revision_documents_reject_secret_globs_and_mismatched_origin() -> None:
             schema_version="model-configuration-revision-v1",
             provider="scripted_mock",
             provider_base_origin="https://api.openai.com",
-            requested_model_id="gpt-5.6-terra",
+            requested_model_id="deepseek-v4-flash",
             returned_model_aliases=(
                 ReturnedModelAliasDocument(
-                    returned_model_id="gpt-5.6-terra",
-                    canonical_model_id="gpt-5.6-terra",
+                    returned_model_id="deepseek-v4-flash",
+                    canonical_model_id="deepseek-v4-flash",
                 ),
             ),
             inference_settings=InferenceSettingsDocument(
@@ -58,12 +58,12 @@ def valid_budget_revision() -> dict[str, object]:
         "output_token_ceiling": 200_000,
         "cost_reserve_usd": Decimal(10),
         "concurrent_worker_ceiling": 3,
-        "pricing_observed_on": date(2026, 7, 26),
+        "pricing_observed_on": date(2026, 8, 5),
         "pricing_entries": (
             ModelPricingEntryDocument(
-                returned_model_id="gpt-5.6-terra",
-                input_usd_per_million=Decimal("2.50"),
-                output_usd_per_million=Decimal(15),
+                returned_model_id="deepseek-v4-flash",
+                input_usd_per_million=Decimal("0.28"),
+                output_usd_per_million=Decimal("0.56"),
             ),
         ),
     }

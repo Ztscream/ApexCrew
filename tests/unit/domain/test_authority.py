@@ -34,8 +34,8 @@ def consume_tranche(
             policy_digest="sha256:" + "3" * 64,
             budget_digest=budget_digest,
             model_configuration_digest="sha256:" + "5" * 64,
-            requested_model_id="gpt-5.6-terra",
-            allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+            requested_model_id="deepseek-v4-flash",
+            allowed_model_ids=frozenset({"deepseek-v4-flash"}),
             prompt=({"role": "user", "content": "finish"},),
             tool_schema_digest="sha256:" + "1" * 64,
             request_digest="sha256:" + f"{index + 1:064x}",
@@ -79,8 +79,8 @@ def planning_reservation(store: InMemoryStateStore, *, request_id: str) -> Model
         policy_digest="sha256:" + "3" * 64,
         budget_digest=budget_digest,
         model_configuration_digest="sha256:" + "5" * 64,
-        requested_model_id="gpt-5.6-terra",
-        allowed_model_ids=frozenset({"gpt-5.6-terra"}),
+        requested_model_id="deepseek-v4-flash",
+        allowed_model_ids=frozenset({"deepseek-v4-flash"}),
         prompt=({"role": "user", "content": "finish"},),
         tool_schema_digest="sha256:" + "1" * 64,
         request_digest="sha256:" + request_id * 64,
@@ -114,7 +114,7 @@ def test_global_model_call_ceiling_pauses_before_second_intent() -> None:
     first = authority.reserve_model_attempt(planning_reservation(store, request_id="a"))
     stopped = authority.reserve_model_attempt(planning_reservation(store, request_id="b"))
     assert first.decision == "RESERVED"
-    assert first.reserved_amounts.cost_usd == Decimal("0.0055")
+    assert first.reserved_amounts.cost_usd == Decimal("0.000392")
     assert stopped.decision == "PAUSE"
     assert stopped.reason == "MODEL_CALL_CEILING"
     assert store.model_counters("run-1").calls == 1
