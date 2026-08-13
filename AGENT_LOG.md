@@ -2,6 +2,18 @@
 
 This chronological log records material agent work and human decisions. Future implementation entries must include the `PLAN.md` task, Superpowers skill, red/green evidence, commit or PR, and any manual correction. Never record credentials, private prompt text, or secret-bearing command output.
 
+## 2026-08-13 / Versioned static Pages assets
+
+- **Base and task**: `4f12cd6fba36236b626ab51dde9fb52ebf6555da`; prevent an old cached Pages JavaScript asset from continuing to display `UNAVAILABLE / Read failed` after the static replay repair.
+- **Subagent/Human-Changes**: Codex; none.
+- **Observed diagnosis**: the public source returned the repaired HTML and JavaScript, and a clean Playwright session rendered `SANITIZED REPLAY / COMPLETED` with no console error. GitHub Pages returned `Cache-Control: max-age=600` for both `index.html` and the stable `app.js` URL, so a browser holding the earlier script could still call `/api/run` for up to ten minutes after a deployment.
+- **Observed red**: the updated bundle selector `uv run --python 3.12 pytest tests/unit/test_webui_build.py -q` failed because the output HTML still referenced stable `app.js` and `styles.css` names rather than content-versioned asset URLs.
+- **Implementation**: `scripts/build_webui.py` now computes a SHA-256 prefix for each CSS and JavaScript asset, writes `app.<hash>.js` and `styles.<hash>.css`, and substitutes those names into generated HTML. The checker retains the source-template names and validates the no-network replay boundary before build.
+- **Green evidence**: `uv run --python 3.12 pytest tests/unit/test_webui_build.py tests/contract/test_bootstrap_ci.py -q`, `uv run --python 3.12 python scripts/check_static_replay.py`, `make web-build`, Python Ruff format/check, and `git diff --check` passed. A fresh build contained exactly the generated HTML and its two hashed assets. Playwright rendered the completed replay with no dynamic requests; only the temporary local server's missing favicon produced a 404.
+- **Spec-Review**: PASS. The static replay remains fixed, sanitized, read-only, same-origin, and network-denied; versioned filenames only prevent stale code reuse.
+- **Quality-Review**: PASS. Hash names derive directly from emitted bytes, output is deterministic, tests assert the HTML-to-asset relation, and the change is constrained to the build boundary.
+- **Intended commit**: `fix(pages): version static assets`.
+
 ## 2026-08-13 / Static GitHub Pages replay repair
 
 - **Base and task**: `4f26bbb4471574e81fbdb67073f5be7f04fd2594`; repair the deployed GitHub Pages replay that displayed `UNAVAILABLE / Read failed`.
