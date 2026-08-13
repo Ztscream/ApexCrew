@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -54,6 +55,10 @@ def main() -> None:
         "state": "COMPLETED",
     }:
         raise SystemExit("STATIC_REPLAY_FIELDS_INVALID")
+    if 'href="styles.css"' not in index or 'src="app.js"' not in index:
+        raise SystemExit("STATIC_REPLAY_SOURCE_ASSET_NAMES_INVALID")
+    if re.search(r"app\.[0-9a-f]{12}\.js", index):
+        raise SystemExit("STATIC_REPLAY_SOURCE_ASSET_ALREADY_HASHED")
     print("static-replay: clean")
 
 

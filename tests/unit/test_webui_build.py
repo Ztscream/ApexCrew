@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -13,8 +14,16 @@ def test_static_webui_build_contains_sanitized_embedded_replay(tmp_path: Path) -
     )
     assert result.returncode == 0, result.stderr
     index = (tmp_path / "index.html").read_text(encoding="utf-8")
-    script = (tmp_path / "app.js").read_text(encoding="utf-8")
-    assert {path.name for path in tmp_path.iterdir()} == {"app.js", "index.html", "styles.css"}
+    script_match = re.search(r'<script src="(app\.[0-9a-f]{12}\.js)"></script>', index)
+    style_match = re.search(r'<link rel="stylesheet" href="(styles\.[0-9a-f]{12}\.css)">', index)
+    assert script_match is not None
+    assert style_match is not None
+    script = (tmp_path / script_match.group(1)).read_text(encoding="utf-8")
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "index.html",
+        script_match.group(1),
+        style_match.group(1),
+    }
     assert "ApexCrew" in index
     assert "Content-Security-Policy" in index
     assert "default-src 'self'" in index
